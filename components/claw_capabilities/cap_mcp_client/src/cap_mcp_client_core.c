@@ -306,8 +306,10 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
 
     result = cJSON_GetObjectItem(response, "result");
     if (!cJSON_IsObject(result)) {
+        /* tools_out is not attached to root yet; delete it explicitly. */
         cJSON_Delete(response);
         cJSON_Delete(root);
+        cJSON_Delete(tools_out);
         return ESP_FAIL;
     }
 
@@ -317,8 +319,10 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
             cJSON *duplicate = cJSON_Duplicate(tool, 1);
 
             if (!duplicate) {
+                /* tools_out is not attached to root yet; delete it explicitly. */
                 cJSON_Delete(response);
                 cJSON_Delete(root);
+                cJSON_Delete(tools_out);
                 return ESP_ERR_NO_MEM;
             }
             cJSON_AddItemToArray(tools_out, duplicate);

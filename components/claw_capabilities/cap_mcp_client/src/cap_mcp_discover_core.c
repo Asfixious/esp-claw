@@ -298,8 +298,10 @@ esp_err_t cap_mcp_discover_services(const char *input_json, cJSON **result_out)
                                            result->port,
                                            endpoint);
         if (append_err != ESP_OK) {
+            /* devices is not attached to root yet; delete it explicitly. */
             mdns_query_results_free(results);
             cJSON_Delete(root);
+            cJSON_Delete(devices);
             return append_err;
         }
         found++;
@@ -309,7 +311,9 @@ esp_err_t cap_mcp_discover_services(const char *input_json, cJSON **result_out)
     if (include_self) {
         err = cap_mcp_append_self_device_if_needed(devices, &found);
         if (err != ESP_OK) {
+            /* devices is not attached to root yet; delete it explicitly. */
             cJSON_Delete(root);
+            cJSON_Delete(devices);
             return err;
         }
     }

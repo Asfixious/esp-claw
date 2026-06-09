@@ -1,0 +1,13 @@
+[package]
+name = "claw_sys"
+version = "0.1.0"
+edition = "2021"
+description = "Thin IDF shims std cannot express: the ESP_LOGx log backend and the esp_http_client ClawHttp driver"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+claw_interfaces = { path = "../claw_interfaces" }
+log = "0.4"
+serde_json = "1"

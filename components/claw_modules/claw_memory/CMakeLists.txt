@@ -1,13 +1,8 @@
+# claw_memory is now implemented in Rust (../rust/claw_memory) and bundled into
+# libclaw_rt.a via the claw_core component. This component is header-only: it
+# exposes claw_memory.h, and all claw_memory_* symbols resolve from libclaw_rt.a
+# through the claw_core dependency.
 idf_component_register(
-    SRCS
-        "src/claw_memory.c"
-        "src/claw_memory_cap.c"
-        "src/claw_memory_extract.c"
-        "src/claw_memory_lightweight.c"
-        "src/claw_memory_profile.c"
-        "src/claw_memory_session.c"
-        "src/claw_memory_storage.c"
-        "src/claw_memory_utils.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

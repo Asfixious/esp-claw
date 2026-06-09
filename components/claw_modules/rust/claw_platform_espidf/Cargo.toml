@@ -1,0 +1,12 @@
+[package]
+name = "claw_platform_espidf"
+version = "0.1.0"
+edition = "2021"
+description = "ESP-IDF implementation of claw_platform via raw extern \"C\" FFI (no esp-idf-sys/std)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+claw_platform = { path = "../claw_platform" }
+libc = { version = "0.2", default-features = false }

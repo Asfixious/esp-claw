@@ -1,0 +1,8 @@
+[package]
+name = "claw_interfaces"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types and dependency-injection traits for the claw_modules Rust crates (esp_err, ClawEvent, EventPublisher, ClawHttp)"
+
+[lib]
+crate-type = ["rlib"]

@@ -1,0 +1,17 @@
+[package]
+name = "claw_memory"
+version = "0.1.0"
+edition = "2021"
+description = "Long-term + session memory (port of the claw_memory component), exporting the claw_memory.h C ABI"
+
+[lib]
+# rlib only; the #[no_mangle] symbols are bundled into libclaw_rt.a via claw_rt.
+crate-type = ["rlib"]
+
+[dependencies]
+claw_core = { path = "../claw_core" }
+claw_interfaces = { path = "../claw_interfaces" }
+claw_sys = { path = "../claw_sys" }
+serde_json = { version = "1", features = ["preserve_order"] }
+log = "0.4"
+libc = "0.2"

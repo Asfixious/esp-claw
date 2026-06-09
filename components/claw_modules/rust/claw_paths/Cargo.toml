@@ -1,0 +1,11 @@
+[package]
+name = "claw_paths"
+version = "0.1.0"
+edition = "2021"
+description = "Boot-time logical storage root registry (port of claw_paths.c), exporting the claw_paths_* C ABI"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+claw_interfaces = { path = "../claw_interfaces" }

@@ -1,0 +1,18 @@
+[package]
+name = "claw_rt"
+version = "0.1.0"
+edition = "2021"
+description = "Single staticlib aggregator that bundles all migrated claw_modules Rust crates into one archive (libclaw_rt.a) so their #[no_mangle] C-ABI symbols are emitted exactly once."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Each of these crates owns a slice of the firmware C ABI. Re-exporting them
+# from lib.rs forces rustc to link their objects (and #[no_mangle] exports)
+# into the single libclaw_rt.a that the ESP-IDF claw_core component links.
+claw_core = { path = "../claw_core" }
+claw_memory = { path = "../claw_memory" }
+cap_llm_inspect = { path = "../cap_llm_inspect" }
+claw_paths = { path = "../claw_paths" }
+claw_task = { path = "../claw_task" }

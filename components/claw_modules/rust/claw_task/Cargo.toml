@@ -1,0 +1,17 @@
+[package]
+name = "claw_task"
+version = "0.1.0"
+edition = "2021"
+description = "Pinned/PSRAM-stack FreeRTOS task wrapper (port of claw_task.c) for external C consumers; not used by claw_core"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+claw_interfaces = { path = "../claw_interfaces" }
+log = "0.4"
+
+[lints.rust]
+# `claw_freertos_ext_mem` is set via rustflags from CMake when the IDF option
+# CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is enabled.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(claw_freertos_ext_mem)'] }

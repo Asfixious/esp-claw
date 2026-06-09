@@ -1538,7 +1538,11 @@ static esp_err_t cap_im_wechat_poll_once(void)
 
     if (cap_im_wechat_int_value(cJSON_GetObjectItemCaseSensitive(root, "ret"), 0) != 0 ||
             cap_im_wechat_int_value(cJSON_GetObjectItemCaseSensitive(root, "errcode"), 0) != 0) {
-        ESP_LOGW(TAG, "wechat getupdates error: %s", cJSON_PrintUnformatted(root));
+        /* cJSON_PrintUnformatted returns a heap string; free it after logging
+         * (it was previously leaked on every error poll cycle). */
+        char *err_body = cJSON_PrintUnformatted(root);
+        ESP_LOGW(TAG, "wechat getupdates error: %s", err_body ? err_body : "(null)");
+        cJSON_free(err_body);
         cJSON_Delete(root);
         return ESP_FAIL;
     }

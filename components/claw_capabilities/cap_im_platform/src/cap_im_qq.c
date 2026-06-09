@@ -467,16 +467,19 @@ static esp_err_t cap_im_qq_get_access_token(void)
         cJSON *expires_json;
         int expires_in;
 
-        free(resp.buf);
         if (!root) {
+            free(resp.buf);
             return ESP_FAIL;
         }
 
         token_json = cJSON_GetObjectItem(root, "access_token");
         expires_json = cJSON_GetObjectItem(root, "expires_in");
         if (!cJSON_IsString(token_json) || !token_json->valuestring) {
+            /* Log the raw body before freeing it (it was previously freed first,
+             * leaving this a use-after-free read). */
             cap_im_qq_log_http_failure("QQ token parse", ESP_FAIL, 200, resp.buf);
             cJSON_Delete(root);
+            free(resp.buf);
             return ESP_FAIL;
         }
 
@@ -484,6 +487,7 @@ static esp_err_t cap_im_qq_get_access_token(void)
         expires_in = cJSON_IsNumber(expires_json) ? expires_json->valueint : 7200;
         s_qq.token_expire_time = now + expires_in - 300;
         cJSON_Delete(root);
+        free(resp.buf);
     }
 
     return ESP_OK;
@@ -561,20 +565,23 @@ retry:
         cJSON *root = cJSON_Parse(resp.buf);
         cJSON *url_json;
 
-        free(resp.buf);
         if (!root) {
+            free(resp.buf);
             return ESP_FAIL;
         }
 
         url_json = cJSON_GetObjectItem(root, "url");
         if (!cJSON_IsString(url_json) || !url_json->valuestring) {
+            /* Log the raw body before freeing it (previously freed first -> UAF). */
             cap_im_qq_log_http_failure("QQ gateway parse", ESP_FAIL, 200, resp.buf);
             cJSON_Delete(root);
+            free(resp.buf);
             return ESP_FAIL;
         }
 
         strlcpy(s_qq.ws_url, url_json->valuestring, sizeof(s_qq.ws_url));
         cJSON_Delete(root);
+        free(resp.buf);
     }
 
     return ESP_OK;

@@ -20,36 +20,34 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use claw_api::{ChatError, ChatRequest, ClawApi, InitError};
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_NOT_SUPPORTED, ESP_FAIL, ESP_OK,
-};
 
-/// `claw-api` is platform-agnostic; map its init error to the `esp_err_t` the
-/// memory extract C ABI returns.
-fn init_error_code(err: &InitError) -> EspErr {
+use crate::api::{self, MemoryConfig};
+use crate::consts::{MessageIntent, AUTO_EXTRACT_MAX_ITEMS, KEYWORDS_CAP, MAX_SUMMARIES, TAGS_CAP};
+use crate::error::{MemoryError, MemoryResult};
+use crate::item::{self, MemItem};
+use crate::storage;
+use crate::util;
+
+/// `claw-api` is platform-agnostic; map its init error to the crate-internal
+/// [`MemoryError`] (which carries the exact `esp_err_t` returned to C).
+fn init_error_code(err: &InitError) -> MemoryError {
     match err {
         InitError::MissingApiKey
         | InitError::MissingModel
         | InitError::MissingBaseUrl
-        | InitError::MissingBackendType => ESP_ERR_INVALID_ARG,
-        InitError::UnknownBackend => ESP_ERR_NOT_SUPPORTED,
+        | InitError::MissingBackendType => MemoryError::InvalidArg,
+        InitError::UnknownBackend => MemoryError::NotSupported,
     }
 }
 
-/// Map a [`ChatError`] to the `esp_err_t` the memory extract C ABI returns.
-fn chat_error_code(err: &ChatError) -> EspErr {
+/// Map a [`ChatError`] to the crate-internal [`MemoryError`].
+fn chat_error_code(err: &ChatError) -> MemoryError {
     match err {
-        ChatError::ToolsUnsupported => ESP_ERR_NOT_SUPPORTED,
-        ChatError::InvalidToolsJson => ESP_ERR_INVALID_ARG,
-        ChatError::Api(_) => ESP_FAIL,
+        ChatError::ToolsUnsupported => MemoryError::NotSupported,
+        ChatError::InvalidToolsJson => MemoryError::InvalidArg,
+        ChatError::Api(_) => MemoryError::Fail,
     }
 }
-
-use crate::api::{self, MemoryConfig};
-use crate::consts::{MessageIntent, AUTO_EXTRACT_MAX_ITEMS, KEYWORDS_CAP, MAX_SUMMARIES, TAGS_CAP};
-use crate::item::{self, MemItem};
-use crate::storage;
-use crate::util;
 
 /// Async extract worker stack. Larger than the C task's 6 KiB because the Rust
 /// LLM/HTTP/TLS/serde path uses deeper frames; placed in PSRAM by `spawn_worker`.
@@ -88,12 +86,12 @@ pub fn parse_llm_json_document(text: &str) -> Option<Value> {
 // --- LLM chat helper ------------------------------------------------------
 
 /// `claw_memory_llm_chat_with_runtime`: a single user-message chat with no
-/// tools. Returns the response text, or an `(EspErr, message)` failure.
+/// tools. Returns the response text, or a `(MemoryError, message)` failure.
 fn llm_chat_with_runtime(
     runtime: &ClawApi,
     system_prompt: &str,
     user_text: &str,
-) -> Result<Option<String>, (EspErr, String)> {
+) -> Result<Option<String>, (MemoryError, String)> {
     let messages = serde_json::json!([{ "role": "user", "content": user_text }]);
     let request = ChatRequest {
         system_prompt,
@@ -105,7 +103,7 @@ fn llm_chat_with_runtime(
         .chat(&request, &abort)
         .map_err(|e| (chat_error_code(&e), e.to_string()))?;
     if !response.tool_calls.is_empty() {
-        return Err((ESP_ERR_NOT_SUPPORTED, "LLM returned unsupported tool calls".to_string()));
+        return Err((MemoryError::NotSupported, "LLM returned unsupported tool calls".to_string()));
     }
     Ok(response.text)
 }
@@ -114,7 +112,7 @@ fn llm_chat_with_runtime(
 pub fn auto_extract_prepare_with_runtime(
     runtime: &ClawApi,
     user_text: &str,
-) -> Result<(MessageIntent, Option<String>), EspErr> {
+) -> MemoryResult<(MessageIntent, Option<String>)> {
     if user_text.is_empty() {
         return Ok((MessageIntent::None, None));
     }
@@ -136,7 +134,7 @@ pub fn auto_extract_prepare_with_runtime(
                 "auto_extract llm failed: {}",
                 if msg.is_empty() { "unknown_error" } else { &msg }
             );
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
 
@@ -193,9 +191,9 @@ fn store_extracted_candidate(
     candidate: &Value,
     intent: MessageIntent,
     out_summary: &mut Option<String>,
-) -> EspErr {
+) -> MemoryResult<()> {
     if !candidate.is_object() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
 
     let mut item = MemItem::default();
@@ -219,34 +217,25 @@ fn store_extracted_candidate(
     item::normalize_item_metadata(&mut item);
 
     if item.content.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
 
-    let (err, changed) = api::store_with_result(&mut item);
-    if err == ESP_OK && changed {
-        let replace_err = api::replace_conflicting_items(&item, intent);
-        if replace_err != ESP_OK {
-            return replace_err;
-        }
-    }
-    if err == ESP_OK && changed {
-        let append_err = item::append_item_summary_labels(&item, out_summary);
-        if append_err != ESP_OK {
-            return append_err;
-        }
-    }
-    if err == ESP_OK && !changed {
+    let changed = api::store_with_result(&mut item)?;
+    if changed {
+        api::replace_conflicting_items(&item, intent)?;
+        item::append_item_summary_labels(&item, out_summary)?;
+    } else {
         let key = item::build_item_key(&item);
         log::info!("auto_extract skipped duplicate key={}", key);
     }
-    err
+    Ok(())
 }
 
 /// `claw_memory_auto_extract_apply_result`.
 pub fn auto_extract_apply_result(
     llm_text: Option<&str>,
     intent: MessageIntent,
-) -> Result<Option<String>, EspErr> {
+) -> MemoryResult<Option<String>> {
     let text = match llm_text {
         Some(t) if !t.is_empty() => t,
         _ => return Ok(None),
@@ -259,7 +248,7 @@ pub fn auto_extract_apply_result(
         Some(r) => r,
         None => {
             log::warn!("auto_extract llm returned invalid json: {}", text);
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
 
@@ -270,29 +259,27 @@ pub fn auto_extract_apply_result(
     };
     let memories = match memories {
         Some(Value::Array(a)) => a,
-        _ => return Err(ESP_FAIL),
+        _ => return Err(MemoryError::Fail),
     };
 
     let mut summary: Option<String> = None;
-    let mut result = ESP_OK;
+    let mut result: MemoryResult<()> = Ok(());
     let mut stored = 0;
     for (i, candidate) in memories.iter().take(AUTO_EXTRACT_MAX_ITEMS).enumerate() {
-        let err = store_extracted_candidate(candidate, intent, &mut summary);
-        if err == ESP_OK {
-            stored += 1;
-        } else {
-            log::warn!(
-                "auto_extract candidate[{}] skipped err={}",
-                i,
-                claw_core::errname::esp_err_to_name(err)
-            );
-            result = err;
+        match store_extracted_candidate(candidate, intent, &mut summary) {
+            Ok(()) => stored += 1,
+            Err(e) => {
+                log::warn!(
+                    "auto_extract candidate[{}] skipped err={}",
+                    i,
+                    e.code_name()
+                );
+                result = Err(e);
+            }
         }
     }
     log::info!("auto_extract llm candidates={} stored={}", memories.len(), stored);
-    if result != ESP_OK {
-        return Err(result);
-    }
+    result?;
     Ok(summary)
 }
 
@@ -341,8 +328,7 @@ fn sweep_locked(state: &mut AsyncState) {
         !(job.completed
             && job
                 .completed_at
-                .map(|t| now.duration_since(t) >= SWEEP_AFTER)
-                .unwrap_or(false))
+                .is_some_and(|t| now.duration_since(t) >= SWEEP_AFTER))
     });
 }
 
@@ -381,7 +367,7 @@ fn worker_loop(runtime: std::sync::Arc<ClawApi>, rx: Receiver<WorkItem>) {
 }
 
 #[cfg(target_os = "espidf")]
-fn start_worker(config: &MemoryConfig) -> EspErr {
+fn start_worker(config: &MemoryConfig) -> MemoryResult<()> {
     use std::sync::Arc;
 
     use claw_api::ClawApiConfig;
@@ -407,7 +393,7 @@ fn start_worker(config: &MemoryConfig) -> EspErr {
         Err(e) => {
             log::error!("Failed to init async memory extract runtime: {e}");
             async_extract_deinit();
-            return init_error_code(&e);
+            return Err(init_error_code(&e));
         }
     };
 
@@ -430,33 +416,32 @@ fn start_worker(config: &MemoryConfig) -> EspErr {
     state.sender = Some(tx);
     state.enabled = true;
     log::info!("Async memory extract worker ready");
-    ESP_OK
+    Ok(())
 }
 
 #[cfg(not(target_os = "espidf"))]
-fn start_worker(_config: &MemoryConfig) -> EspErr {
+fn start_worker(_config: &MemoryConfig) -> MemoryResult<()> {
     // No EspIdfHttp transport off-target; async extract stays disabled so the
     // host build still compiles and links.
-    let _ = ESP_ERR_NOT_SUPPORTED;
     log::debug!("Async memory extract unavailable on host build");
-    ESP_OK
+    Ok(())
 }
 
 /// `claw_memory_async_extract_init`.
-pub fn async_extract_init(config: &MemoryConfig) -> EspErr {
+pub fn async_extract_init(config: &MemoryConfig) -> MemoryResult<()> {
     async_extract_deinit();
 
     if !config.enable_async_extract_stage_note {
-        return ESP_OK;
+        return Ok(());
     }
 
     let llm = &config.llm;
-    let complete = llm.api_key.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
-        && llm.model.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
-        && llm.backend_type.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let complete = llm.api_key.as_deref().is_some_and(|s| !s.is_empty())
+        && llm.model.as_deref().is_some_and(|s| !s.is_empty())
+        && llm.backend_type.as_deref().is_some_and(|s| !s.is_empty());
     if !complete {
         log::info!("Async memory extract disabled: LLM config incomplete");
-        return ESP_OK;
+        return Ok(());
     }
 
     start_worker(config)
@@ -467,17 +452,17 @@ pub fn async_extract_ensure_started(
     request_id: u32,
     session_id: Option<&str>,
     user_text: Option<&str>,
-) -> EspErr {
+) -> MemoryResult<()> {
     let session_id = match session_id {
         Some(s) if !s.is_empty() => s,
-        _ => return ESP_OK,
+        _ => return Ok(()),
     };
     let user_text = match user_text {
         Some(s) if !s.is_empty() => s,
-        _ => return ESP_OK,
+        _ => return Ok(()),
     };
     if request_id == 0 {
-        return ESP_OK;
+        return Ok(());
     }
 
     let (m, _cv) = async_cell();
@@ -485,15 +470,15 @@ pub fn async_extract_ensure_started(
     {
         let mut state = m.lock().unwrap_or_else(|e| e.into_inner());
         if !state.enabled {
-            return ESP_OK;
+            return Ok(());
         }
         let tx = match &state.sender {
             Some(tx) => tx.clone(),
-            None => return claw_interfaces::error::ESP_ERR_INVALID_STATE,
+            None => return Err(MemoryError::InvalidState),
         };
         sweep_locked(&mut state);
         if state.jobs.iter().any(|j| j.request_id == request_id) {
-            return ESP_OK;
+            return Ok(());
         }
         state.jobs.push(Job {
             request_id,
@@ -513,7 +498,7 @@ pub fn async_extract_ensure_started(
     if send_result.is_err() {
         let mut state = m.lock().unwrap_or_else(|e| e.into_inner());
         state.jobs.retain(|j| j.request_id != request_id);
-        return claw_interfaces::error::ESP_ERR_TIMEOUT;
+        return Err(MemoryError::Timeout);
     }
 
     log::info!(
@@ -521,7 +506,7 @@ pub fn async_extract_ensure_started(
         request_id,
         session_id
     );
-    ESP_OK
+    Ok(())
 }
 
 /// `claw_memory_async_extract_take_summary_list`.

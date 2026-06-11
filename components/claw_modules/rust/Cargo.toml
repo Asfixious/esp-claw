@@ -10,7 +10,7 @@ members = [
     "claw_task",
     "claw_core",
     "claw_memory",
-    "cap_llm_inspect",
+    "claw_capi",
     "claw_rt",
 ]
 

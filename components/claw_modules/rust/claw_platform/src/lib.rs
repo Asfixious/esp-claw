@@ -30,7 +30,11 @@ pub const ESP_LOG_ERROR: u32 = 1;
 /// Platform services required by the claw_modules crates.
 ///
 /// All methods take raw pointers and mirror their C counterparts 1:1. They are
-/// `unsafe` because they forward to C functions with C contracts.
+/// `unsafe` because they forward to C functions with C contracts: every pointer
+/// argument carries the same validity contract as the C function it wraps.
+/// Because that contract is uniform across the whole trait, it is documented
+/// here once rather than repeated on each method.
+#[allow(clippy::missing_safety_doc)]
 pub trait ClawPlatform: Sync {
     // --- heap (capability aware) ------------------------------------------
     /// `heap_caps_malloc(size, caps)`
@@ -138,10 +142,7 @@ pub fn set_platform(p: &'static dyn ClawPlatform) {
 #[inline]
 pub fn platform() -> &'static dyn ClawPlatform {
     // Safety: PLATFORM is only written once at boot via set_platform.
-    match unsafe { PLATFORM } {
-        Some(p) => p,
-        None => panic!("claw_platform: platform not installed"),
-    }
+    unsafe { PLATFORM }.expect("claw_platform: platform not installed")
 }
 
 /// `ESP_LOGE`-equivalent helper used by the modules.

@@ -1,6 +1,6 @@
-//! C ABI for `claw_core`, exporting the `claw_core.h` surface as
-//! `#[no_mangle] extern "C"` and adapting the C callback function pointers to
-//! the Rust [`crate::callbacks`] traits.
+//! C ABI for `claw_core` (moved from `claw_core::cabi`), exporting the
+//! `claw_core.h` surface as `#[no_mangle] extern "C"` and adapting the C
+//! callback function pointers to the [`claw_core::callbacks`] traits.
 //!
 //! The handle is an `Arc<Core>` leaked via [`Arc::into_raw`]; `destroy` reclaims
 //! it. C-side string outputs from callbacks (`call_cap`, context content, stage
@@ -21,26 +21,14 @@ use claw_interfaces::error::{
     EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_OK,
 };
 
-use crate::callbacks::{
+use claw_core::callbacks::{
     CapCaller, CompletionObserver, CompletionSummary, ContextProvider, GateOutcome, PersistContext,
     PersistRecord, ProviderOutcome, RequestGate, RequestStart, StageNote,
 };
-use crate::consts::{AgentLoopPhase, ContextKind};
-use crate::core::Core;
-use crate::request::RequestItem;
-use crate::response::ResponseItem;
-
-extern "C" {
-    fn free(ptr: *mut c_void);
-}
-
-/// Install the `log` facade backend once, so the Rust modules' `log::*` calls
-/// reach `ESP_LOGx`. Idempotent; safe to call from every `claw_core_create`.
-fn install_logger_once() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(claw_sys::init_logger);
-}
+use claw_core::consts::{AgentLoopPhase, ContextKind};
+use claw_core::core::Core;
+use claw_core::request::RequestItem;
+use claw_core::response::ResponseItem;
 
 // --- C ABI types ---------------------------------------------------------
 
@@ -203,7 +191,7 @@ unsafe fn take_c_string(p: *mut c_char) -> Option<String> {
         return None;
     }
     let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-    free(p as *mut c_void);
+    crate::ffi::free(p as *mut c_void);
     Some(s)
 }
 
@@ -263,7 +251,7 @@ impl RequestCView {
     }
 }
 
-unsafe fn request_from_c(req: *const claw_core_request_t) -> RequestItem {
+pub(crate) unsafe fn request_from_c(req: *const claw_core_request_t) -> RequestItem {
     let r = &*req;
     RequestItem {
         request_id: r.request_id,
@@ -511,7 +499,11 @@ impl CompletionObserver for CCompletionObserver {
 
 // --- handle helpers ------------------------------------------------------
 
-unsafe fn handle_ref<'a>(handle: claw_core_handle_t) -> Option<&'a Core> {
+/// Borrow the [`Core`] behind a `claw_core_handle_t`.
+///
+/// # Safety
+/// `handle` must be a live handle returned by `claw_core_create` (or null).
+pub unsafe fn handle_ref<'a>(handle: claw_core_handle_t) -> Option<&'a Core> {
     if handle.is_null() {
         None
     } else {
@@ -520,7 +512,7 @@ unsafe fn handle_ref<'a>(handle: claw_core_handle_t) -> Option<&'a Core> {
 }
 
 /// Borrow the [`Core`] behind a `claw_core_handle_t`. Exposed for sibling
-/// crates (e.g. `cap_llm_inspect`) that receive the opaque handle from C and
+/// modules (e.g. `crate::llm`) that receive the opaque handle from C and
 /// need to call core methods such as [`Core::infer_media`].
 ///
 /// # Safety
@@ -532,12 +524,16 @@ pub unsafe fn core_from_handle<'a>(handle: claw_core_handle_t) -> Option<&'a Cor
 // --- exported C ABI ------------------------------------------------------
 
 /// `claw_core_create`.
+///
+/// # Safety
+/// `config` and `out_core` must each be null or a valid pointer; the C string
+/// fields of `*config` must be null or NUL-terminated and valid for reads.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_create(
     config: *const claw_core_config_t,
     out_core: *mut claw_core_handle_t,
 ) -> EspErr {
-    install_logger_once();
+    crate::ffi::install_logger_once();
     if !out_core.is_null() {
         *out_core = ptr::null_mut();
     }
@@ -562,8 +558,8 @@ unsafe fn build_and_store_core(
     c: &claw_core_config_t,
     out_core: *mut claw_core_handle_t,
 ) -> EspErr {
-    use crate::core::CoreConfig;
     use claw_api::ClawApiConfig;
+    use claw_core::core::CoreConfig;
 
     let runtime_config = ClawApiConfig {
         api_key: cstr_opt(c.api_key),
@@ -617,7 +613,7 @@ unsafe fn build_and_store_core(
             *out_core = Arc::into_raw(arc) as claw_core_handle_t;
             ESP_OK
         }
-        Err(err) => err,
+        Err(err) => crate::errmap::core_esp_err(&err),
     }
 }
 
@@ -631,27 +627,43 @@ unsafe fn build_and_store_core(
 }
 
 /// `claw_core_start`.
+///
+/// # Safety
+/// `core` must be null or a live handle returned by [`claw_core_create`].
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_start(core: claw_core_handle_t) -> EspErr {
     if core.is_null() {
         return ESP_ERR_INVALID_STATE;
     }
     let arc = Arc::from_raw(core as *const Core);
-    let ret = arc.start();
+    let ret = match arc.start() {
+        Ok(()) => ESP_OK,
+        Err(err) => crate::errmap::core_esp_err(&err),
+    };
     let _ = Arc::into_raw(arc);
     ret
 }
 
 /// `claw_core_stop`.
+///
+/// # Safety
+/// `core` must be null or a live handle returned by [`claw_core_create`].
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_stop(core: claw_core_handle_t, timeout_ms: u32) -> EspErr {
     match handle_ref(core) {
-        Some(core) => core.stop(timeout_ms),
+        Some(core) => match core.stop(timeout_ms) {
+            Ok(()) => ESP_OK,
+            Err(err) => crate::errmap::core_esp_err(&err),
+        },
         None => ESP_ERR_INVALID_STATE,
     }
 }
 
 /// `claw_core_destroy`.
+///
+/// # Safety
+/// `core` must be null or a live handle returned by [`claw_core_create`] that
+/// has not already been destroyed; it is consumed by this call.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_destroy(core: claw_core_handle_t) -> EspErr {
     if core.is_null() {
@@ -659,7 +671,10 @@ pub unsafe extern "C" fn claw_core_destroy(core: claw_core_handle_t) -> EspErr {
     }
     let arc = Arc::from_raw(core as *const Core);
     if arc.is_started() {
-        let err = arc.stop(5000);
+        let err = match arc.stop(5000) {
+            Ok(()) => ESP_OK,
+            Err(err) => crate::errmap::core_esp_err(&err),
+        };
         if err != ESP_OK {
             let _ = Arc::into_raw(arc);
             return err;
@@ -670,22 +685,24 @@ pub unsafe extern "C" fn claw_core_destroy(core: claw_core_handle_t) -> EspErr {
 }
 
 /// `claw_core_add_context_provider`.
+///
+/// # Safety
+/// `core` must be null or a live handle from [`claw_core_create`], and
+/// `provider` must be null or a valid pointer whose `name` is NUL-terminated.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_add_context_provider(
     core: claw_core_handle_t,
     provider: *const claw_core_context_provider_t,
 ) -> EspErr {
-    let core = match handle_ref(core) {
-        Some(c) => c,
-        None => return ESP_ERR_INVALID_STATE,
+    let Some(core) = handle_ref(core) else {
+        return ESP_ERR_INVALID_STATE;
     };
     if provider.is_null() {
         return ESP_ERR_INVALID_ARG;
     }
     let p = &*provider;
-    let collect = match p.collect {
-        Some(f) => f,
-        None => return ESP_ERR_INVALID_ARG,
+    let Some(collect) = p.collect else {
+        return ESP_ERR_INVALID_ARG;
     };
     if p.name.is_null() {
         return ESP_ERR_INVALID_ARG;
@@ -696,57 +713,80 @@ pub unsafe extern "C" fn claw_core_add_context_provider(
         user_ctx: p.user_ctx,
         flags: p.flags,
     };
-    core.add_context_provider(Box::new(adapter))
+    match core.add_context_provider(Box::new(adapter)) {
+        Ok(()) => ESP_OK,
+        Err(err) => crate::errmap::core_esp_err(&err),
+    }
 }
 
 /// `claw_core_add_completion_observer`.
+///
+/// # Safety
+/// `core` must be null or a live handle from [`claw_core_create`]; `observer`
+/// (if set) and `user_ctx` must remain valid for the lifetime of the core.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_add_completion_observer(
     core: claw_core_handle_t,
     observer: claw_core_completion_observer_fn,
     user_ctx: *mut c_void,
 ) -> EspErr {
-    let core = match handle_ref(core) {
-        Some(c) => c,
-        None => return ESP_ERR_INVALID_STATE,
+    let Some(core) = handle_ref(core) else {
+        return ESP_ERR_INVALID_STATE;
     };
-    let f = match observer {
-        Some(f) => f,
-        None => return ESP_ERR_INVALID_ARG,
+    let Some(f) = observer else {
+        return ESP_ERR_INVALID_ARG;
     };
-    core.add_completion_observer(Box::new(CCompletionObserver { f, user_ctx }))
+    match core.add_completion_observer(Box::new(CCompletionObserver { f, user_ctx })) {
+        Ok(()) => ESP_OK,
+        Err(err) => crate::errmap::core_esp_err(&err),
+    }
 }
 
 /// `claw_core_submit`.
+///
+/// # Safety
+/// `core` must be null or a live handle from [`claw_core_create`], and
+/// `request` must be null or a valid pointer with NUL-terminated string fields.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_submit(
     core: claw_core_handle_t,
     request: *const claw_core_request_t,
     timeout_ms: u32,
 ) -> EspErr {
-    let core = match handle_ref(core) {
-        Some(c) => c,
-        None => return ESP_ERR_INVALID_STATE,
+    let Some(core) = handle_ref(core) else {
+        return ESP_ERR_INVALID_STATE;
     };
     if request.is_null() {
         return ESP_ERR_INVALID_ARG;
     }
-    core.submit(request_from_c(request), timeout_ms)
+    match core.submit(request_from_c(request), timeout_ms) {
+        Ok(()) => ESP_OK,
+        Err(err) => crate::errmap::core_esp_err(&err),
+    }
 }
 
 /// `claw_core_cancel_request`.
+///
+/// # Safety
+/// `core` must be null or a live handle returned by [`claw_core_create`].
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_cancel_request(
     core: claw_core_handle_t,
     request_id: u32,
 ) -> EspErr {
     match handle_ref(core) {
-        Some(core) => core.cancel_request(request_id),
+        Some(core) => match core.cancel_request(request_id) {
+            Ok(()) => ESP_OK,
+            Err(err) => crate::errmap::core_esp_err(&err),
+        },
         None => ESP_ERR_INVALID_STATE,
     }
 }
 
 /// `claw_core_get_agent_loop_phase`.
+///
+/// # Safety
+/// `core` must be null or a live handle returned by [`claw_core_create`].
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_get_agent_loop_phase(core: claw_core_handle_t) -> c_int {
     match handle_ref(core) {
@@ -756,6 +796,10 @@ pub unsafe extern "C" fn claw_core_get_agent_loop_phase(core: claw_core_handle_t
 }
 
 /// `claw_core_receive`.
+///
+/// # Safety
+/// `core` must be null or a live handle from [`claw_core_create`], and
+/// `response` must be null or a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_receive(
     core: claw_core_handle_t,
@@ -766,6 +810,10 @@ pub unsafe extern "C" fn claw_core_receive(
 }
 
 /// `claw_core_receive_for`.
+///
+/// # Safety
+/// `core` must be null or a live handle from [`claw_core_create`], and
+/// `response` must be null or a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_receive_for(
     core: claw_core_handle_t,
@@ -773,9 +821,8 @@ pub unsafe extern "C" fn claw_core_receive_for(
     response: *mut claw_core_response_t,
     timeout_ms: u32,
 ) -> EspErr {
-    let core = match handle_ref(core) {
-        Some(c) => c,
-        None => return ESP_ERR_INVALID_STATE,
+    let Some(core) = handle_ref(core) else {
+        return ESP_ERR_INVALID_STATE;
     };
     if response.is_null() {
         return ESP_ERR_INVALID_ARG;
@@ -785,7 +832,7 @@ pub unsafe extern "C" fn claw_core_receive_for(
             write_response_to_c(item, response);
             ESP_OK
         }
-        Err(err) => err,
+        Err(err) => crate::errmap::core_esp_err(&err),
     }
 }
 
@@ -801,6 +848,11 @@ unsafe fn write_response_to_c(item: ResponseItem, out: *mut claw_core_response_t
 }
 
 /// `claw_core_response_free`.
+///
+/// # Safety
+/// `response` must be null or a pointer previously populated by
+/// [`claw_core_receive`] / [`claw_core_receive_for`]; its owned strings are
+/// freed and the pointers nulled.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_response_free(response: *mut claw_core_response_t) {
     if response.is_null() {
@@ -818,6 +870,10 @@ pub unsafe extern "C" fn claw_core_response_free(response: *mut claw_core_respon
 }
 
 /// `claw_core_publish_stage_text`.
+///
+/// # Safety
+/// `request` must be null or a valid pointer with NUL-terminated string fields,
+/// and `text` must be null or a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn claw_core_publish_stage_text(
     request: *const claw_core_request_t,
@@ -830,16 +886,16 @@ pub unsafe extern "C" fn claw_core_publish_stage_text(
     if text.is_empty() {
         return ESP_ERR_INVALID_ARG;
     }
-    publish_stage_text_impl(request_from_c(request), &text)
+    publish_stage_text_impl(&request_from_c(request), &text)
 }
 
 #[cfg(target_os = "espidf")]
-fn publish_stage_text_impl(request: RequestItem, text: &str) -> EspErr {
-    crate::events::publish_stage_text(&espidf_events::CEventPublisher, &request, text)
+pub(crate) fn publish_stage_text_impl(request: &RequestItem, text: &str) -> EspErr {
+    claw_core::events::publish_stage_text(&espidf_events::CEventPublisher, request, text)
 }
 
 #[cfg(not(target_os = "espidf"))]
-fn publish_stage_text_impl(_request: RequestItem, _text: &str) -> EspErr {
+pub(crate) fn publish_stage_text_impl(_request: &RequestItem, _text: &str) -> EspErr {
     claw_interfaces::error::ESP_ERR_NOT_SUPPORTED
 }
 

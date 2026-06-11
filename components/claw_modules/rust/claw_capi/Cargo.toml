@@ -1,0 +1,27 @@
+[package]
+name = "claw_capi"
+version = "0.1.0"
+edition = "2021"
+description = "The single C ABI layer between the pure-Rust claw modules and the firmware's C callers"
+
+[lib]
+# rlib consumed by the `claw_rt` staticlib aggregator. All #[no_mangle] C ABI
+# symbols for the claw modules originate here so they are emitted exactly once.
+crate-type = ["rlib"]
+
+[dependencies]
+claw_interfaces = { path = "../claw_interfaces" }
+claw-api = { path = "../claw-api" }
+claw_sys = { path = "../claw_sys" }
+claw_core = { path = "../claw_core" }
+claw_memory = { path = "../claw_memory" }
+claw_paths = { path = "../claw_paths" }
+claw_task = { path = "../claw_task" }
+log = "0.4"
+serde_json = "1"
+libc = "0.2"
+
+[lints.rust]
+# `claw_freertos_ext_mem` is set via rustflags from CMake when the IDF option
+# CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is enabled (used by the task ABI).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(claw_freertos_ext_mem)'] }

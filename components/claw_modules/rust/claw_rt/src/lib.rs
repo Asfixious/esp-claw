@@ -14,8 +14,8 @@
 
 #![allow(unused_imports)]
 
-pub extern crate cap_llm_inspect;
-pub extern crate claw_core;
-pub extern crate claw_memory;
-pub extern crate claw_paths;
-pub extern crate claw_task;
+// Every #[no_mangle] C-ABI symbol for the claw modules now originates in the
+// single `claw_capi` crate, which depends on (and pulls in) the pure-Rust logic
+// crates. Re-exporting just `claw_capi` links all of those symbols into
+// libclaw_rt.a exactly once.
+pub extern crate claw_capi;

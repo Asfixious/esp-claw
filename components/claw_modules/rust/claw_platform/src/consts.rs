@@ -18,12 +18,17 @@ pub const S_IRWXU: u32 = libc::S_IRUSR | libc::S_IWUSR | libc::S_IXUSR;
 pub const S_IRWXG: u32 = libc::S_IRGRP | libc::S_IWGRP | libc::S_IXGRP;
 pub const S_IRWXO: u32 = libc::S_IROTH | libc::S_IWOTH | libc::S_IXOTH;
 
+// The `as u32` casts are required on the `espidf` target, where libc types
+// these `S_IF*` macros as `c_int`; they are redundant on a host build (libc
+// types them as `u32` there), hence the `unnecessary_cast` allow.
 #[inline]
+#[allow(clippy::unnecessary_cast)]
 pub fn s_isdir(mode: u32) -> bool {
     (mode & S_IFMT as u32) == S_IFDIR as u32
 }
 
 #[inline]
+#[allow(clippy::unnecessary_cast)]
 pub fn s_isreg(mode: u32) -> bool {
     (mode & S_IFMT as u32) == S_IFREG as u32
 }

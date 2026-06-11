@@ -5,15 +5,11 @@
 
 use serde_json::Value;
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
-    ESP_FAIL, ESP_OK,
-};
-
 use crate::consts::{
     BackendFormat, MessageIntent, DEFAULT_MAX_MESSAGE_CHARS, DEFAULT_MAX_TOOL_ITERATIONS, MAX_PATH,
     MAX_SUMMARIES, RECALL_DEFAULT_LIMIT,
 };
+use crate::error::{MemoryError, MemoryResult};
 use crate::item::{self, MemItem};
 use crate::state::{self, MemoryState};
 use crate::storage;
@@ -57,14 +53,14 @@ pub struct MemoryConfig {
 // --- init -----------------------------------------------------------------
 
 /// `claw_memory_init`.
-pub fn init(config: &MemoryConfig) -> EspErr {
+pub fn init(config: &MemoryConfig) -> MemoryResult<()> {
     let session_root = match &config.session_root_dir {
         Some(s) => s.clone(),
-        None => return ESP_ERR_INVALID_ARG,
+        None => return Err(MemoryError::InvalidArg),
     };
     let memory_root = match &config.memory_root_dir {
         Some(s) if !s.is_empty() => s.clone(),
-        _ => return ESP_ERR_INVALID_ARG,
+        _ => return Err(MemoryError::InvalidArg),
     };
 
     {
@@ -86,55 +82,42 @@ pub fn init(config: &MemoryConfig) -> EspErr {
         st.next_memory_seq = util::now_sec() % 10000;
 
         let md = st.memory_root_dir.clone();
-        st.markdown_path = match util::join_path(&md, crate::consts::MARKDOWN_FILE) {
-            Ok(p) => p,
-            Err(_) => return ESP_ERR_INVALID_SIZE,
-        };
-        st.records_path = match util::join_path(&md, crate::consts::RECORDS_FILE) {
-            Ok(p) => p,
-            Err(_) => return ESP_ERR_INVALID_SIZE,
-        };
-        st.index_path = match util::join_path(&md, crate::consts::INDEX_FILE) {
-            Ok(p) => p,
-            Err(_) => return ESP_ERR_INVALID_SIZE,
-        };
-        st.digest_path = match util::join_path(&md, crate::consts::DIGEST_FILE) {
-            Ok(p) => p,
-            Err(_) => return ESP_ERR_INVALID_SIZE,
-        };
+        // `join_path` only fails with `InvalidSize`, matching the original
+        // `ESP_ERR_INVALID_SIZE` return for an over-long path.
+        st.markdown_path = util::join_path(&md, crate::consts::MARKDOWN_FILE)?;
+        st.records_path = util::join_path(&md, crate::consts::RECORDS_FILE)?;
+        st.index_path = util::join_path(&md, crate::consts::INDEX_FILE)?;
+        st.digest_path = util::join_path(&md, crate::consts::DIGEST_FILE)?;
 
-        if util::ensure_dir_recursive(&st.session_root_dir) != ESP_OK
-            || util::ensure_dir_recursive(&st.memory_root_dir) != ESP_OK
+        if util::ensure_dir_recursive(&st.session_root_dir).is_err()
+            || util::ensure_dir_recursive(&st.memory_root_dir).is_err()
         {
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
 
-        if crate::profile::profile_init_defaults(&mut st) != ESP_OK {
-            return ESP_FAIL;
+        if crate::profile::profile_init_defaults(&mut st).is_err() {
+            return Err(MemoryError::Fail);
         }
 
-        if util::ensure_file_with_default(&st.records_path, "") != ESP_OK
-            || util::ensure_file_with_default(&st.index_path, DEFAULT_INDEX) != ESP_OK
-            || util::ensure_file_with_default(&st.digest_path, "") != ESP_OK
-            || util::ensure_file_with_default(&st.markdown_path, DEFAULT_MARKDOWN) != ESP_OK
+        if util::ensure_file_with_default(&st.records_path, "").is_err()
+            || util::ensure_file_with_default(&st.index_path, DEFAULT_INDEX).is_err()
+            || util::ensure_file_with_default(&st.digest_path, "").is_err()
+            || util::ensure_file_with_default(&st.markdown_path, DEFAULT_MARKDOWN).is_err()
         {
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
 
         st.initialized = true;
     }
 
-    let async_err = crate::extract::async_extract_init(config);
-    if async_err != ESP_OK {
-        return async_err;
-    }
+    crate::extract::async_extract_init(config)?;
 
     {
         let mut st = state::lock();
         let _ = storage::compact_internal(&mut st, false);
         log::info!("Initialized memory root={}", st.memory_root_dir);
     }
-    ESP_OK
+    Ok(())
 }
 
 // --- store ----------------------------------------------------------------
@@ -145,16 +128,17 @@ fn fill_defaults(item: &mut MemItem) {
     }
 }
 
-/// `claw_memory_store_prepared_item_internal`.
+/// `claw_memory_store_prepared_item_internal`. Returns whether the item was
+/// actually written (`changed`).
 fn store_prepared_item_internal(
     st: &mut MemoryState,
     item: &mut MemItem,
     digest_action: &str,
     digest_extra: Option<&str>,
     ignore_existing_id: Option<&str>,
-) -> (EspErr, bool) {
+) -> MemoryResult<bool> {
     if item.content.is_empty() {
-        return (ESP_ERR_INVALID_ARG, false);
+        return Err(MemoryError::InvalidArg);
     }
 
     item.content = util::trim_whitespace(&item.content).to_string();
@@ -162,7 +146,7 @@ fn store_prepared_item_internal(
     item.keywords = util::trim_whitespace(&item.keywords).to_string();
     item::normalize_item_metadata(item);
     if item.content.is_empty() {
-        return (ESP_ERR_INVALID_ARG, false);
+        return Err(MemoryError::InvalidArg);
     }
 
     fill_defaults(item);
@@ -176,10 +160,7 @@ fn store_prepared_item_internal(
     item.updated_at = util::now_sec();
     let item_key = item::build_item_key(item);
 
-    let mut items = match storage::load_current_items(st) {
-        Ok(v) => v,
-        Err(e) => return (e, false),
-    };
+    let mut items = storage::load_current_items(st)?;
 
     for existing in items.iter() {
         if let Some(ignore) = ignore_existing_id {
@@ -191,57 +172,42 @@ fn store_prepared_item_internal(
             let existing_key = item::build_item_key(existing);
             if !existing_key.is_empty() && existing_key == item_key {
                 *item = existing.clone();
-                return (ESP_OK, false);
+                return Ok(false);
             }
         }
         if item::items_semantically_match(existing, item) {
             *item = existing.clone();
-            return (ESP_OK, false);
+            return Ok(false);
         }
     }
 
-    let mut index_root = match storage::load_index(st) {
-        Ok(v) => v,
-        Err(e) => return (e, false),
-    };
+    let mut index_root = storage::load_index(st)?;
 
     let labels = item::collect_summary_labels(item);
     item.summary_ids.clear();
     for label in labels.iter().take(MAX_SUMMARIES) {
-        match storage::ensure_summary_label(&mut index_root, label, 0) {
-            Ok(id) => item.summary_ids.push(id as u16),
-            Err(e) => return (e, false),
-        }
+        let id = storage::ensure_summary_label(&mut index_root, label, 0)?;
+        item.summary_ids.push(id as u16);
     }
 
-    let mut err = storage::append_record(st, item);
-    let mut changed = false;
-    if err == ESP_OK {
-        storage::adjust_summary_stats(&mut index_root, item, 1);
-        items.push(item.clone());
-        storage::rebuild_keyword_index(&mut index_root, &items);
-        err = storage::save_index(st, &index_root);
-    }
-    if err == ESP_OK {
-        err = storage::sync_markdown(st, &items, &index_root);
-    }
-    if err == ESP_OK {
-        storage::append_digest_line(st, digest_action, Some(item), digest_extra);
-        st.write_changes_since_compact += 1;
-        changed = true;
-    }
+    storage::append_record(st, item)?;
+    storage::adjust_summary_stats(&mut index_root, item, 1);
+    items.push(item.clone());
+    storage::rebuild_keyword_index(&mut index_root, &items);
+    storage::save_index(st, &index_root)?;
+    storage::sync_markdown(st, &items, &index_root)?;
+    storage::append_digest_line(st, digest_action, Some(item), digest_extra);
+    st.write_changes_since_compact += 1;
 
-    if err == ESP_OK {
-        err = storage::maybe_compact(st);
-    }
-    (err, changed)
+    storage::maybe_compact(st)?;
+    Ok(true)
 }
 
 /// `claw_memory_store_with_result`.
-pub fn store_with_result(item: &mut MemItem) -> (EspErr, bool) {
+pub fn store_with_result(item: &mut MemItem) -> MemoryResult<bool> {
     let mut st = state::lock();
     if !st.initialized {
-        return (ESP_ERR_INVALID_STATE, false);
+        return Err(MemoryError::InvalidState);
     }
     store_prepared_item_internal(&mut st, item, "store", None, None)
 }
@@ -264,7 +230,7 @@ fn apply_update_patch(dst: &mut MemItem, patch: &MemItem) {
 }
 
 /// `claw_memory_prepare_updated_replacement`.
-fn prepare_updated_replacement(existing: &MemItem, patch: &MemItem) -> Result<MemItem, EspErr> {
+fn prepare_updated_replacement(existing: &MemItem, patch: &MemItem) -> MemoryResult<MemItem> {
     let mut replacement = existing.clone();
     replacement.id.clear();
     replacement.summary_ids.clear();
@@ -280,24 +246,21 @@ fn prepare_updated_replacement(existing: &MemItem, patch: &MemItem) -> Result<Me
     item::normalize_item_metadata(&mut replacement);
     fill_defaults(&mut replacement);
     if replacement.content.is_empty() {
-        return Err(ESP_ERR_INVALID_ARG);
+        return Err(MemoryError::InvalidArg);
     }
     Ok(replacement)
 }
 
-fn update_with_result_locked(st: &mut MemoryState, item: &mut MemItem) -> (EspErr, bool) {
+fn update_with_result_locked(st: &mut MemoryState, item: &mut MemItem) -> MemoryResult<bool> {
     if item.id.is_empty() {
-        return (ESP_ERR_INVALID_ARG, false);
+        return Err(MemoryError::InvalidArg);
     }
     let orig_id = item.id.clone();
 
-    let items = match storage::load_current_items(st) {
-        Ok(v) => v,
-        Err(e) => return (e, false),
-    };
+    let items = storage::load_current_items(st)?;
     let idx = match items.iter().position(|i| i.id == orig_id) {
         Some(i) if !items[i].deleted => i,
-        _ => return (ESP_ERR_NOT_FOUND, false),
+        _ => return Err(MemoryError::NotFound),
     };
 
     let existing = items[idx].clone();
@@ -305,42 +268,38 @@ fn update_with_result_locked(st: &mut MemoryState, item: &mut MemItem) -> (EspEr
     if let Ok(ref replacement) = prep {
         if item::items_equivalent_for_update(&existing, replacement) {
             *item = existing;
-            return (ESP_OK, false);
+            return Ok(false);
         }
     }
-    let mut replacement = match prep {
-        Ok(r) => r,
-        Err(e) => return (e, false),
-    };
+    let mut replacement = prep?;
 
-    let (err, stored_changed) =
-        store_prepared_item_internal(st, &mut replacement, "update_store", Some(&orig_id), Some(&orig_id));
-    if err != ESP_OK {
-        return (err, false);
-    }
+    let stored_changed = store_prepared_item_internal(
+        st,
+        &mut replacement,
+        "update_store",
+        Some(&orig_id),
+        Some(&orig_id),
+    )?;
 
-    let (err, forgotten, forgotten_changed) = forget_with_result_locked(st, &orig_id, true);
-    if err != ESP_OK {
-        return (err, false);
-    }
+    let (forgotten, forgotten_changed) = forget_with_result_locked(st, &orig_id, true)?;
 
     let forgotten_id = forgotten.map(|f| f.id).unwrap_or_default();
     storage::append_digest_line(st, "update", Some(&replacement), Some(&forgotten_id));
     *item = replacement;
     let out_changed = stored_changed || forgotten_changed;
 
-    let err = storage::maybe_compact(st);
-    (err, out_changed)
+    storage::maybe_compact(st)?;
+    Ok(out_changed)
 }
 
 /// `claw_memory_update_with_result`.
-pub fn update_with_result(item: &mut MemItem) -> (EspErr, bool) {
+pub fn update_with_result(item: &mut MemItem) -> MemoryResult<bool> {
     let mut st = state::lock();
     if item.id.is_empty() {
-        return (ESP_ERR_INVALID_ARG, false);
+        return Err(MemoryError::InvalidArg);
     }
     if !st.initialized {
-        return (ESP_ERR_INVALID_STATE, false);
+        return Err(MemoryError::InvalidState);
     }
     update_with_result_locked(&mut st, item)
 }
@@ -351,18 +310,15 @@ fn forget_with_result_locked(
     st: &mut MemoryState,
     memory_id: &str,
     want_item: bool,
-) -> (EspErr, Option<MemItem>, bool) {
+) -> MemoryResult<(Option<MemItem>, bool)> {
     if memory_id.is_empty() {
-        return (ESP_ERR_INVALID_ARG, None, false);
+        return Err(MemoryError::InvalidArg);
     }
 
-    let mut items = match storage::load_current_items(st) {
-        Ok(v) => v,
-        Err(e) => return (e, None, false),
-    };
+    let mut items = storage::load_current_items(st)?;
     let idx = match items.iter().position(|i| i.id == memory_id) {
         Some(i) if !items[i].deleted => i,
-        _ => return (ESP_ERR_NOT_FOUND, None, false),
+        _ => return Err(MemoryError::NotFound),
     };
 
     let out_item = if want_item { Some(items[idx].clone()) } else { None };
@@ -371,46 +327,37 @@ fn forget_with_result_locked(
     forgotten.deleted = true;
     forgotten.updated_at = util::now_sec();
 
-    let err = storage::append_record(st, &forgotten);
-    if err != ESP_OK {
-        return (err, None, false);
-    }
+    storage::append_record(st, &forgotten)?;
 
-    let mut index_root = match storage::load_index(st) {
-        Ok(v) => v,
-        Err(e) => return (e, None, false),
-    };
+    let mut index_root = storage::load_index(st)?;
 
     items[idx] = forgotten.clone();
     storage::adjust_summary_stats(&mut index_root, &forgotten, -1);
     storage::remove_unused_summaries(&mut index_root);
     storage::rebuild_keyword_index(&mut index_root, &items);
-    let mut err = storage::save_index(st, &index_root);
-    if err == ESP_OK {
-        let active: Vec<MemItem> = items.iter().filter(|i| !i.deleted).cloned().collect();
-        err = storage::sync_markdown(st, &active, &index_root);
-    }
-    let mut out_changed = false;
-    if err == ESP_OK {
-        storage::append_digest_line(st, "forget", Some(&forgotten), None);
-        st.write_changes_since_compact += 1;
-        out_changed = true;
-    }
+    storage::save_index(st, &index_root)?;
 
-    if err == ESP_OK {
-        err = storage::maybe_compact(st);
-    }
-    (err, out_item, out_changed)
+    let active: Vec<MemItem> = items.iter().filter(|i| !i.deleted).cloned().collect();
+    storage::sync_markdown(st, &active, &index_root)?;
+
+    storage::append_digest_line(st, "forget", Some(&forgotten), None);
+    st.write_changes_since_compact += 1;
+
+    storage::maybe_compact(st)?;
+    Ok((out_item, true))
 }
 
 /// `claw_memory_forget_with_result`.
-pub fn forget_with_result(memory_id: &str, want_item: bool) -> (EspErr, Option<MemItem>, bool) {
+pub fn forget_with_result(
+    memory_id: &str,
+    want_item: bool,
+) -> MemoryResult<(Option<MemItem>, bool)> {
     if memory_id.is_empty() {
-        return (ESP_ERR_INVALID_ARG, None, false);
+        return Err(MemoryError::InvalidArg);
     }
     let mut st = state::lock();
     if !st.initialized {
-        return (ESP_ERR_INVALID_STATE, None, false);
+        return Err(MemoryError::InvalidState);
     }
     forget_with_result_locked(&mut st, memory_id, want_item)
 }
@@ -418,28 +365,26 @@ pub fn forget_with_result(memory_id: &str, want_item: bool) -> (EspErr, Option<M
 // --- replace conflicting (used by auto-extract) ---------------------------
 
 /// `claw_memory_replace_conflicting_items`.
-pub fn replace_conflicting_items(incoming: &MemItem, intent: MessageIntent) -> EspErr {
+pub fn replace_conflicting_items(incoming: &MemItem, intent: MessageIntent) -> MemoryResult<()> {
     if incoming.id.is_empty() || intent != MessageIntent::Replace {
-        return ESP_OK;
+        return Ok(());
     }
     let mut st = state::lock();
     if !st.initialized {
-        return ESP_ERR_INVALID_STATE;
+        return Err(MemoryError::InvalidState);
     }
-    let items = match storage::load_current_items(&st) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let items = storage::load_current_items(&st)?;
     for existing in items.iter() {
         if !item::items_conflict_for_replacement(existing, incoming) {
             continue;
         }
-        let (err, _, _) = forget_with_result_locked(&mut st, &existing.id, false);
-        if err != ESP_OK && err != ESP_ERR_NOT_FOUND {
-            return err;
+        // A missing item is benign (already gone); any other failure propagates.
+        match forget_with_result_locked(&mut st, &existing.id, false) {
+            Ok(_) | Err(MemoryError::NotFound) => {}
+            Err(e) => return Err(e),
         }
     }
-    ESP_OK
+    Ok(())
 }
 
 // --- recall / list --------------------------------------------------------
@@ -458,25 +403,22 @@ fn item_matches_summary_ids(item: &MemItem, summary_ids: &[i64]) -> bool {
     false
 }
 
-fn render_item_list_json(items: &[MemItem], index_root: &Value) -> Result<String, EspErr> {
+fn render_item_list_json(items: &[MemItem], index_root: &Value) -> MemoryResult<String> {
     let arr: Vec<Value> = items
         .iter()
         .map(|i| storage::item_to_json(i, Some(index_root)))
         .collect();
-    serde_json::to_string(&Value::Array(arr)).map_err(|_| claw_interfaces::error::ESP_ERR_NO_MEM)
+    serde_json::to_string(&Value::Array(arr)).map_err(|_| MemoryError::NoMem)
 }
 
 /// `claw_memory_recall`.
-pub fn recall(labels: &[String], limit: usize) -> (EspErr, Option<String>) {
+pub fn recall(labels: &[String], limit: usize) -> MemoryResult<String> {
     let st = state::lock();
     if !st.initialized {
-        return (ESP_ERR_INVALID_STATE, None);
+        return Err(MemoryError::InvalidState);
     }
 
-    let index_root = match storage::load_index(&st) {
-        Ok(v) => v,
-        Err(e) => return (e, None),
-    };
+    let index_root = storage::load_index(&st)?;
 
     let mut summary_ids: Vec<i64> = Vec::new();
     for label in labels.iter().take(MAX_SUMMARIES) {
@@ -485,16 +427,10 @@ pub fn recall(labels: &[String], limit: usize) -> (EspErr, Option<String>) {
         }
     }
     if !labels.is_empty() && summary_ids.is_empty() {
-        return match render_item_list_json(&[], &index_root) {
-            Ok(s) => (ESP_OK, Some(s)),
-            Err(e) => (e, None),
-        };
+        return render_item_list_json(&[], &index_root);
     }
 
-    let items = match storage::load_current_items(&st) {
-        Ok(v) => v,
-        Err(e) => return (e, None),
-    };
+    let items = storage::load_current_items(&st)?;
 
     let limit = if limit > 0 { limit } else { RECALL_DEFAULT_LIMIT };
     let mut matches: Vec<MemItem> = Vec::new();
@@ -515,39 +451,26 @@ pub fn recall(labels: &[String], limit: usize) -> (EspErr, Option<String>) {
         matches.truncate(limit);
     }
 
-    match render_item_list_json(&matches, &index_root) {
-        Ok(s) => {
-            for m in matches.iter() {
-                storage::append_digest_line(&st, "recall", Some(m), Some("access_count+1"));
-            }
-            (ESP_OK, Some(s))
-        }
-        Err(e) => (e, None),
+    let rendered = render_item_list_json(&matches, &index_root)?;
+    for m in matches.iter() {
+        storage::append_digest_line(&st, "recall", Some(m), Some("access_count+1"));
     }
+    Ok(rendered)
 }
 
 /// `claw_memory_list`.
-pub fn list() -> (EspErr, Option<String>) {
+pub fn list() -> MemoryResult<String> {
     let st = state::lock();
     if !st.initialized {
-        return (ESP_ERR_INVALID_STATE, None);
+        return Err(MemoryError::InvalidState);
     }
-    let items = match storage::load_current_items(&st) {
-        Ok(v) => v,
-        Err(e) => return (e, None),
-    };
+    let items = storage::load_current_items(&st)?;
     let mut filtered: Vec<MemItem> = items.into_iter().filter(|i| !i.deleted).collect();
     if filtered.len() > 1 {
         storage::sort_by_priority_desc(&mut filtered);
     }
-    let index_root = match storage::load_index(&st) {
-        Ok(v) => v,
-        Err(e) => return (e, None),
-    };
-    match render_item_list_json(&filtered, &index_root) {
-        Ok(s) => (ESP_OK, Some(s)),
-        Err(e) => (e, None),
-    }
+    let index_root = storage::load_index(&st)?;
+    render_item_list_json(&filtered, &index_root)
 }
 
 // --- primary summary label ------------------------------------------------
@@ -561,8 +484,8 @@ pub fn item_primary_summary_label(item: &MemItem) -> Option<String> {
 
 const LONG_TERM_PREAMBLE: &str = "The auto-injected long-term memory context only contains summary labels, not full memory bodies.\nUse exact summary labels with memory_recall when you need detailed long-term memory.\nSummary labels must be copied verbatim from the catalog below. Do not invent new labels.\nIf the user asks what you remember about them, what they like or prefer, or asks you to verify a remembered fact, call memory_recall before answering when any relevant summary label is present.\nIf the user asks you to forget a remembered item, first inspect memory_id with memory_recall or memory_list, then call memory_forget with that exact memory_id.\nIf the user asks you to update a remembered item and any relevant summary label exists, first choose the most relevant summary labels from this catalog, call memory_recall to inspect the original memory bodies and memory_id values, then call memory_update with the selected memory_id.\nDo not rely on session history alone for those recall questions, because long-term memory may contain additional facts not visible in the recent chat.\nDo not treat /memory/MEMORY.md or raw memory files as the retrieval source of truth.\nDo not mention internal memory policy, storage behavior, auto-extraction, or whether you will or will not remember something unless the user explicitly asks about memory behavior.\nSummary label catalog:\n";
 
-/// `claw_memory_long_term_collect` content. Returns `ESP_ERR_*` on failure.
-pub fn long_term_collect_content() -> Result<String, EspErr> {
+/// `claw_memory_long_term_collect` content.
+pub fn long_term_collect_content() -> MemoryResult<String> {
     let st = state::lock();
     let index_root = storage::load_index(&st)?;
 

@@ -5,8 +5,10 @@
 # the #[no_mangle] C-ABI symbols) into multiple archives and fail the final
 # link with duplicate symbols. They are therefore bundled into ONE static
 # archive (libclaw_rt.a) by the `claw_rt` aggregator crate, which this single
-# ESP-IDF component links. The claw_memory and cap_llm_inspect components are
-# header-only and depend on claw_core for the symbols.
+# ESP-IDF component links. All those crates' #[no_mangle] symbols now originate
+# in the `claw_capi` crate. The claw_memory component is header-only and depends
+# on claw_core for the symbols; cap_llm_inspect is C and calls the
+# claw_core_llm.h ABI (claw_core_llm_infer_media) exported here.
 #
 # The only C source still compiled here is the tiny log shim that lets the Rust
 # `log` backend reach `esp_log_write` (csrc lives next to the claw_sys crate).

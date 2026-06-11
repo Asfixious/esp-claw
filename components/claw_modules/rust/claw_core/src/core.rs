@@ -14,10 +14,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NO_MEM, ESP_ERR_NOT_SUPPORTED,
-    ESP_FAIL, ESP_OK,
-};
+use claw_interfaces::error::ESP_OK;
 use claw_interfaces::event::EventPublisher;
 use claw_interfaces::http::ClawHttp;
 
@@ -39,10 +36,11 @@ use crate::context::{
 };
 use crate::core_state::CoreState;
 use crate::errname::esp_err_to_name;
+use crate::error::CoreError;
 use crate::events::publish_out_message_if_requested;
 #[cfg(feature = "stage_verbose")]
 use crate::events::publish_stage_text;
-use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiConfig, InitError, LlmResponse};
+use claw_api::{ChatRequest, ClawApi, ClawApiConfig, LlmResponse};
 use crate::request::RequestItem;
 use crate::response::ResponseItem;
 use crate::util::obs_csv_append;
@@ -72,33 +70,23 @@ pub struct CoreConfig {
     pub task_core: i32,
 }
 
-/// Maps a [`claw_api::errors::InitError`] to the `esp_err_t` this component
-/// reports across its C ABI (`claw-api` itself is platform-agnostic).
-fn init_error_code(err: &InitError) -> EspErr {
-    match err {
-        InitError::MissingApiKey
-        | InitError::MissingModel
-        | InitError::MissingBaseUrl
-        | InitError::MissingBackendType => ESP_ERR_INVALID_ARG,
-        InitError::UnknownBackend => ESP_ERR_NOT_SUPPORTED,
-    }
-}
-
-/// Maps a [`claw_api::errors::ChatError`] to the `esp_err_t` this component
-/// reports across its C ABI.
-fn chat_error_code(err: &ChatError) -> EspErr {
-    match err {
-        ChatError::ToolsUnsupported => ESP_ERR_NOT_SUPPORTED,
-        ChatError::InvalidToolsJson => ESP_ERR_INVALID_ARG,
-        ChatError::Api(_) => ESP_FAIL,
-    }
-}
-
-/// Distinguishes a normal tool-loop completion (run the success/persist/observer
-/// block) from a `goto finish_request` (skip it). Mirrors the C control flow.
+/// How a turn body finished successfully. A failure is carried separately as a
+/// [`CoreError`] in the [`Result`] returned by [`Core::run_turn_body`]. Mirrors
+/// the C control flow: `Completed` runs the success/persist/observer block,
+/// `EarlyOk` is a `goto finish_request` with `ESP_OK` (e.g. a gate rejection).
 enum TurnOutcome {
     Completed,
-    Finished(EspErr),
+    EarlyOk,
+}
+
+/// Return `value` when non-zero, otherwise `default` (the C `?:` fallbacks used
+/// for the configurable queue/iteration/stack sizes).
+fn nonzero_or(value: u32, default: u32) -> u32 {
+    if value > 0 {
+        value
+    } else {
+        default
+    }
 }
 
 pub struct Core {
@@ -123,29 +111,17 @@ pub struct Core {
 
 impl Core {
     /// `claw_core_create`.
-    pub fn create(config: CoreConfig) -> Result<Arc<Core>, EspErr> {
+    pub fn create(config: CoreConfig) -> Result<Arc<Core>, CoreError> {
         check_timezone();
 
         let llm = ClawApi::init(config.runtime_config, config.http).map_err(|e| {
             log::error!("LLM init failed: {e}");
-            init_error_code(&e)
+            CoreError::Init(e)
         })?;
 
-        let request_q = if config.request_queue_len > 0 {
-            config.request_queue_len
-        } else {
-            DEFAULT_REQUEST_Q
-        } as usize;
-        let response_q = if config.response_queue_len > 0 {
-            config.response_queue_len
-        } else {
-            DEFAULT_RESPONSE_Q
-        } as usize;
-        let max_iter = if config.max_tool_iterations > 0 {
-            config.max_tool_iterations
-        } else {
-            DEFAULT_TOOL_ITERATIONS
-        };
+        let request_q = nonzero_or(config.request_queue_len, DEFAULT_REQUEST_Q) as usize;
+        let response_q = nonzero_or(config.response_queue_len, DEFAULT_RESPONSE_Q) as usize;
+        let max_iter = nonzero_or(config.max_tool_iterations, DEFAULT_TOOL_ITERATIONS);
 
         let log_tag = format!("claw_core_agent_{}", config.instance_id);
         let core = Core {
@@ -163,11 +139,7 @@ impl Core {
             collect_stage_note: config.collect_stage_note,
             events: config.events,
             task: Mutex::new(None),
-            task_stack_size: if config.task_stack_size > 0 {
-                config.task_stack_size
-            } else {
-                DEFAULT_STACK_SIZE
-            },
+            task_stack_size: nonzero_or(config.task_stack_size, DEFAULT_STACK_SIZE),
             task_priority: config.task_priority,
             task_core: config.task_core,
         };
@@ -176,39 +148,45 @@ impl Core {
     }
 
     /// `claw_core_add_context_provider`.
-    pub fn add_context_provider(&self, provider: Box<dyn ContextProvider>) -> EspErr {
+    pub fn add_context_provider(
+        &self,
+        provider: Box<dyn ContextProvider>,
+    ) -> Result<(), CoreError> {
         if !self.state.initialized.load(Ordering::Acquire) || self.state.started.load(Ordering::Acquire)
         {
-            return ESP_ERR_INVALID_STATE;
+            return Err(CoreError::InvalidState);
         }
         let mut providers = self.providers.lock().unwrap();
         if providers.len() >= self.provider_capacity {
-            return ESP_ERR_NO_MEM;
+            return Err(CoreError::NoMem);
         }
         providers.push(provider);
-        ESP_OK
+        Ok(())
     }
 
     /// `claw_core_add_completion_observer`.
-    pub fn add_completion_observer(&self, observer: Box<dyn CompletionObserver>) -> EspErr {
+    pub fn add_completion_observer(
+        &self,
+        observer: Box<dyn CompletionObserver>,
+    ) -> Result<(), CoreError> {
         if !self.state.initialized.load(Ordering::Acquire) {
-            return ESP_ERR_INVALID_STATE;
+            return Err(CoreError::InvalidState);
         }
         let mut observers = self.observers.lock().unwrap();
         if observers.len() >= MAX_COMPLETION_OBSERVERS {
-            return ESP_ERR_NO_MEM;
+            return Err(CoreError::NoMem);
         }
         observers.push(observer);
-        ESP_OK
+        Ok(())
     }
 
     /// `claw_core_start`.
-    pub fn start(self: &Arc<Self>) -> EspErr {
+    pub fn start(self: &Arc<Self>) -> Result<(), CoreError> {
         if !self.state.initialized.load(Ordering::Acquire) {
-            return ESP_ERR_INVALID_STATE;
+            return Err(CoreError::InvalidState);
         }
         if self.state.started.load(Ordering::Acquire) {
-            return ESP_OK;
+            return Ok(());
         }
         self.state.started.store(true, Ordering::Release);
         self.state.stop_requested.store(false, Ordering::Release);
@@ -231,22 +209,22 @@ impl Core {
             Ok(handle) => {
                 *self.task.lock().unwrap() = Some(handle);
                 log::info!("{} Started worker task", self.log_tag);
-                ESP_OK
+                Ok(())
             }
             Err(_) => {
                 self.state.started.store(false, Ordering::Release);
-                ESP_FAIL
+                Err(CoreError::Fail)
             }
         }
     }
 
     /// `claw_core_stop`.
-    pub fn stop(&self, _timeout_ms: u32) -> EspErr {
+    pub fn stop(&self, _timeout_ms: u32) -> Result<(), CoreError> {
         if !self.state.initialized.load(Ordering::Acquire) {
-            return ESP_ERR_INVALID_STATE;
+            return Err(CoreError::InvalidState);
         }
         if !self.state.started.load(Ordering::Acquire) {
-            return ESP_OK;
+            return Ok(());
         }
         self.state.stop_requested.store(true, Ordering::Release);
         let _ = self.state.cancel_request(0);
@@ -260,21 +238,27 @@ impl Core {
         if let Some(handle) = handle {
             let _ = handle.join();
         }
-        ESP_OK
+        Ok(())
     }
 
     /// `claw_core_submit`.
-    pub fn submit(&self, request: RequestItem, timeout_ms: u32) -> EspErr {
+    pub fn submit(&self, request: RequestItem, timeout_ms: u32) -> Result<(), CoreError> {
         self.state.ingress_submit(request, timeout_ms)
     }
 
     /// `claw_core_receive_for` / `claw_core_receive`.
-    pub fn receive_for(&self, request_id: u32, timeout_ms: u32) -> Result<ResponseItem, EspErr> {
-        self.state.response_receive_for(request_id, timeout_ms)
+    pub fn receive_for(
+        &self,
+        request_id: u32,
+        timeout_ms: u32,
+    ) -> Result<ResponseItem, CoreError> {
+        self.state
+            .response_receive_for(request_id, timeout_ms)
+            .map_err(CoreError::Esp)
     }
 
     /// `claw_core_cancel_request`.
-    pub fn cancel_request(&self, request_id: u32) -> EspErr {
+    pub fn cancel_request(&self, request_id: u32) -> Result<(), CoreError> {
         self.state.cancel_request(request_id)
     }
 
@@ -304,9 +288,8 @@ impl Core {
     /// `claw_core_agent_loop_task`.
     fn run(&self) {
         while !self.state.stop_requested.load(Ordering::Acquire) {
-            let request = match self.state.request_queue.recv_timeout(None) {
-                Some(r) => r,
-                None => continue,
+            let Some(request) = self.state.request_queue.recv_timeout(None) else {
+                continue;
             };
             if self.state.stop_requested.load(Ordering::Acquire) {
                 break;
@@ -324,11 +307,9 @@ impl Core {
         let mut response = ResponseItem {
             request_id: request.request_id,
             status: ResponseStatus::Error,
-            completion_type: CompletionType::Done,
             target_channel: request.target_channel.clone(),
             target_chat_id: request.target_chat_id.clone(),
-            text: None,
-            error_message: None,
+            ..Default::default()
         };
 
         let mut tool_summary = String::new();
@@ -345,18 +326,18 @@ impl Core {
             &mut last_raw_message_json,
         );
 
-        let err = match outcome {
-            TurnOutcome::Completed => {
+        let error: Option<CoreError> = match outcome {
+            Ok(TurnOutcome::Completed) => {
                 // Success block: only reached on a normal tool-loop break.
                 if response.text.is_some() {
                     response.status = ResponseStatus::Ok;
-                    let persist_err = persist_context_final_if_configured(
+                    let persist_result = persist_context_final_if_configured(
                         self.persist_context.as_deref(),
                         &request,
                         last_raw_message_json.as_deref(),
                         response.text.as_deref(),
                     );
-                    log_context_persist_failure(&request, "persist_context_final", persist_err);
+                    log_context_persist_failure(&request, "persist_context_final", persist_result);
                     self.run_completion_observers(
                         &request,
                         &response,
@@ -366,12 +347,16 @@ impl Core {
                 } else if response.error_message.is_none() {
                     response.error_message = Some(esp_err_to_name(ESP_OK).to_string());
                 }
-                ESP_OK
+                None
             }
-            TurnOutcome::Finished(err) => err,
+            Ok(TurnOutcome::EarlyOk) => None,
+            Err(err) => {
+                response.error_message = Some(err.response_message());
+                Some(err)
+            }
         };
 
-        self.finish_request(&request, &mut response, &tool_summary, err);
+        self.finish_request(&request, &mut response, &tool_summary, error.as_ref());
     }
 
     /// The tool loop and its setup, returning how to finalize. `response`,
@@ -384,19 +369,16 @@ impl Core {
         obs_providers_csv: &mut String,
         obs_tool_calls_csv: &mut String,
         last_raw_message_json: &mut Option<String>,
-    ) -> TurnOutcome {
+    ) -> Result<TurnOutcome, CoreError> {
         if let Some(gate) = self.request_gate.as_deref() {
             match gate.gate(request) {
                 GateOutcome::Allow => {}
                 GateOutcome::Reject(message) => {
                     response.status = ResponseStatus::Ok;
                     response.text = Some(message);
-                    return TurnOutcome::Finished(ESP_OK);
+                    return Ok(TurnOutcome::EarlyOk);
                 }
-                GateOutcome::Error(err) => {
-                    response.error_message = Some(esp_err_to_name(err).to_string());
-                    return TurnOutcome::Finished(err);
-                }
+                GateOutcome::Error(err) => return Err(CoreError::Esp(err)),
             }
         }
 
@@ -417,7 +399,7 @@ impl Core {
             match persist_context_user_messages_if_configured(persist, request, &texts) {
                 Ok(persisted) => persisted,
                 Err(err) => {
-                    log_context_persist_failure(request, "persist_context_user", err);
+                    log_context_persist_failure(request, "persist_context_user", Err(err));
                     false
                 }
             }
@@ -425,16 +407,21 @@ impl Core {
 
         let mut runtime_messages = Value::Array(Vec::new());
 
-        let providers = self.providers.lock().unwrap();
-        let providers: &[Box<dyn ContextProvider>] = &providers;
+        // Drain any queued user-interrupt inputs at a timing point: propagate
+        // any error to finish the turn; when inputs were drained, restart the
+        // loop iteration.
+        macro_rules! drain_user_interrupts {
+            ($point:expr) => {
+                if self.handle_pending_user_interrupts(request, $point, &mut runtime_messages)? {
+                    continue;
+                }
+            };
+        }
 
-        let request_start_contexts = match collect_request_start_only_contexts(providers, request) {
-            Ok(contexts) => contexts,
-            Err(err) => {
-                response.error_message = Some(esp_err_to_name(err).to_string());
-                return TurnOutcome::Finished(err);
-            }
-        };
+        let providers = self.providers.lock().unwrap();
+        let providers = providers.as_slice();
+
+        let request_start_contexts = collect_request_start_only_contexts(providers, request)?;
 
         let mut inject_active_user = true;
         if original_user_persisted && cached_contexts_have_messages(&request_start_contexts) {
@@ -445,22 +432,11 @@ impl Core {
         loop {
             self.state
                 .set_phase(AgentLoopPhase::BeforeBuildIterationContext);
-            match self.handle_pending_user_interrupts(
-                request,
-                "before_build_iteration_context",
-                &mut runtime_messages,
-            ) {
-                Err(err) => {
-                    response.error_message = Some(esp_err_to_name(err).to_string());
-                    return TurnOutcome::Finished(err);
-                }
-                Ok(true) => continue,
-                Ok(false) => {}
-            }
+            drain_user_interrupts!("before_build_iteration_context");
 
             self.state
                 .set_phase(AgentLoopPhase::BuildingIterationContext);
-            let built = match build_iteration_context(
+            let built = build_iteration_context(
                 &self.system_prompt,
                 providers,
                 request,
@@ -468,27 +444,10 @@ impl Core {
                 &request_start_contexts,
                 inject_active_user,
                 obs_providers_csv,
-            ) {
-                Ok(built) => built,
-                Err(err) => {
-                    response.error_message = Some(esp_err_to_name(err).to_string());
-                    return TurnOutcome::Finished(err);
-                }
-            };
+            )?;
 
             self.state.set_phase(AgentLoopPhase::BeforeLlmHttp);
-            match self.handle_pending_user_interrupts(
-                request,
-                "before_llm_http",
-                &mut runtime_messages,
-            ) {
-                Err(err) => {
-                    response.error_message = Some(esp_err_to_name(err).to_string());
-                    return TurnOutcome::Finished(err);
-                }
-                Ok(true) => continue,
-                Ok(false) => {}
-            }
+            drain_user_interrupts!("before_llm_http");
 
             self.state.set_phase(AgentLoopPhase::InLlmHttp);
             let chat_request = ChatRequest {
@@ -503,21 +462,9 @@ impl Core {
                         .state
                         .take_user_interrupt_http_abort(request.request_id)
                     {
-                        match self.handle_pending_user_interrupts(
-                            request,
-                            "in_llm_http_abort",
-                            &mut runtime_messages,
-                        ) {
-                            Err(err) => {
-                                response.error_message = Some(esp_err_to_name(err).to_string());
-                                return TurnOutcome::Finished(err);
-                            }
-                            Ok(true) => continue,
-                            Ok(false) => {}
-                        }
+                        drain_user_interrupts!("in_llm_http_abort");
                     }
-                    response.error_message = Some(llm_err.to_string());
-                    return TurnOutcome::Finished(chat_error_code(&llm_err));
+                    return Err(CoreError::Chat(llm_err));
                 }
             };
 
@@ -527,22 +474,11 @@ impl Core {
                 self.state.set_phase(AgentLoopPhase::Finalizing);
                 self.publish_stage_note_for_round(request, iteration);
                 self.finish_from_plain_text(request.request_id, &llm_response, response);
-                return TurnOutcome::Completed;
+                return Ok(TurnOutcome::Completed);
             }
 
             self.state.set_phase(AgentLoopPhase::AfterLlmBeforeTool);
-            match self.handle_pending_user_interrupts(
-                request,
-                "after_llm_before_tool",
-                &mut runtime_messages,
-            ) {
-                Err(err) => {
-                    response.error_message = Some(esp_err_to_name(err).to_string());
-                    return TurnOutcome::Finished(err);
-                }
-                Ok(true) => continue,
-                Ok(false) => {}
-            }
+            drain_user_interrupts!("after_llm_before_tool");
 
             self.state.set_phase(AgentLoopPhase::RunningTool);
             self.log_tool_call_names(request.request_id, &llm_response);
@@ -552,48 +488,32 @@ impl Core {
             }
 
             let assistant_tool_message_json = llm_response.raw_message_json.clone();
-            let err = append_assistant_tool_calls(&mut runtime_messages, &llm_response);
-            if err != ESP_OK {
-                response.error_message = Some(esp_err_to_name(err).to_string());
-                return TurnOutcome::Finished(err);
-            }
+            append_assistant_tool_calls(&mut runtime_messages, &llm_response)?;
 
-            let call_cap = match self.call_cap.as_deref() {
-                Some(cap) => cap,
-                None => {
-                    response.error_message =
-                        Some(esp_err_to_name(ESP_ERR_INVALID_STATE).to_string());
-                    return TurnOutcome::Finished(ESP_ERR_INVALID_STATE);
-                }
+            let Some(call_cap) = self.call_cap.as_deref() else {
+                return Err(CoreError::InvalidState);
             };
-            let tool_results_json = match append_tool_results_messages(
+            let tool_results_json = append_tool_results_messages(
                 call_cap,
                 &mut runtime_messages,
                 &llm_response,
                 request,
                 tool_summary,
-            ) {
-                Ok(json) => json,
-                Err(err) => {
-                    response.error_message = Some(esp_err_to_name(err).to_string());
-                    return TurnOutcome::Finished(err);
-                }
-            };
+            )?;
 
             if !tool_results_json.is_empty() {
                 if let Some(raw) = assistant_tool_message_json.as_deref() {
-                    let persist_err = persist_context_tool_round_if_configured(
+                    if let Err(persist_err) = persist_context_tool_round_if_configured(
                         persist,
                         request,
                         raw,
                         &tool_results_json,
-                    );
-                    if persist_err != ESP_OK {
+                    ) {
                         log::warn!(
                             "persist_context_tool_round failed for request={} iteration={}: {}",
                             request.request_id,
                             iteration,
-                            esp_err_to_name(persist_err)
+                            persist_err.esp_name()
                         );
                     }
                 }
@@ -601,8 +521,7 @@ impl Core {
 
             iteration += 1;
             if iteration >= self.state.max_tool_iterations {
-                response.error_message = Some("cap tool iteration limit reached".to_string());
-                return TurnOutcome::Finished(ESP_ERR_INVALID_STATE);
+                return Err(CoreError::IterationLimit);
             }
         }
     }
@@ -632,7 +551,7 @@ impl Core {
         request: &RequestItem,
         timing_point: &str,
         runtime_messages: &mut Value,
-    ) -> Result<bool, EspErr> {
+    ) -> Result<bool, CoreError> {
         let texts = self
             .state
             .dequeue_inserted_user_inputs(request.session_id_str(), INSERT_QUEUE_LEN);
@@ -649,7 +568,7 @@ impl Core {
         ) {
             Ok(persisted) => persisted,
             Err(err) => {
-                log_context_persist_failure(request, "persist_context_user_interrupt", err);
+                log_context_persist_failure(request, "persist_context_user_interrupt", Err(err));
                 false
             }
         };
@@ -662,10 +581,7 @@ impl Core {
         );
 
         for text in &texts {
-            let err = append_user_message(runtime_messages, text);
-            if err != ESP_OK {
-                return Err(err);
-            }
+            append_user_message(runtime_messages, text)?;
         }
         Ok(true)
     }
@@ -700,22 +616,22 @@ impl Core {
         request: &RequestItem,
         response: &mut ResponseItem,
         tool_summary: &str,
-        err: EspErr,
+        error: Option<&CoreError>,
     ) {
         self.state.set_phase(AgentLoopPhase::Finalizing);
         let was_cancelled = self.state.end_turn();
-        if was_cancelled && err != ESP_OK && response.error_message.is_some() {
+        if was_cancelled && error.is_some() && response.error_message.is_some() {
             response.error_message = Some("request cancelled".to_string());
         }
 
-        if err != ESP_OK {
+        if let Some(error) = error {
             log::error!(
                 "request={} failed: {}",
                 request.request_id,
                 response
                     .error_message
                     .as_deref()
-                    .unwrap_or_else(|| esp_err_to_name(err))
+                    .unwrap_or_else(|| error.esp_name())
             );
             if self.persist_context.is_some()
                 && !request.session_id_str().is_empty()
@@ -763,9 +679,8 @@ impl Core {
     /// `claw_core_publish_stage_note_for_round`. The stage-note callback is
     /// always invoked (for its side effects); publishing is verbose-only.
     fn publish_stage_note_for_round(&self, request: &RequestItem, round_index: u32) {
-        let collector = match self.collect_stage_note.as_deref() {
-            Some(c) => c,
-            None => return,
+        let Some(collector) = self.collect_stage_note.as_deref() else {
+            return;
         };
         let note = match collector.collect(request) {
             Ok(note) => note,
@@ -800,9 +715,8 @@ impl Core {
             if response.tool_calls.is_empty() {
                 return;
             }
-            let events = match self.events.as_deref() {
-                Some(e) => e,
-                None => return,
+            let Some(events) = self.events.as_deref() else {
+                return;
             };
             let mut buf = format!("\u{1F99E} [Round {}] Snap: ", iteration + 1);
             for (i, tc) in response.tool_calls.iter().enumerate() {
@@ -842,7 +756,7 @@ mod tests {
     use crate::callbacks::ProviderOutcome;
     use crate::consts::{ContextKind, REQUEST_FLAG_USER_INTERRUPT};
     use claw_api::ClawApiConfig;
-    use claw_interfaces::error::ESP_OK;
+    use claw_interfaces::error::{EspErr, ESP_OK};
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
@@ -945,23 +859,23 @@ mod tests {
     #[test]
     fn single_turn_plain_text() {
         let core = Core::create(base_config(vec![FINAL_BODY.into()])).unwrap();
-        assert_eq!(core.start(), ESP_OK);
-        assert_eq!(core.submit(user_request(1, "hi"), 1000), ESP_OK);
+        core.start().unwrap();
+        core.submit(user_request(1, "hi"), 1000).unwrap();
         let resp = core.receive_for(1, 2000).unwrap();
         assert_eq!(resp.status, ResponseStatus::Ok);
         assert_eq!(resp.text.as_deref(), Some("all done"));
-        assert_eq!(core.stop(1000), ESP_OK);
+        core.stop(1000).unwrap();
     }
 
     #[test]
     fn tool_loop_then_final() {
         let core = Core::create(base_config(vec![TOOL_CALL_BODY.into(), FINAL_BODY.into()])).unwrap();
-        assert_eq!(core.start(), ESP_OK);
-        assert_eq!(core.submit(user_request(7, "do work"), 1000), ESP_OK);
+        core.start().unwrap();
+        core.submit(user_request(7, "do work"), 1000).unwrap();
         let resp = core.receive_for(7, 2000).unwrap();
         assert_eq!(resp.status, ResponseStatus::Ok);
         assert_eq!(resp.text.as_deref(), Some("all done"));
-        assert_eq!(core.stop(1000), ESP_OK);
+        core.stop(1000).unwrap();
     }
 
     #[test]
@@ -970,31 +884,29 @@ mod tests {
         let mut cfg = base_config(vec![TOOL_CALL_BODY.into(), TOOL_CALL_BODY.into()]);
         cfg.max_tool_iterations = 2;
         let core = Core::create(cfg).unwrap();
-        assert_eq!(core.start(), ESP_OK);
-        assert_eq!(core.submit(user_request(9, "loop"), 1000), ESP_OK);
+        core.start().unwrap();
+        core.submit(user_request(9, "loop"), 1000).unwrap();
         let resp = core.receive_for(9, 2000).unwrap();
         assert_eq!(resp.status, ResponseStatus::Error);
         assert_eq!(resp.error_message.as_deref(), Some("cap tool iteration limit reached"));
-        assert_eq!(core.stop(1000), ESP_OK);
+        core.stop(1000).unwrap();
     }
 
     #[test]
     fn provider_injects_system_prompt() {
         let core = Core::create(base_config(vec![FINAL_BODY.into()])).unwrap();
-        assert_eq!(
-            core.add_context_provider(Box::new(StaticProvider {
-                name: "skills".into(),
-                flags: 0,
-                kind: ContextKind::SystemPrompt,
-                content: "extra instructions".into(),
-            })),
-            ESP_OK
-        );
-        assert_eq!(core.start(), ESP_OK);
-        assert_eq!(core.submit(user_request(3, "hi"), 1000), ESP_OK);
+        core.add_context_provider(Box::new(StaticProvider {
+            name: "skills".into(),
+            flags: 0,
+            kind: ContextKind::SystemPrompt,
+            content: "extra instructions".into(),
+        }))
+        .unwrap();
+        core.start().unwrap();
+        core.submit(user_request(3, "hi"), 1000).unwrap();
         let resp = core.receive_for(3, 2000).unwrap();
         assert_eq!(resp.text.as_deref(), Some("all done"));
-        assert_eq!(core.stop(1000), ESP_OK);
+        core.stop(1000).unwrap();
     }
 
     #[test]
@@ -1002,14 +914,14 @@ mod tests {
         // First chat blocks behaviorally by being a tool call; meanwhile we
         // submit an interrupt, which is drained before the next iteration.
         let core = Core::create(base_config(vec![TOOL_CALL_BODY.into(), FINAL_BODY.into()])).unwrap();
-        assert_eq!(core.start(), ESP_OK);
-        assert_eq!(core.submit(user_request(11, "first"), 1000), ESP_OK);
+        core.start().unwrap();
+        core.submit(user_request(11, "first"), 1000).unwrap();
         // best-effort: also queue an interrupt for the same session
         let mut interrupt = user_request(12, "second");
         interrupt.flags = REQUEST_FLAG_USER_INTERRUPT;
         let _ = core.submit(interrupt, 100);
         let resp = core.receive_for(11, 2000).unwrap();
         assert_eq!(resp.status, ResponseStatus::Ok);
-        assert_eq!(core.stop(1000), ESP_OK);
+        core.stop(1000).unwrap();
     }
 }

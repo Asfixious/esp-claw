@@ -1,21 +1,23 @@
 //! `claw_memory` — long-term + session memory, a faithful Rust port of the
-//! `claw_memory` ESP-IDF component. It exports the exact `claw_memory.h` C ABI
-//! (`#[no_mangle] extern "C"` functions and the four context-provider statics)
-//! so existing C callers link unchanged. The crate is an `rlib`; the symbols
-//! are bundled into the firmware staticlib by `claw_rt`.
+//! `claw_memory` ESP-IDF component. This crate is pure Rust: it exposes the
+//! memory logic as idiomatic Rust APIs. The `claw_memory.h` C ABI
+//! (`#[no_mangle] extern "C"` functions, the by-value `claw_memory_item_t`
+//! struct, the context-provider statics, and the capability registration) lives
+//! in the `claw_capi` crate, which depends on and wraps these APIs. The crate is
+//! an `rlib`.
 
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
 
-mod api;
-mod cabi;
-mod cap;
-mod consts;
-mod extract;
-mod item;
-mod lightweight;
-mod profile;
-mod session;
+pub mod api;
+pub mod cap;
+pub mod consts;
+pub mod error;
+pub mod extract;
+pub mod item;
+pub mod lightweight;
+pub mod profile;
+pub mod session;
 mod state;
 mod storage;
-mod util;
+pub mod util;

@@ -5,19 +5,17 @@
 
 use serde_json::Value;
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NO_MEM, ESP_FAIL, ESP_OK,
-};
+use claw_interfaces::error::ESP_OK;
 
 use crate::callbacks::{CapCaller, ContextProvider, PersistContext, PersistRecord, ProviderOutcome};
 use crate::consts::{
     ContextKind, ContextRecordType, CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY, INSERT_QUEUE_LEN,
 };
 use crate::errname::esp_err_to_name;
+use crate::error::CoreError;
 use claw_api::LlmResponse;
 use crate::request::RequestItem;
-use crate::util::append_tool_summary_line;
-use crate::util::obs_csv_append;
+use crate::util::{append_tool_summary_line, obs_csv_append};
 
 /// A request-start-only context captured once at request start
 /// (`claw_core_cached_context_t`).
@@ -35,36 +33,30 @@ pub struct BuiltContext {
 }
 
 /// `claw_core_append_user_message`: push `{"role":"user","content":text}`.
-pub fn append_user_message(messages: &mut Value, text: &str) -> EspErr {
-    let arr = match messages.as_array_mut() {
-        Some(a) => a,
-        None => return ESP_ERR_INVALID_ARG,
+pub fn append_user_message(messages: &mut Value, text: &str) -> Result<(), CoreError> {
+    let Some(arr) = messages.as_array_mut() else {
+        return Err(CoreError::InvalidArg);
     };
     arr.push(serde_json::json!({ "role": "user", "content": text }));
-    ESP_OK
+    Ok(())
 }
 
 /// Parse a JSON array of objects and append each element to `dest`.
-fn append_array_json(dest: &mut Value, json_text: &str) -> EspErr {
+fn append_array_json(dest: &mut Value, json_text: &str) -> Result<(), CoreError> {
     if json_text.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(CoreError::InvalidArg);
     }
-    let parsed: Value = match serde_json::from_str(json_text) {
-        Ok(v) => v,
-        Err(_) => return ESP_FAIL,
+    let Ok(parsed) = serde_json::from_str::<Value>(json_text) else {
+        return Err(CoreError::Fail);
     };
-    let items = match parsed.as_array() {
-        Some(a) => a,
-        None => return ESP_FAIL,
+    let Some(items) = parsed.as_array() else {
+        return Err(CoreError::Fail);
     };
-    let arr = match dest.as_array_mut() {
-        Some(a) => a,
-        None => return ESP_ERR_INVALID_ARG,
+    let Some(arr) = dest.as_array_mut() else {
+        return Err(CoreError::InvalidArg);
     };
-    for item in items {
-        arr.push(item.clone());
-    }
-    ESP_OK
+    arr.extend(items.iter().cloned());
+    Ok(())
 }
 
 /// `build_current_turn_prompt`.
@@ -77,15 +69,19 @@ fn build_current_turn_prompt(request: &RequestItem) -> String {
 }
 
 /// `append_prompt_section`: append `"\n\n## {name}\n{content}"`.
-fn append_prompt_section(prompt: &mut String, section_name: &str, content: &str) -> EspErr {
+fn append_prompt_section(
+    prompt: &mut String,
+    section_name: &str,
+    content: &str,
+) -> Result<(), CoreError> {
     if section_name.is_empty() || content.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(CoreError::InvalidArg);
     }
     prompt.push_str("\n\n## ");
     prompt.push_str(section_name);
     prompt.push('\n');
     prompt.push_str(content);
-    ESP_OK
+    Ok(())
 }
 
 /// `apply_context_content`.
@@ -96,9 +92,9 @@ fn apply_context_content(
     kind: ContextKind,
     section_name: &str,
     content: &str,
-) -> EspErr {
+) -> Result<(), CoreError> {
     if section_name.is_empty() || content.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(CoreError::InvalidArg);
     }
     match kind {
         ContextKind::SystemPrompt => append_prompt_section(system_prompt, section_name, content),
@@ -112,7 +108,7 @@ fn apply_context_content(
 pub fn collect_request_start_only_contexts(
     providers: &[Box<dyn ContextProvider>],
     request: &RequestItem,
-) -> Result<Vec<Option<CachedContext>>, EspErr> {
+) -> Result<Vec<Option<CachedContext>>, CoreError> {
     let mut out: Vec<Option<CachedContext>> = vec![None; providers.len()];
     if providers.is_empty() {
         return Ok(out);
@@ -131,7 +127,7 @@ pub fn collect_request_start_only_contexts(
                     provider.name(),
                     esp_err_to_name(err)
                 );
-                return Err(err);
+                return Err(CoreError::Esp(err));
             }
             ProviderOutcome::Provided { kind, content } => {
                 if content.is_empty() {
@@ -140,7 +136,7 @@ pub fn collect_request_start_only_contexts(
                         request.request_id,
                         provider.name()
                     );
-                    return Err(ESP_FAIL);
+                    return Err(CoreError::Fail);
                 }
                 log::info!(
                     "context_cached request={} provider={} context_kind={} context_len={}",
@@ -174,7 +170,7 @@ pub fn build_iteration_context(
     request_start_contexts: &[Option<CachedContext>],
     inject_active_user: bool,
     obs_providers_csv: &mut String,
-) -> Result<BuiltContext, EspErr> {
+) -> Result<BuiltContext, CoreError> {
     let mut system_prompt = system_prompt_base.to_string();
     let mut messages = Value::Array(Vec::new());
     let mut tools = Value::Array(Vec::new());
@@ -182,17 +178,14 @@ pub fn build_iteration_context(
     for (i, provider) in providers.iter().enumerate() {
         if provider.flags() & CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY != 0 {
             if let Some(Some(cached)) = request_start_contexts.get(i) {
-                let err = apply_context_content(
+                apply_context_content(
                     &mut system_prompt,
                     &mut messages,
                     &mut tools,
                     cached.kind,
                     provider.name(),
                     &cached.content,
-                );
-                if err != ESP_OK {
-                    return Err(err);
-                }
+                )?;
                 obs_csv_append(obs_providers_csv, provider.name(), true);
             }
             continue;
@@ -207,7 +200,7 @@ pub fn build_iteration_context(
                     provider.name(),
                     esp_err_to_name(err)
                 );
-                return Err(err);
+                return Err(CoreError::Esp(err));
             }
             ProviderOutcome::Provided { kind, content } => {
                 if content.is_empty() {
@@ -216,7 +209,7 @@ pub fn build_iteration_context(
                         request.request_id,
                         provider.name()
                     );
-                    return Err(ESP_FAIL);
+                    return Err(CoreError::Fail);
                 }
                 log::info!(
                     "context_loaded request={} provider={} context_kind={} context_len={}",
@@ -226,39 +219,29 @@ pub fn build_iteration_context(
                     content.len()
                 );
                 obs_csv_append(obs_providers_csv, provider.name(), true);
-                let err = apply_context_content(
+                apply_context_content(
                     &mut system_prompt,
                     &mut messages,
                     &mut tools,
                     kind,
                     provider.name(),
                     &content,
-                );
-                if err != ESP_OK {
-                    return Err(err);
-                }
+                )?;
             }
         }
     }
 
     let turn_prompt = build_current_turn_prompt(request);
-    let err = append_prompt_section(&mut system_prompt, "Core Request", &turn_prompt);
-    if err != ESP_OK {
-        return Err(err);
-    }
+    append_prompt_section(&mut system_prompt, "Core Request", &turn_prompt)?;
 
     if inject_active_user {
-        let err = append_user_message(&mut messages, &request.user_text);
-        if err != ESP_OK {
-            return Err(err);
-        }
+        append_user_message(&mut messages, &request.user_text)?;
     }
 
     if let Some(runtime_arr) = runtime_messages.as_array() {
         if !runtime_arr.is_empty() {
-            let dest = messages.as_array_mut().unwrap();
-            for item in runtime_arr {
-                dest.push(item.clone());
+            if let Some(dest) = messages.as_array_mut() {
+                dest.extend(runtime_arr.iter().cloned());
             }
         }
     }
@@ -277,21 +260,22 @@ pub fn build_iteration_context(
 
 /// `claw_core_append_assistant_tool_calls`: parse the raw assistant message and
 /// push it onto `messages`.
-pub fn append_assistant_tool_calls(messages: &mut Value, response: &LlmResponse) -> EspErr {
-    let raw = match response.raw_message_json.as_deref() {
-        Some(s) if !s.is_empty() => s,
-        _ => return ESP_ERR_INVALID_STATE,
+pub fn append_assistant_tool_calls(
+    messages: &mut Value,
+    response: &LlmResponse,
+) -> Result<(), CoreError> {
+    let Some(raw) = response.raw_message_json.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(CoreError::InvalidState);
     };
-    let assistant: Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return ESP_ERR_INVALID_STATE,
+    let Ok(assistant) = serde_json::from_str::<Value>(raw) else {
+        return Err(CoreError::InvalidState);
     };
     match messages.as_array_mut() {
         Some(a) => {
             a.push(assistant);
-            ESP_OK
+            Ok(())
         }
-        None => ESP_ERR_INVALID_ARG,
+        None => Err(CoreError::InvalidArg),
     }
 }
 
@@ -304,10 +288,9 @@ pub fn append_tool_results_messages(
     response: &LlmResponse,
     request: &RequestItem,
     tool_summary: &mut String,
-) -> Result<String, EspErr> {
-    let runtime_arr = match runtime_messages.as_array_mut() {
-        Some(a) => a,
-        None => return Err(ESP_ERR_INVALID_ARG),
+) -> Result<String, CoreError> {
+    let Some(runtime_arr) = runtime_messages.as_array_mut() else {
+        return Err(CoreError::InvalidArg);
     };
     let mut tool_results: Vec<Value> = Vec::new();
 
@@ -326,7 +309,7 @@ pub fn append_tool_results_messages(
                 if err != ESP_OK {
                     esp_err_to_name(err).to_string()
                 } else {
-                    return Err(ESP_ERR_NO_MEM);
+                    return Err(CoreError::NoMem);
                 }
             }
         };
@@ -339,11 +322,10 @@ pub fn append_tool_results_messages(
             content
         );
 
-        if !tc.name.is_empty() {
-            let summary_err = append_tool_summary_line(tool_summary, &tc.name, err == ESP_OK);
-            if summary_err != ESP_OK {
-                log::warn!("tool summary truncated for request={}", request.request_id);
-            }
+        if !tc.name.is_empty()
+            && append_tool_summary_line(tool_summary, &tc.name, err == ESP_OK).is_err()
+        {
+            log::warn!("tool summary truncated for request={}", request.request_id);
         }
 
         let tool_message = serde_json::json!({
@@ -362,38 +344,45 @@ pub fn append_tool_results_messages(
 
 // --- persistence (claw_core_context_persist.c) ---------------------------
 
-/// `persist_context_batch_if_configured`.
+/// `persist_context_batch_if_configured`. The injected persist callback is a C
+/// ABI shim returning `esp_err_t`; a non-OK code is preserved verbatim as
+/// [`CoreError::Esp`] so the logged `esp_err_to_name` is unchanged.
 fn persist_batch_if_configured(
     persist: Option<&dyn PersistContext>,
     request: &RequestItem,
     records: &[PersistRecord],
     turn_completed: bool,
-) -> EspErr {
-    let persist = match persist {
-        Some(p) => p,
-        None => return ESP_OK,
+) -> Result<(), CoreError> {
+    let Some(persist) = persist else {
+        return Ok(());
     };
     let session = request.session_id_str();
     if session.is_empty() {
-        return ESP_OK;
+        return Ok(());
     }
     if records.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(CoreError::InvalidArg);
     }
-    persist.persist(session, request, records, turn_completed)
+    match persist.persist(session, request, records, turn_completed) {
+        ESP_OK => Ok(()),
+        code => Err(CoreError::Esp(code)),
+    }
 }
 
 /// `claw_core_log_context_persist_failure`.
-pub fn log_context_persist_failure(request: &RequestItem, operation: &str, err: EspErr) {
-    if err == ESP_OK {
-        return;
+pub fn log_context_persist_failure(
+    request: &RequestItem,
+    operation: &str,
+    result: Result<(), CoreError>,
+) {
+    if let Err(err) = result {
+        log::warn!(
+            "{} failed for request={}: {}",
+            operation,
+            request.request_id,
+            err.esp_name()
+        );
     }
-    log::warn!(
-        "{} failed for request={}: {}",
-        operation,
-        request.request_id,
-        esp_err_to_name(err)
-    );
 }
 
 /// `claw_core_persist_context_user_messages_if_configured`. Returns whether the
@@ -402,9 +391,9 @@ pub fn persist_context_user_messages_if_configured(
     persist: Option<&dyn PersistContext>,
     request: &RequestItem,
     texts: &[&str],
-) -> Result<bool, EspErr> {
+) -> Result<bool, CoreError> {
     if texts.is_empty() || texts.len() > INSERT_QUEUE_LEN {
-        return Err(ESP_ERR_INVALID_ARG);
+        return Err(CoreError::InvalidArg);
     }
     let has_persist = persist.is_some() && !request.session_id_str().is_empty();
     if !has_persist {
@@ -413,7 +402,7 @@ pub fn persist_context_user_messages_if_configured(
     let mut records = Vec::with_capacity(texts.len());
     for t in texts {
         if t.is_empty() {
-            return Err(ESP_ERR_INVALID_ARG);
+            return Err(CoreError::InvalidArg);
         }
         records.push(PersistRecord {
             record_type: ContextRecordType::User,
@@ -421,12 +410,7 @@ pub fn persist_context_user_messages_if_configured(
             text: Some((*t).to_string()),
         });
     }
-    let err = persist_batch_if_configured(persist, request, &records, false);
-    if err == ESP_OK {
-        Ok(true)
-    } else {
-        Err(err)
-    }
+    persist_batch_if_configured(persist, request, &records, false).map(|()| true)
 }
 
 /// `claw_core_persist_context_tool_round_if_configured`.
@@ -435,9 +419,9 @@ pub fn persist_context_tool_round_if_configured(
     request: &RequestItem,
     assistant_tool_message_json: &str,
     tool_results_json: &str,
-) -> EspErr {
+) -> Result<(), CoreError> {
     if assistant_tool_message_json.is_empty() || tool_results_json.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(CoreError::InvalidArg);
     }
     let records = [
         PersistRecord {
@@ -460,7 +444,7 @@ pub fn persist_context_final_if_configured(
     request: &RequestItem,
     assistant_final_json: Option<&str>,
     assistant_text: Option<&str>,
-) -> EspErr {
+) -> Result<(), CoreError> {
     let records = [PersistRecord {
         record_type: ContextRecordType::AssistantFinal,
         message_json: assistant_final_json.map(|s| s.to_string()),
@@ -486,6 +470,7 @@ pub fn build_context_failure_trace(error_message: Option<&str>, tool_summary: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claw_interfaces::error::EspErr;
 
     struct FixedProvider {
         name: String,
@@ -591,7 +576,7 @@ mod tests {
             }],
         };
         let mut runtime = Value::Array(vec![]);
-        assert_eq!(append_assistant_tool_calls(&mut runtime, &resp), ESP_OK);
+        assert!(append_assistant_tool_calls(&mut runtime, &resp).is_ok());
         let mut summary = String::new();
         let results =
             append_tool_results_messages(&EchoCap, &mut runtime, &resp, &req(), &mut summary)

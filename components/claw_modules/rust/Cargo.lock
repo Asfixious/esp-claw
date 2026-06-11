@@ -9,17 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "cap_llm_inspect"
-version = "0.1.0"
-dependencies = [
- "claw-api",
- "claw_core",
- "claw_interfaces",
- "log",
- "serde_json",
-]
-
-[[package]]
 name = "claw-api"
 version = "0.1.0"
 dependencies = [
@@ -30,16 +19,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw_capi"
+version = "0.1.0"
+dependencies = [
+ "claw-api",
+ "claw_core",
+ "claw_interfaces",
+ "claw_memory",
+ "claw_paths",
+ "claw_sys",
+ "claw_task",
+ "libc",
+ "log",
+ "serde_json",
+]
+
+[[package]]
 name = "claw_core"
 version = "0.1.0"
 dependencies = [
  "claw-api",
  "claw_interfaces",
- "claw_paths",
  "claw_sys",
- "claw_task",
  "log",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -57,14 +61,12 @@ dependencies = [
  "libc",
  "log",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
 name = "claw_paths"
 version = "0.1.0"
-dependencies = [
- "claw_interfaces",
-]
 
 [[package]]
 name = "claw_platform"
@@ -85,11 +87,7 @@ dependencies = [
 name = "claw_rt"
 version = "0.1.0"
 dependencies = [
- "cap_llm_inspect",
- "claw_core",
- "claw_memory",
- "claw_paths",
- "claw_task",
+ "claw_capi",
 ]
 
 [[package]]
@@ -104,10 +102,6 @@ dependencies = [
 [[package]]
 name = "claw_task"
 version = "0.1.0"
-dependencies = [
- "claw_interfaces",
- "log",
-]
 
 [[package]]
 name = "equivalent"

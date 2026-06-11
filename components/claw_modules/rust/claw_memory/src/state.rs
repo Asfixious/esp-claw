@@ -7,7 +7,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::consts::BackendFormat;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemoryState {
     pub initialized: bool,
     pub session_root_dir: String,
@@ -24,28 +24,6 @@ pub struct MemoryState {
     pub backend_format: BackendFormat,
     pub write_changes_since_compact: u32,
     pub next_memory_seq: u32,
-}
-
-impl Default for MemoryState {
-    fn default() -> Self {
-        MemoryState {
-            initialized: false,
-            session_root_dir: String::new(),
-            memory_root_dir: String::new(),
-            markdown_path: String::new(),
-            records_path: String::new(),
-            index_path: String::new(),
-            digest_path: String::new(),
-            soul_path: String::new(),
-            identity_path: String::new(),
-            user_path: String::new(),
-            max_message_chars: 0,
-            max_tool_iterations: 0,
-            backend_format: BackendFormat::Unknown,
-            write_changes_since_compact: 0,
-            next_memory_seq: 0,
-        }
-    }
 }
 
 static MEMORY: OnceLock<Mutex<MemoryState>> = OnceLock::new();

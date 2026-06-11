@@ -13,11 +13,18 @@ pub use http::EspIdfHttp;
 
 #[cfg(test)]
 mod tests {
-    use super::http::{build_auth_header, parse_error_message_body};
+    use super::http::{build_auth_header, parse_error_message_body, truncate};
 
     #[test]
     fn auth_header_bearer_default() {
         let (name, value) = build_auth_header(None, Some("sk-123")).unwrap();
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer sk-123");
+    }
+
+    #[test]
+    fn auth_header_bearer_explicit() {
+        let (name, value) = build_auth_header(Some("bearer"), Some("sk-123")).unwrap();
         assert_eq!(name, "Authorization");
         assert_eq!(value, "Bearer sk-123");
     }
@@ -52,5 +59,23 @@ mod tests {
     fn error_body_non_json_truncates() {
         assert_eq!(parse_error_message_body("oops", 500), "HTTP 500: oops");
         assert_eq!(parse_error_message_body("", 500), "HTTP 500");
+    }
+
+    #[test]
+    fn error_body_falls_back_when_message_not_a_string() {
+        // A non-string `error.message` is ignored in favor of the top-level one.
+        let body = r#"{"error":{"message":123},"message":"fallback"}"#;
+        assert_eq!(parse_error_message_body(body, 400), "HTTP 400: fallback");
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings() {
+        assert_eq!(truncate("hello", 160), "hello");
+    }
+
+    #[test]
+    fn truncate_backs_off_to_char_boundary() {
+        // "é" is two bytes; a cut at byte 3 must back off so it never splits a char.
+        assert_eq!(truncate("ééé", 3), "é");
     }
 }

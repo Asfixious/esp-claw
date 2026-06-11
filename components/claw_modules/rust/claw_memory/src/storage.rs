@@ -5,9 +5,8 @@
 
 use serde_json::{Map, Value};
 
-use claw_interfaces::error::{EspErr, ESP_ERR_NO_MEM, ESP_FAIL, ESP_OK};
-
 use crate::consts::{MAX_ACTIVE_ITEMS, MAX_SUMMARIES};
+use crate::error::{MemoryError, MemoryResult};
 use crate::item::{self, MemItem};
 use crate::state::MemoryState;
 use crate::util;
@@ -29,10 +28,10 @@ fn num_i64(v: &Value, key: &str) -> Option<i64> {
 }
 
 /// `claw_memory_load_index` (with the legacy normalization/sanitization).
-pub fn load_index(state: &MemoryState) -> Result<Value, EspErr> {
+pub fn load_index(state: &MemoryState) -> MemoryResult<Value> {
     let raw = match util::read_file_dup(&state.index_path) {
         Ok(s) => s,
-        Err(claw_interfaces::error::ESP_ERR_NOT_FOUND) => return Ok(new_index_root()),
+        Err(MemoryError::NotFound) => return Ok(new_index_root()),
         Err(e) => return Err(e),
     };
 
@@ -40,26 +39,22 @@ pub fn load_index(state: &MemoryState) -> Result<Value, EspErr> {
         Ok(v @ Value::Object(_)) => v,
         _ => {
             log::error!("Failed to parse memory index: {}", state.index_path);
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
 
     {
         let obj = root.as_object_mut().unwrap();
-        if !obj.get("summaries").map(|v| v.is_array()).unwrap_or(false) {
+        if !obj.get("summaries").is_some_and(|v| v.is_array()) {
             obj.insert("summaries".into(), Value::Array(Vec::new()));
         }
-        if !obj.get("next_summary_id").map(|v| v.is_number()).unwrap_or(false) {
+        if !obj.get("next_summary_id").is_some_and(|v| v.is_number()) {
             obj.insert("next_summary_id".into(), Value::from(1i64));
         }
-        if !obj
-            .get("last_compact_digest_size")
-            .map(|v| v.is_number())
-            .unwrap_or(false)
-        {
+        if !obj.get("last_compact_digest_size").is_some_and(|v| v.is_number()) {
             obj.insert("last_compact_digest_size".into(), Value::from(0i64));
         }
-        if !obj.get("keyword_index").map(|v| v.is_object()).unwrap_or(false) {
+        if !obj.get("keyword_index").is_some_and(|v| v.is_object()) {
             obj.insert("keyword_index".into(), Value::Object(Map::new()));
         }
     }
@@ -92,10 +87,10 @@ pub fn load_index(state: &MemoryState) -> Result<Value, EspErr> {
     Ok(root)
 }
 
-pub fn save_index(state: &MemoryState, root: &Value) -> EspErr {
+pub fn save_index(state: &MemoryState, root: &Value) -> MemoryResult<()> {
     match serde_json::to_string(root) {
         Ok(text) => util::write_file_text(&state.index_path, &text),
-        Err(_) => ESP_ERR_NO_MEM,
+        Err(_) => Err(MemoryError::NoMem),
     }
 }
 
@@ -164,22 +159,21 @@ fn set_next_summary_id(root: &mut Value, next_id: i64) {
 }
 
 /// `claw_memory_ensure_summary_label`.
-pub fn ensure_summary_label(root: &mut Value, label: &str, preferred_id: i64) -> Result<i64, EspErr> {
+pub fn ensure_summary_label(root: &mut Value, label: &str, preferred_id: i64) -> MemoryResult<i64> {
     if label.is_empty() {
-        return Err(claw_interfaces::error::ESP_ERR_INVALID_ARG);
+        return Err(MemoryError::InvalidArg);
     }
     if let Some(id) = find_summary_id_by_label(root, label) {
         return Ok(id);
     }
     if summaries_ref(root).is_none() {
-        return Err(ESP_FAIL);
+        return Err(MemoryError::Fail);
     }
 
     let mut next_id = next_summary_id(root);
     if preferred_id > 0 {
         let exists = summaries_ref(root)
-            .map(|s| find_summary_index_by_id(s, preferred_id).is_some())
-            .unwrap_or(false);
+            .is_some_and(|s| find_summary_index_by_id(s, preferred_id).is_some());
         if !exists {
             next_id = preferred_id;
         }
@@ -227,7 +221,7 @@ pub fn adjust_summary_stats(root: &mut Value, item: &MemItem, ref_delta: i64) {
 /// `claw_memory_remove_unused_summaries`.
 pub fn remove_unused_summaries(root: &mut Value) {
     if let Some(summaries) = summaries_mut(root) {
-        summaries.retain(|s| s.get("ref_count").and_then(|v| v.as_i64()).map(|n| n > 0).unwrap_or(false));
+        summaries.retain(|s| s.get("ref_count").and_then(|v| v.as_i64()).is_some_and(|n| n > 0));
     }
 }
 
@@ -258,7 +252,7 @@ pub fn item_from_json(json: &Value) -> MemItem {
     item.created_at = json.get("created_at").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
     item.updated_at = json.get("updated_at").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
     item.access_count = json.get("access_count").and_then(|v| v.as_f64()).unwrap_or(0.0) as u16;
-    item.deleted = json.get("deleted").map(|v| v.as_bool().unwrap_or(false)).unwrap_or(false);
+    item.deleted = json.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
 
     if let Some(arr) = json.get("summary_ids").and_then(|v| v.as_array()) {
         let count = arr.len().min(MAX_SUMMARIES);
@@ -321,22 +315,22 @@ fn record_json(item: &MemItem) -> Value {
 }
 
 /// `claw_memory_append_record`.
-pub fn append_record(state: &MemoryState, item: &MemItem) -> EspErr {
+pub fn append_record(state: &MemoryState, item: &MemItem) -> MemoryResult<()> {
     let text = match serde_json::to_string(&record_json(item)) {
         Ok(t) => t,
-        Err(_) => return ESP_ERR_NO_MEM,
+        Err(_) => return Err(MemoryError::NoMem),
     };
     util::append_file_text(&state.records_path, &format!("{}\n", text))
 }
 
 /// `claw_memory_load_current_items` (deduplicated by id, later records win).
-pub fn load_current_items(state: &MemoryState) -> Result<Vec<MemItem>, EspErr> {
+pub fn load_current_items(state: &MemoryState) -> MemoryResult<Vec<MemItem>> {
     let raw = match util::read_file_dup(&state.records_path) {
         Ok(s) => s,
-        Err(claw_interfaces::error::ESP_ERR_NOT_FOUND) => return Ok(Vec::new()),
+        Err(MemoryError::NotFound) => return Ok(Vec::new()),
         Err(_) => {
             log::error!("Failed to open memory records: {}", state.records_path);
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
 
@@ -390,7 +384,9 @@ pub fn append_digest_line(state: &MemoryState, action: &str, item: Option<&MemIt
         Some(e) => format!("{}\t{}\t{}\t{}\n", ts, action, id, e),
         None => format!("{}\t{}\t{}\n", ts, action, id),
     };
-    util::append_file_text(&state.digest_path, &line);
+    // The C `claw_memory_append_digest_line` is best-effort and ignores write
+    // failures; preserve that behaviour.
+    let _ = util::append_file_text(&state.digest_path, &line);
 }
 
 // --- keyword index --------------------------------------------------------
@@ -493,7 +489,7 @@ pub fn export_markdown(items: &[MemItem], index_root: Option<&Value>) -> String 
 }
 
 /// `claw_memory_sync_markdown`.
-pub fn sync_markdown(state: &MemoryState, items: &[MemItem], index_root: &Value) -> EspErr {
+pub fn sync_markdown(state: &MemoryState, items: &[MemItem], index_root: &Value) -> MemoryResult<()> {
     let markdown = export_markdown(items, Some(index_root));
     util::write_file_text(&state.markdown_path, &markdown)
 }
@@ -506,15 +502,14 @@ fn capacity_score(item: &MemItem) -> i64 {
 
 fn trim_to_capacity(items: &mut Vec<MemItem>) {
     while items.len() > MAX_ACTIVE_ITEMS {
-        let mut remove_idx = 0usize;
-        let mut lowest = capacity_score(&items[0]);
-        for i in 1..items.len() {
-            let score = capacity_score(&items[i]);
-            if score < lowest {
-                lowest = score;
-                remove_idx = i;
-            }
-        }
+        // `min_by_key` keeps the first of equal-minimum scores, matching the C
+        // strict-less-than scan that retains the earliest lowest-scoring item.
+        let remove_idx = items
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, item)| capacity_score(item))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
         items.remove(remove_idx);
     }
 }
@@ -561,7 +556,7 @@ fn apply_digest_recall_deltas(state: &MemoryState, items: &mut [MemItem], old_in
 
     for line in text.split('\n') {
         let fields: Vec<&str> = line
-            .split(|c| c == '\t' || c == '\r')
+            .split(['\t', '\r'])
             .filter(|s| !s.is_empty())
             .take(5)
             .collect();
@@ -571,13 +566,8 @@ fn apply_digest_recall_deltas(state: &MemoryState, items: &mut [MemItem], old_in
         if fields[1] != "recall" || fields[3] != "access_count+1" {
             continue;
         }
-        for item in items.iter_mut() {
-            if item.id != fields[2] {
-                continue;
-            }
-            if item.access_count < u16::MAX {
-                item.access_count += 1;
-            }
+        if let Some(item) = items.iter_mut().find(|item| item.id == fields[2]) {
+            item.access_count = item.access_count.saturating_add(1);
             if !fields[0].is_empty() {
                 if let Ok(ts) = fields[0].parse::<u64>() {
                     if ts > item.updated_at as u64 {
@@ -585,7 +575,6 @@ fn apply_digest_recall_deltas(state: &MemoryState, items: &mut [MemItem], old_in
                     }
                 }
             }
-            break;
         }
     }
 
@@ -593,15 +582,9 @@ fn apply_digest_recall_deltas(state: &MemoryState, items: &mut [MemItem], old_in
 }
 
 /// `claw_memory_compact_internal`.
-pub fn compact_internal(state: &mut MemoryState, append_digest: bool) -> EspErr {
-    let mut items = match load_current_items(state) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut old_index = match load_index(state) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+pub fn compact_internal(state: &mut MemoryState, append_digest: bool) -> MemoryResult<()> {
+    let mut items = load_current_items(state)?;
+    let mut old_index = load_index(state)?;
     let digest_size = util::file_size_bytes(&state.digest_path);
     apply_digest_recall_deltas(state, &mut items, &mut old_index, digest_size);
 
@@ -611,15 +594,11 @@ pub fn compact_internal(state: &mut MemoryState, append_digest: bool) -> EspErr 
             continue;
         }
         let key = compact_dedup_key(src);
-        let mut existing: Option<usize> = None;
-        if !key.is_empty() {
-            for (j, other) in compacted.iter().enumerate() {
-                if compact_dedup_key(other) == key {
-                    existing = Some(j);
-                    break;
-                }
-            }
-        }
+        let existing = if key.is_empty() {
+            None
+        } else {
+            compacted.iter().position(|other| compact_dedup_key(other) == key)
+        };
 
         match existing {
             Some(idx) => {
@@ -667,29 +646,29 @@ pub fn compact_internal(state: &mut MemoryState, append_digest: bool) -> EspErr 
         }
     }
 
-    let mut err = util::write_file_text(&state.records_path, &records_text);
-    if err == ESP_OK {
-        err = save_index(state, &new_index);
+    let mut result = util::write_file_text(&state.records_path, &records_text);
+    if result.is_ok() {
+        result = save_index(state, &new_index);
     }
-    if err == ESP_OK {
-        err = sync_markdown(state, &compacted, &new_index);
+    if result.is_ok() {
+        result = sync_markdown(state, &compacted, &new_index);
     }
-    if err == ESP_OK && append_digest {
+    if result.is_ok() && append_digest {
         append_digest_line(state, "compact", None, Some("rebuild=index+markdown"));
     }
 
     state.write_changes_since_compact = 0;
-    err
+    result
 }
 
 /// `claw_memory_maybe_compact`.
-pub fn maybe_compact(state: &mut MemoryState) -> EspErr {
+pub fn maybe_compact(state: &mut MemoryState) -> MemoryResult<()> {
     if state.write_changes_since_compact >= crate::consts::COMPACT_CHANGE_THRESHOLD
         || util::file_size_bytes(&state.records_path) >= crate::consts::COMPACT_SIZE_THRESHOLD
     {
         return compact_internal(state, true);
     }
-    ESP_OK
+    Ok(())
 }
 
 /// `claw_memory_summary_catalog_dup`. Only consumed by the espidf async-extract

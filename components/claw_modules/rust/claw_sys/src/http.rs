@@ -15,10 +15,10 @@ pub(crate) fn build_auth_header(auth_type: Option<&str>, api_key: Option<&str>) 
     if key.is_empty() || kind == "none" {
         return None;
     }
-    if kind == "api-key" {
-        return Some(("X-API-Key", key.to_string()));
-    }
-    Some(("Authorization", format!("Bearer {key}")))
+    Some(match kind {
+        "api-key" => ("X-API-Key", key.to_string()),
+        _ => ("Authorization", format!("Bearer {key}")),
+    })
 }
 
 /// Build the error message for a non-200 response, mirroring
@@ -29,27 +29,26 @@ pub(crate) fn parse_error_message_body(body: &str, status: i32) -> String {
     if body.is_empty() {
         return format!("HTTP {status}");
     }
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(root) => {
-            if let Some(msg) = root
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                return format!("HTTP {status}: {msg}");
-            }
-            if let Some(msg) = root.get("message").and_then(|m| m.as_str()).filter(|s| !s.is_empty()) {
-                return format!("HTTP {status}: {msg}");
-            }
-            format!("HTTP {status}: {}", truncate(body, 160))
-        }
-        Err(_) => format!("HTTP {status}: {}", truncate(body, 160)),
+    match serde_json::from_str::<serde_json::Value>(body).ok().and_then(|root| extract_message(&root)) {
+        Some(msg) => format!("HTTP {status}: {msg}"),
+        None => format!("HTTP {status}: {}", truncate(body, 160)),
     }
 }
 
+/// First non-empty string among `error.message` then top-level `message`.
 #[cfg_attr(not(any(test, target_os = "espidf")), allow(dead_code))]
-fn truncate(s: &str, max: usize) -> &str {
+fn extract_message(root: &serde_json::Value) -> Option<String> {
+    let nested = root.get("error").and_then(|e| e.get("message"));
+    [nested, root.get("message")]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg_attr(not(any(test, target_os = "espidf")), allow(dead_code))]
+pub(crate) fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -193,10 +192,8 @@ mod espidf_driver {
 
     impl ClawHttp for EspIdfHttp {
         fn post_json(&self, request: &HttpJsonRequest, abort: &AtomicBool) -> Result<HttpResponse, HttpError> {
-            let url = match CString::new(request.url) {
-                Ok(c) => c,
-                Err(_) => return Err(HttpError { err: ESP_FAIL, message: "invalid url".into() }),
-            };
+            let url = CString::new(request.url)
+                .map_err(|_| HttpError { err: ESP_FAIL, message: "invalid url".into() })?;
             let mut ctx = Box::new(RequestCtx { body: Vec::with_capacity(4096), abort: abort as *const _ });
 
             let mut config: esp_http_client_config_t = unsafe { core::mem::zeroed() };

@@ -1,76 +1,13 @@
-//! `claw_memory_item_t` (the by-value C ABI struct) plus the ergonomic
-//! internal `MemItem` model and the item-centric logic ported from
-//! `claw_memory_utils.c` / `claw_memory_extract.c`.
-
-use core::ffi::c_char;
+//! The ergonomic internal `MemItem` model and the item-centric logic ported
+//! from `claw_memory_utils.c` / `claw_memory_extract.c`. The by-value
+//! `claw_memory_item_t` C ABI struct and its `MemItem` conversions live in
+//! `claw_capi::memory_abi`.
 
 use crate::consts::{
     CONTENT_CAP, ID_CAP, KEYWORDS_CAP, MAX_LABEL_CHARS, MAX_LABEL_TEXT, MAX_SUMMARIES, SOURCE_CAP,
     TAGS_CAP,
 };
 use crate::util;
-
-/// The exact `claw_memory_item_t` C ABI layout (`include/claw_memory.h`).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct claw_memory_item_t {
-    pub id: [c_char; 40],
-    pub source: [c_char; 16],
-    pub content: [c_char; 256],
-    pub summary_ids: [u16; 3],
-    pub summary_id_count: u8,
-    pub tags: [c_char; 96],
-    pub keywords: [c_char; 128],
-    pub created_at: u32,
-    pub updated_at: u32,
-    pub access_count: u16,
-    pub deleted: u8,
-}
-
-impl Default for claw_memory_item_t {
-    fn default() -> Self {
-        claw_memory_item_t {
-            id: [0; 40],
-            source: [0; 16],
-            content: [0; 256],
-            summary_ids: [0; 3],
-            summary_id_count: 0,
-            tags: [0; 96],
-            keywords: [0; 128],
-            created_at: 0,
-            updated_at: 0,
-            access_count: 0,
-            deleted: 0,
-        }
-    }
-}
-
-fn read_carr(arr: &[c_char]) -> String {
-    let mut bytes: Vec<u8> = Vec::with_capacity(arr.len());
-    for &c in arr {
-        let b = c as u8;
-        if b == 0 {
-            break;
-        }
-        bytes.push(b);
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn write_carr(arr: &mut [c_char], s: &str) {
-    for slot in arr.iter_mut() {
-        *slot = 0;
-    }
-    let cap = arr.len();
-    if cap == 0 {
-        return;
-    }
-    let truncated = util::safe_copy(s, cap);
-    let bytes = truncated.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        arr[i] = b as c_char;
-    }
-}
 
 /// Internal item model with owned `String` fields. Each string is kept within
 /// the matching C buffer capacity by the setters.
@@ -89,42 +26,6 @@ pub struct MemItem {
 }
 
 impl MemItem {
-    pub fn from_c(c: &claw_memory_item_t) -> MemItem {
-        let count = (c.summary_id_count as usize).min(MAX_SUMMARIES);
-        let summary_ids = c.summary_ids[..count].to_vec();
-        MemItem {
-            id: read_carr(&c.id),
-            source: read_carr(&c.source),
-            content: read_carr(&c.content),
-            summary_ids,
-            tags: read_carr(&c.tags),
-            keywords: read_carr(&c.keywords),
-            created_at: c.created_at,
-            updated_at: c.updated_at,
-            access_count: c.access_count,
-            deleted: c.deleted != 0,
-        }
-    }
-
-    pub fn to_c(&self) -> claw_memory_item_t {
-        let mut c = claw_memory_item_t::default();
-        write_carr(&mut c.id, &self.id);
-        write_carr(&mut c.source, &self.source);
-        write_carr(&mut c.content, &self.content);
-        write_carr(&mut c.tags, &self.tags);
-        write_carr(&mut c.keywords, &self.keywords);
-        let count = self.summary_ids.len().min(MAX_SUMMARIES);
-        for i in 0..count {
-            c.summary_ids[i] = self.summary_ids[i];
-        }
-        c.summary_id_count = count as u8;
-        c.created_at = self.created_at;
-        c.updated_at = self.updated_at;
-        c.access_count = self.access_count;
-        c.deleted = if self.deleted { 1 } else { 0 };
-        c
-    }
-
     pub fn set_id(&mut self, s: &str) {
         self.id = util::safe_copy(s, ID_CAP);
     }
@@ -356,26 +257,21 @@ pub fn collect_summary_labels(item: &MemItem) -> Vec<String> {
 
 /// `claw_memory_item_primary_summary_label`.
 pub fn primary_summary_label(item: &MemItem) -> Option<String> {
-    let labels = collect_summary_labels(item);
-    match labels.into_iter().next() {
-        Some(l) if !l.is_empty() => Some(l),
-        _ => None,
-    }
+    collect_summary_labels(item)
+        .into_iter()
+        .next()
+        .filter(|label| !label.is_empty())
 }
 
 /// `claw_memory_append_item_summary_labels`: merge this item's labels into a
-/// newline list. Returns an `EspErr` only on the (unreachable) empty-label
-/// case, mirroring `line_list_append_unique`.
+/// newline list. Returns an error only on the (unreachable) empty-label case,
+/// mirroring `line_list_append_unique`.
 pub fn append_item_summary_labels(
     item: &MemItem,
     out_summary_list: &mut Option<String>,
-) -> claw_interfaces::error::EspErr {
-    use claw_interfaces::error::ESP_OK;
+) -> crate::error::MemoryResult<()> {
     for label in collect_summary_labels(item) {
-        let err = util::line_list_append_unique(out_summary_list, &label);
-        if err != ESP_OK {
-            return err;
-        }
+        util::line_list_append_unique(out_summary_list, &label)?;
     }
-    ESP_OK
+    Ok(())
 }

@@ -2,22 +2,13 @@
 //! joining, timestamps, and C-string interop. Ports `claw_memory_utils.c` and
 //! the UTF-8 / normalization helpers used across the component.
 
-use core::ffi::c_char;
-use core::ptr;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_NOT_FOUND, ESP_FAIL, ESP_OK,
-};
-
 use crate::consts::MAX_PATH;
-
-extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
+use crate::error::{MemoryError, MemoryResult};
 
 // --- byte-bounded copy ----------------------------------------------------
 
@@ -50,18 +41,13 @@ pub fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
 pub fn utf8_copy_chars(src: &str, dst_size: usize, max_chars: usize) -> String {
     let mut out = String::new();
     let mut bytes = 0usize;
-    let mut chars = 0usize;
-    for ch in src.chars() {
-        if chars >= max_chars {
-            break;
-        }
+    for ch in src.chars().take(max_chars) {
         let l = ch.len_utf8();
         if bytes + l >= dst_size {
             break;
         }
         out.push(ch);
         bytes += l;
-        chars += 1;
     }
     out
 }
@@ -72,7 +58,7 @@ pub fn normalize_session_text(src: &str, dst_size: usize, max_chars: usize) -> S
     let mut bytes = 0usize;
     let mut chars = 0usize;
     for ch in src.chars() {
-        if !(bytes + 1 < dst_size) || chars >= max_chars {
+        if bytes + 1 >= dst_size || chars >= max_chars {
             break;
         }
         if ch.is_ascii() {
@@ -108,7 +94,7 @@ pub fn normalize_text_for_key(src: &str, dst_size: usize) -> String {
     let mut out = String::new();
     let mut bytes = 0usize;
     for ch in src.chars() {
-        if !(bytes + 1 < dst_size) {
+        if bytes + 1 >= dst_size {
             break;
         }
         if ch.is_ascii() {
@@ -152,19 +138,7 @@ pub fn text_contains_ascii_ci(haystack: &str, needle: &str) -> bool {
     if need.len() > hay.len() {
         return false;
     }
-    for start in 0..=(hay.len() - need.len()) {
-        let mut matched = true;
-        for i in 0..need.len() {
-            if hay[start + i].to_ascii_lowercase() != need[i].to_ascii_lowercase() {
-                matched = false;
-                break;
-            }
-        }
-        if matched {
-            return true;
-        }
-    }
-    false
+    hay.windows(need.len()).any(|window| window.eq_ignore_ascii_case(need))
 }
 
 /// Mirror of `text_contains_token`: case-sensitive substring OR ASCII-CI.
@@ -178,7 +152,7 @@ pub fn text_contains_token(haystack: &str, needle: &str) -> bool {
 /// Split a CSV string on any of `,;/|` (mirrors `strtok_r(s, ",;/|", ...)`,
 /// which collapses consecutive delimiters and drops empty tokens).
 pub fn csv_split(s: &str) -> Vec<&str> {
-    s.split(|c| matches!(c, ',' | ';' | '/' | '|'))
+    s.split([',', ';', '/', '|'])
         .filter(|t| !t.is_empty())
         .collect()
 }
@@ -192,16 +166,16 @@ pub fn line_list_contains(list: &str, item: &str) -> bool {
     list.split('\n').any(|line| line == item)
 }
 
-/// Mirror of `line_list_append_unique`. Returns `ESP_ERR_INVALID_ARG` for an
-/// empty item (matching C).
-pub fn line_list_append_unique(list: &mut Option<String>, item: &str) -> EspErr {
+/// Mirror of `line_list_append_unique`. Returns `MemoryError::InvalidArg` for an
+/// empty item (matching the C `ESP_ERR_INVALID_ARG`).
+pub fn line_list_append_unique(list: &mut Option<String>, item: &str) -> MemoryResult<()> {
     if item.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
     match list {
         Some(existing) => {
             if line_list_contains(existing, item) {
-                return ESP_OK;
+                return Ok(());
             }
             existing.push('\n');
             existing.push_str(item);
@@ -210,29 +184,28 @@ pub fn line_list_append_unique(list: &mut Option<String>, item: &str) -> EspErr 
             *list = Some(item.to_string());
         }
     }
-    ESP_OK
+    Ok(())
 }
 
 /// Mirror of `line_list_merge_unique` (each source line is truncated to 255
 /// bytes before being appended).
-pub fn line_list_merge_unique(dst: &mut Option<String>, src: Option<&str>) -> EspErr {
+pub fn line_list_merge_unique(dst: &mut Option<String>, src: Option<&str>) -> MemoryResult<()> {
     let src = match src {
         Some(s) if !s.is_empty() => s,
-        _ => return ESP_OK,
+        _ => return Ok(()),
     };
     for line in src.split('\n') {
         let truncated = truncate_to_bytes(line, 255);
-        let err = line_list_append_unique(dst, &truncated);
-        if err != ESP_OK {
+        if let Err(e) = line_list_append_unique(dst, &truncated) {
             // C skips empty lines via append returning INVALID_ARG only when
             // item is empty; replicate by ignoring empty truncations.
             if truncated.is_empty() {
                 continue;
             }
-            return err;
+            return Err(e);
         }
     }
-    ESP_OK
+    Ok(())
 }
 
 /// Mirror of `claw_memory_format_update_stage_note`.
@@ -241,88 +214,76 @@ pub fn format_update_stage_note(summary_list: Option<&str>) -> Option<String> {
         Some(s) if !s.is_empty() => s,
         _ => return None,
     };
-    let joined = list.split('\n').collect::<Vec<_>>().join(";");
+    let joined = list.replace('\n', ";");
     Some(format!("Memory update: [{}]", joined))
 }
 
 // --- paths ----------------------------------------------------------------
 
 /// Mirror of `claw_memory_join_path`.
-pub fn join_path(dir: &str, name: &str) -> Result<String, EspErr> {
+pub fn join_path(dir: &str, name: &str) -> MemoryResult<String> {
     if dir.len() + 1 + name.len() + 1 > MAX_PATH {
-        return Err(ESP_ERR_INVALID_SIZE);
+        return Err(MemoryError::InvalidSize);
     }
     Ok(format!("{}/{}", dir, name))
 }
 
 /// Mirror of `ensure_dir_recursive`.
-pub fn ensure_dir_recursive(path: &str) -> EspErr {
+pub fn ensure_dir_recursive(path: &str) -> MemoryResult<()> {
     if path.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
     if path.len() >= MAX_PATH {
-        return ESP_ERR_INVALID_SIZE;
+        return Err(MemoryError::InvalidSize);
     }
-    match fs::create_dir_all(path) {
-        Ok(()) => ESP_OK,
-        Err(_) => ESP_FAIL,
-    }
+    fs::create_dir_all(path).map_err(|_| MemoryError::Fail)
 }
 
 /// Mirror of `ensure_parent_dir`.
-pub fn ensure_parent_dir(path: &str) -> EspErr {
+pub fn ensure_parent_dir(path: &str) -> MemoryResult<()> {
     if path.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
     if path.len() >= MAX_PATH {
-        return ESP_ERR_INVALID_SIZE;
+        return Err(MemoryError::InvalidSize);
     }
     match path.rfind('/') {
-        None => ESP_OK,
-        Some(0) => ESP_OK,
+        None => Ok(()),
+        Some(0) => Ok(()),
         Some(idx) => ensure_dir_recursive(&path[..idx]),
     }
 }
 
 // --- file IO --------------------------------------------------------------
 
-/// Mirror of `read_file_dup`. Any open failure maps to `ESP_ERR_NOT_FOUND`
-/// (as the C code returns for a failed `fopen`).
-pub fn read_file_dup(path: &str) -> Result<String, EspErr> {
+/// Mirror of `read_file_dup`. Any open failure maps to `MemoryError::NotFound`
+/// (as the C code returns `ESP_ERR_NOT_FOUND` for a failed `fopen`).
+pub fn read_file_dup(path: &str) -> MemoryResult<String> {
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return Err(ESP_ERR_NOT_FOUND),
+        Err(_) => return Err(MemoryError::NotFound),
     };
     let mut buf = Vec::new();
     match file.read_to_end(&mut buf) {
         Ok(_) => Ok(String::from_utf8_lossy(&buf).into_owned()),
-        Err(_) => Err(ESP_FAIL),
+        Err(_) => Err(MemoryError::Fail),
     }
 }
 
-pub fn write_file_text(path: &str, text: &str) -> EspErr {
-    if ensure_parent_dir(path) != ESP_OK {
-        return ESP_FAIL;
-    }
-    match fs::write(path, text.as_bytes()) {
-        Ok(()) => ESP_OK,
-        Err(_) => ESP_FAIL,
-    }
+pub fn write_file_text(path: &str, text: &str) -> MemoryResult<()> {
+    ensure_parent_dir(path).map_err(|_| MemoryError::Fail)?;
+    fs::write(path, text.as_bytes()).map_err(|_| MemoryError::Fail)
 }
 
-pub fn append_file_text(path: &str, text: &str) -> EspErr {
+pub fn append_file_text(path: &str, text: &str) -> MemoryResult<()> {
     use std::io::Write;
-    if ensure_parent_dir(path) != ESP_OK {
-        return ESP_FAIL;
-    }
-    let mut file = match fs::OpenOptions::new().append(true).create(true).open(path) {
-        Ok(f) => f,
-        Err(_) => return ESP_FAIL,
-    };
-    match file.write_all(text.as_bytes()) {
-        Ok(()) => ESP_OK,
-        Err(_) => ESP_FAIL,
-    }
+    ensure_parent_dir(path).map_err(|_| MemoryError::Fail)?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|_| MemoryError::Fail)?;
+    file.write_all(text.as_bytes()).map_err(|_| MemoryError::Fail)
 }
 
 pub fn file_size_bytes(path: &str) -> usize {
@@ -337,9 +298,9 @@ pub fn path_exists(path: &str) -> bool {
 }
 
 /// Mirror of `ensure_file_with_default`.
-pub fn ensure_file_with_default(path: &str, default_text: &str) -> EspErr {
+pub fn ensure_file_with_default(path: &str, default_text: &str) -> MemoryResult<()> {
     if fs::File::open(path).is_ok() {
-        return ESP_OK;
+        return Ok(());
     }
     write_file_text(path, default_text)
 }
@@ -381,48 +342,3 @@ pub fn format_timestamp(ts: u32) -> String {
     }
 }
 
-// --- C-string interop -----------------------------------------------------
-
-/// Read a `*const c_char` into an owned `String` (lossy), or `None` if null.
-pub unsafe fn cstr_to_string(p: *const c_char) -> Option<String> {
-    if p.is_null() {
-        None
-    } else {
-        Some(
-            core::ffi::CStr::from_ptr(p)
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
-}
-
-/// Duplicate `s` into a NUL-terminated C string allocated with the **C**
-/// allocator (`malloc`), so C callers can `free()` it.
-pub unsafe fn c_strdup(s: &str) -> *mut c_char {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let p = malloc(len + 1) as *mut u8;
-    if p.is_null() {
-        return ptr::null_mut();
-    }
-    ptr::copy_nonoverlapping(bytes.as_ptr(), p, len);
-    *p.add(len) = 0;
-    p as *mut c_char
-}
-
-/// Write `s` into the C buffer with NUL termination, truncating to fit
-/// (`strlcpy`/`snprintf("%s")` semantics).
-pub unsafe fn write_c_buf(dst: *mut c_char, dst_size: usize, s: &str) {
-    if dst.is_null() || dst_size == 0 {
-        return;
-    }
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(dst_size - 1);
-    // Back off to a char boundary to avoid emitting a partial sequence.
-    let mut end = n;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, end);
-    *dst.add(end) = 0;
-}

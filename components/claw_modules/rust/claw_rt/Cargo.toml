@@ -8,11 +8,8 @@ description = "Single staticlib aggregator that bundles all migrated claw_module
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# Each of these crates owns a slice of the firmware C ABI. Re-exporting them
-# from lib.rs forces rustc to link their objects (and #[no_mangle] exports)
-# into the single libclaw_rt.a that the ESP-IDF claw_core component links.
-claw_core = { path = "../claw_core" }
-claw_memory = { path = "../claw_memory" }
-cap_llm_inspect = { path = "../cap_llm_inspect" }
-claw_paths = { path = "../claw_paths" }
-claw_task = { path = "../claw_task" }
+# claw_capi owns every #[no_mangle] C-ABI symbol for the claw modules and
+# depends on the pure-Rust logic crates. Re-exporting it from lib.rs forces
+# rustc to link all those objects into the single libclaw_rt.a that the ESP-IDF
+# claw_core component links.
+claw_capi = { path = "../claw_capi" }

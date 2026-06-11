@@ -8,8 +8,9 @@ use crate::error::EspErr;
 
 /// Mirror of `claw_session_policy_t` from `claw_session_mgr.h`.
 #[repr(i32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SessionPolicy {
+    #[default]
     Chat = 0,
     Trigger = 1,
     Global = 2,
@@ -20,7 +21,11 @@ pub enum SessionPolicy {
 /// Rust-owned representation of the fields `claw_core` populates on a
 /// `claw_event_t`. String fields are truncated to the C buffer sizes at the
 /// publish boundary, not here.
-#[derive(Clone, Debug)]
+///
+/// [`Default`] yields all-empty strings, a zero timestamp, no text/payload, and
+/// the [`SessionPolicy::Chat`] policy (discriminant `0`), matching a
+/// zero-initialized C `claw_event_t`.
+#[derive(Clone, Debug, Default)]
 pub struct ClawEvent {
     pub event_id: String,
     pub source_cap: String,
@@ -34,25 +39,6 @@ pub struct ClawEvent {
     pub session_policy: SessionPolicy,
     pub text: Option<String>,
     pub payload_json: Option<String>,
-}
-
-impl Default for ClawEvent {
-    fn default() -> Self {
-        ClawEvent {
-            event_id: String::new(),
-            source_cap: String::new(),
-            event_type: String::new(),
-            source_channel: String::new(),
-            chat_id: String::new(),
-            message_id: String::new(),
-            correlation_id: String::new(),
-            content_type: String::new(),
-            timestamp_ms: 0,
-            session_policy: SessionPolicy::Chat,
-            text: None,
-            payload_json: None,
-        }
-    }
 }
 
 /// Injection point for publishing events to the (still-C) event router.

@@ -5,15 +5,14 @@
 //! because their output is fed to the LLM and logs.
 
 use crate::consts::{LOG_SNIPPET_LEN, OBS_CSV_MAX, TOOL_SUMMARY_MAX_LEN};
-use claw_interfaces::error::{EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_NO_MEM, ESP_OK};
+use crate::error::CoreError;
 
 /// `claw_core_now_ms` — milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as i64,
-        Err(_) => 0,
-    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Number of leading bytes to show for a log snippet, capped at
@@ -44,20 +43,24 @@ pub fn truncate_for_log(text: &str) -> String {
 /// Append one tool-result line to a bounded summary buffer, mirroring
 /// `claw_core_append_tool_summary_line` (including the `[tool_calls]\n` header
 /// on the first line and the [`TOOL_SUMMARY_MAX_LEN`] cap).
-pub fn append_tool_summary_line(summary: &mut String, tool_name: &str, ok: bool) -> EspErr {
+pub fn append_tool_summary_line(
+    summary: &mut String,
+    tool_name: &str,
+    ok: bool,
+) -> Result<(), CoreError> {
     if tool_name.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(CoreError::InvalidArg);
     }
     if summary.len() >= TOOL_SUMMARY_MAX_LEN - 1 {
-        return ESP_ERR_NO_MEM;
+        return Err(CoreError::NoMem);
     }
     let header = if summary.is_empty() { "[tool_calls]\n" } else { "" };
     let line = format!("{header}- {tool_name}: {}\n", if ok { "ok" } else { "failed" });
     if summary.len() + line.len() >= TOOL_SUMMARY_MAX_LEN {
-        return ESP_ERR_NO_MEM;
+        return Err(CoreError::NoMem);
     }
     summary.push_str(&line);
-    ESP_OK
+    Ok(())
 }
 
 fn obs_csv_contains(csv: &str, name: &str) -> bool {
@@ -91,11 +94,14 @@ mod tests {
     #[test]
     fn tool_summary_header_then_lines() {
         let mut s = String::new();
-        assert_eq!(append_tool_summary_line(&mut s, "files", true), ESP_OK);
+        assert!(append_tool_summary_line(&mut s, "files", true).is_ok());
         assert_eq!(s, "[tool_calls]\n- files: ok\n");
-        assert_eq!(append_tool_summary_line(&mut s, "http", false), ESP_OK);
+        assert!(append_tool_summary_line(&mut s, "http", false).is_ok());
         assert_eq!(s, "[tool_calls]\n- files: ok\n- http: failed\n");
-        assert_eq!(append_tool_summary_line(&mut s, "", true), ESP_ERR_INVALID_ARG);
+        assert!(matches!(
+            append_tool_summary_line(&mut s, "", true).unwrap_err(),
+            crate::error::CoreError::InvalidArg
+        ));
     }
 
     #[test]

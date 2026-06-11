@@ -2,18 +2,11 @@
 //! raw record writing, the binary index format, compaction, and deletion.
 //! Ports `claw_memory_session.c`.
 
-use core::ffi::c_char;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Map, Value};
-
-use claw_core::cabi::claw_core_request_t;
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
-    ESP_FAIL, ESP_OK,
-};
 
 use crate::consts::{
     BackendFormat, CONTEXT_RECORD_ASSISTANT_FINAL, CONTEXT_RECORD_ASSISTANT_TOOL,
@@ -21,12 +14,9 @@ use crate::consts::{
     SESSION_IDX_ENTRY_SIZE, SESSION_IDX_HEADER_SIZE, SESSION_IDX_MAGIC, SESSION_IDX_VERSION,
     SESSION_SIZE_LIMIT, SESSION_SIZE_WARNING,
 };
+use crate::error::{MemoryError, MemoryResult};
 use crate::state;
 use crate::util;
-
-extern "C" {
-    fn claw_core_publish_stage_text(request: *const claw_core_request_t, text: *const c_char) -> EspErr;
-}
 
 // --- pending summaries / request states -----------------------------------
 
@@ -46,9 +36,9 @@ fn request_states() -> &'static Mutex<Vec<(u32, bool)>> {
 }
 
 /// `claw_memory_note_session_summary`.
-pub fn note_session_summary(session_id: &str, summary_list: &str) -> EspErr {
+pub fn note_session_summary(session_id: &str, summary_list: &str) -> MemoryResult<()> {
     if session_id.is_empty() || summary_list.is_empty() {
-        return ESP_OK;
+        return Ok(());
     }
     let mut guard = pending().lock().unwrap_or_else(|e| e.into_inner());
     let idx = match guard.iter().position(|p| p.session_id == session_id) {
@@ -75,16 +65,16 @@ fn pending_take_summary_list(session_id: &str) -> Option<String> {
 }
 
 /// `claw_memory_request_mark_manual_write`.
-pub fn request_mark_manual_write(request_id: u32) -> EspErr {
+pub fn request_mark_manual_write(request_id: u32) -> MemoryResult<()> {
     if request_id == 0 {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
     let mut guard = request_states().lock().unwrap_or_else(|e| e.into_inner());
     match guard.iter_mut().find(|(id, _)| *id == request_id) {
         Some(entry) => entry.1 = true,
         None => guard.push((request_id, true)),
     }
-    ESP_OK
+    Ok(())
 }
 
 fn request_take_manual_write(request_id: u32) -> bool {
@@ -146,10 +136,11 @@ fn blocked_path_dup(data_path: &str) -> String {
 // --- record/backend validity ----------------------------------------------
 
 fn record_type_valid(record_type: u8) -> bool {
-    matches!(record_type as i32, x if x == CONTEXT_RECORD_USER
-        || x == CONTEXT_RECORD_ASSISTANT_FINAL
-        || x == CONTEXT_RECORD_ASSISTANT_TOOL
-        || x == CONTEXT_RECORD_TOOL_RESULT)
+    let t = record_type as i32;
+    t == CONTEXT_RECORD_USER
+        || t == CONTEXT_RECORD_ASSISTANT_FINAL
+        || t == CONTEXT_RECORD_ASSISTANT_TOOL
+        || t == CONTEXT_RECORD_TOOL_RESULT
 }
 
 fn backend_format_valid(v: u8) -> bool {
@@ -223,31 +214,31 @@ fn parse_entry(buf: &[u8]) -> IndexEntry {
 }
 
 /// `session_history_read_index_file`.
-fn read_index_file(idx_path: &str) -> Result<Vec<IndexEntry>, EspErr> {
+fn read_index_file(idx_path: &str) -> MemoryResult<Vec<IndexEntry>> {
     let bytes = match fs::read(idx_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             log::error!("open session history idx {} failed", idx_path);
-            return Err(ESP_ERR_NOT_FOUND);
+            return Err(MemoryError::NotFound);
         }
         Err(_) => {
             log::error!("open session history idx {} failed", idx_path);
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
 
     if bytes.len() < SESSION_IDX_HEADER_SIZE {
         log::warn!("read session history idx header failed");
-        return Err(ESP_ERR_INVALID_STATE);
+        return Err(MemoryError::InvalidState);
     }
     if !header_valid(&bytes[..SESSION_IDX_HEADER_SIZE]) {
-        return Err(ESP_ERR_INVALID_STATE);
+        return Err(MemoryError::InvalidState);
     }
 
     let payload = bytes.len() - SESSION_IDX_HEADER_SIZE;
-    if payload % SESSION_IDX_ENTRY_SIZE != 0 {
+    if !payload.is_multiple_of(SESSION_IDX_ENTRY_SIZE) {
         log::warn!("Session history idx file has a partial entry");
-        return Err(ESP_ERR_INVALID_STATE);
+        return Err(MemoryError::InvalidState);
     }
     let entry_count = payload / SESSION_IDX_ENTRY_SIZE;
 
@@ -261,7 +252,7 @@ fn read_index_file(idx_path: &str) -> Result<Vec<IndexEntry>, EspErr> {
                 i,
                 entry.record_type
             );
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
         if !backend_format_valid(entry.backend_format) {
             log::warn!(
@@ -269,7 +260,7 @@ fn read_index_file(idx_path: &str) -> Result<Vec<IndexEntry>, EspErr> {
                 i,
                 entry.backend_format
             );
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
         entries.push(entry);
     }
@@ -277,15 +268,15 @@ fn read_index_file(idx_path: &str) -> Result<Vec<IndexEntry>, EspErr> {
 }
 
 /// `session_history_validate_pair`.
-fn validate_pair(data_path: &str, idx_path: &str) -> Result<Vec<IndexEntry>, EspErr> {
+fn validate_pair(data_path: &str, idx_path: &str) -> MemoryResult<Vec<IndexEntry>> {
     let entries = read_index_file(idx_path)?;
     if !util::path_exists(data_path) {
-        return Err(ESP_ERR_NOT_FOUND);
+        return Err(MemoryError::NotFound);
     }
     let data_size = util::file_size_bytes(data_path);
     if entries.is_empty() && data_size > 0 {
         log::warn!("Session history data has no matching idx entries");
-        return Err(ESP_ERR_INVALID_STATE);
+        return Err(MemoryError::InvalidState);
     }
     for (i, entry) in entries.iter().enumerate() {
         let offset = entry.offset as usize;
@@ -298,7 +289,7 @@ fn validate_pair(data_path: &str, idx_path: &str) -> Result<Vec<IndexEntry>, Esp
                 entry.length,
                 data_size
             );
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
     }
     Ok(entries)
@@ -315,36 +306,36 @@ fn record_object_len(entry: &IndexEntry) -> usize {
 // --- file (re)creation -----------------------------------------------------
 
 /// `session_history_recreate_file`.
-fn recreate_file(data_path: &str, idx_path: &str) -> EspErr {
-    if util::ensure_parent_dir(data_path) != ESP_OK {
-        return ESP_FAIL;
+fn recreate_file(data_path: &str, idx_path: &str) -> MemoryResult<()> {
+    if util::ensure_parent_dir(data_path).is_err() {
+        return Err(MemoryError::Fail);
     }
     if fs::File::create(data_path).is_err() {
         log::error!("create session history {} failed", data_path);
-        return ESP_FAIL;
+        return Err(MemoryError::Fail);
     }
     match fs::File::create(idx_path) {
         Ok(mut f) => {
             if f.write_all(&pack_header()).is_err() {
                 log::error!("write session history idx header failed");
-                return ESP_FAIL;
+                return Err(MemoryError::Fail);
             }
-            ESP_OK
+            Ok(())
         }
         Err(_) => {
             log::error!("create session history idx {} failed", idx_path);
-            ESP_FAIL
+            Err(MemoryError::Fail)
         }
     }
 }
 
-fn mark_blocked(data_path: &str) -> EspErr {
+fn mark_blocked(data_path: &str) -> MemoryResult<()> {
     let blocked = blocked_path_dup(data_path);
     match fs::File::create(&blocked) {
-        Ok(_) => ESP_OK,
+        Ok(_) => Ok(()),
         Err(_) => {
             log::error!("create session history blocked marker {} failed", blocked);
-            ESP_FAIL
+            Err(MemoryError::Fail)
         }
     }
 }
@@ -378,12 +369,12 @@ fn backend_mismatch(state: &state::MemoryState, record_format: u8) -> bool {
 }
 
 /// `session_history_degrade_assistant_final`.
-fn degrade_assistant_final(record: Value) -> Result<Value, EspErr> {
+fn degrade_assistant_final(record: Value) -> MemoryResult<Value> {
     let content = record.get("content");
     match content {
         Some(Value::String(_)) => return Ok(record),
         Some(Value::Array(_)) => {}
-        _ => return Err(ESP_ERR_NOT_FOUND),
+        _ => return Err(MemoryError::NotFound),
     }
 
     let mut text = String::new();
@@ -398,7 +389,7 @@ fn degrade_assistant_final(record: Value) -> Result<Value, EspErr> {
         }
     }
     if text.is_empty() {
-        return Err(ESP_ERR_NOT_FOUND);
+        return Err(MemoryError::NotFound);
     }
 
     let mut fallback = Map::new();
@@ -412,9 +403,9 @@ fn load_indexed_json(
     state: &state::MemoryState,
     data: &[u8],
     entries: &[IndexEntry],
-) -> Result<String, EspErr> {
+) -> MemoryResult<String> {
     if entries.is_empty() {
-        return Err(ESP_ERR_INVALID_ARG);
+        return Err(MemoryError::InvalidArg);
     }
     let mut records: Vec<Value> = Vec::new();
 
@@ -426,17 +417,17 @@ fn load_indexed_json(
                 entry.offset,
                 entry.length
             );
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
         let offset = entry.offset as usize;
         if offset + object_len >= data.len() || data[offset + object_len] != b'\n' {
             log::warn!("session history record missing newline separator");
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
         let slice = &data[offset..offset + object_len];
         let record: Value = match serde_json::from_slice(slice) {
             Ok(v) => v,
-            Err(_) => return Err(ESP_ERR_INVALID_STATE),
+            Err(_) => return Err(MemoryError::InvalidState),
         };
 
         let record_type = entry.record_type as i32;
@@ -450,37 +441,30 @@ fn load_indexed_json(
             if record_type == CONTEXT_RECORD_ASSISTANT_FINAL {
                 match degrade_assistant_final(record) {
                     Ok(v) => record = v,
-                    Err(e) if e == ESP_ERR_NOT_FOUND => continue,
+                    Err(MemoryError::NotFound) => continue,
                     Err(e) => return Err(e),
                 }
             }
         }
 
-        let expand = record_type == CONTEXT_RECORD_TOOL_RESULT;
-        if expand {
-            if let Value::Array(items) = record {
-                for item in items {
-                    records.push(item);
-                }
-                continue;
-            } else {
-                records.push(record);
+        match record {
+            Value::Array(items) if record_type == CONTEXT_RECORD_TOOL_RESULT => {
+                records.extend(items)
             }
-        } else {
-            records.push(record);
+            other => records.push(other),
         }
     }
 
-    serde_json::to_string(&Value::Array(records)).map_err(|_| claw_interfaces::error::ESP_ERR_NO_MEM)
+    serde_json::to_string(&Value::Array(records)).map_err(|_| MemoryError::NoMem)
 }
 
 /// `claw_memory_session_load_json_alloc`. Returns the rendered messages JSON,
-/// or an `ESP_ERR_*`.
-fn session_load_json_alloc(session_id: &str) -> Result<String, EspErr> {
+/// or a `MemoryError`.
+fn session_load_json_alloc(session_id: &str) -> MemoryResult<String> {
     let (data_path, idx_path) = {
         let st = state::lock();
         if !st.initialized {
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
         let dp = session_path_dup(&st, session_id);
         let ip = idx_path_dup(&dp);
@@ -490,20 +474,21 @@ fn session_load_json_alloc(session_id: &str) -> Result<String, EspErr> {
     let data_exists = util::path_exists(&data_path);
     let idx_exists = util::path_exists(&idx_path);
 
-    let mut err: EspErr = ESP_OK;
+    // `None` means success; otherwise the deferred error returned to the caller.
+    let mut err: Option<MemoryError> = None;
     let mut reset_file = false;
     let mut reset_reason = "";
     let mut json: Option<String> = None;
 
     'block: {
         if !data_exists && !idx_exists {
-            err = ESP_ERR_NOT_FOUND;
+            err = Some(MemoryError::NotFound);
             break 'block;
         }
         if !data_exists || !idx_exists {
             reset_file = true;
             reset_reason = "missing data/index pair";
-            err = ESP_ERR_NOT_FOUND;
+            err = Some(MemoryError::NotFound);
             break 'block;
         }
 
@@ -512,12 +497,12 @@ fn session_load_json_alloc(session_id: &str) -> Result<String, EspErr> {
             Err(_) => {
                 reset_file = true;
                 reset_reason = "invalid data/index pair";
-                err = ESP_ERR_NOT_FOUND;
+                err = Some(MemoryError::NotFound);
                 break 'block;
             }
         };
         if entries.is_empty() {
-            err = ESP_ERR_NOT_FOUND;
+            err = Some(MemoryError::NotFound);
             break 'block;
         }
 
@@ -525,7 +510,7 @@ fn session_load_json_alloc(session_id: &str) -> Result<String, EspErr> {
             Ok(b) => b,
             Err(_) => {
                 log::error!("open session history {} failed", data_path);
-                err = ESP_FAIL;
+                err = Some(MemoryError::Fail);
                 break 'block;
             }
         };
@@ -536,35 +521,34 @@ fn session_load_json_alloc(session_id: &str) -> Result<String, EspErr> {
             Err(_) => {
                 reset_file = true;
                 reset_reason = "read indexed records failed";
-                err = ESP_ERR_NOT_FOUND;
+                err = Some(MemoryError::NotFound);
             }
         }
     }
 
     if reset_file {
         log::warn!("Resetting session history {}: {}", data_path, reset_reason);
-        let reset_err = recreate_file(&data_path, &idx_path);
-        if reset_err != ESP_OK {
+        if let Err(reset_err) = recreate_file(&data_path, &idx_path) {
             log::error!("reset session history {} failed", data_path);
-            err = reset_err;
+            err = Some(reset_err);
         }
     }
 
-    if err != ESP_OK {
-        return Err(err);
+    match err {
+        Some(e) => Err(e),
+        None => Ok(json.unwrap_or_default()),
     }
-    Ok(json.unwrap_or_default())
 }
 
 /// `claw_memory_session_history_collect` content.
-pub fn session_history_collect_content(session_id: Option<&str>) -> Result<String, EspErr> {
+pub fn session_history_collect_content(session_id: Option<&str>) -> MemoryResult<String> {
     let session_id = match session_id {
         Some(s) if !s.is_empty() => s,
-        _ => return Err(ESP_ERR_NOT_FOUND),
+        _ => return Err(MemoryError::NotFound),
     };
     let content = session_load_json_alloc(session_id)?;
     if content.is_empty() || content == "[]" {
-        return Err(ESP_ERR_NOT_FOUND);
+        return Err(MemoryError::NotFound);
     }
     Ok(content)
 }
@@ -580,17 +564,17 @@ fn text_buffer_size(mut max_chars: usize) -> usize {
 
 /// `claw_memory_write_session_raw_record`: append `json_text` + '\n' and report
 /// the byte offset and the written length (json bytes + 1).
-fn write_session_raw_record(data_file: &mut fs::File, json_text: &str) -> Result<(u32, u32), EspErr> {
+fn write_session_raw_record(data_file: &mut fs::File, json_text: &str) -> MemoryResult<(u32, u32)> {
     let offset = match data_file.seek(SeekFrom::End(0)) {
         Ok(o) if o <= u32::MAX as u64 => o as u32,
-        _ => return Err(ESP_FAIL),
+        _ => return Err(MemoryError::Fail),
     };
     let record_len = json_text.len();
     if record_len as u64 + 1 > u32::MAX as u64 {
-        return Err(ESP_ERR_INVALID_SIZE);
+        return Err(MemoryError::InvalidSize);
     }
     if data_file.write_all(json_text.as_bytes()).is_err() || data_file.write_all(b"\n").is_err() {
-        return Err(ESP_FAIL);
+        return Err(MemoryError::Fail);
     }
     Ok((offset, (record_len + 1) as u32))
 }
@@ -604,10 +588,10 @@ fn append_indexed_record(
     message_json: Option<&str>,
     role: Option<&str>,
     text: Option<&str>,
-) -> EspErr {
-    let has_json = message_json.map(|s| !s.is_empty()).unwrap_or(false);
+) -> MemoryResult<()> {
+    let has_json = message_json.is_some_and(|s| !s.is_empty());
     if (!has_json && (role.is_none() || text.is_none())) || !record_type_valid(record_type as u8) {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
 
     let owned_json;
@@ -621,7 +605,7 @@ fn append_indexed_record(
         record.insert("content".into(), Value::from(normalized));
         owned_json = match serde_json::to_string(&Value::Object(record)) {
             Ok(s) => s,
-            Err(_) => return claw_interfaces::error::ESP_ERR_NO_MEM,
+            Err(_) => return Err(MemoryError::NoMem),
         };
         &owned_json
     };
@@ -630,7 +614,7 @@ fn append_indexed_record(
         Ok(v) => v,
         Err(e) => {
             log::error!("write session history {} record failed", role.unwrap_or("raw"));
-            return e;
+            return Err(e);
         }
     };
 
@@ -642,16 +626,16 @@ fn append_indexed_record(
     };
     if idx_file.write_all(&pack_entry(&entry)).is_err() {
         log::error!("write session history idx entry failed");
-        return ESP_FAIL;
+        return Err(MemoryError::Fail);
     }
-    ESP_OK
+    Ok(())
 }
 
 /// `session_history_open_pair_for_append`.
-fn open_pair_for_append(data_path: &str, idx_path: &str) -> Result<(fs::File, fs::File), EspErr> {
+fn open_pair_for_append(data_path: &str, idx_path: &str) -> MemoryResult<(fs::File, fs::File)> {
     let validation = validate_pair(data_path, idx_path);
     if let Err(e) = validation {
-        if e == ESP_ERR_NOT_FOUND {
+        if e == MemoryError::NotFound {
             let data_exists = util::path_exists(data_path);
             let idx_exists = util::path_exists(idx_path);
             if data_exists != idx_exists {
@@ -660,24 +644,21 @@ fn open_pair_for_append(data_path: &str, idx_path: &str) -> Result<(fs::File, fs
         } else {
             log::warn!("Reinitializing legacy or invalid session history pair {}", data_path);
         }
-        let r = recreate_file(data_path, idx_path);
-        if r != ESP_OK {
-            return Err(r);
-        }
+        recreate_file(data_path, idx_path)?;
     }
 
     let data_file = match fs::OpenOptions::new().append(true).create(true).open(data_path) {
         Ok(f) => f,
         Err(_) => {
             log::error!("open session history {} for append failed", data_path);
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
     let idx_file = match fs::OpenOptions::new().append(true).create(true).open(idx_path) {
         Ok(f) => f,
         Err(_) => {
             log::error!("open session history idx {} for append failed", idx_path);
-            return Err(ESP_FAIL);
+            return Err(MemoryError::Fail);
         }
     };
     Ok((data_file, idx_file))
@@ -694,9 +675,9 @@ struct Turn {
 }
 
 /// `session_history_analyze_turns`.
-fn analyze_turns(entries: &[IndexEntry]) -> Result<Vec<Turn>, EspErr> {
+fn analyze_turns(entries: &[IndexEntry]) -> MemoryResult<Vec<Turn>> {
     if entries.is_empty() {
-        return Err(ESP_ERR_NOT_FOUND);
+        return Err(MemoryError::NotFound);
     }
     let mut turns: Vec<Turn> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
@@ -715,7 +696,7 @@ fn analyze_turns(entries: &[IndexEntry]) -> Result<Vec<Turn>, EspErr> {
         }
     }
     if turns.is_empty() {
-        return Err(ESP_ERR_NOT_FOUND);
+        return Err(MemoryError::NotFound);
     }
     let last = turns.len() - 1;
     turns[last].end = entries.len();
@@ -760,7 +741,7 @@ fn keep_record(turns: &[Turn], turn_index: usize, record_type: i32) -> bool {
 }
 
 /// `session_history_plan_compaction`.
-fn plan_compaction(entries: &[IndexEntry], turns: &[Turn]) -> Result<(usize, usize), EspErr> {
+fn plan_compaction(entries: &[IndexEntry], turns: &[Turn]) -> MemoryResult<(usize, usize)> {
     let mut data_size = 0usize;
     let mut entry_count = 0usize;
     let mut turn_index = 0usize;
@@ -774,22 +755,22 @@ fn plan_compaction(entries: &[IndexEntry], turns: &[Turn]) -> Result<(usize, usi
         }
         data_size = match data_size.checked_add(entry.length as usize) {
             Some(v) => v,
-            None => return Err(ESP_ERR_INVALID_SIZE),
+            None => return Err(MemoryError::InvalidSize),
         };
         entry_count += 1;
     }
     Ok((data_size, entry_count))
 }
 
-fn publish_size_warning(request: *const claw_core_request_t, session_id: &str) {
-    if request.is_null() {
-        log::warn!("session history blocked for {}: {}", session_id, SESSION_SIZE_WARNING);
-        return;
-    }
-    if let Ok(c) = std::ffi::CString::new(SESSION_SIZE_WARNING) {
-        let err = unsafe { claw_core_publish_stage_text(request, c.as_ptr()) };
-        if err != ESP_OK {
-            log::warn!("publish session history size warning failed for {}", session_id);
+fn publish_size_warning(session_id: &str, publish: Option<&dyn Fn(&str) -> bool>) {
+    match publish {
+        None => {
+            log::warn!("session history blocked for {}: {}", session_id, SESSION_SIZE_WARNING);
+        }
+        Some(f) => {
+            if !f(SESSION_SIZE_WARNING) {
+                log::warn!("publish session history size warning failed for {}", session_id);
+            }
         }
     }
 }
@@ -797,34 +778,27 @@ fn publish_size_warning(request: *const claw_core_request_t, session_id: &str) {
 /// `session_history_rewrite_compacted`.
 fn rewrite_compacted(
     session_id: &str,
-    request: *const claw_core_request_t,
+    publish: Option<&dyn Fn(&str) -> bool>,
     data_path: &str,
     idx_path: &str,
     entries: &[IndexEntry],
-) -> EspErr {
-    let turns = match analyze_turns(entries) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    let (compacted_data_size, compacted_entry_count) = match plan_compaction(entries, &turns) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+) -> MemoryResult<()> {
+    let turns = analyze_turns(entries)?;
+    let (compacted_data_size, compacted_entry_count) = plan_compaction(entries, &turns)?;
 
     if compacted_data_size > SESSION_SIZE_LIMIT {
-        let block_err = mark_blocked(data_path);
-        if block_err != ESP_OK {
+        if mark_blocked(data_path).is_err() {
             log::warn!("mark session history blocked failed for {}", session_id);
         }
-        publish_size_warning(request, session_id);
-        return ESP_OK;
+        publish_size_warning(session_id, publish);
+        return Ok(());
     }
 
     let original = match fs::read(data_path) {
         Ok(b) => b,
         Err(_) => {
             log::error!("open session history compaction files failed");
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
     };
 
@@ -832,20 +806,20 @@ fn rewrite_compacted(
         Ok(f) => f,
         Err(_) => {
             log::error!("open session history compaction files failed");
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
     };
     let mut idx_file = match fs::OpenOptions::new().read(true).write(true).open(idx_path) {
         Ok(f) => f,
         Err(_) => {
             log::error!("open session history compaction files failed");
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
     };
 
     if idx_file.seek(SeekFrom::Start(0)).is_err() || idx_file.write_all(&pack_header()).is_err() {
         log::error!("write session history idx header failed");
-        return ESP_FAIL;
+        return Err(MemoryError::Fail);
     }
 
     let mut turn_index = 0usize;
@@ -862,13 +836,13 @@ fn rewrite_compacted(
         let offset = entry.offset as usize;
         let length = entry.length as usize;
         if offset + length > original.len() {
-            return ESP_ERR_INVALID_STATE;
+            return Err(MemoryError::InvalidState);
         }
         if data_file.seek(SeekFrom::Start(write_offset as u64)).is_err()
             || data_file.write_all(&original[offset..offset + length]).is_err()
         {
             log::error!("seek compacted session history write offset failed");
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
 
         let new_entry = IndexEntry {
@@ -878,7 +852,7 @@ fn rewrite_compacted(
             backend_format: entry.backend_format,
         };
         if idx_file.write_all(&pack_entry(&new_entry)).is_err() {
-            return ESP_FAIL;
+            return Err(MemoryError::Fail);
         }
         write_offset += entry.length;
     }
@@ -889,33 +863,33 @@ fn rewrite_compacted(
             write_offset,
             compacted_data_size
         );
-        return ESP_ERR_INVALID_STATE;
+        return Err(MemoryError::InvalidState);
     }
     if data_file.flush().is_err() || idx_file.flush().is_err() {
         log::error!("flush compacted session history files failed");
-        return ESP_FAIL;
+        return Err(MemoryError::Fail);
     }
     if data_file.set_len(compacted_data_size as u64).is_err() {
         log::error!("truncate compacted session history failed");
-        return ESP_FAIL;
+        return Err(MemoryError::Fail);
     }
     let idx_len = (SESSION_IDX_HEADER_SIZE + compacted_entry_count * SESSION_IDX_ENTRY_SIZE) as u64;
     if idx_file.set_len(idx_len).is_err() {
         log::error!("truncate compacted session history idx failed");
-        return ESP_FAIL;
+        return Err(MemoryError::Fail);
     }
-    ESP_OK
+    Ok(())
 }
 
 /// `session_history_compact_if_needed`.
 fn compact_if_needed(
     session_id: &str,
-    request: *const claw_core_request_t,
+    publish: Option<&dyn Fn(&str) -> bool>,
     data_path: &str,
     idx_path: &str,
-) -> EspErr {
+) -> MemoryResult<()> {
     if util::file_size_bytes(data_path) <= SESSION_SIZE_LIMIT {
-        return ESP_OK;
+        return Ok(());
     }
     let entries = match validate_pair(data_path, idx_path) {
         Ok(e) => e,
@@ -924,7 +898,7 @@ fn compact_if_needed(
             return recreate_file(data_path, idx_path);
         }
     };
-    rewrite_compacted(session_id, request, data_path, idx_path, &entries)
+    rewrite_compacted(session_id, publish, data_path, idx_path, &entries)
 }
 
 // --- persist callback ------------------------------------------------------
@@ -941,8 +915,8 @@ fn validate_batch(records: &[PersistRecordIn]) -> bool {
         return false;
     }
     for r in records {
-        let has_json = r.message_json.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
-        let has_text = r.text.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+        let has_json = r.message_json.as_deref().is_some_and(|s| !s.is_empty());
+        let has_text = r.text.as_deref().is_some_and(|s| !s.is_empty());
         if !record_type_valid(r.record_type as u8) || (!has_json && !has_text) {
             return false;
         }
@@ -955,23 +929,23 @@ pub fn persist_context(
     session_id: Option<&str>,
     records: &[PersistRecordIn],
     turn_completed: bool,
-    request: *const claw_core_request_t,
-) -> EspErr {
+    publish: Option<&dyn Fn(&str) -> bool>,
+) -> MemoryResult<()> {
     {
         let st = state::lock();
         if !st.initialized {
-            return ESP_ERR_INVALID_STATE;
+            return Err(MemoryError::InvalidState);
         }
     }
     let session_id = match session_id {
         Some(s) if !s.is_empty() => s,
-        _ => return ESP_ERR_INVALID_ARG,
+        _ => return Err(MemoryError::InvalidArg),
     };
     if !validate_batch(records) {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
     if session_blocked(session_id) {
-        return ESP_ERR_INVALID_STATE;
+        return Err(MemoryError::InvalidState);
     }
 
     let (data_path, idx_path) = {
@@ -981,32 +955,29 @@ pub fn persist_context(
         (dp, ip)
     };
 
-    if util::ensure_parent_dir(&data_path) != ESP_OK {
-        return ESP_FAIL;
+    if util::ensure_parent_dir(&data_path).is_err() {
+        return Err(MemoryError::Fail);
     }
 
-    let (mut data_file, mut idx_file) = match open_pair_for_append(&data_path, &idx_path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (mut data_file, mut idx_file) = open_pair_for_append(&data_path, &idx_path)?;
 
-    let mut err = ESP_OK;
+    let mut result: MemoryResult<()> = Ok(());
     {
         let st = state::lock();
         for r in records {
-            let has_json = r.message_json.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+            let has_json = r.message_json.as_deref().is_some_and(|s| !s.is_empty());
             let (role, text) = if !has_json {
                 let role = record_text_role(r.record_type);
                 let text = r.text.as_deref();
-                if role.is_none() || text.map(|s| s.is_empty()).unwrap_or(true) {
-                    err = ESP_ERR_INVALID_ARG;
+                if role.is_none() || text.is_none_or(|s| s.is_empty()) {
+                    result = Err(MemoryError::InvalidArg);
                     break;
                 }
                 (role, text)
             } else {
                 (None, None)
             };
-            err = append_indexed_record(
+            result = append_indexed_record(
                 &st,
                 &mut data_file,
                 &mut idx_file,
@@ -1015,7 +986,7 @@ pub fn persist_context(
                 role,
                 text,
             );
-            if err != ESP_OK {
+            if result.is_err() {
                 break;
             }
         }
@@ -1025,40 +996,40 @@ pub fn persist_context(
     drop(data_file);
     drop(idx_file);
 
-    if err == ESP_OK && turn_completed {
-        err = compact_if_needed(session_id, request, &data_path, &idx_path);
+    if result.is_ok() && turn_completed {
+        result = compact_if_needed(session_id, publish, &data_path, &idx_path);
     }
-    err
+    result
 }
 
 // --- delete ----------------------------------------------------------------
 
-fn unlink_path(path: &str, deleted_any: &mut bool) -> EspErr {
+fn unlink_path(path: &str, deleted_any: &mut bool) -> MemoryResult<()> {
     if path.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(MemoryError::InvalidArg);
     }
     match fs::remove_file(path) {
         Ok(()) => {
             *deleted_any = true;
-            ESP_OK
+            Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ESP_OK,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => {
             log::error!("delete session history artifact {} failed", path);
-            ESP_FAIL
+            Err(MemoryError::Fail)
         }
     }
 }
 
 /// `claw_memory_delete_session_history`.
-pub fn delete_session_history(session_id: &str) -> Result<bool, EspErr> {
+pub fn delete_session_history(session_id: &str) -> MemoryResult<bool> {
     if session_id.is_empty() {
-        return Err(ESP_ERR_INVALID_ARG);
+        return Err(MemoryError::InvalidArg);
     }
     let (data_path, idx_path, blocked_path) = {
         let st = state::lock();
         if !st.initialized {
-            return Err(ESP_ERR_INVALID_STATE);
+            return Err(MemoryError::InvalidState);
         }
         let dp = session_path_dup(&st, session_id);
         let ip = idx_path_dup(&dp);
@@ -1067,18 +1038,9 @@ pub fn delete_session_history(session_id: &str) -> Result<bool, EspErr> {
     };
 
     let mut deleted_any = false;
-    let err = unlink_path(&data_path, &mut deleted_any);
-    if err != ESP_OK {
-        return Err(err);
-    }
-    let err = unlink_path(&idx_path, &mut deleted_any);
-    if err != ESP_OK {
-        return Err(err);
-    }
-    let err = unlink_path(&blocked_path, &mut deleted_any);
-    if err != ESP_OK {
-        return Err(err);
-    }
+    unlink_path(&data_path, &mut deleted_any)?;
+    unlink_path(&idx_path, &mut deleted_any)?;
+    unlink_path(&blocked_path, &mut deleted_any)?;
     Ok(deleted_any)
 }
 
@@ -1094,7 +1056,7 @@ pub fn stage_note(request_id: u32, session_id: Option<&str>) -> Option<String> {
     let manual_write = request_take_manual_write(request_id);
     let mut summary_list = pending_take_summary_list(session_id);
     let async_summary = crate::extract::async_extract_take_summary_list(request_id, !manual_write);
-    if util::line_list_merge_unique(&mut summary_list, async_summary.as_deref()) != ESP_OK {
+    if util::line_list_merge_unique(&mut summary_list, async_summary.as_deref()).is_err() {
         log::warn!("merge async extract summary failed for request={}", request_id);
     }
     util::format_update_stage_note(summary_list.as_deref())

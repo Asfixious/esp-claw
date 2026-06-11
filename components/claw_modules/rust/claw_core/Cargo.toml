@@ -5,9 +5,8 @@ edition = "2021"
 description = "Agent core (port of the claw_core component), exporting the claw_core.h C ABI"
 
 [lib]
-# claw_core is now an rlib consumed by the single `claw_rt` staticlib aggregator
-# (which bundles claw_core + claw_memory + cap_llm_inspect into one archive so
-# their #[no_mangle] symbols are not duplicated across multiple staticlibs).
+# claw_core is a pure-Rust rlib. Its C ABI lives in the `claw_capi` crate, which
+# is bundled (with the other logic crates) into the single `claw_rt` staticlib.
 crate-type = ["rlib"]
 
 [features]
@@ -18,13 +17,9 @@ stage_verbose = []
 claw_interfaces = { path = "../claw_interfaces" }
 claw-api = { path = "../claw-api" }
 claw_sys = { path = "../claw_sys" }
-# claw_paths and claw_task expose their own C ABI but ship no separate archive;
-# they are re-exported from lib.rs so their #[no_mangle] symbols land in the
-# single libclaw_core.a that the firmware links.
-claw_paths = { path = "../claw_paths" }
-claw_task = { path = "../claw_task" }
 log = "0.4"
 serde_json = "1"
+thiserror = "2"
 
 [dev-dependencies]
 serde_json = "1"

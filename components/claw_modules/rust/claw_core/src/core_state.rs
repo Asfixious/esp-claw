@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_ERR_NO_MEM,
-    ESP_ERR_TIMEOUT, ESP_OK,
+    EspErr, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_ERR_NO_MEM, ESP_ERR_TIMEOUT,
 };
 
 use crate::channel::BoundedQueue;
 use crate::consts::{
     AbortReason, AgentLoopPhase, INSERT_QUEUE_LEN, REQUEST_FLAG_USER_INTERRUPT,
 };
+use crate::error::CoreError;
 use crate::request::RequestItem;
 use crate::response::ResponseItem;
 
@@ -96,18 +96,18 @@ impl CoreState {
     // --- ingress (claw_core_messages.c) -----------------------------------
 
     /// `claw_core_ingress_submit`
-    pub fn ingress_submit(&self, item: RequestItem, timeout_ms: u32) -> EspErr {
+    pub fn ingress_submit(&self, item: RequestItem, timeout_ms: u32) -> Result<(), CoreError> {
         if !self.started.load(Ordering::Acquire) {
-            return ESP_ERR_INVALID_STATE;
+            return Err(CoreError::InvalidState);
         }
         if item.user_text.is_empty() {
-            return ESP_ERR_INVALID_ARG;
+            return Err(CoreError::InvalidArg);
         }
 
         let item = if item.flags & REQUEST_FLAG_USER_INTERRUPT != 0 {
             match self.try_queue_insert(item) {
-                InsertOutcome::Inserted => return ESP_OK,
-                InsertOutcome::Reject(err, _item) => return err,
+                InsertOutcome::Inserted => return Ok(()),
+                InsertOutcome::Reject(err, _item) => return Err(CoreError::Esp(err)),
                 InsertOutcome::Fallthrough(item) => item,
             }
         } else {
@@ -116,8 +116,8 @@ impl CoreState {
 
         let timeout = timeout_to_duration(timeout_ms);
         match self.request_queue.send_timeout(item, timeout) {
-            Ok(()) => ESP_OK,
-            Err(_) => ESP_ERR_TIMEOUT,
+            Ok(()) => Ok(()),
+            Err(_) => Err(CoreError::Esp(ESP_ERR_TIMEOUT)),
         }
     }
 
@@ -240,18 +240,18 @@ impl CoreState {
     }
 
     /// `claw_core_control_cancel_request`
-    pub fn cancel_request(&self, request_id: u32) -> EspErr {
+    pub fn cancel_request(&self, request_id: u32) -> Result<(), CoreError> {
         if !self.initialized.load(Ordering::Acquire) {
-            return ESP_ERR_INVALID_STATE;
+            return Err(CoreError::InvalidState);
         }
         let mut inf = self.inflight.lock().unwrap();
         if inf.request_id != 0 && (request_id == 0 || inf.request_id == request_id) {
             inf.abort = true;
             inf.abort_reason = AbortReason::Cancel;
             self.abort_flag.store(true, Ordering::Release);
-            ESP_OK
+            Ok(())
         } else {
-            ESP_ERR_NOT_FOUND
+            Err(CoreError::Esp(ESP_ERR_NOT_FOUND))
         }
     }
 
@@ -358,19 +358,25 @@ mod tests {
     #[test]
     fn submit_rejects_when_not_started() {
         let c = CoreState::new(1, 4, 4, 10);
-        assert_eq!(c.ingress_submit(req(1, "s", "hi", 0), 0), ESP_ERR_INVALID_STATE);
+        assert!(matches!(
+            c.ingress_submit(req(1, "s", "hi", 0), 0).unwrap_err(),
+            CoreError::InvalidState
+        ));
     }
 
     #[test]
     fn submit_rejects_empty_text() {
         let c = core();
-        assert_eq!(c.ingress_submit(req(1, "s", "", 0), 0), ESP_ERR_INVALID_ARG);
+        assert!(matches!(
+            c.ingress_submit(req(1, "s", "", 0), 0).unwrap_err(),
+            CoreError::InvalidArg
+        ));
     }
 
     #[test]
     fn submit_and_receive_roundtrip() {
         let c = core();
-        assert_eq!(c.ingress_submit(req(7, "s", "hi", 0), 1000), ESP_OK);
+        c.ingress_submit(req(7, "s", "hi", 0), 1000).unwrap();
         // simulate the agent consuming the request and pushing a response
         let got = c.request_queue.recv_timeout(Some(Duration::from_millis(50))).unwrap();
         assert_eq!(got.request_id, 7);
@@ -401,11 +407,17 @@ mod tests {
     #[test]
     fn cancel_and_phase() {
         let c = core();
-        assert_eq!(c.cancel_request(0), ESP_ERR_NOT_FOUND);
+        assert!(matches!(
+            c.cancel_request(0).unwrap_err(),
+            CoreError::Esp(ESP_ERR_NOT_FOUND)
+        ));
         c.begin_turn(5, "s");
-        assert_eq!(c.cancel_request(5), ESP_OK);
+        c.cancel_request(5).unwrap();
         assert!(c.abort_flag.load(Ordering::Acquire));
-        assert_eq!(c.cancel_request(6), ESP_ERR_NOT_FOUND);
+        assert!(matches!(
+            c.cancel_request(6).unwrap_err(),
+            CoreError::Esp(ESP_ERR_NOT_FOUND)
+        ));
         c.set_phase(AgentLoopPhase::InLlmHttp);
         assert_eq!(c.get_phase(), AgentLoopPhase::InLlmHttp);
     }
@@ -416,7 +428,8 @@ mod tests {
         c.begin_turn(5, "sess");
         c.set_phase(AgentLoopPhase::InLlmHttp);
         // interrupt for the same session is inserted and arms abort
-        assert_eq!(c.ingress_submit(req(6, "sess", "more", REQUEST_FLAG_USER_INTERRUPT), 0), ESP_OK);
+        c.ingress_submit(req(6, "sess", "more", REQUEST_FLAG_USER_INTERRUPT), 0)
+            .unwrap();
         assert!(c.abort_flag.load(Ordering::Acquire));
         let inserted = c.dequeue_inserted_user_inputs("sess", 4);
         assert_eq!(inserted, vec!["more".to_string()]);
@@ -426,7 +439,8 @@ mod tests {
     fn user_interrupt_falls_through_when_no_match() {
         let c = core();
         // no in-flight turn -> falls through to the normal request queue
-        assert_eq!(c.ingress_submit(req(6, "sess", "more", REQUEST_FLAG_USER_INTERRUPT), 1000), ESP_OK);
+        c.ingress_submit(req(6, "sess", "more", REQUEST_FLAG_USER_INTERRUPT), 1000)
+            .unwrap();
         let got = c.request_queue.recv_timeout(Some(Duration::from_millis(50))).unwrap();
         assert_eq!(got.request_id, 6);
     }

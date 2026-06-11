@@ -1,198 +1,130 @@
-//! `claw_paths` — boot-time logical storage root registry.
+//! `claw_paths` — boot-time logical storage root registry (pure Rust).
 //!
-//! Direct port of `claw_paths.c`. Exports the exact `claw_paths_*` C ABI. The
-//! roots are written once during early boot (before any reader runs), mirroring
-//! the C code's lock-free `static` storage; `claw_paths_get` returns a pointer
-//! into that storage, so it must stay valid for the program lifetime.
-
-#![allow(non_camel_case_types)]
+//! Holds the process-global `CLAW_PATH_DATA` / `CLAW_PATH_SYSTEM` root strings.
+//! The roots are written once during early boot (before any reader runs),
+//! mirroring the original lock-free `static` storage; [`get`] returns a
+//! reference into that storage, so it stays valid for the program lifetime.
+//!
+//! The C ABI (`claw_paths_set/get/join`) lives in `claw_capi::paths`, which
+//! wraps this Rust API; this crate itself exposes no C ABI.
 
 use core::cell::UnsafeCell;
-use core::ffi::{c_char, c_int};
-use core::ptr;
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_OK,
-};
+/// Logical root indices (`claw_path_root_t` discriminants).
+pub const CLAW_PATH_DATA: usize = 0;
+pub const CLAW_PATH_SYSTEM: usize = 1;
+/// Number of logical roots.
+pub const ROOT_MAX: usize = 2;
+/// Maximum stored root length, including the implicit NUL the C ABI relies on.
+pub const MAX_LEN: usize = 32;
 
-const CLAW_PATHS_MAX_LEN: usize = 32;
-const CLAW_PATH_ROOT_MAX: usize = 2;
+/// Why a [`set`] was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathError {
+    /// Root index is out of range.
+    InvalidRoot,
+    /// The path was empty.
+    EmptyPath,
+    /// The path did not fit in [`MAX_LEN`] (including the trailing NUL).
+    PathTooLong,
+}
 
-/// `claw_path_root_t` discriminants.
-pub const CLAW_PATH_DATA: c_int = 0;
-pub const CLAW_PATH_SYSTEM: c_int = 1;
-
-struct Roots(UnsafeCell<[[u8; CLAW_PATHS_MAX_LEN]; CLAW_PATH_ROOT_MAX]>);
-// Safety: written once at boot before any reader; matches the C contract.
+struct Roots(UnsafeCell<[[u8; MAX_LEN]; ROOT_MAX]>);
+// Safety: written once at boot before any reader runs; matches the C contract.
 unsafe impl Sync for Roots {}
 
-static ROOTS: Roots = Roots(UnsafeCell::new([[0u8; CLAW_PATHS_MAX_LEN]; CLAW_PATH_ROOT_MAX]));
+static ROOTS: Roots = Roots(UnsafeCell::new([[0u8; MAX_LEN]; ROOT_MAX]));
 
-#[inline]
-fn root_in_range(root: c_int) -> bool {
-    (root as u32) < CLAW_PATH_ROOT_MAX as u32
-}
-
-/// `esp_err_t claw_paths_set(claw_path_root_t root, const char *path)`
-#[no_mangle]
-pub unsafe extern "C" fn claw_paths_set(root: c_int, path: *const c_char) -> EspErr {
-    if !root_in_range(root) || path.is_null() {
-        return ESP_ERR_INVALID_ARG;
+/// Store `path` for `root`. Rejects out-of-range roots, empty paths, and paths
+/// that do not leave room for a trailing NUL within [`MAX_LEN`].
+///
+/// Must be called during early boot before any concurrent [`get`] (the C
+/// contract); the storage is lock-free.
+pub fn set(root: usize, path: &str) -> Result<(), PathError> {
+    if root >= ROOT_MAX {
+        return Err(PathError::InvalidRoot);
     }
-    let bytes = core::ffi::CStr::from_ptr(path).to_bytes();
+    let bytes = path.as_bytes();
     if bytes.is_empty() {
-        return ESP_ERR_INVALID_ARG;
+        return Err(PathError::EmptyPath);
     }
-    // strlcpy returns strlen(src); success requires it to be < buffer size.
-    if bytes.len() >= CLAW_PATHS_MAX_LEN {
-        return ESP_ERR_INVALID_SIZE;
+    // strlcpy success requires strlen(src) < buffer size.
+    if bytes.len() >= MAX_LEN {
+        return Err(PathError::PathTooLong);
     }
-    let dst = &mut (*ROOTS.0.get())[root as usize];
+    // Safety: see `Roots` — boot-time single-writer.
+    let dst = unsafe { &mut (*ROOTS.0.get())[root] };
     dst.fill(0);
     dst[..bytes.len()].copy_from_slice(bytes);
-    ESP_OK
+    Ok(())
 }
 
-/// `const char *claw_paths_get(claw_path_root_t root)`
-#[no_mangle]
-pub unsafe extern "C" fn claw_paths_get(root: c_int) -> *const c_char {
-    if !root_in_range(root) {
-        return ptr::null();
+/// The stored path for `root`, or `None` if the root is out of range or unset.
+///
+/// The returned reference points into process-global storage that is valid for
+/// the program lifetime and is always NUL-terminated within its backing buffer.
+pub fn get(root: usize) -> Option<&'static str> {
+    if root >= ROOT_MAX {
+        return None;
     }
-    let buf = &(*ROOTS.0.get())[root as usize];
+    // Safety: see `Roots` — readers run after the boot-time writes.
+    let buf = unsafe { &(*ROOTS.0.get())[root] };
     if buf[0] == 0 {
-        return ptr::null();
+        return None;
     }
-    buf.as_ptr() as *const c_char
-}
-
-/// `esp_err_t claw_paths_join(claw_path_root_t root, const char *subpath, char *out, size_t out_size)`
-#[no_mangle]
-pub unsafe extern "C" fn claw_paths_join(
-    root: c_int,
-    subpath: *const c_char,
-    out: *mut c_char,
-    out_size: usize,
-) -> EspErr {
-    let base = claw_paths_get(root);
-    if base.is_null() {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if out.is_null() || out_size == 0 {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    let base_bytes = core::ffi::CStr::from_ptr(base).to_bytes();
-    let sub_bytes: &[u8] = if subpath.is_null() {
-        &[]
-    } else {
-        core::ffi::CStr::from_ptr(subpath).to_bytes()
-    };
-
-    // Chars that snprintf would write, excluding the NUL. Success requires
-    // `written < out_size`, matching the C check.
-    let written = if !sub_bytes.is_empty() {
-        base_bytes.len() + 1 + sub_bytes.len()
-    } else {
-        base_bytes.len()
-    };
-    if written >= out_size {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    let out_slice = core::slice::from_raw_parts_mut(out as *mut u8, out_size);
-    let mut i = 0;
-    out_slice[i..i + base_bytes.len()].copy_from_slice(base_bytes);
-    i += base_bytes.len();
-    if !sub_bytes.is_empty() {
-        out_slice[i] = b'/';
-        i += 1;
-        out_slice[i..i + sub_bytes.len()].copy_from_slice(sub_bytes);
-        i += sub_bytes.len();
-    }
-    out_slice[i] = 0;
-    ESP_OK
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(MAX_LEN);
+    core::str::from_utf8(&buf[..len]).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
     use std::sync::Mutex;
 
     // claw_paths uses process-global state; serialize the tests that touch it.
     static GUARD: Mutex<()> = Mutex::new(());
 
-    unsafe fn reset() {
-        for r in 0..CLAW_PATH_ROOT_MAX {
-            (*ROOTS.0.get())[r].fill(0);
+    fn reset() {
+        // Safety: tests hold GUARD, so this is the only accessor.
+        unsafe {
+            for r in 0..ROOT_MAX {
+                (*ROOTS.0.get())[r].fill(0);
+            }
         }
     }
 
     #[test]
     fn set_get_roundtrip() {
         let _g = GUARD.lock().unwrap();
-        unsafe {
-            reset();
-            let p = CString::new("/fatfs").unwrap();
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, p.as_ptr()), ESP_OK);
-            let got = claw_paths_get(CLAW_PATH_DATA);
-            assert!(!got.is_null());
-            assert_eq!(core::ffi::CStr::from_ptr(got).to_str().unwrap(), "/fatfs");
-            // unset root returns null
-            assert!(claw_paths_get(CLAW_PATH_SYSTEM).is_null());
-        }
+        reset();
+        assert_eq!(set(CLAW_PATH_DATA, "/fatfs"), Ok(()));
+        assert_eq!(get(CLAW_PATH_DATA), Some("/fatfs"));
+        assert_eq!(get(CLAW_PATH_SYSTEM), None);
     }
 
     #[test]
     fn set_rejects_bad_args() {
         let _g = GUARD.lock().unwrap();
-        unsafe {
-            reset();
-            assert_eq!(claw_paths_set(99, CString::new("/x").unwrap().as_ptr()), ESP_ERR_INVALID_ARG);
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, ptr::null()), ESP_ERR_INVALID_ARG);
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, CString::new("").unwrap().as_ptr()), ESP_ERR_INVALID_ARG);
-            let too_long = CString::new("/".repeat(40)).unwrap();
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, too_long.as_ptr()), ESP_ERR_INVALID_SIZE);
-        }
+        reset();
+        assert_eq!(set(99, "/x"), Err(PathError::InvalidRoot));
+        assert_eq!(set(CLAW_PATH_DATA, ""), Err(PathError::EmptyPath));
+        assert_eq!(set(CLAW_PATH_DATA, &"/".repeat(40)), Err(PathError::PathTooLong));
     }
 
     #[test]
-    fn join_composes_and_validates() {
+    fn get_rejects_out_of_range_root() {
         let _g = GUARD.lock().unwrap();
-        unsafe {
-            reset();
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, CString::new("/fatfs").unwrap().as_ptr()), ESP_OK);
+        reset();
+        assert_eq!(get(ROOT_MAX), None);
+    }
 
-            let mut out = [0u8; 64];
-            let sub = CString::new("skills/foo").unwrap();
-            assert_eq!(
-                claw_paths_join(CLAW_PATH_DATA, sub.as_ptr(), out.as_mut_ptr() as *mut c_char, out.len()),
-                ESP_OK
-            );
-            let s = core::ffi::CStr::from_ptr(out.as_ptr() as *const c_char).to_str().unwrap();
-            assert_eq!(s, "/fatfs/skills/foo");
-
-            // NULL subpath -> just the base
-            let mut out2 = [0u8; 64];
-            assert_eq!(
-                claw_paths_join(CLAW_PATH_DATA, ptr::null(), out2.as_mut_ptr() as *mut c_char, out2.len()),
-                ESP_OK
-            );
-            assert_eq!(core::ffi::CStr::from_ptr(out2.as_ptr() as *const c_char).to_str().unwrap(), "/fatfs");
-
-            // unset root -> INVALID_STATE
-            assert_eq!(
-                claw_paths_join(CLAW_PATH_SYSTEM, sub.as_ptr(), out.as_mut_ptr() as *mut c_char, out.len()),
-                ESP_ERR_INVALID_STATE
-            );
-
-            // too small buffer -> INVALID_SIZE
-            let mut tiny = [0u8; 4];
-            assert_eq!(
-                claw_paths_join(CLAW_PATH_DATA, sub.as_ptr(), tiny.as_mut_ptr() as *mut c_char, tiny.len()),
-                ESP_ERR_INVALID_SIZE
-            );
-        }
+    #[test]
+    fn max_len_boundary() {
+        let _g = GUARD.lock().unwrap();
+        reset();
+        // 31 chars fit (leaves room for NUL); 32 do not.
+        assert_eq!(set(CLAW_PATH_DATA, &"a".repeat(31)), Ok(()));
+        assert_eq!(get(CLAW_PATH_DATA), Some("a".repeat(31).as_str()));
+        assert_eq!(set(CLAW_PATH_DATA, &"a".repeat(32)), Err(PathError::PathTooLong));
     }
 }

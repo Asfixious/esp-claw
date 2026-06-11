@@ -13,7 +13,7 @@ use crate::request::RequestItem;
 use crate::response::ResponseItem;
 use crate::util::now_ms;
 
-fn non_empty<'a>(value: &'a Option<String>) -> Option<&'a str> {
+fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|s| !s.is_empty())
 }
 
@@ -79,37 +79,33 @@ pub fn publish_out_message_if_requested(
         ResponseStatus::Ok => non_empty(&response.text),
         ResponseStatus::Error => non_empty(&response.error_message),
     };
-    let text = match text {
-        Some(t) => t.to_string(),
-        None => return,
+    let Some(text) = text else {
+        return;
     };
 
     let channel = non_empty(&response.target_channel)
-        .or_else(|| request.source_channel.as_deref())
+        .or(request.source_channel.as_deref())
         .unwrap_or("");
     let chat_id = non_empty(&response.target_chat_id)
-        .or_else(|| request.source_chat_id.as_deref())
+        .or(request.source_chat_id.as_deref())
         .unwrap_or("");
 
     let now = now_ms();
-    let mut event = match build_common(
+    let Some(mut event) = build_common(
         "agent",
         "out_message",
         request.request_id,
         now,
         channel,
         chat_id,
-        &text,
-    ) {
-        Some(e) => e,
-        None => return,
+        text,
+    ) else {
+        return;
     };
 
     event.message_id = format!("agent-{}", request.request_id);
-    event.correlation_id = match non_empty(&request.source_message_id) {
-        Some(id) => id.to_string(),
-        None => format!("{}", request.request_id),
-    };
+    event.correlation_id = non_empty(&request.source_message_id)
+        .map_or_else(|| request.request_id.to_string(), str::to_string);
     event.payload_json = Some(build_response_payload_json(request, response));
 
     let err = publisher.publish(&event);
@@ -136,14 +132,14 @@ pub fn publish_stage_text(
     }
 
     let channel = non_empty(&request.target_channel)
-        .or_else(|| request.source_channel.as_deref())
+        .or(request.source_channel.as_deref())
         .unwrap_or("");
     let chat_id = non_empty(&request.target_chat_id)
-        .or_else(|| request.source_chat_id.as_deref())
+        .or(request.source_chat_id.as_deref())
         .unwrap_or("");
 
     let now = now_ms();
-    let event = match build_common(
+    let Some(event) = build_common(
         "stage",
         "agent_stage",
         request.request_id,
@@ -151,9 +147,8 @@ pub fn publish_stage_text(
         channel,
         chat_id,
         text,
-    ) {
-        Some(e) => e,
-        None => return ESP_ERR_INVALID_ARG,
+    ) else {
+        return ESP_ERR_INVALID_ARG;
     };
 
     let err = publisher.publish(&event);

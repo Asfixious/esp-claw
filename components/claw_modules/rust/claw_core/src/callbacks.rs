@@ -4,8 +4,8 @@
 //! (`call_cap`, context providers, `persist_context`, `request_gate`,
 //! `on_request_start`, `collect_stage_note`, completion observers). Modelling
 //! them as Rust traits keeps the loop host-testable with mock implementations;
-//! the C ABI layer ([`crate::cabi`]) wraps the C function pointers in adapters
-//! that implement these traits.
+//! the C ABI layer (in the `claw_capi` crate) wraps the C function pointers in
+//! adapters that implement these traits.
 
 use claw_interfaces::error::EspErr;
 

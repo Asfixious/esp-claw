@@ -152,6 +152,10 @@ impl ClawPlatform for EspPlatform {
         unsafe { libc::time(core::ptr::null_mut()) }
     }
 
+    // `tag` is forwarded verbatim to `esp_log_write`; it is never dereferenced
+    // here, and the safe trait signature is the intended public API, so the
+    // raw-pointer-arg lint does not apply.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn log_write(&self, level: u32, tag: *const c_char, args: fmt::Arguments) {
         let mut storage = [0u8; 200];
         let mut sink = StackFmt::new(&mut storage);
@@ -162,7 +166,7 @@ impl ClawPlatform for EspPlatform {
             ffi::esp_log_write(
                 level,
                 tag,
-                b"%s\n\0".as_ptr() as *const c_char,
+                c"%s\n".as_ptr(),
                 storage.as_ptr() as *const c_char,
             );
         }

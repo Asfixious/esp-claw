@@ -48,8 +48,9 @@ pub const CONTEXT_RECORD_TOOL_RESULT: i32 = 4;
 pub const CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY: u32 = 1 << 0;
 
 /// `claw_memory_backend_format_t`
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendFormat {
+    #[default]
     Unknown = 0,
     OpenAi = 1,
     Anthropic = 2,
@@ -87,6 +88,8 @@ pub enum MessageIntent {
 }
 
 impl MessageIntent {
+    // Takes `Option<&str>` and is infallible, so it cannot implement `FromStr`.
+    #[allow(clippy::should_implement_trait)]
     #[cfg_attr(not(target_os = "espidf"), allow(dead_code))]
     pub fn from_str(value: Option<&str>) -> MessageIntent {
         match value {

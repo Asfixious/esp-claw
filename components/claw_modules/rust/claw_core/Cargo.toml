@@ -2,7 +2,7 @@
 name = "claw_core"
 version = "0.1.0"
 edition = "2021"
-description = "Agent core (port of the claw_core component), exporting the claw_core.h C ABI"
+description = "Multi-agent runtime: orchestrator, semantic agents, and iteration loop"
 
 [lib]
 # claw_core is a pure-Rust rlib. Its C ABI lives in the `claw_capi` crate, which
@@ -17,8 +17,8 @@ stage_verbose = []
 claw_cap = { path = "../claw_cap" }
 claw_interfaces = { path = "../claw_interfaces" }
 claw-api = { path = "../claw-api" }
-claw_sys = { path = "../claw_sys" }
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 

@@ -49,12 +49,8 @@ enum InterruptDrainPoint {
     AfterLlmBeforeTool,
 }
 
-pub(crate) fn phase_is_insertable(phase: IterationLoopPhase) -> bool {
-    !matches!(
-        phase,
-        IterationLoopPhase::Idle | IterationLoopPhase::Finalizing
-    )
-}
+/// Max user-interrupt messages drained per checkpoint.
+const INSERT_QUEUE_LEN: usize = 4;
 
 /// Borrowed OpenAI-style system prompt for one LLM call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,8 +264,6 @@ fn drain_user_interrupts(
     timing: InterruptDrainPoint,
     appended: &mut AppendedMessages,
 ) -> Result<bool, IterationLoopError> {
-    use crate::consts::INSERT_QUEUE_LEN;
-
     let texts = control.dequeue_inserted_user_inputs(request.session_id_str(), INSERT_QUEUE_LEN);
     if texts.is_empty() {
         return Ok(false);
@@ -454,16 +448,6 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["content"], "first");
         assert_eq!(items[1]["content"], "second");
-    }
-
-    #[test]
-    fn phase_is_insertable_excludes_idle_and_finalizing() {
-        assert!(!phase_is_insertable(IterationLoopPhase::Idle));
-        assert!(!phase_is_insertable(IterationLoopPhase::Finalizing));
-        assert!(phase_is_insertable(IterationLoopPhase::BeforeLlmHttp));
-        assert!(phase_is_insertable(IterationLoopPhase::InLlmHttp));
-        assert!(phase_is_insertable(IterationLoopPhase::AfterLlmBeforeTool));
-        assert!(phase_is_insertable(IterationLoopPhase::RunningTool));
     }
 
     #[test]

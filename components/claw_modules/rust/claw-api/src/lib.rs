@@ -1,15 +1,26 @@
-//! LLM runtime, backends, types, and media preparation (port of `src/llm/`).
+//! `claw-api` — LLM runtime, backends, types, and media preparation.
+//!
+//! Extracted from `claw_core::llm` into a standalone crate so the LLM client
+//! surface (OpenAI-/Anthropic-compatible chat + media inference over the
+//! [`claw_interfaces::http::ClawHttp`] trait) can be reused independently of the
+//! agent core (e.g. by `claw_memory`'s async extractor and `cap_llm_inspect`).
 
 pub mod backend;
 pub mod backends;
+pub mod client;
+pub mod errors;
 pub mod media;
-pub mod runtime;
 pub mod types;
+
+pub use client::ClawApi;
+pub use errors::{ChatError, ClawApiError, InferMediaError, InitError};
+pub use types::{
+    AssetKind, ChatRequest, ClawApiConfig, LlmResponse, MediaAsset, MediaRequest, ToolCall,
+};
 
 #[cfg(test)]
 mod tests {
-    use super::runtime::LlmRuntime;
-    use super::types::{ChatRequest, RuntimeConfig};
+    use super::{ChatRequest, ClawApi, ClawApiConfig, InitError};
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use core::sync::atomic::AtomicBool;
     use serde_json::{json, Value};
@@ -43,8 +54,8 @@ mod tests {
         }
     }
 
-    fn cfg(backend: &str, base_url: &str) -> RuntimeConfig {
-        RuntimeConfig {
+    fn cfg(backend: &str, base_url: &str) -> ClawApiConfig {
+        ClawApiConfig {
             api_key: Some("key".into()),
             backend_type: backend.into(),
             model: Some("model-x".into()),
@@ -58,12 +69,10 @@ mod tests {
     #[test]
     fn openai_chat_text() {
         let http = MockHttp::new(r#"{"choices":[{"message":{"role":"assistant","content":"hi there"}}]}"#);
-        let rt = LlmRuntime::init(cfg("openai_compatible", "https://api.example.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(cfg("openai_compatible", "https://api.example.com/v1"), http.clone()).unwrap();
         let messages = json!([{"role": "user", "content": "hello"}]);
         let abort = AtomicBool::new(false);
-        let resp = rt
-            .chat(&ChatRequest { system_prompt: "sys", messages: &messages, tools_json: None }, &abort)
-            .unwrap();
+        let resp = rt.chat(&ChatRequest::new("sys", &messages), &abort).unwrap();
         assert_eq!(resp.text.as_deref(), Some("hi there"));
 
         // URL joined with one slash; body carries system + user messages.
@@ -81,12 +90,10 @@ mod tests {
         let reply = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
             {"id":"call_1","function":{"name":"files","arguments":"{\"p\":\"/x\"}"}}]}}]}"#;
         let http = MockHttp::new(reply);
-        let rt = LlmRuntime::init(cfg("openai_compatible", "https://api.example.com"), http).unwrap();
+        let rt = ClawApi::init(cfg("openai_compatible", "https://api.example.com"), http).unwrap();
         let messages = json!([{"role": "user", "content": "list"}]);
         let abort = AtomicBool::new(false);
-        let resp = rt
-            .chat(&ChatRequest { system_prompt: "s", messages: &messages, tools_json: None }, &abort)
-            .unwrap();
+        let resp = rt.chat(&ChatRequest::new("s", &messages), &abort).unwrap();
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "call_1");
         assert_eq!(resp.tool_calls[0].name, "files");
@@ -98,7 +105,7 @@ mod tests {
         let reply = r#"{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"done"},
             {"type":"tool_use","id":"tu1","name":"foo","input":{"a":1}}]}"#;
         let http = MockHttp::new(reply);
-        let rt = LlmRuntime::init(cfg("anthropic_compatible", "https://api.anthropic.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(cfg("anthropic_compatible", "https://api.anthropic.com/v1"), http.clone()).unwrap();
 
         // assistant with tool_calls, then a tool result message
         let messages = json!([
@@ -109,9 +116,7 @@ mod tests {
             {"role": "tool", "tool_call_id": "tu1", "content": "result-text"}
         ]);
         let abort = AtomicBool::new(false);
-        let resp = rt
-            .chat(&ChatRequest { system_prompt: "sys", messages: &messages, tools_json: None }, &abort)
-            .unwrap();
+        let resp = rt.chat(&ChatRequest::new("sys", &messages), &abort).unwrap();
         assert_eq!(resp.text.as_deref(), Some("done"));
         assert_eq!(resp.reasoning_content.as_deref(), Some("hmm"));
         assert_eq!(resp.tool_calls.len(), 1);
@@ -138,11 +143,11 @@ mod tests {
     #[test]
     fn anthropic_converts_tools() {
         let http = MockHttp::new(r#"{"content":[{"type":"text","text":"ok"}]}"#);
-        let rt = LlmRuntime::init(cfg("anthropic_compatible", "https://api.anthropic.com"), http.clone()).unwrap();
+        let rt = ClawApi::init(cfg("anthropic_compatible", "https://api.anthropic.com"), http.clone()).unwrap();
         let messages = json!([{"role": "user", "content": "hi"}]);
         let tools = r#"[{"type":"function","function":{"name":"foo","description":"d","parameters":{"type":"object"}}}]"#;
         let abort = AtomicBool::new(false);
-        rt.chat(&ChatRequest { system_prompt: "s", messages: &messages, tools_json: Some(tools) }, &abort)
+        rt.chat(&ChatRequest::new("s", &messages).with_tools(tools), &abort)
             .unwrap();
         let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         let tools_out = body["tools"].as_array().unwrap();
@@ -155,10 +160,10 @@ mod tests {
     #[test]
     fn unknown_backend_rejected() {
         let http = MockHttp::new("{}");
-        let err = match LlmRuntime::init(cfg("nope", "https://x"), http) {
+        let err = match ClawApi::init(cfg("nope", "https://x"), http) {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
-        assert_eq!(err.err, claw_interfaces::error::ESP_ERR_NOT_SUPPORTED);
+        assert!(matches!(err, InitError::UnknownBackend));
     }
 }

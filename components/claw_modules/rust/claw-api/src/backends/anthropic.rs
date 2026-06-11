@@ -7,16 +7,13 @@ use core::sync::atomic::AtomicBool;
 
 use serde_json::{json, Map, Value};
 
-use claw_interfaces::error::{
-    ESP_ERR_INVALID_ARG, ESP_ERR_NOT_SUPPORTED, ESP_FAIL,
-};
 use claw_interfaces::http::{ClawHttp, HttpHeader, HttpJsonRequest};
 
 use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
+use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};
 use super::super::media::prepare_asset;
 use super::super::types::{
-    ChatRequest, LlmError, LlmResponse, MediaRequest, ModelProfile, PreparedKind, RuntimeConfig,
-    ToolCall,
+    ChatRequest, LlmResponse, MediaRequest, ModelProfile, PreparedKind, ClawApiConfig, ToolCall,
 };
 use super::common::join_url;
 
@@ -48,18 +45,18 @@ struct Anthropic {
 }
 
 /// `anthropic_init`
-fn make(config: &RuntimeConfig) -> Result<Box<dyn LlmBackend>, LlmError> {
+fn make(config: &ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError> {
     let api_key = config.api_key.as_deref().unwrap_or("");
     if api_key.is_empty() {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "LLM API key is empty"));
+        return Err(InitError::MissingApiKey);
     }
     let model = config.model.as_deref().unwrap_or("");
     if model.is_empty() {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "LLM model is empty"));
+        return Err(InitError::MissingModel);
     }
     let base_url = config.base_url.as_deref().unwrap_or("");
     if base_url.is_empty() {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "LLM base_url is empty"));
+        return Err(InitError::MissingBaseUrl);
     }
     Ok(Box::new(Anthropic {
         api_key: api_key.to_string(),
@@ -109,7 +106,7 @@ fn duplicate_supported_block(block: &Value) -> Option<Value> {
 }
 
 /// `convert_messages_to_anthropic`
-fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, LlmError> {
+fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, ClawApiError> {
     let mut out: Vec<Value> = Vec::new();
     let arr = match messages.as_array() {
         Some(a) => a,
@@ -182,10 +179,7 @@ fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, LlmError> {
                     match make_tool_use_block(tc) {
                         Some(b) => blocks.push(b),
                         None => {
-                            return Err(LlmError::new(
-                                claw_interfaces::error::ESP_ERR_NO_MEM,
-                                "Out of memory converting messages",
-                            ))
+                            return Err(ClawApiError::ApiError("out of memory converting messages"))
                         }
                     }
                 }
@@ -265,19 +259,18 @@ fn parse_data_url(data_url: &str) -> Option<(String, String)> {
 }
 
 /// `parse_chat_response` (Anthropic content-block form).
-fn parse_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
-    let root: Value = serde_json::from_str(body)
-        .map_err(|_| LlmError::fail("Failed to parse LLM JSON response"))?;
+fn parse_chat_response(body: &str) -> Result<LlmResponse, ClawApiError> {
+    let root: Value = serde_json::from_str(body).map_err(|_| ClawApiError::Parse)?;
     let content = match root.get("content") {
         Some(Value::Array(a)) => a,
-        _ => return Err(LlmError::fail("LLM response missing content")),
+        _ => return Err(ClawApiError::MalformedResponse("response missing content")),
     };
 
     let raw_message_json = serde_json::to_string(&json!({
         "role": "assistant",
         "content": Value::Array(content.clone()),
     }))
-    .map_err(|_| LlmError::fail("Out of memory copying LLM raw message"))?;
+    .map_err(|_| ClawApiError::ApiError("out of memory copying raw message"))?;
 
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -297,12 +290,12 @@ fn parse_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
             }
             Some("tool_use") => {
                 let id = str_field(block, "id")
-                    .ok_or_else(|| LlmError::fail("Out of memory copying tool call"))?;
+                    .ok_or(ClawApiError::MalformedResponse("malformed tool call"))?;
                 let name = str_field(block, "name")
-                    .ok_or_else(|| LlmError::fail("Out of memory copying tool call"))?;
+                    .ok_or(ClawApiError::MalformedResponse("malformed tool call"))?;
                 let arguments_json = match block.get("input") {
                     Some(input) => serde_json::to_string(input)
-                        .map_err(|_| LlmError::fail("Out of memory copying tool call"))?,
+                        .map_err(|_| ClawApiError::ApiError("out of memory copying tool call"))?,
                     None => "{}".to_string(),
                 };
                 tool_calls.push(ToolCall { id: id.to_string(), name: name.to_string(), arguments_json });
@@ -315,7 +308,7 @@ fn parse_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
     let reasoning_opt = (!reasoning.is_empty()).then_some(reasoning);
 
     if text_opt.is_none() && tool_calls.is_empty() && reasoning_opt.is_none() {
-        return Err(LlmError::new(ESP_FAIL, "LLM returned empty response"));
+        return Err(ClawApiError::EmptyResponse);
     }
 
     Ok(LlmResponse {
@@ -328,7 +321,7 @@ fn parse_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
 
 impl Anthropic {
     /// `build_chat_body`
-    fn build_chat_body(&self, request: &ChatRequest) -> Result<String, LlmError> {
+    fn build_chat_body(&self, request: &ChatRequest) -> Result<String, ChatError> {
         let messages = convert_messages_to_anthropic(request.messages)?;
 
         let mut body = Map::new();
@@ -339,7 +332,7 @@ impl Anthropic {
 
         let tools = convert_tools_to_anthropic(request.tools_json);
         if request.tools_json.map(|s| !s.is_empty()).unwrap_or(false) && tools.is_none() {
-            return Err(LlmError::new(ESP_ERR_INVALID_ARG, "Invalid tools JSON"));
+            return Err(ChatError::InvalidToolsJson);
         }
         if let Some(tools) = tools {
             if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
@@ -349,7 +342,7 @@ impl Anthropic {
         }
 
         serde_json::to_string(&Value::Object(body))
-            .map_err(|_| LlmError::fail("Out of memory serializing request"))
+            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
     }
 
     fn headers(&self) -> [(&'static str, String); 2] {
@@ -368,7 +361,7 @@ impl LlmBackend for Anthropic {
         profile: &ModelProfile,
         request: &ChatRequest,
         abort: &AtomicBool,
-    ) -> Result<LlmResponse, LlmError> {
+    ) -> Result<LlmResponse, ChatError> {
         let post_data = self.build_chat_body(request)?;
         let url = join_url(&self.base_url, &profile.chat_path);
         let header_storage = self.headers();
@@ -387,8 +380,8 @@ impl LlmBackend for Anthropic {
         };
         let response = http
             .post_json(&http_request, abort)
-            .map_err(|e| LlmError::new(e.err, e.message))?;
-        parse_chat_response(&response.body)
+            .map_err(|e| ClawApiError::Transport(e.message))?;
+        Ok(parse_chat_response(&response.body)?)
     }
 
     /// `anthropic_infer_media`
@@ -398,27 +391,21 @@ impl LlmBackend for Anthropic {
         profile: &ModelProfile,
         request: &MediaRequest,
         _abort: &AtomicBool,
-    ) -> Result<String, LlmError> {
+    ) -> Result<String, InferMediaError> {
         if !profile.supports_vision {
-            return Err(LlmError::new(
-                ESP_ERR_NOT_SUPPORTED,
-                "Selected profile does not support media inference",
-            ));
+            return Err(InferMediaError::VisionUnsupported);
         }
         let user_prompt = request.user_prompt.unwrap_or("");
         if user_prompt.is_empty() || request.media.is_empty() {
-            return Err(LlmError::new(ESP_ERR_INVALID_ARG, "media request is incomplete"));
+            return Err(InferMediaError::IncompleteRequest);
         }
 
         let prepared = prepare_asset(&request.media[0], profile, self.image_max_bytes)?;
         if prepared.kind != PreparedKind::DataUrl {
-            return Err(LlmError::new(
-                ESP_ERR_NOT_SUPPORTED,
-                "Anthropic backend requires local image data",
-            ));
+            return Err(InferMediaError::RequiresLocalImage);
         }
-        let (mime, base64_data) = parse_data_url(&prepared.payload)
-            .ok_or_else(|| LlmError::fail("Failed to prepare Anthropic image payload"))?;
+        let (mime, base64_data) =
+            parse_data_url(&prepared.payload).ok_or(InferMediaError::PayloadPrepFailed)?;
 
         let body = json!({
             "model": self.model,
@@ -432,8 +419,9 @@ impl LlmBackend for Anthropic {
                 ]
             }]
         });
-        let post_data = serde_json::to_string(&body)
-            .map_err(|_| LlmError::fail("Out of memory serializing media request"))?;
+        let post_data = serde_json::to_string(&body).map_err(|_| {
+            ClawApiError::ApiError("out of memory serializing media request")
+        })?;
         let url = join_url(&self.base_url, &profile.chat_path);
         let header_storage = self.headers();
         let headers: Vec<HttpHeader> = header_storage
@@ -452,12 +440,12 @@ impl LlmBackend for Anthropic {
         };
         let response = http
             .post_json(&http_request, &never)
-            .map_err(|e| LlmError::new(e.err, e.message))?;
+            .map_err(|e| ClawApiError::Transport(e.message))?;
 
         let parsed = parse_chat_response(&response.body)?;
         match parsed.text {
             Some(t) if !t.is_empty() => Ok(t),
-            _ => Err(LlmError::new(ESP_FAIL, "LLM returned empty media response")),
+            _ => Err(ClawApiError::EmptyResponse.into()),
         }
     }
 }

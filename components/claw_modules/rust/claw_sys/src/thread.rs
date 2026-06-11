@@ -31,14 +31,23 @@ where
     F: FnOnce() + Send + 'static,
 {
     #[cfg(target_os = "espidf")]
-    let _restore = espidf::apply_cfg(name, stack_size, priority, core);
+    {
+        let _restore = espidf::apply_cfg(name, stack_size, priority, core);
+        // The embedded stack size is tuned for ESP32 frames and PSRAM; esp_pthread
+        // (via _restore's cfg) already carries it, and Builder::stack_size pins
+        // the pthread attr stack to the same value.
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(stack_size)
+            .spawn(f)
+    }
+    // On host, the small embedded stack sizes (8-16 KiB) would overflow std's
+    // deeper frames, so let the platform pick its default (multi-MiB) stack.
     #[cfg(not(target_os = "espidf"))]
-    let _ = (priority, core);
-
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(stack_size)
-        .spawn(f)
+    {
+        let _ = (stack_size, priority, core);
+        std::thread::Builder::new().name(name.to_string()).spawn(f)
+    }
 }
 
 #[cfg(target_os = "espidf")]

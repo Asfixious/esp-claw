@@ -2,7 +2,7 @@
 //! extract/apply helpers plus the async worker. The C version uses a FreeRTOS
 //! task + queue + per-job binary semaphore + singleton runtime; this port uses
 //! `std::thread` + an `mpsc` channel + a `Condvar`-signalled job list and stores
-//! the singleton `LlmRuntime` inside the worker thread.
+//! the singleton `ClawApi` client inside the worker thread.
 //!
 //! The runtime / `EspIdfHttp` creation is gated to `target_os = "espidf"`; on
 //! the host the worker is never started (async extract stays disabled), so the
@@ -19,9 +19,31 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use claw_core::llm::runtime::LlmRuntime;
-use claw_core::llm::types::ChatRequest;
-use claw_interfaces::error::{EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_NOT_SUPPORTED, ESP_FAIL, ESP_OK};
+use claw_api::{ChatError, ChatRequest, ClawApi, InitError};
+use claw_interfaces::error::{
+    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_NOT_SUPPORTED, ESP_FAIL, ESP_OK,
+};
+
+/// `claw-api` is platform-agnostic; map its init error to the `esp_err_t` the
+/// memory extract C ABI returns.
+fn init_error_code(err: &InitError) -> EspErr {
+    match err {
+        InitError::MissingApiKey
+        | InitError::MissingModel
+        | InitError::MissingBaseUrl
+        | InitError::MissingBackendType => ESP_ERR_INVALID_ARG,
+        InitError::UnknownBackend => ESP_ERR_NOT_SUPPORTED,
+    }
+}
+
+/// Map a [`ChatError`] to the `esp_err_t` the memory extract C ABI returns.
+fn chat_error_code(err: &ChatError) -> EspErr {
+    match err {
+        ChatError::ToolsUnsupported => ESP_ERR_NOT_SUPPORTED,
+        ChatError::InvalidToolsJson => ESP_ERR_INVALID_ARG,
+        ChatError::Api(_) => ESP_FAIL,
+    }
+}
 
 use crate::api::{self, MemoryConfig};
 use crate::consts::{MessageIntent, AUTO_EXTRACT_MAX_ITEMS, KEYWORDS_CAP, MAX_SUMMARIES, TAGS_CAP};
@@ -68,7 +90,7 @@ pub fn parse_llm_json_document(text: &str) -> Option<Value> {
 /// `claw_memory_llm_chat_with_runtime`: a single user-message chat with no
 /// tools. Returns the response text, or an `(EspErr, message)` failure.
 fn llm_chat_with_runtime(
-    runtime: &LlmRuntime,
+    runtime: &ClawApi,
     system_prompt: &str,
     user_text: &str,
 ) -> Result<Option<String>, (EspErr, String)> {
@@ -81,7 +103,7 @@ fn llm_chat_with_runtime(
     let abort = AtomicBool::new(false);
     let response = runtime
         .chat(&request, &abort)
-        .map_err(|e| (e.err, e.message))?;
+        .map_err(|e| (chat_error_code(&e), e.to_string()))?;
     if !response.tool_calls.is_empty() {
         return Err((ESP_ERR_NOT_SUPPORTED, "LLM returned unsupported tool calls".to_string()));
     }
@@ -90,7 +112,7 @@ fn llm_chat_with_runtime(
 
 /// `claw_memory_auto_extract_prepare_with_runtime`.
 pub fn auto_extract_prepare_with_runtime(
-    runtime: &LlmRuntime,
+    runtime: &ClawApi,
     user_text: &str,
 ) -> Result<(MessageIntent, Option<String>), EspErr> {
     if user_text.is_empty() {
@@ -334,7 +356,7 @@ fn async_extract_deinit() {
     cv.notify_all();
 }
 
-fn worker_loop(runtime: std::sync::Arc<LlmRuntime>, rx: Receiver<WorkItem>) {
+fn worker_loop(runtime: std::sync::Arc<ClawApi>, rx: Receiver<WorkItem>) {
     while let Ok(work) = rx.recv() {
         let result = auto_extract_prepare_with_runtime(&runtime, &work.user_text);
         let (m, cv) = async_cell();
@@ -362,10 +384,10 @@ fn worker_loop(runtime: std::sync::Arc<LlmRuntime>, rx: Receiver<WorkItem>) {
 fn start_worker(config: &MemoryConfig) -> EspErr {
     use std::sync::Arc;
 
-    use claw_core::llm::types::RuntimeConfig;
+    use claw_api::ClawApiConfig;
 
     let llm = &config.llm;
-    let runtime_config = RuntimeConfig {
+    let runtime_config = ClawApiConfig {
         api_key: llm.api_key.clone(),
         backend_type: llm.backend_type.clone().unwrap_or_default(),
         model: llm.model.clone(),
@@ -380,19 +402,12 @@ fn start_worker(config: &MemoryConfig) -> EspErr {
         image_remote_url_only: llm.image_remote_url_only,
     };
 
-    let runtime = match LlmRuntime::init(runtime_config, Arc::new(claw_sys::EspIdfHttp)) {
+    let runtime = match ClawApi::init(runtime_config, Arc::new(claw_sys::EspIdfHttp)) {
         Ok(rt) => Arc::new(rt),
         Err(e) => {
-            log::error!(
-                "Failed to init async memory extract runtime: {}",
-                if e.message.is_empty() {
-                    claw_core::errname::esp_err_to_name(e.err)
-                } else {
-                    &e.message
-                }
-            );
+            log::error!("Failed to init async memory extract runtime: {e}");
             async_extract_deinit();
-            return e.err;
+            return init_error_code(&e);
         }
     };
 

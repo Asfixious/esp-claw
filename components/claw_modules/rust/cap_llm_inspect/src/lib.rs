@@ -13,8 +13,32 @@ use core::ptr;
 
 use claw_core::cabi::{claw_core_handle_t, core_from_handle};
 use claw_core::errname::esp_err_to_name;
-use claw_core::llm::types::{AssetKind, MediaAsset, MediaRequest};
-use claw_interfaces::error::{EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_OK};
+use claw_api::{InferMediaError, MediaAsset, MediaRequest};
+use claw_interfaces::error::{
+    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
+    ESP_ERR_NOT_SUPPORTED, ESP_FAIL, ESP_OK,
+};
+
+/// `claw-api` is platform-agnostic; map its media error to the `esp_err_t` this
+/// capability returns to `claw_cap` (C).
+fn infer_media_error_code(err: &InferMediaError) -> EspErr {
+    match err {
+        InferMediaError::VisionUnsupported
+        | InferMediaError::UnsupportedMediaType
+        | InferMediaError::UnsupportedMediaKind
+        | InferMediaError::RemoteOnlyProfile
+        | InferMediaError::RequiresLocalImage => ESP_ERR_NOT_SUPPORTED,
+        InferMediaError::IncompleteRequest
+        | InferMediaError::MediaPathEmpty
+        | InferMediaError::MediaPathNotAbsolute
+        | InferMediaError::MediaUrlEmpty => ESP_ERR_INVALID_ARG,
+        InferMediaError::MediaNotFound => ESP_ERR_NOT_FOUND,
+        InferMediaError::MediaFileEmpty | InferMediaError::MediaTooLarge => ESP_ERR_INVALID_SIZE,
+        InferMediaError::MediaReadFailed
+        | InferMediaError::PayloadPrepFailed
+        | InferMediaError::Api(_) => ESP_FAIL,
+    }
+}
 
 const SYSTEM_PROMPT: &[u8] = b"You analyze local image files for the ESP32 claw. \
 Describe visible content plainly and briefly. \
@@ -189,19 +213,11 @@ unsafe extern "C" fn cap_llm_inspect_execute(
         }
     };
 
-    let asset = MediaAsset {
-        kind: AssetKind::LocalPath,
-        path: Some(path.to_string()),
-        url: None,
-        bytes: None,
-        mime_type: None,
-    };
+    let asset = [MediaAsset::local_path(path)];
     let system = core::str::from_utf8(&SYSTEM_PROMPT[..SYSTEM_PROMPT.len() - 1]).unwrap();
-    let request = MediaRequest {
-        system_prompt: Some(system),
-        user_prompt: Some(prompt),
-        media: core::slice::from_ref(&asset),
-    };
+    let request = MediaRequest::new(&asset)
+        .with_system_prompt(system)
+        .with_user_prompt(prompt);
 
     match core.infer_media(&request) {
         Ok(analysis) => {
@@ -209,18 +225,14 @@ unsafe extern "C" fn cap_llm_inspect_execute(
             ESP_OK
         }
         Err(err) => {
-            let detail = if err.message.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", err.message)
-            };
+            let code = infer_media_error_code(&err);
             let msg = format!(
-                "Error: image analysis failed ({}){}",
-                esp_err_to_name(err.err),
-                detail
+                "Error: image analysis failed ({}): {}",
+                esp_err_to_name(code),
+                err
             );
             write_output(output, output_size, &msg);
-            err.err
+            code
         }
     }
 }

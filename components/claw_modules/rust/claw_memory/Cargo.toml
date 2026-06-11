@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 claw_core = { path = "../claw_core" }
+claw-api = { path = "../claw-api" }
 claw_interfaces = { path = "../claw_interfaces" }
 claw_sys = { path = "../claw_sys" }
 serde_json = { version = "1", features = ["preserve_order"] }

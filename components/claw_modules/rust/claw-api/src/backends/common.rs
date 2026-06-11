@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 
-use super::super::types::{LlmError, LlmResponse, ToolCall};
-use claw_interfaces::error::ESP_FAIL;
+use super::super::errors::ClawApiError;
+use super::super::types::{LlmResponse, ToolCall};
 
 /// `join_url` from the backends: join `base_url` and `path` with exactly one
 /// slash between them.
@@ -21,9 +21,8 @@ pub fn join_url(base_url: &str, path: &str) -> String {
 
 /// Parse an OpenAI chat-completions response, mirroring `parse_chat_response`
 /// in `claw_llm_backend_openai_compatible.c`.
-pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
-    let root: Value = serde_json::from_str(body)
-        .map_err(|_| LlmError::fail("Failed to parse LLM JSON response"))?;
+pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, ClawApiError> {
+    let root: Value = serde_json::from_str(body).map_err(|_| ClawApiError::Parse)?;
 
     let message = root
         .get("choices")
@@ -32,15 +31,15 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
         .and_then(|c0| c0.get("message"));
     let message = match message {
         Some(m) if m.is_object() => m,
-        _ => return Err(LlmError::fail("LLM response missing message")),
+        _ => return Err(ClawApiError::MalformedResponse("response missing message")),
     };
 
     if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-        return Err(LlmError::fail("LLM response message is not assistant"));
+        return Err(ClawApiError::MalformedResponse("response message is not assistant"));
     }
 
     let raw_message_json = serde_json::to_string(message)
-        .map_err(|_| LlmError::fail("Out of memory copying LLM raw message"))?;
+        .map_err(|_| ClawApiError::ApiError("out of memory copying raw message"))?;
 
     let text = message
         .get("content")
@@ -62,7 +61,7 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
             let name = function.and_then(|f| f.get("name"));
             let args = function.and_then(|f| f.get("arguments"));
             if id.is_none() || function.is_none() || name.is_none() || args.is_none() {
-                return Err(LlmError::fail("Malformed tool call in LLM response"));
+                return Err(ClawApiError::MalformedResponse("malformed tool call"));
             }
             match (id.unwrap().as_str(), name.unwrap().as_str(), args.unwrap().as_str()) {
                 (Some(id), Some(name), Some(args)) => tool_calls.push(ToolCall {
@@ -70,13 +69,13 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, LlmError> {
                     name: name.to_string(),
                     arguments_json: args.to_string(),
                 }),
-                _ => return Err(LlmError::fail("Malformed tool call in LLM response")),
+                _ => return Err(ClawApiError::MalformedResponse("malformed tool call")),
             }
         }
     }
 
     if text.is_none() && tool_calls.is_empty() {
-        return Err(LlmError::new(ESP_FAIL, "LLM returned empty text response"));
+        return Err(ClawApiError::EmptyResponse);
     }
 
     Ok(LlmResponse { text, reasoning_content, raw_message_json: Some(raw_message_json), tool_calls })

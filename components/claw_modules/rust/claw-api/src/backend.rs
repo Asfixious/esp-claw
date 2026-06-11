@@ -7,7 +7,8 @@ use core::sync::atomic::AtomicBool;
 use claw_interfaces::http::ClawHttp;
 
 use super::backends::{anthropic, openai_compatible};
-use super::types::{ChatRequest, LlmError, LlmResponse, MediaRequest, ModelProfile, RuntimeConfig};
+use super::errors::{ChatError, InferMediaError, InitError};
+use super::types::{ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
 
 /// A constructed backend instance (`backend_ctx` + the vtable methods in C).
 pub trait LlmBackend: Send + Sync {
@@ -17,7 +18,7 @@ pub trait LlmBackend: Send + Sync {
         profile: &ModelProfile,
         request: &ChatRequest,
         abort: &AtomicBool,
-    ) -> Result<LlmResponse, LlmError>;
+    ) -> Result<LlmResponse, ChatError>;
 
     fn infer_media(
         &self,
@@ -25,7 +26,7 @@ pub trait LlmBackend: Send + Sync {
         profile: &ModelProfile,
         request: &MediaRequest,
         abort: &AtomicBool,
-    ) -> Result<String, LlmError>;
+    ) -> Result<String, InferMediaError>;
 }
 
 /// `claw_llm_backend_defaults_t`
@@ -41,7 +42,7 @@ pub struct BackendDefaults {
 pub struct BackendRegistration {
     pub id: &'static str,
     pub defaults: BackendDefaults,
-    pub make: fn(&RuntimeConfig) -> Result<Box<dyn LlmBackend>, LlmError>,
+    pub make: fn(&ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError>,
 }
 
 /// Built-in registrations, mirroring `find_builtin_backend_registration`.

@@ -12,6 +12,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "cap_llm_inspect"
 version = "0.1.0"
 dependencies = [
+ "claw-api",
  "claw_core",
  "claw_interfaces",
  "log",
@@ -19,10 +20,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "claw_core"
+name = "claw-api"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "claw_interfaces",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "claw_core"
+version = "0.1.0"
+dependencies = [
+ "claw-api",
  "claw_interfaces",
  "claw_paths",
  "claw_sys",
@@ -39,6 +50,7 @@ version = "0.1.0"
 name = "claw_memory"
 version = "0.1.0"
 dependencies = [
+ "claw-api",
  "claw_core",
  "claw_interfaces",
  "claw_sys",
@@ -213,6 +225,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

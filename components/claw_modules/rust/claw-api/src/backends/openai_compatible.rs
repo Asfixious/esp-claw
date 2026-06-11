@@ -4,14 +4,12 @@ use core::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
-use claw_interfaces::error::{ESP_ERR_INVALID_ARG, ESP_ERR_NOT_SUPPORTED, ESP_FAIL};
 use claw_interfaces::http::{ClawHttp, HttpJsonRequest};
 
 use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
+use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};
 use super::super::media::prepare_asset;
-use super::super::types::{
-    ChatRequest, LlmError, LlmResponse, MediaRequest, ModelProfile, RuntimeConfig,
-};
+use super::super::types::{ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
 use super::common::{join_url, parse_openai_chat_response};
 
 pub const ID: &str = "openai_compatible";
@@ -42,18 +40,18 @@ struct OpenAiCompatible {
 }
 
 /// `openai_compatible_init`
-fn make(config: &RuntimeConfig) -> Result<Box<dyn LlmBackend>, LlmError> {
+fn make(config: &ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError> {
     let api_key = config.api_key.as_deref().unwrap_or("");
     if api_key.is_empty() {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "LLM API key is empty"));
+        return Err(InitError::MissingApiKey);
     }
     let model = config.model.as_deref().unwrap_or("");
     if model.is_empty() {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "LLM model is empty"));
+        return Err(InitError::MissingModel);
     }
     let base_url = config.base_url.as_deref().unwrap_or("");
     if base_url.is_empty() {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "LLM base_url is empty"));
+        return Err(InitError::MissingBaseUrl);
     }
     let auth_type = match config.auth_type.as_deref() {
         Some(a) if !a.is_empty() => a,
@@ -73,7 +71,7 @@ fn make(config: &RuntimeConfig) -> Result<Box<dyn LlmBackend>, LlmError> {
 
 impl OpenAiCompatible {
     /// `build_chat_body`
-    fn build_chat_body(&self, profile: &ModelProfile, request: &ChatRequest) -> Result<String, LlmError> {
+    fn build_chat_body(&self, profile: &ModelProfile, request: &ChatRequest) -> Result<String, ChatError> {
         let mut messages: Vec<Value> = Vec::new();
         messages.push(json!({"role": "system", "content": request.system_prompt}));
         if let Some(arr) = request.messages.as_array() {
@@ -87,21 +85,18 @@ impl OpenAiCompatible {
 
         if let Some(tools_json) = request.tools_json.filter(|s| !s.is_empty()) {
             if !profile.supports_tools {
-                return Err(LlmError::new(
-                    ESP_ERR_NOT_SUPPORTED,
-                    "Selected backend does not support tool calls",
-                ));
+                return Err(ChatError::ToolsUnsupported);
             }
-            let tools: Value = serde_json::from_str(tools_json)
-                .map_err(|_| LlmError::new(ESP_ERR_INVALID_ARG, "Invalid tools JSON"))?;
+            let tools: Value =
+                serde_json::from_str(tools_json).map_err(|_| ChatError::InvalidToolsJson)?;
             if !tools.is_array() {
-                return Err(LlmError::new(ESP_ERR_INVALID_ARG, "Invalid tools JSON"));
+                return Err(ChatError::InvalidToolsJson);
             }
             body.insert("tools".to_string(), tools);
         }
 
         serde_json::to_string(&Value::Object(body))
-            .map_err(|_| LlmError::fail("Out of memory serializing request"))
+            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
     }
 }
 
@@ -113,7 +108,7 @@ impl LlmBackend for OpenAiCompatible {
         profile: &ModelProfile,
         request: &ChatRequest,
         abort: &AtomicBool,
-    ) -> Result<LlmResponse, LlmError> {
+    ) -> Result<LlmResponse, ChatError> {
         let post_data = self.build_chat_body(profile, request)?;
         let url = join_url(&self.base_url, &profile.chat_path);
 
@@ -127,8 +122,8 @@ impl LlmBackend for OpenAiCompatible {
         };
         let response = http
             .post_json(&http_request, abort)
-            .map_err(|e| LlmError::new(e.err, e.message))?;
-        parse_openai_chat_response(&response.body)
+            .map_err(|e| ClawApiError::Transport(e.message))?;
+        Ok(parse_openai_chat_response(&response.body)?)
     }
 
     /// `openai_compatible_infer_media`
@@ -138,16 +133,13 @@ impl LlmBackend for OpenAiCompatible {
         profile: &ModelProfile,
         request: &MediaRequest,
         _abort: &AtomicBool,
-    ) -> Result<String, LlmError> {
+    ) -> Result<String, InferMediaError> {
         if !profile.supports_vision {
-            return Err(LlmError::new(
-                ESP_ERR_NOT_SUPPORTED,
-                "Selected profile does not support media inference",
-            ));
+            return Err(InferMediaError::VisionUnsupported);
         }
         let user_prompt = request.user_prompt.unwrap_or("");
         if user_prompt.is_empty() || request.media.is_empty() {
-            return Err(LlmError::new(ESP_ERR_INVALID_ARG, "media request is incomplete"));
+            return Err(InferMediaError::IncompleteRequest);
         }
 
         let prepared = prepare_asset(&request.media[0], profile, self.image_max_bytes)?;
@@ -167,8 +159,9 @@ impl LlmBackend for OpenAiCompatible {
         ]);
         body.insert("messages".to_string(), messages);
 
-        let post_data = serde_json::to_string(&Value::Object(body))
-            .map_err(|_| LlmError::fail("Out of memory serializing media request"))?;
+        let post_data = serde_json::to_string(&Value::Object(body)).map_err(|_| {
+            ClawApiError::ApiError("out of memory serializing media request")
+        })?;
         let url = join_url(&self.base_url, &profile.chat_path);
 
         // The C media path does not wire an abort flag.
@@ -183,12 +176,12 @@ impl LlmBackend for OpenAiCompatible {
         };
         let response = http
             .post_json(&http_request, &never)
-            .map_err(|e| LlmError::new(e.err, e.message))?;
+            .map_err(|e| ClawApiError::Transport(e.message))?;
 
         let parsed = parse_openai_chat_response(&response.body)?;
         match parsed.text {
             Some(t) if !t.is_empty() => Ok(t),
-            _ => Err(LlmError::new(ESP_FAIL, "LLM returned empty media response")),
+            _ => Err(ClawApiError::EmptyResponse.into()),
         }
     }
 }

@@ -14,7 +14,7 @@ use crate::consts::{
     ContextKind, ContextRecordType, CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY, INSERT_QUEUE_LEN,
 };
 use crate::errname::esp_err_to_name;
-use crate::llm::types::LlmResponse;
+use claw_api::LlmResponse;
 use crate::request::RequestItem;
 use crate::util::append_tool_summary_line;
 use crate::util::obs_csv_append;
@@ -584,7 +584,7 @@ mod tests {
             raw_message_json: Some(
                 r#"{"role":"assistant","tool_calls":[{"id":"t1"}]}"#.to_string(),
             ),
-            tool_calls: vec![crate::llm::types::ToolCall {
+            tool_calls: vec![claw_api::ToolCall {
                 id: "t1".into(),
                 name: "files".into(),
                 arguments_json: "{}".into(),

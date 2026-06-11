@@ -15,7 +15,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_STATE, ESP_ERR_NO_MEM, ESP_FAIL, ESP_OK,
+    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NO_MEM, ESP_ERR_NOT_SUPPORTED,
+    ESP_FAIL, ESP_OK,
 };
 use claw_interfaces::event::EventPublisher;
 use claw_interfaces::http::ClawHttp;
@@ -41,8 +42,7 @@ use crate::errname::esp_err_to_name;
 use crate::events::publish_out_message_if_requested;
 #[cfg(feature = "stage_verbose")]
 use crate::events::publish_stage_text;
-use crate::llm::runtime::LlmRuntime;
-use crate::llm::types::{ChatRequest, LlmResponse, RuntimeConfig};
+use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiConfig, InitError, LlmResponse};
 use crate::request::RequestItem;
 use crate::response::ResponseItem;
 use crate::util::obs_csv_append;
@@ -52,7 +52,7 @@ use crate::util::obs_csv_append;
 pub struct CoreConfig {
     pub instance_id: u32,
     pub system_prompt: String,
-    pub runtime_config: RuntimeConfig,
+    pub runtime_config: ClawApiConfig,
     pub http: Arc<dyn ClawHttp>,
     pub call_cap: Option<Box<dyn CapCaller>>,
     pub persist_context: Option<Box<dyn PersistContext>>,
@@ -72,6 +72,28 @@ pub struct CoreConfig {
     pub task_core: i32,
 }
 
+/// Maps a [`claw_api::errors::InitError`] to the `esp_err_t` this component
+/// reports across its C ABI (`claw-api` itself is platform-agnostic).
+fn init_error_code(err: &InitError) -> EspErr {
+    match err {
+        InitError::MissingApiKey
+        | InitError::MissingModel
+        | InitError::MissingBaseUrl
+        | InitError::MissingBackendType => ESP_ERR_INVALID_ARG,
+        InitError::UnknownBackend => ESP_ERR_NOT_SUPPORTED,
+    }
+}
+
+/// Maps a [`claw_api::errors::ChatError`] to the `esp_err_t` this component
+/// reports across its C ABI.
+fn chat_error_code(err: &ChatError) -> EspErr {
+    match err {
+        ChatError::ToolsUnsupported => ESP_ERR_NOT_SUPPORTED,
+        ChatError::InvalidToolsJson => ESP_ERR_INVALID_ARG,
+        ChatError::Api(_) => ESP_FAIL,
+    }
+}
+
 /// Distinguishes a normal tool-loop completion (run the success/persist/observer
 /// block) from a `goto finish_request` (skip it). Mirrors the C control flow.
 enum TurnOutcome {
@@ -83,7 +105,7 @@ pub struct Core {
     pub state: CoreState,
     log_tag: String,
     system_prompt: String,
-    llm: LlmRuntime,
+    llm: ClawApi,
     providers: Mutex<Vec<Box<dyn ContextProvider>>>,
     provider_capacity: usize,
     observers: Mutex<Vec<Box<dyn CompletionObserver>>>,
@@ -104,9 +126,9 @@ impl Core {
     pub fn create(config: CoreConfig) -> Result<Arc<Core>, EspErr> {
         check_timezone();
 
-        let llm = LlmRuntime::init(config.runtime_config, config.http).map_err(|e| {
-            log::error!("LLM init failed: {}", e.message);
-            e.err
+        let llm = ClawApi::init(config.runtime_config, config.http).map_err(|e| {
+            log::error!("LLM init failed: {e}");
+            init_error_code(&e)
         })?;
 
         let request_q = if config.request_queue_len > 0 {
@@ -261,8 +283,8 @@ impl Core {
     /// there is no per-request abort, so a fresh, un-aborted flag is passed.
     pub fn infer_media(
         &self,
-        request: &crate::llm::types::MediaRequest,
-    ) -> Result<String, crate::llm::types::LlmError> {
+        request: &claw_api::MediaRequest,
+    ) -> Result<String, claw_api::InferMediaError> {
         let abort = std::sync::atomic::AtomicBool::new(false);
         self.llm.infer_media(request, &abort)
     }
@@ -494,8 +516,8 @@ impl Core {
                             Ok(false) => {}
                         }
                     }
-                    response.error_message = Some(llm_err.message);
-                    return TurnOutcome::Finished(llm_err.err);
+                    response.error_message = Some(llm_err.to_string());
+                    return TurnOutcome::Finished(chat_error_code(&llm_err));
                 }
             };
 
@@ -819,7 +841,7 @@ mod tests {
     use super::*;
     use crate::callbacks::ProviderOutcome;
     use crate::consts::{ContextKind, REQUEST_FLAG_USER_INTERRUPT};
-    use crate::llm::types::RuntimeConfig;
+    use claw_api::ClawApiConfig;
     use claw_interfaces::error::ESP_OK;
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use std::collections::VecDeque;
@@ -878,7 +900,7 @@ mod tests {
         CoreConfig {
             instance_id: 1,
             system_prompt: "You are a test agent.".into(),
-            runtime_config: RuntimeConfig {
+            runtime_config: ClawApiConfig {
                 api_key: Some("sk-test".into()),
                 backend_type: "openai_compatible".into(),
                 model: Some("gpt-test".into()),

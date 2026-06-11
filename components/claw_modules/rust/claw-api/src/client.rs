@@ -1,23 +1,24 @@
-//! LLM runtime, port of `claw_llm_runtime.c`.
+//! `ClawApi` — the LLM client, port of `claw_llm_runtime.c`.
 //!
 //! Holds the resolved config, the derived model profile, the constructed
-//! backend, and the injected [`ClawHttp`]. The `init` here applies the same
+//! backend, and the injected [`ClawHttp`]. [`ClawApi::init`] applies the same
 //! defaulting logic as the C `claw_llm_runtime_init`.
 
 use core::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use claw_interfaces::error::{ESP_ERR_INVALID_ARG, ESP_ERR_NOT_SUPPORTED};
 use claw_interfaces::http::ClawHttp;
 
 use super::backend::{find_builtin_registration, LlmBackend};
-use super::types::{ChatRequest, LlmError, LlmResponse, MediaRequest, ModelProfile, RuntimeConfig};
+use super::errors::{ChatError, InferMediaError, InitError};
+use super::types::{ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
 
 const DEFAULT_TIMEOUT_MS: u32 = 120 * 1000;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_IMAGE_MAX_BYTES: usize = 512 * 1024;
 
-pub struct LlmRuntime {
+/// The LLM client: a resolved backend + profile behind a [`ClawHttp`] transport.
+pub struct ClawApi {
     profile: ModelProfile,
     backend: Box<dyn LlmBackend>,
     http: Arc<dyn ClawHttp>,
@@ -27,15 +28,21 @@ fn empty(value: &Option<String>) -> bool {
     value.as_deref().map(|s| s.is_empty()).unwrap_or(true)
 }
 
-impl LlmRuntime {
+impl ClawApi {
     /// `claw_llm_runtime_init`
-    pub fn init(mut config: RuntimeConfig, http: Arc<dyn ClawHttp>) -> Result<LlmRuntime, LlmError> {
-        if config.api_key.is_none() || config.model.is_none() || config.backend_type.is_empty() {
-            return Err(LlmError::new(ESP_ERR_INVALID_ARG, "invalid runtime config"));
+    pub fn init(mut config: ClawApiConfig, http: Arc<dyn ClawHttp>) -> Result<ClawApi, InitError> {
+        if config.api_key.is_none() {
+            return Err(InitError::MissingApiKey);
+        }
+        if config.model.is_none() {
+            return Err(InitError::MissingModel);
+        }
+        if config.backend_type.is_empty() {
+            return Err(InitError::MissingBackendType);
         }
 
-        let registration = find_builtin_registration(&config.backend_type)
-            .ok_or_else(|| LlmError::new(ESP_ERR_NOT_SUPPORTED, "Unknown LLM backend type"))?;
+        let registration =
+            find_builtin_registration(&config.backend_type).ok_or(InitError::UnknownBackend)?;
 
         // Apply defaults exactly as the C code does.
         if empty(&config.auth_type) {
@@ -64,16 +71,20 @@ impl LlmRuntime {
 
         let backend = (registration.make)(&config)?;
 
-        Ok(LlmRuntime { profile, backend, http })
+        Ok(ClawApi { profile, backend, http })
     }
 
     /// `claw_llm_runtime_chat`
-    pub fn chat(&self, request: &ChatRequest, abort: &AtomicBool) -> Result<LlmResponse, LlmError> {
+    pub fn chat(&self, request: &ChatRequest, abort: &AtomicBool) -> Result<LlmResponse, ChatError> {
         self.backend.chat(self.http.as_ref(), &self.profile, request, abort)
     }
 
     /// `claw_llm_runtime_infer_media`
-    pub fn infer_media(&self, request: &MediaRequest, abort: &AtomicBool) -> Result<String, LlmError> {
+    pub fn infer_media(
+        &self,
+        request: &MediaRequest,
+        abort: &AtomicBool,
+    ) -> Result<String, InferMediaError> {
         self.backend.infer_media(self.http.as_ref(), &self.profile, request, abort)
     }
 

@@ -20,7 +20,6 @@ pub mod core;
 pub mod core_state;
 pub mod errname;
 pub mod events;
-pub mod llm;
 pub mod request;
 pub mod response;
 pub mod util;

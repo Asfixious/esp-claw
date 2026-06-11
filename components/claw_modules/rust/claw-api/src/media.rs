@@ -6,11 +6,8 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
-use claw_interfaces::error::{
-    ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_NOT_FOUND, ESP_ERR_NOT_SUPPORTED, ESP_FAIL,
-};
-
-use super::types::{AssetKind, LlmError, MediaAsset, ModelProfile, Prepared, PreparedKind};
+use super::errors::InferMediaError;
+use super::types::{AssetKind, MediaAsset, ModelProfile, Prepared, PreparedKind};
 
 /// Mirror of `image_mime_from_path`: extension-based MIME, case-insensitive.
 fn image_mime_from_path(path: &str) -> Option<&'static str> {
@@ -28,43 +25,33 @@ fn image_mime_from_path(path: &str) -> Option<&'static str> {
 fn prepare_local_path_asset(
     asset: &MediaAsset,
     image_max_bytes: usize,
-) -> Result<Prepared, LlmError> {
+) -> Result<Prepared, InferMediaError> {
     let path = match asset.path.as_deref() {
         Some(p) if !p.is_empty() => p,
-        _ => return Err(LlmError::new(ESP_ERR_INVALID_ARG, "media path is empty")),
+        _ => return Err(InferMediaError::MediaPathEmpty),
     };
     if !path.starts_with('/') {
-        return Err(LlmError::new(ESP_ERR_INVALID_ARG, "media path must be an absolute path"));
+        return Err(InferMediaError::MediaPathNotAbsolute);
     }
 
     let mime = asset
         .mime_type
         .as_deref()
         .or_else(|| image_mime_from_path(path))
-        .ok_or_else(|| {
-            LlmError::new(
-                ESP_ERR_NOT_SUPPORTED,
-                "Only local jpg/jpeg/png/gif/webp files are supported",
-            )
-        })?;
+        .ok_or(InferMediaError::UnsupportedMediaType)?;
 
-    let meta = std::fs::metadata(path)
-        .map_err(|_| LlmError::new(ESP_ERR_NOT_FOUND, format!("Media file not found: {path}")))?;
+    let meta = std::fs::metadata(path).map_err(|_| InferMediaError::MediaNotFound)?;
     let size = meta.len() as usize;
     if size == 0 {
-        return Err(LlmError::new(ESP_ERR_INVALID_SIZE, format!("Media file is empty: {path}")));
+        return Err(InferMediaError::MediaFileEmpty);
     }
     if size > image_max_bytes {
-        return Err(LlmError::new(
-            ESP_ERR_INVALID_SIZE,
-            format!("Media file is too large ({size} bytes > {image_max_bytes} bytes)"),
-        ));
+        return Err(InferMediaError::MediaTooLarge);
     }
 
-    let raw = std::fs::read(path)
-        .map_err(|_| LlmError::new(ESP_FAIL, format!("Failed to read full media file: {path}")))?;
+    let raw = std::fs::read(path).map_err(|_| InferMediaError::MediaReadFailed)?;
     if raw.len() != size {
-        return Err(LlmError::new(ESP_FAIL, format!("Failed to read full media file: {path}")));
+        return Err(InferMediaError::MediaReadFailed);
     }
 
     let encoded = STANDARD.encode(&raw);
@@ -83,12 +70,12 @@ pub fn prepare_asset(
     asset: &MediaAsset,
     profile: &ModelProfile,
     image_max_bytes: usize,
-) -> Result<Prepared, LlmError> {
+) -> Result<Prepared, InferMediaError> {
     match asset.kind {
         AssetKind::RemoteUrl => {
             let url = match asset.url.as_deref() {
                 Some(u) if !u.is_empty() => u,
-                _ => return Err(LlmError::new(ESP_ERR_INVALID_ARG, "media url is empty")),
+                _ => return Err(InferMediaError::MediaUrlEmpty),
             };
             Ok(Prepared {
                 kind: PreparedKind::RemoteUrl,
@@ -97,15 +84,10 @@ pub fn prepare_asset(
                 original_size: 0,
             })
         }
-        AssetKind::InlineBytes => {
-            Err(LlmError::new(ESP_ERR_NOT_SUPPORTED, "Unsupported media asset kind"))
-        }
+        AssetKind::InlineBytes => Err(InferMediaError::UnsupportedMediaKind),
         AssetKind::LocalPath => {
             if profile.image_remote_url_only {
-                return Err(LlmError::new(
-                    ESP_ERR_NOT_SUPPORTED,
-                    "Selected profile only supports remote image URLs",
-                ));
+                return Err(InferMediaError::RemoteOnlyProfile);
             }
             prepare_local_path_asset(asset, image_max_bytes)
         }
@@ -163,7 +145,7 @@ mod tests {
             mime_type: None,
         };
         let e = prepare_asset(&asset, &profile(), 1024).unwrap_err();
-        assert_eq!(e.err, ESP_ERR_INVALID_ARG);
+        assert!(matches!(e, InferMediaError::MediaPathNotAbsolute));
     }
 
     #[test]
@@ -176,6 +158,6 @@ mod tests {
             mime_type: None,
         };
         let e = prepare_asset(&asset, &profile(), 1024).unwrap_err();
-        assert_eq!(e.err, ESP_ERR_NOT_SUPPORTED);
+        assert!(matches!(e, InferMediaError::UnsupportedMediaType));
     }
 }

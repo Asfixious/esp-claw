@@ -563,9 +563,9 @@ unsafe fn build_and_store_core(
     out_core: *mut claw_core_handle_t,
 ) -> EspErr {
     use crate::core::CoreConfig;
-    use crate::llm::types::RuntimeConfig;
+    use claw_api::ClawApiConfig;
 
-    let runtime_config = RuntimeConfig {
+    let runtime_config = ClawApiConfig {
         api_key: cstr_opt(c.api_key),
         backend_type: cstr_str(c.backend_type),
         model: cstr_opt(c.model),

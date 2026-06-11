@@ -43,7 +43,7 @@ pub enum CoreError {
     #[error(transparent)]
     Chat(ChatError),
     /// A raw `esp_err_t` produced by an injected C callback (context provider,
-    /// request gate, persist) that must reach the boundary / logs verbatim.
+    /// request gate) that must reach the boundary / logs verbatim.
     #[error("{}", esp_err_to_name(*.0))]
     Esp(EspErr),
 }

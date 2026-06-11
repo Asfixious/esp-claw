@@ -984,8 +984,6 @@ static void claw_agent_mgr_fill_info_locked(const claw_agent_mgr_agent_t *agent,
     strlcpy(out_info->parent_session_id, agent->parent_session_id, sizeof(out_info->parent_session_id));
     strlcpy(out_info->agent_type, agent->agent_type, sizeof(out_info->agent_type));
     out_info->status = agent->status;
-    out_info->phase = agent->core ? claw_core_get_agent_loop_phase(agent->core) :
-                      CLAW_CORE_AGENT_LOOP_PHASE_IDLE;
     out_info->last_request_id = agent->last_request_id;
     strlcpy(out_info->last_error, agent->last_error, sizeof(out_info->last_error));
 }
@@ -1031,7 +1029,6 @@ esp_err_t claw_agent_mgr_list_agents(const claw_cap_call_context_t *ctx,
                     sizeof(out_infos[i].parent_session_id));
             strlcpy(out_infos[i].agent_type, "subagent", sizeof(out_infos[i].agent_type));
             out_infos[i].status = CLAW_AGENT_MGR_STATUS_CLOSED;
-            out_infos[i].phase = CLAW_CORE_AGENT_LOOP_PHASE_IDLE;
         }
     }
     claw_agent_mgr_unlock();

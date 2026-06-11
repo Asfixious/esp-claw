@@ -22,10 +22,10 @@ use claw_interfaces::error::{
 };
 
 use claw_core::callbacks::{
-    CapCaller, CompletionObserver, CompletionSummary, ContextProvider, GateOutcome, PersistContext,
-    PersistRecord, ProviderOutcome, RequestGate, RequestStart, StageNote,
+    CapabilityInvoker, CompletionObserver, CompletionSummary, ContextProvider, GateOutcome,
+    PersistContext, PersistRecord, ProviderOutcome, RequestGate, RequestStart, StageNote,
 };
-use claw_core::consts::{AgentLoopPhase, ContextKind};
+use claw_core::consts::ContextKind;
 use claw_core::core::Core;
 use claw_core::request::RequestItem;
 use claw_core::response::ResponseItem;
@@ -286,15 +286,15 @@ type CallCapFn = unsafe extern "C" fn(
     *mut c_void,
 ) -> EspErr;
 
-struct CCapCaller {
+struct CCapabilityInvoker {
     f: CallCapFn,
     user_ctx: *mut c_void,
 }
-unsafe impl Send for CCapCaller {}
-unsafe impl Sync for CCapCaller {}
+unsafe impl Send for CCapabilityInvoker {}
+unsafe impl Sync for CCapabilityInvoker {}
 
-impl CapCaller for CCapCaller {
-    fn call_cap(
+impl CapabilityInvoker for CCapabilityInvoker {
+    fn invoke(
         &self,
         cap_name: &str,
         input_json: &str,
@@ -581,13 +581,12 @@ unsafe fn build_and_store_core(
         system_prompt: cstr_str(c.system_prompt),
         runtime_config,
         http: Arc::new(claw_sys::EspIdfHttp),
-        call_cap: c
+        capability_invoker: c
             .call_cap
-            .map(|f| Box::new(CCapCaller { f, user_ctx: c.cap_user_ctx }) as Box<dyn CapCaller>),
-        persist_context: c.persist_context.map(|f| {
-            Box::new(CPersistContext { f, user_ctx: c.persist_context_user_ctx })
-                as Box<dyn PersistContext>
-        }),
+            .map(|f| {
+                Box::new(CCapabilityInvoker { f, user_ctx: c.cap_user_ctx })
+                    as Box<dyn CapabilityInvoker>
+            }),
         request_gate: c.request_gate.map(|f| {
             Box::new(CRequestGate { f, user_ctx: c.request_gate_user_ctx }) as Box<dyn RequestGate>
         }),
@@ -780,18 +779,6 @@ pub unsafe extern "C" fn claw_core_cancel_request(
             Err(err) => crate::errmap::core_esp_err(&err),
         },
         None => ESP_ERR_INVALID_STATE,
-    }
-}
-
-/// `claw_core_get_agent_loop_phase`.
-///
-/// # Safety
-/// `core` must be null or a live handle returned by [`claw_core_create`].
-#[no_mangle]
-pub unsafe extern "C" fn claw_core_get_agent_loop_phase(core: claw_core_handle_t) -> c_int {
-    match handle_ref(core) {
-        Some(core) => core.get_agent_loop_phase().as_c(),
-        None => AgentLoopPhase::Idle.as_c(),
     }
 }
 

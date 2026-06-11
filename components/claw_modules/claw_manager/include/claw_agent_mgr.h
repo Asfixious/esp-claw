@@ -66,7 +66,6 @@ typedef struct {
     char parent_session_id[CLAW_SESSION_MGR_ID_SIZE];
     char agent_type[32];
     claw_agent_mgr_status_t status;
-    claw_core_agent_loop_phase_t phase;
     uint32_t last_request_id;
     char last_error[96];
 } claw_agent_mgr_agent_info_t;

@@ -1,7 +1,7 @@
 //! Dependency-injection traits for the agent loop.
 //!
 //! In C these are function-pointer-plus-`user_ctx` fields on `claw_core_state_t`
-//! (`call_cap`, context providers, `persist_context`, `request_gate`,
+//! (`call_cap`, context providers, `request_gate`,
 //! `on_request_start`, `collect_stage_note`, completion observers). Modelling
 //! them as Rust traits keeps the loop host-testable with mock implementations;
 //! the C ABI layer (in the `claw_capi` crate) wraps the C function pointers in
@@ -15,8 +15,8 @@ use crate::request::RequestItem;
 /// `claw_core_call_cap_fn`. Returns the capability `esp_err_t` and the produced
 /// output (the C `*out_output`). The loop uses the error for the `is_error`
 /// flag and falls back to the error name when no output is produced.
-pub trait CapCaller: Send + Sync {
-    fn call_cap(
+pub trait CapabilityInvoker: Send + Sync {
+    fn invoke(
         &self,
         cap_name: &str,
         input_json: &str,

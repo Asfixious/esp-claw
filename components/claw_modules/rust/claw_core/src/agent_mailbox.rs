@@ -1,4 +1,4 @@
-//! Core request/response plumbing and control state.
+//! Agent request/response queues and per-turn control (the worker mailbox).
 //!
 //! Ports the non-LLM parts of `claw_core_messages.c` and `claw_core_control.c`:
 //! the request/response queues, the in-flight tracking, the user-interrupt
@@ -18,9 +18,8 @@ use claw_interfaces::error::{
 };
 
 use crate::channel::BoundedQueue;
-use crate::consts::{
-    AbortReason, AgentLoopPhase, INSERT_QUEUE_LEN, REQUEST_FLAG_USER_INTERRUPT,
-};
+use crate::consts::{AbortReason, INSERT_QUEUE_LEN, REQUEST_FLAG_USER_INTERRUPT};
+use crate::iteration_loop::IterationLoopPhase;
 use crate::error::CoreError;
 use crate::request::RequestItem;
 use crate::response::ResponseItem;
@@ -29,7 +28,7 @@ use crate::response::ResponseItem;
 pub struct Inflight {
     pub request_id: u32,
     pub session_id: String,
-    pub phase: AgentLoopPhase,
+    pub phase: IterationLoopPhase,
     pub abort: bool,
     pub abort_reason: AbortReason,
     pub insert_queue: VecDeque<RequestItem>,
@@ -40,7 +39,7 @@ impl Default for Inflight {
         Inflight {
             request_id: 0,
             session_id: String::new(),
-            phase: AgentLoopPhase::Idle,
+            phase: IterationLoopPhase::Idle,
             abort: false,
             abort_reason: AbortReason::None,
             insert_queue: VecDeque::with_capacity(INSERT_QUEUE_LEN),
@@ -56,7 +55,7 @@ enum InsertOutcome {
     Reject(EspErr, RequestItem),
 }
 
-pub struct CoreState {
+pub struct AgentMailbox {
     pub initialized: AtomicBool,
     pub started: AtomicBool,
     pub stop_requested: AtomicBool,
@@ -72,14 +71,14 @@ pub struct CoreState {
     pub abort_flag: Arc<AtomicBool>,
 }
 
-impl CoreState {
+impl AgentMailbox {
     pub fn new(
         instance_id: u32,
         request_q_len: usize,
         response_q_len: usize,
         max_tool_iterations: u32,
     ) -> Self {
-        CoreState {
+        AgentMailbox {
             initialized: AtomicBool::new(true),
             started: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
@@ -131,7 +130,7 @@ impl CoreState {
         if !session_ok {
             return InsertOutcome::Fallthrough(item); // ESP_ERR_NOT_FOUND
         }
-        if !inf.phase.is_insertable() {
+        if !crate::iteration_loop::phase_is_insertable(inf.phase) {
             return InsertOutcome::Fallthrough(item); // ESP_ERR_INVALID_STATE
         }
         if inf.insert_queue.len() >= INSERT_QUEUE_LEN {
@@ -139,7 +138,7 @@ impl CoreState {
         }
 
         inf.insert_queue.push_back(item);
-        if inf.phase == AgentLoopPhase::InLlmHttp && inf.abort_reason != AbortReason::Cancel {
+        if inf.phase == IterationLoopPhase::InLlmHttp && inf.abort_reason != AbortReason::Cancel {
             inf.abort = true;
             inf.abort_reason = AbortReason::UserInterrupt;
             self.abort_flag.store(true, Ordering::Release);
@@ -226,15 +225,15 @@ impl CoreState {
     // --- control (claw_core_control.c) ------------------------------------
 
     /// `claw_core_control_set_phase`
-    pub fn set_phase(&self, phase: AgentLoopPhase) {
+    pub fn set_phase(&self, phase: IterationLoopPhase) {
         let mut inf = self.inflight.lock().unwrap();
         inf.phase = phase;
     }
 
     /// `claw_core_control_get_phase`
-    pub fn get_phase(&self) -> AgentLoopPhase {
+    pub fn get_phase(&self) -> IterationLoopPhase {
         if !self.initialized.load(Ordering::Acquire) {
-            return AgentLoopPhase::Idle;
+            return IterationLoopPhase::Idle;
         }
         self.inflight.lock().unwrap().phase
     }
@@ -292,7 +291,7 @@ impl CoreState {
         let bytes = session_id.as_bytes();
         let take = bytes.len().min(crate::consts::INFLIGHT_SESSION_ID_SIZE - 1);
         inf.session_id.push_str(&session_id[..floor_char_boundary(session_id, take)]);
-        inf.phase = AgentLoopPhase::BeforeBuildIterationContext;
+        inf.phase = IterationLoopPhase::BeforeLlmHttp;
         inf.abort = false;
         inf.abort_reason = AbortReason::None;
         inf.insert_queue.clear();
@@ -307,7 +306,7 @@ impl CoreState {
         let was_cancelled = inf.abort && inf.abort_reason == AbortReason::Cancel;
         inf.request_id = 0;
         inf.session_id.clear();
-        inf.phase = AgentLoopPhase::Idle;
+        inf.phase = IterationLoopPhase::Idle;
         inf.abort = false;
         inf.abort_reason = AbortReason::None;
         inf.insert_queue.clear();
@@ -334,6 +333,28 @@ fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
+impl crate::iteration_loop::RequestControl for AgentMailbox {
+    fn set_phase(&self, phase: IterationLoopPhase) {
+        AgentMailbox::set_phase(self, phase);
+    }
+
+    fn abort_flag(&self) -> &Arc<AtomicBool> {
+        &self.abort_flag
+    }
+
+    fn take_user_interrupt_http_abort(&self, request_id: u32) -> bool {
+        AgentMailbox::take_user_interrupt_http_abort(self, request_id)
+    }
+
+    fn dequeue_inserted_user_inputs(&self, session_id: &str, max: usize) -> Vec<String> {
+        AgentMailbox::dequeue_inserted_user_inputs(self, session_id, max)
+    }
+
+    fn clear_user_interrupt_abort(&self, request_id: u32) {
+        AgentMailbox::clear_user_interrupt_abort(self, request_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,15 +370,15 @@ mod tests {
         }
     }
 
-    fn core() -> CoreState {
-        let c = CoreState::new(1, 4, 4, 10);
+    fn mailbox() -> AgentMailbox {
+        let c = AgentMailbox::new(1, 4, 4, 10);
         c.started.store(true, Ordering::Release);
         c
     }
 
     #[test]
     fn submit_rejects_when_not_started() {
-        let c = CoreState::new(1, 4, 4, 10);
+        let c = AgentMailbox::new(1, 4, 4, 10);
         assert!(matches!(
             c.ingress_submit(req(1, "s", "hi", 0), 0).unwrap_err(),
             CoreError::InvalidState
@@ -366,7 +387,7 @@ mod tests {
 
     #[test]
     fn submit_rejects_empty_text() {
-        let c = core();
+        let c = mailbox();
         assert!(matches!(
             c.ingress_submit(req(1, "s", "", 0), 0).unwrap_err(),
             CoreError::InvalidArg
@@ -375,7 +396,7 @@ mod tests {
 
     #[test]
     fn submit_and_receive_roundtrip() {
-        let c = core();
+        let c = mailbox();
         c.ingress_submit(req(7, "s", "hi", 0), 1000).unwrap();
         // simulate the agent consuming the request and pushing a response
         let got = c.request_queue.recv_timeout(Some(Duration::from_millis(50))).unwrap();
@@ -388,7 +409,7 @@ mod tests {
 
     #[test]
     fn receive_out_of_order_uses_pending() {
-        let c = core();
+        let c = mailbox();
         c.response_push(ResponseItem { request_id: 1, text: Some("a".into()), ..Default::default() });
         c.response_push(ResponseItem { request_id: 2, text: Some("b".into()), ..Default::default() });
         // ask for id 2 first; id 1 should be parked in pending and returned next
@@ -400,13 +421,13 @@ mod tests {
 
     #[test]
     fn receive_timeout() {
-        let c = core();
+        let c = mailbox();
         assert_eq!(c.response_receive_for(0, 10).err(), Some(ESP_ERR_TIMEOUT));
     }
 
     #[test]
     fn cancel_and_phase() {
-        let c = core();
+        let c = mailbox();
         assert!(matches!(
             c.cancel_request(0).unwrap_err(),
             CoreError::Esp(ESP_ERR_NOT_FOUND)
@@ -418,15 +439,15 @@ mod tests {
             c.cancel_request(6).unwrap_err(),
             CoreError::Esp(ESP_ERR_NOT_FOUND)
         ));
-        c.set_phase(AgentLoopPhase::InLlmHttp);
-        assert_eq!(c.get_phase(), AgentLoopPhase::InLlmHttp);
+        c.set_phase(IterationLoopPhase::InLlmHttp);
+        assert_eq!(c.get_phase(), IterationLoopPhase::InLlmHttp);
     }
 
     #[test]
     fn user_interrupt_insert_during_llm_http() {
-        let c = core();
+        let c = mailbox();
         c.begin_turn(5, "sess");
-        c.set_phase(AgentLoopPhase::InLlmHttp);
+        c.set_phase(IterationLoopPhase::InLlmHttp);
         // interrupt for the same session is inserted and arms abort
         c.ingress_submit(req(6, "sess", "more", REQUEST_FLAG_USER_INTERRUPT), 0)
             .unwrap();
@@ -437,7 +458,7 @@ mod tests {
 
     #[test]
     fn user_interrupt_falls_through_when_no_match() {
-        let c = core();
+        let c = mailbox();
         // no in-flight turn -> falls through to the normal request queue
         c.ingress_submit(req(6, "sess", "more", REQUEST_FLAG_USER_INTERRUPT), 1000)
             .unwrap();

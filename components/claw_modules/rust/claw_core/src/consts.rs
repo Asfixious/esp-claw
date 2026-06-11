@@ -1,7 +1,5 @@
 //! Constants and small enums mirroring `claw_core.h` and `claw_core_internal.h`.
 
-use core::ffi::c_int;
-
 // --- request flags (claw_core.h) -----------------------------------------
 pub const REQUEST_FLAG_PUBLISH_OUT_MESSAGE: u32 = 1 << 0;
 pub const REQUEST_FLAG_SKIP_RESPONSE_QUEUE: u32 = 1 << 1;
@@ -36,32 +34,6 @@ pub enum ResponseStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionType {
     Done = 0,
-}
-
-/// `claw_core_agent_loop_phase_t`
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentLoopPhase {
-    Idle = 0,
-    BeforeBuildIterationContext = 1,
-    BuildingIterationContext = 2,
-    BeforeLlmHttp = 3,
-    InLlmHttp = 4,
-    AfterLlmBeforeTool = 5,
-    RunningTool = 6,
-    Finalizing = 7,
-}
-
-impl AgentLoopPhase {
-    pub fn as_c(self) -> c_int {
-        self as c_int
-    }
-
-    /// Insertable phases mirror `claw_core_agent_loop_phase_is_insertable`:
-    /// any phase that is neither Idle nor Finalizing.
-    pub fn is_insertable(self) -> bool {
-        !matches!(self, AgentLoopPhase::Idle | AgentLoopPhase::Finalizing)
-    }
 }
 
 /// `claw_core_context_record_type_t`

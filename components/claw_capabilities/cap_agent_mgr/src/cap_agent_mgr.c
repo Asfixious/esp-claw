@@ -177,10 +177,9 @@ static esp_err_t cap_agent_mgr_inspect_execute(const char *input_json,
 
     snprintf(output,
              output_size,
-             "{\"agent_id\":\"%s\",\"status\":\"%s\",\"phase\":%d,\"last_request_id\":%" PRIu32 ",\"agent_type\":\"%s\",\"last_error\":\"%s\"}",
+             "{\"agent_id\":\"%s\",\"status\":\"%s\",\"last_request_id\":%" PRIu32 ",\"agent_type\":\"%s\",\"last_error\":\"%s\"}",
              info.agent_id,
              claw_agent_mgr_status_to_string(info.status),
-             (int)info.phase,
              info.last_request_id,
              info.agent_type,
              info.last_error);
@@ -236,7 +235,6 @@ static esp_err_t cap_agent_mgr_list_execute(const char *input_json,
         cJSON_AddStringToObject(item, "agent_id", infos[i].agent_id);
         cJSON_AddStringToObject(item, "status", claw_agent_mgr_status_to_string(infos[i].status));
         cJSON_AddStringToObject(item, "agent_type", infos[i].agent_type);
-        cJSON_AddNumberToObject(item, "phase", (double)infos[i].phase);
         cJSON_AddNumberToObject(item, "last_request_id", (double)infos[i].last_request_id);
         if (infos[i].last_error[0]) {
             cJSON_AddStringToObject(item, "last_error", infos[i].last_error);

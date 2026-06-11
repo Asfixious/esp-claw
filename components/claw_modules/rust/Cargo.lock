@@ -19,10 +19,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw_cap"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "claw_capi"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw_cap",
  "claw_core",
  "claw_interfaces",
  "claw_memory",
@@ -39,6 +47,7 @@ name = "claw_core"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw_cap",
  "claw_interfaces",
  "claw_sys",
  "log",

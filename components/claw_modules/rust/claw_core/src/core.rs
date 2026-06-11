@@ -16,10 +16,10 @@ use claw_interfaces::event::EventPublisher;
 use claw_interfaces::http::ClawHttp;
 
 use crate::callbacks::{
-    CapabilityInvoker, CompletionObserver, CompletionSummary, ContextProvider, GateOutcome,
-    RequestGate,
-    RequestStart, StageNote,
+    CompletionObserver, CompletionSummary, ContextProvider, GateOutcome, RequestGate, RequestStart,
+    StageNote,
 };
+use claw_cap::CapabilityInvoker;
 use crate::consts::{
     CompletionType, ResponseStatus, DEFAULT_REQUEST_Q, DEFAULT_RESPONSE_Q, DEFAULT_STACK_SIZE,
     DEFAULT_TOOL_ITERATIONS, MAX_COMPLETION_OBSERVERS, REQUEST_FLAG_SKIP_RESPONSE_QUEUE,
@@ -29,8 +29,8 @@ use crate::errname::esp_err_to_name;
 use crate::error::CoreError;
 use crate::events::publish_out_message_if_requested;
 use crate::iteration_loop::{
-    AppendedMessages, ChatMessages, IterationLoop, IterationLoopPhase, IterationResult,
-    IterationStep, PlainTextOutcome, SystemPrompt, ToolRun, ToolSet,
+    AppendedMessages, ChatMessages, IterationLoop, IterationLoopError, IterationLoopPhase,
+    IterationResult, IterationStep, PlainTextOutcome, SystemPrompt, ToolRun, ToolSet,
 };
 use crate::util::{append_tool_summary_line, obs_csv_append};
 use claw_api::{ClawApi, ClawApiConfig};
@@ -379,7 +379,7 @@ impl Core {
                     break;
                 }
                 Err(err) => {
-                    turn_error = Some(err);
+                    turn_error = Some(err.into());
                     break;
                 }
             }
@@ -591,6 +591,28 @@ fn record_tool_runs(
     }
 }
 
+impl From<IterationLoopError> for CoreError {
+    fn from(error: IterationLoopError) -> Self {
+        use claw_cap::CapabilityError;
+        match error {
+            IterationLoopError::MessagesNotArray => CoreError::InvalidArg,
+            IterationLoopError::MissingCapabilityInvoker => CoreError::InvalidState,
+            IterationLoopError::MissingAssistantMessage
+            | IterationLoopError::MalformedAssistantMessage => CoreError::Fail,
+            IterationLoopError::Chat(chat) => CoreError::Chat(chat),
+            IterationLoopError::Capability(capability) => match capability {
+                CapabilityError::NoMem => CoreError::NoMem,
+                CapabilityError::InvalidArg => CoreError::InvalidArg,
+                CapabilityError::NotFound => CoreError::Fail,
+                CapabilityError::NotAvailable | CapabilityError::NotVisible => {
+                    CoreError::InvalidState
+                }
+                CapabilityError::Failed => CoreError::Fail,
+            },
+        }
+    }
+}
+
 /// `claw_core_check_timezone`.
 fn check_timezone() {
     let tz = std::env::var("TZ").unwrap_or_default();
@@ -603,7 +625,6 @@ mod tests {
     use super::*;
     use crate::consts::{ResponseStatus, REQUEST_FLAG_USER_INTERRUPT};
     use claw_api::ClawApiConfig;
-    use claw_interfaces::error::{EspErr, ESP_OK};
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
@@ -629,10 +650,18 @@ mod tests {
         }
     }
 
-    struct EchoCap;
-    impl CapabilityInvoker for EchoCap {
-        fn invoke(&self, cap_name: &str, _input: &str, _req: &RequestItem) -> (EspErr, Option<String>) {
-            (ESP_OK, Some(format!("{cap_name} done")))
+    struct EchoCapability;
+    impl CapabilityInvoker for EchoCapability {
+        fn invoke(
+            &self,
+            capability_name: &str,
+            _input_json: &str,
+            _context: &claw_cap::CapabilityContext,
+        ) -> Result<claw_cap::CapabilityInvokeResult, claw_cap::CapabilityError> {
+            Ok(claw_cap::CapabilityInvokeResult {
+                output: format!("{capability_name} done"),
+                ok: true,
+            })
         }
     }
 
@@ -651,7 +680,7 @@ mod tests {
             http: Arc::new(ScriptedHttp {
                 bodies: StdMutex::new(bodies.into_iter().collect()),
             }),
-            capability_invoker: Some(Box::new(EchoCap)),
+            capability_invoker: Some(Box::new(EchoCapability)),
             request_gate: None,
             on_request_start: None,
             collect_stage_note: None,

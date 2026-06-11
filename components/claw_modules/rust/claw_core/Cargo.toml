@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 stage_verbose = []
 
 [dependencies]
+claw_cap = { path = "../claw_cap" }
 claw_interfaces = { path = "../claw_interfaces" }
 claw-api = { path = "../claw-api" }
 claw_sys = { path = "../claw_sys" }

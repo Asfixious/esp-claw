@@ -9,6 +9,7 @@ members = [
     "claw_paths",
     "claw_task",
     "claw_core",
+    "claw_cap",
     "claw_memory",
     "claw_capi",
     "claw_rt",

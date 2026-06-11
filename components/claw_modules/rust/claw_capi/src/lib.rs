@@ -13,6 +13,7 @@
 // off-target they exist for their trait impls but are otherwise unused.
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
+pub mod capability;
 pub mod core_abi;
 pub mod errmap;
 pub mod ffi;

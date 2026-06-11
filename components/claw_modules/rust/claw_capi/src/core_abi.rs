@@ -22,8 +22,8 @@ use claw_interfaces::error::{
 };
 
 use claw_core::callbacks::{
-    CapabilityInvoker, CompletionObserver, CompletionSummary, ContextProvider, GateOutcome,
-    PersistContext, PersistRecord, ProviderOutcome, RequestGate, RequestStart, StageNote,
+    CompletionObserver, CompletionSummary, ContextProvider, GateOutcome, PersistContext,
+    PersistRecord, ProviderOutcome, RequestGate, RequestStart, StageNote,
 };
 use claw_core::consts::ContextKind;
 use claw_core::core::Core;
@@ -277,46 +277,6 @@ fn context_kind_from_c(kind: c_int) -> ContextKind {
 }
 
 // --- callback adapters ---------------------------------------------------
-
-type CallCapFn = unsafe extern "C" fn(
-    *const c_char,
-    *const c_char,
-    *const claw_core_request_t,
-    *mut *mut c_char,
-    *mut c_void,
-) -> EspErr;
-
-struct CCapabilityInvoker {
-    f: CallCapFn,
-    user_ctx: *mut c_void,
-}
-unsafe impl Send for CCapabilityInvoker {}
-unsafe impl Sync for CCapabilityInvoker {}
-
-impl CapabilityInvoker for CCapabilityInvoker {
-    fn invoke(
-        &self,
-        cap_name: &str,
-        input_json: &str,
-        request: &RequestItem,
-    ) -> (EspErr, Option<String>) {
-        let view = RequestCView::new(request);
-        let name = cstring(cap_name);
-        let input = cstring(input_json);
-        let mut out: *mut c_char = ptr::null_mut();
-        let err = unsafe {
-            (self.f)(
-                name.as_ptr(),
-                input.as_ptr(),
-                &view.view,
-                &mut out,
-                self.user_ctx,
-            )
-        };
-        let output = unsafe { take_c_string(out) };
-        (err, output)
-    }
-}
 
 type CollectFn =
     unsafe extern "C" fn(*const claw_core_request_t, *mut claw_core_context_t, *mut c_void) -> EspErr;
@@ -581,12 +541,8 @@ unsafe fn build_and_store_core(
         system_prompt: cstr_str(c.system_prompt),
         runtime_config,
         http: Arc::new(claw_sys::EspIdfHttp),
-        capability_invoker: c
-            .call_cap
-            .map(|f| {
-                Box::new(CCapabilityInvoker { f, user_ctx: c.cap_user_ctx })
-                    as Box<dyn CapabilityInvoker>
-            }),
+        capability_invoker: Some(Box::new(crate::capability::default_registry(c.cap_user_ctx))
+            as Box<dyn claw_cap::CapabilityInvoker>),
         request_gate: c.request_gate.map(|f| {
             Box::new(CRequestGate { f, user_ctx: c.request_gate_user_ctx }) as Box<dyn RequestGate>
         }),

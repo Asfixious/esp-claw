@@ -12,18 +12,6 @@ use claw_interfaces::error::EspErr;
 use crate::consts::{ContextKind, ContextRecordType};
 use crate::request::RequestItem;
 
-/// `claw_core_call_cap_fn`. Returns the capability `esp_err_t` and the produced
-/// output (the C `*out_output`). The loop uses the error for the `is_error`
-/// flag and falls back to the error name when no output is produced.
-pub trait CapabilityInvoker: Send + Sync {
-    fn invoke(
-        &self,
-        cap_name: &str,
-        input_json: &str,
-        request: &RequestItem,
-    ) -> (EspErr, Option<String>);
-}
-
 /// Result of a `claw_core_context_provider_collect_fn` call.
 pub enum ProviderOutcome {
     /// `ESP_ERR_NOT_FOUND`: the provider has nothing for this request.

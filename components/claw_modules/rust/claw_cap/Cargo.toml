@@ -1,0 +1,11 @@
+[package]
+name = "claw_cap"
+version = "0.1.0"
+edition = "2021"
+description = "Capability registry and dispatch (Rust-first; C handlers are adapters)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror = "2"

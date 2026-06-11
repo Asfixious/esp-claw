@@ -10,14 +10,26 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use claw_interfaces::error::ESP_OK;
-
-use crate::callbacks::CapabilityInvoker;
-use crate::errname::esp_err_to_name;
-use crate::error::CoreError;
-use claw_api::ClawApi;
-use claw_api::{ChatRequest, LlmResponse};
+use claw_api::{ChatError, ChatRequest, ClawApi, LlmResponse};
+use claw_cap::{CapabilityError, CapabilityInvokeResult, CapabilityInvoker};
 use crate::request::RequestItem;
+
+/// Errors from one [`IterationLoop::run`] step.
+#[derive(Debug, thiserror::Error)]
+pub enum IterationLoopError {
+    #[error("messages must be a JSON array")]
+    MessagesNotArray,
+    #[error("tool calls require a configured capability invoker")]
+    MissingCapabilityInvoker,
+    #[error("LLM tool-call response missing raw assistant message JSON")]
+    MissingAssistantMessage,
+    #[error("LLM raw assistant message JSON is not valid JSON")]
+    MalformedAssistantMessage,
+    #[error(transparent)]
+    Chat(#[from] ChatError),
+    #[error(transparent)]
+    Capability(#[from] CapabilityError),
+}
 
 /// Internal iteration phase for interrupt gating and diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +169,7 @@ pub struct IterationLoop<'a> {
 
 impl IterationLoop<'_> {
     /// Execute exactly one iteration: LLM chat → optional tool execution.
-    pub fn run(&self, step: IterationStep<'_>) -> Result<IterationResult, CoreError> {
+    pub fn run(&self, step: IterationStep<'_>) -> Result<IterationResult, IterationLoopError> {
         run_one_iteration(self, step)
     }
 }
@@ -165,7 +177,7 @@ impl IterationLoop<'_> {
 fn run_one_iteration(
     loop_: &IterationLoop<'_>,
     step: IterationStep<'_>,
-) -> Result<IterationResult, CoreError> {
+) -> Result<IterationResult, IterationLoopError> {
     let request = step.request;
     let mut appended = AppendedMessages::empty();
 
@@ -200,7 +212,7 @@ fn run_one_iteration(
             {
                 return Ok(IterationResult::Interrupted(InterruptedOutcome { appended }));
             }
-            return Err(CoreError::Chat(llm_err));
+            return Err(IterationLoopError::Chat(llm_err));
         }
     };
 
@@ -236,10 +248,12 @@ fn run_one_iteration(
     append_assistant_tool_calls(&mut appended.0, &llm_response)?;
 
     let Some(invoker) = loop_.capability_invoker else {
-        return Err(CoreError::InvalidState);
+        return Err(IterationLoopError::MissingCapabilityInvoker);
     };
+    let context = request.capability_context();
     let runs = append_tool_results_messages(
         invoker,
+        &context,
         &mut appended.0,
         &llm_response,
         request,
@@ -253,7 +267,7 @@ fn drain_user_interrupts(
     request: &RequestItem,
     timing: InterruptDrainPoint,
     appended: &mut AppendedMessages,
-) -> Result<bool, CoreError> {
+) -> Result<bool, IterationLoopError> {
     use crate::consts::INSERT_QUEUE_LEN;
 
     let texts = control.dequeue_inserted_user_inputs(request.session_id_str(), INSERT_QUEUE_LEN);
@@ -275,9 +289,9 @@ fn drain_user_interrupts(
     Ok(true)
 }
 
-fn append_user_message(messages: &mut Value, text: &str) -> Result<(), CoreError> {
+fn append_user_message(messages: &mut Value, text: &str) -> Result<(), IterationLoopError> {
     let Some(arr) = messages.as_array_mut() else {
-        return Err(CoreError::InvalidArg);
+        return Err(IterationLoopError::MessagesNotArray);
     };
     arr.push(serde_json::json!({ "role": "user", "content": text }));
     Ok(())
@@ -286,30 +300,31 @@ fn append_user_message(messages: &mut Value, text: &str) -> Result<(), CoreError
 fn append_assistant_tool_calls(
     messages: &mut Value,
     response: &LlmResponse,
-) -> Result<(), CoreError> {
+) -> Result<(), IterationLoopError> {
     let Some(raw) = response.raw_message_json.as_deref().filter(|s| !s.is_empty()) else {
-        return Err(CoreError::InvalidState);
+        return Err(IterationLoopError::MissingAssistantMessage);
     };
     let Ok(assistant) = serde_json::from_str::<Value>(raw) else {
-        return Err(CoreError::InvalidState);
+        return Err(IterationLoopError::MalformedAssistantMessage);
     };
     match messages.as_array_mut() {
         Some(a) => {
             a.push(assistant);
             Ok(())
         }
-        None => Err(CoreError::InvalidArg),
+        None => Err(IterationLoopError::MessagesNotArray),
     }
 }
 
 fn append_tool_results_messages(
     invoker: &dyn CapabilityInvoker,
+    context: &claw_cap::CapabilityContext,
     runtime_messages: &mut Value,
     response: &LlmResponse,
     request: &RequestItem,
-) -> Result<Vec<ToolRun>, CoreError> {
+) -> Result<Vec<ToolRun>, IterationLoopError> {
     let Some(runtime_arr) = runtime_messages.as_array_mut() else {
-        return Err(CoreError::InvalidArg);
+        return Err(IterationLoopError::MessagesNotArray);
     };
     let mut runs: Vec<ToolRun> = Vec::with_capacity(response.tool_calls.len());
 
@@ -321,31 +336,22 @@ fn append_tool_results_messages(
             tc.arguments_json
         );
 
-        let (err, output) = invoker.invoke(&tc.name, &tc.arguments_json, request);
-        let content = match output {
-            Some(o) => o,
-            None => {
-                if err != ESP_OK {
-                    esp_err_to_name(err).to_string()
-                } else {
-                    return Err(CoreError::NoMem);
-                }
-            }
-        };
+        let CapabilityInvokeResult { output, ok } =
+            invoker.invoke(&tc.name, &tc.arguments_json, context)?;
 
         log::info!(
-            "tool_result request={} name={} err={} output={}",
+            "tool_result request={} name={} ok={} output={}",
             request.request_id,
             if tc.name.is_empty() { "(null)" } else { &tc.name },
-            esp_err_to_name(err),
-            content
+            ok,
+            output
         );
 
         let tool_message = serde_json::json!({
             "role": "tool",
             "tool_call_id": tc.id,
-            "content": content,
-            "is_error": err != ESP_OK,
+            "content": output,
+            "is_error": !ok,
         });
 
         runtime_arr.push(tool_message);
@@ -355,7 +361,7 @@ fn append_tool_results_messages(
             } else {
                 tc.name.clone()
             },
-            ok: err == ESP_OK,
+            ok,
         });
     }
 

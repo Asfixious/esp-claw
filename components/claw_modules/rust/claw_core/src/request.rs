@@ -4,6 +4,8 @@
 //! `const char *` fields point at. In Rust the owned `String`s *are* the
 //! storage; the C ABI layer rebuilds a borrowed view at the boundary.
 
+use claw_cap::CapabilityContext;
+
 /// Owned copy of a submitted request.
 #[derive(Clone, Debug, Default)]
 pub struct RequestItem {
@@ -25,5 +27,18 @@ impl RequestItem {
     /// `view.session_id` guarded by `[0] == '\0'`).
     pub fn session_id_str(&self) -> &str {
         self.session_id.as_deref().unwrap_or("")
+    }
+
+    /// Routing context for a capability invocation on this turn.
+    pub fn capability_context(&self) -> CapabilityContext {
+        CapabilityContext::agent_turn(
+            self.request_id,
+            self.session_id.clone(),
+            self.source_channel.clone(),
+            self.source_chat_id.clone(),
+            self.target_channel.clone(),
+            self.target_chat_id.clone(),
+            self.source_cap.clone(),
+        )
     }
 }

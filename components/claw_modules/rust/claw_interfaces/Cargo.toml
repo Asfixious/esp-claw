@@ -6,3 +6,6 @@ description = "Shared types and dependency-injection traits for the claw_modules
 
 [lib]
 crate-type = ["rlib"]
+
+[dependencies]
+thiserror = "2"

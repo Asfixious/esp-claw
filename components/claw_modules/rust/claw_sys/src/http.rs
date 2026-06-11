@@ -65,7 +65,7 @@ pub use espidf_driver::EspIdfHttp;
 #[cfg(target_os = "espidf")]
 mod espidf_driver {
     use super::{build_auth_header, parse_error_message_body};
-    use claw_interfaces::error::{ESP_ERR_INVALID_STATE, ESP_FAIL, ESP_OK};
+    use claw_interfaces::error::{ESP_OK};
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use core::ffi::{c_char, c_int, c_void};
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -192,8 +192,7 @@ mod espidf_driver {
 
     impl ClawHttp for EspIdfHttp {
         fn post_json(&self, request: &HttpJsonRequest, abort: &AtomicBool) -> Result<HttpResponse, HttpError> {
-            let url = CString::new(request.url)
-                .map_err(|_| HttpError { err: ESP_FAIL, message: "invalid url".into() })?;
+            let url = CString::new(request.url).map_err(|_| HttpError::InvalidUrl)?;
             let mut ctx = Box::new(RequestCtx { body: Vec::with_capacity(4096), abort: abort as *const _ });
 
             let mut config: esp_http_client_config_t = unsafe { core::mem::zeroed() };
@@ -207,7 +206,7 @@ mod espidf_driver {
 
             let client = unsafe { esp_http_client_init(&config) };
             if client.is_null() {
-                return Err(HttpError { err: ESP_FAIL, message: "Failed to create HTTP client".into() });
+                return Err(HttpError::ClientInitFailed);
             }
 
             let result = (|| unsafe {
@@ -230,24 +229,27 @@ mod espidf_driver {
                         esp_http_client_set_header(client, k.as_ptr(), v.as_ptr());
                     }
                 }
-                let body = CString::new(request.body).map_err(|_| HttpError { err: ESP_FAIL, message: "body has NUL".into() })?;
+                let body = CString::new(request.body).map_err(|_| HttpError::InvalidBody)?;
                 esp_http_client_set_post_field(client, body.as_ptr(), request.body.len() as c_int);
 
                 let err = esp_http_client_perform(client);
                 let aborted = abort.load(Ordering::Relaxed);
                 if err != ESP_OK {
                     if aborted {
-                        return Err(HttpError { err: ESP_ERR_INVALID_STATE, message: "HTTP request aborted by caller".into() });
+                        return Err(HttpError::Aborted);
                     }
-                    return Err(HttpError { err, message: format!("HTTP request failed: {}", err_name(err)) });
+                    return Err(HttpError::RequestFailed(err_name(err).to_string()));
                 }
                 if aborted {
-                    return Err(HttpError { err: ESP_ERR_INVALID_STATE, message: "HTTP request aborted by caller".into() });
+                    return Err(HttpError::Aborted);
                 }
                 let status = esp_http_client_get_status_code(client);
                 let body_str = String::from_utf8_lossy(&ctx.body).into_owned();
                 if status != 200 {
-                    return Err(HttpError { err: ESP_FAIL, message: parse_error_message_body(&body_str, status) });
+                    return Err(HttpError::UnexpectedStatus(parse_error_message_body(
+                        &body_str,
+                        status,
+                    )));
                 }
                 Ok(HttpResponse { status_code: status, body: body_str })
             })();

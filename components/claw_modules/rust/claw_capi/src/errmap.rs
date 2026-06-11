@@ -16,6 +16,7 @@ use claw_interfaces::error::{
     EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
     ESP_ERR_NOT_SUPPORTED, ESP_ERR_NO_MEM, ESP_ERR_TIMEOUT, ESP_FAIL, ESP_OK,
 };
+use claw_interfaces::http::HttpError;
 use claw_memory::cap::CapStatus;
 use claw_memory::error::MemoryError;
 
@@ -46,6 +47,17 @@ pub fn memory_esp_err(err: MemoryError) -> EspErr {
         MemoryError::NotFound => ESP_ERR_NOT_FOUND,
         MemoryError::NotSupported => ESP_ERR_NOT_SUPPORTED,
         MemoryError::Timeout => ESP_ERR_TIMEOUT,
+    }
+}
+
+/// Map an [`HttpError`] to the `esp_err_t` the C HTTP transport reports.
+pub fn http_esp_err(err: &HttpError) -> EspErr {
+    match err {
+        HttpError::Aborted => ESP_ERR_INVALID_STATE,
+        HttpError::InvalidUrl | HttpError::InvalidBody => ESP_ERR_INVALID_ARG,
+        HttpError::ClientInitFailed
+        | HttpError::RequestFailed(_)
+        | HttpError::UnexpectedStatus(_) => ESP_FAIL,
     }
 }
 
@@ -99,5 +111,21 @@ fn chat_error_code(err: &ChatError) -> EspErr {
         ChatError::ToolsUnsupported => ESP_ERR_NOT_SUPPORTED,
         ChatError::InvalidToolsJson => ESP_ERR_INVALID_ARG,
         ChatError::Api(_) => ESP_FAIL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claw_interfaces::http::HttpError;
+
+    #[test]
+    fn http_esp_err_matches_c_transport() {
+        assert_eq!(http_esp_err(&HttpError::Aborted), ESP_ERR_INVALID_STATE);
+        assert_eq!(http_esp_err(&HttpError::InvalidUrl), ESP_ERR_INVALID_ARG);
+        assert_eq!(
+            http_esp_err(&HttpError::RequestFailed("timeout".into())),
+            ESP_FAIL
+        );
     }
 }

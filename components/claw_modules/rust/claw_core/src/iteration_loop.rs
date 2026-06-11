@@ -384,3 +384,235 @@ fn log_tool_call_names(request_id: u32, response: &LlmResponse) {
         names.join(",")
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use claw_api::ToolCall;
+    use claw_cap::CapabilityContext;
+
+    struct DrainControl {
+        texts: Mutex<Vec<String>>,
+        abort_flag: Arc<AtomicBool>,
+    }
+
+    impl RequestControl for DrainControl {
+        fn set_phase(&self, _phase: IterationLoopPhase) {}
+
+        fn abort_flag(&self) -> &Arc<AtomicBool> {
+            &self.abort_flag
+        }
+
+        fn take_user_interrupt_http_abort(&self, _request_id: u32) -> bool {
+            false
+        }
+
+        fn dequeue_inserted_user_inputs(&self, _session_id: &str, max: usize) -> Vec<String> {
+            let mut queue = self.texts.lock().unwrap();
+            let take = max.min(queue.len());
+            queue.drain(..take).collect()
+        }
+
+        fn clear_user_interrupt_abort(&self, _request_id: u32) {}
+    }
+
+    #[test]
+    fn tool_set_none_and_as_json() {
+        assert_eq!(ToolSet::none().as_json(), None);
+        let tools = r#"[{"type":"function"}]"#;
+        assert_eq!(ToolSet::new(Some(tools)).as_json(), Some(tools));
+    }
+
+    #[test]
+    fn append_user_message_appends_to_array() {
+        let mut messages = Value::Array(Vec::new());
+        append_user_message(&mut messages, "hi").expect("append");
+        assert_eq!(messages[0]["content"], "hi");
+    }
+
+    #[test]
+    fn drain_user_interrupts_appends_queued_messages() {
+        let control = DrainControl {
+            texts: Mutex::new(vec!["first".into(), "second".into()]),
+            abort_flag: Arc::new(AtomicBool::new(false)),
+        };
+        let request = RequestItem::default();
+        let mut appended = AppendedMessages::empty();
+
+        assert!(drain_user_interrupts(
+            &control,
+            &request,
+            InterruptDrainPoint::AfterLlmBeforeTool,
+            &mut appended,
+        )
+        .expect("drain"));
+
+        let items = appended.0.as_array().expect("array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["content"], "first");
+        assert_eq!(items[1]["content"], "second");
+    }
+
+    #[test]
+    fn phase_is_insertable_excludes_idle_and_finalizing() {
+        assert!(!phase_is_insertable(IterationLoopPhase::Idle));
+        assert!(!phase_is_insertable(IterationLoopPhase::Finalizing));
+        assert!(phase_is_insertable(IterationLoopPhase::BeforeLlmHttp));
+        assert!(phase_is_insertable(IterationLoopPhase::InLlmHttp));
+        assert!(phase_is_insertable(IterationLoopPhase::AfterLlmBeforeTool));
+        assert!(phase_is_insertable(IterationLoopPhase::RunningTool));
+    }
+
+    #[test]
+    fn append_user_message_rejects_non_array() {
+        let mut messages = Value::String("not-an-array".into());
+        let err = append_user_message(&mut messages, "hi").unwrap_err();
+        assert!(matches!(err, IterationLoopError::MessagesNotArray));
+    }
+
+    #[test]
+    fn append_assistant_tool_calls_error_paths() {
+        let mut messages = Value::Array(Vec::new());
+        let missing_raw = LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: None,
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "files".into(),
+                arguments_json: "{}".into(),
+            }],
+        };
+        assert!(matches!(
+            append_assistant_tool_calls(&mut messages, &missing_raw).unwrap_err(),
+            IterationLoopError::MissingAssistantMessage
+        ));
+
+        let malformed = LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: Some("{not-json".into()),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "files".into(),
+                arguments_json: "{}".into(),
+            }],
+        };
+        assert!(matches!(
+            append_assistant_tool_calls(&mut messages, &malformed).unwrap_err(),
+            IterationLoopError::MalformedAssistantMessage
+        ));
+
+        let valid = LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: Some(r#"{"role":"assistant"}"#.into()),
+            tool_calls: vec![],
+        };
+        let mut not_array = Value::Object(Default::default());
+        assert!(matches!(
+            append_assistant_tool_calls(&mut not_array, &valid).unwrap_err(),
+            IterationLoopError::MessagesNotArray
+        ));
+    }
+
+    #[test]
+    fn append_tool_results_messages_error_and_empty_name() {
+        struct OkInvoker;
+        impl CapabilityInvoker for OkInvoker {
+            fn invoke(
+                &self,
+                _name: &str,
+                _input: &str,
+                _context: &CapabilityContext,
+            ) -> Result<CapabilityInvokeResult, CapabilityError> {
+                Ok(CapabilityInvokeResult {
+                    output: "done".into(),
+                    ok: false,
+                })
+            }
+        }
+
+        let invoker = OkInvoker;
+        let context = CapabilityContext::default();
+        let request = RequestItem::default();
+        let response = LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: None,
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: String::new(),
+                arguments_json: "{}".into(),
+            }],
+        };
+
+        let mut not_array = Value::Object(Default::default());
+        assert!(matches!(
+            append_tool_results_messages(&invoker, &context, &mut not_array, &response, &request)
+                .unwrap_err(),
+            IterationLoopError::MessagesNotArray
+        ));
+
+        let mut messages = Value::Array(Vec::new());
+        let runs = append_tool_results_messages(
+            &invoker,
+            &context,
+            &mut messages,
+            &response,
+            &request,
+        )
+        .expect("tool results");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].name, "(null)");
+        assert!(!runs[0].ok);
+        assert_eq!(messages[0]["is_error"], true);
+    }
+
+    #[test]
+    fn log_tool_call_names_handles_empty_and_null_names() {
+        log_tool_call_names(1, &LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: None,
+            tool_calls: vec![],
+        });
+
+        log_tool_call_names(
+            2,
+            &LlmResponse {
+                text: None,
+                reasoning_content: None,
+                raw_message_json: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "t1".into(),
+                        name: String::new(),
+                        arguments_json: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "t2".into(),
+                        name: "files".into(),
+                        arguments_json: "{}".into(),
+                    },
+                ],
+            },
+        );
+    }
+
+    #[test]
+    fn append_assistant_tool_calls_accepts_valid_message() {
+        let mut messages = Value::Array(Vec::new());
+        let response = LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: Some(r#"{"role":"assistant","tool_calls":[]}"#.into()),
+            tool_calls: vec![],
+        };
+        append_assistant_tool_calls(&mut messages, &response).expect("append assistant");
+        assert_eq!(messages[0]["role"], "assistant");
+    }
+}

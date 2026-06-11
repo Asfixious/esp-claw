@@ -5,8 +5,6 @@
 
 use core::sync::atomic::AtomicBool;
 
-use crate::error::EspErr;
-
 /// A single extra request header (`name: value`).
 pub struct HttpHeader<'a> {
     pub name: &'a str,
@@ -31,11 +29,24 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// A failed HTTP attempt: the `esp_err_t` plus a human-readable message that
-/// matches the C `out_error_message` strings.
-pub struct HttpError {
-    pub err: EspErr,
-    pub message: String,
+/// Rust-native HTTP transport failure.
+///
+/// `esp_err_t` mapping for the C ABI lives in `claw_capi::errmap::http_esp_err`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HttpError {
+    #[error("HTTP request aborted by caller")]
+    Aborted,
+    #[error("invalid URL")]
+    InvalidUrl,
+    #[error("request body contains NUL byte")]
+    InvalidBody,
+    #[error("failed to create HTTP client")]
+    ClientInitFailed,
+    #[error("HTTP request failed: {0}")]
+    RequestFailed(String),
+    /// Non-200 response; message matches C `parse_error_message_body` shape.
+    #[error("{0}")]
+    UnexpectedStatus(String),
 }
 
 /// Networking injection point for the LLM backends.

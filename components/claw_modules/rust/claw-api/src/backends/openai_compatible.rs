@@ -122,7 +122,7 @@ impl LlmBackend for OpenAiCompatible {
         };
         let response = http
             .post_json(&http_request, abort)
-            .map_err(|e| ClawApiError::Transport(e.message))?;
+            .map_err(|e| ClawApiError::Transport(e.to_string()))?;
         Ok(parse_openai_chat_response(&response.body)?)
     }
 
@@ -176,7 +176,7 @@ impl LlmBackend for OpenAiCompatible {
         };
         let response = http
             .post_json(&http_request, &never)
-            .map_err(|e| ClawApiError::Transport(e.message))?;
+            .map_err(|e| ClawApiError::Transport(e.to_string()))?;
 
         let parsed = parse_openai_chat_response(&response.body)?;
         match parsed.text {

@@ -4,10 +4,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_core::agent_spec::{FrontendPhase, RoleState, RunStatus, WorkerPhase};
+use claw_core::agent::{AgentRole, FrontendPhase, RoleState, RunStatus, WorkerPhase};
 use claw_core::memory::{role_may_read, InMemoryScopedStore, MemoryScope, ScopedMemoryStore};
 use claw_core::orchestrator::{AgentInstance, RunOrchestrator};
-use claw_core::protocol::{ApprovalRecord, Command, SessionId, StepId, TaskId, UserInput, WorkerId};
+use claw_core::protocol::{ApprovalRecord, Command, SessionId, StepId, TaskId, WorkerId};
+use claw_core::InboundMessage;
 
 const SESS: SessionId = SessionId(1);
 const TASK: TaskId = TaskId(1);
@@ -50,7 +51,7 @@ impl claw_cap::CapabilityInvoker for EchoCapability {
         &self,
         capability_name: &str,
         input_json: &str,
-        _context: &claw_cap::CapabilityContext,
+        _context: &claw_cap::ToolContext,
     ) -> Result<claw_cap::CapabilityInvokeResult, claw_cap::CapabilityError> {
         Ok(claw_cap::CapabilityInvokeResult {
             output: format!("{capability_name}:{input_json}"),
@@ -94,8 +95,12 @@ fn orchestrator_frontend_delegates_worker_completes() {
     let mut orch = RunOrchestrator::new().with_llm(llm, Some(invoker));
 
     orch.add_instance(AgentInstance::frontend("fe-1", "run-1", SESS));
-    orch.submit_user_input(UserInput {
-        session_id: SESS,
+    orch.submit_inbound(InboundMessage {
+        message_id: "m-1".into(),
+        channel: "test".into(),
+        chat_id: "local".into(),
+        sender_id: None,
+        session_id: SESS.to_string(),
         text: "build something".into(),
     });
     orch.tick();
@@ -186,15 +191,15 @@ fn orchestrator_approval_unblocks_paused_worker() {
 #[test]
 fn memory_scope_denies_cross_role_private_reads() {
     assert!(!role_may_read(
-        claw_core::agent_spec::AgentRole::Frontend,
+        AgentRole::Frontend,
         MemoryScope::WorkerPrivate
     ));
     assert!(!role_may_read(
-        claw_core::agent_spec::AgentRole::Worker,
+        AgentRole::Worker,
         MemoryScope::FrontendPrivate
     ));
     assert!(role_may_read(
-        claw_core::agent_spec::AgentRole::Worker,
+        AgentRole::Worker,
         MemoryScope::TaskShared
     ));
 
@@ -206,7 +211,7 @@ fn memory_scope_denies_cross_role_private_reads() {
     );
     let snap = claw_core::memory::snapshot_for_role(
         &store,
-        claw_core::agent_spec::AgentRole::Frontend,
+        AgentRole::Frontend,
         Some(TASK),
     );
     assert!(!snap.contains("secret"));
@@ -219,8 +224,12 @@ fn orchestrator_merges_worker_message_tail_after_tool_round() {
     let mut orch = RunOrchestrator::new().with_llm(llm, Some(invoker));
 
     orch.add_instance(AgentInstance::frontend("fe-1", "run-1", SESS));
-    orch.submit_user_input(UserInput {
-        session_id: SESS,
+    orch.submit_inbound(InboundMessage {
+        message_id: "m-1".into(),
+        channel: "test".into(),
+        chat_id: "local".into(),
+        sender_id: None,
+        session_id: SESS.to_string(),
         text: "build".into(),
     });
     orch.tick();
@@ -255,8 +264,12 @@ fn orchestrator_approve_plan_unblocks_worker() {
     let llm = test_llm(vec![INTAKE_BODY, PLAN_BODY]);
     let mut orch = RunOrchestrator::new().with_llm(llm, None);
     orch.add_instance(AgentInstance::frontend("fe-1", "run-1", SESS));
-    orch.submit_user_input(UserInput {
-        session_id: SESS,
+    orch.submit_inbound(InboundMessage {
+        message_id: "m-1".into(),
+        channel: "test".into(),
+        chat_id: "local".into(),
+        sender_id: None,
+        session_id: SESS.to_string(),
         text: "build".into(),
     });
     orch.tick();

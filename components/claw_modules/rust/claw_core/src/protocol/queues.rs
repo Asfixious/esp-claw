@@ -3,34 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use super::{AgentEvent, Command, SessionId};
-
-/// User message submitted from an external channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UserInput {
-    pub session_id: SessionId,
-    pub text: String,
-}
-
-#[derive(Default)]
-pub struct UserInputQueue {
-    inner: Mutex<VecDeque<UserInput>>,
-}
-
-impl UserInputQueue {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(&self, input: UserInput) {
-        self.inner.lock().unwrap().push_back(input);
-    }
-
-    pub fn drain(&self) -> Vec<UserInput> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.drain(..).collect()
-    }
-}
+use super::{AgentEvent, Command};
 
 #[derive(Default)]
 pub struct CommandQueue {

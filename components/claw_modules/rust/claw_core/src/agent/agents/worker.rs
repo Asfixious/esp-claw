@@ -1,11 +1,14 @@
 //! Worker semantic controller: PLAN / ACT / VERIFY / PAUSED / BLOCKED / DONE.
 
-use crate::agent_spec::{
-    AgentRole, AgentSpec, AgentState, ContextBuildInput, ContextBundle, OutputSchema, RoleState,
-    RunStatus, SemanticPhase, StatePatch, ToolVisibility, TransitionInput,
-    TransitionOutput, TransitionSignal, WorkerPhase, WorkerState,
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use crate::agent::{
+    AgentRegistrar, AgentRegistry, AgentRole, AgentSpec, AgentState, ContextBuildInput,
+    OutputSchema, RoleState, RunStatus, StatePatch, ToolVisibility,
+    TransitionInput, TransitionOutput, TransitionSignal, WorkerPhase, WorkerState,
 };
-use crate::context::ContextAssembler;
 use crate::llm_output::ValidatedLlmOutput;
 use crate::protocol::{AgentEvent, StepId};
 use crate::runtime::{ActionSummary, HarnessIterationOutput};
@@ -29,14 +32,48 @@ impl AgentSpec for WorkerAgentSpec {
         AgentRole::Worker
     }
 
-    fn phase(&self, state: &AgentState) -> SemanticPhase {
-        state.semantic_phase()
+    fn state_block(&self, input: &ContextBuildInput<'_>) -> String {
+        let RoleState::Worker(worker) = &input.state.role_state else {
+            return "# STATE\n(invalid role)".to_string();
+        };
+        format!(
+            "# STATE\ninstance={}\nrun={}\niteration={}\nphase={:?}\ntask={}\nstep={:?}\nblocked={:?}",
+            input.state.instance_id,
+            input.state.run_id,
+            input.state.iteration_id,
+            worker.phase,
+            worker.task_id,
+            worker.current_step_id(),
+            worker.blocked_reason,
+        )
     }
 
-    fn build_context(&self, input: &ContextBuildInput<'_>) -> ContextBundle {
-        let tools = self.visible_tools(input);
-        let schema = self.expected_schema(input);
-        ContextAssembler::assemble(input, &schema, tools.tools_json.as_deref())
+    fn plan_block(&self, input: &ContextBuildInput<'_>) -> String {
+        let header = "# PLAN\n";
+        let RoleState::Worker(worker) = &input.state.role_state else {
+            return format!("{header}(invalid role)");
+        };
+        let steps: Vec<String> = worker.plan_steps.iter().map(ToString::to_string).collect();
+        let current = worker
+            .current_step_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(none)".to_string());
+        let revision = worker
+            .revision_note
+            .as_deref()
+            .map(|n| format!("\nrevision_note={n}"))
+            .unwrap_or_default();
+        format!(
+            "{header}task={}\ncurrent_step={current}\nsteps={steps:?}{revision}",
+            worker.task_id
+        )
+    }
+
+    fn conversation_messages(&self, input: &ContextBuildInput<'_>) -> Value {
+        let RoleState::Worker(worker) = &input.state.role_state else {
+            return Value::Array(Vec::new());
+        };
+        worker.message_tail.clone()
     }
 
     fn visible_tools(&self, input: &ContextBuildInput<'_>) -> ToolVisibility {
@@ -239,5 +276,14 @@ impl WorkerAgentSpec {
                 summary,
             });
         }
+    }
+}
+
+/// Registers [`WorkerAgentSpec`] into a registry.
+pub struct Registrar;
+
+impl AgentRegistrar for Registrar {
+    fn register(&self, registry: &mut AgentRegistry) {
+        registry.register(Arc::new(WorkerAgentSpec::new()));
     }
 }

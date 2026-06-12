@@ -95,6 +95,7 @@ dependencies = [
  "claw-api",
  "claw_cap",
  "claw_interfaces",
+ "claw_message_channel",
  "dotenvy",
  "log",
  "reqwest",
@@ -121,6 +122,13 @@ dependencies = [
  "libc",
  "log",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "claw_message_channel"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

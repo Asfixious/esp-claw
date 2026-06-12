@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_cap::{CapabilityContext, CapabilityError, CapabilityInvokeResult, CapabilityInvoker};
+use claw_cap::{CapabilityError, CapabilityInvokeResult, CapabilityInvoker, ToolContext};
 use claw_core::iteration_loop::{
     AppendedMessages, ChatMessages, IterationLoop, IterationLoopError, IterationLoopPhase,
     IterationResult, IterationStep, RequestControl, SystemPrompt, ToolSet,
 };
-use claw_core::request::RequestItem;
+use claw_core::TurnId;
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use serde_json::{json, Value};
 
@@ -173,16 +173,8 @@ fn test_llm(bodies: Vec<&str>) -> ClawApi {
     .expect("test llm init")
 }
 
-fn test_request() -> RequestItem {
-    RequestItem {
-        request_id: 42,
-        user_text: "hi".into(),
-        session_id: Some("sess-1".into()),
-        source_channel: Some("cli".into()),
-        source_chat_id: Some("chat-1".into()),
-        ..Default::default()
-    }
-}
+const TEST_TURN_ID: TurnId = TurnId(42);
+const TEST_SESSION_ID: &str = "sess-1";
 
 struct MockControl {
     phase: Mutex<IterationLoopPhase>,
@@ -231,7 +223,7 @@ impl RequestControl for MockControl {
         &self.abort_flag
     }
 
-    fn take_user_interrupt_http_abort(&self, _request_id: u32) -> bool {
+    fn take_user_interrupt_http_abort(&self, _turn_id: TurnId) -> bool {
         self.interrupt_http_abort.load(Ordering::Acquire)
     }
 
@@ -258,7 +250,7 @@ impl RequestControl for MockControl {
         out
     }
 
-    fn clear_user_interrupt_abort(&self, _request_id: u32) {}
+    fn clear_user_interrupt_abort(&self, _turn_id: TurnId) {}
 }
 
 struct EchoCapability;
@@ -268,7 +260,7 @@ impl CapabilityInvoker for EchoCapability {
         &self,
         capability_name: &str,
         input_json: &str,
-        _context: &CapabilityContext,
+        _context: &ToolContext,
     ) -> Result<CapabilityInvokeResult, CapabilityError> {
         Ok(CapabilityInvokeResult {
             output: format!("{capability_name}:{input_json}"),
@@ -284,7 +276,7 @@ impl CapabilityInvoker for FailingCapability {
         &self,
         _capability_name: &str,
         _input_json: &str,
-        _context: &CapabilityContext,
+        _context: &ToolContext,
     ) -> Result<CapabilityInvokeResult, CapabilityError> {
         Err(CapabilityError::NotFound)
     }
@@ -297,7 +289,7 @@ impl CapabilityInvoker for SoftFailCapability {
         &self,
         capability_name: &str,
         input_json: &str,
-        _context: &CapabilityContext,
+        _context: &ToolContext,
     ) -> Result<CapabilityInvokeResult, CapabilityError> {
         Ok(CapabilityInvokeResult {
             output: format!("soft-fail:{capability_name}:{input_json}"),
@@ -325,12 +317,14 @@ fn run_step<'a>(
     llm: &'a ClawApi,
     control: &'a MockControl,
     capability_invoker: Option<&'a dyn CapabilityInvoker>,
-    request: &'a RequestItem,
+    turn_id: TurnId,
+    session_id: &'a str,
     messages: &'a Value,
     system_prompt: &'a str,
 ) -> Result<IterationResult, IterationLoopError> {
     let step = IterationStep {
-        request,
+        turn_id,
+        session_id,
         system_prompt: SystemPrompt(system_prompt),
         messages: ChatMessages(messages),
         tools: ToolSet::none(),
@@ -381,10 +375,10 @@ fn system_prompt_borrows_text() {
 fn run_returns_plain_text_outcome() {
     let llm = test_llm(vec![PLAIN_TEXT_BODY]);
     let control = MockControl::new();
-    let request = test_request();
     let messages = json!([{"role":"user","content":"hi"}]);
 
-    let result = run_step(&llm, &control, None, &request, &messages, "system")
+    let result = run_step(&llm, &control, None, TEST_TURN_ID,
+        TEST_SESSION_ID, &messages, "system")
         .expect("plain text iteration");
 
     match result {
@@ -402,14 +396,14 @@ fn run_executes_tools_and_records_runs() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
     let echo = EchoCapability;
-    let request = test_request();
     let messages = json!([]);
 
     let result = run_step(
         &llm,
         &control,
         Some(&echo),
-        &request,
+        TEST_TURN_ID,
+        TEST_SESSION_ID,
         &messages,
         "system",
     )
@@ -439,10 +433,10 @@ fn run_returns_interrupted_when_user_input_queued() {
     let llm = test_llm(vec![PLAIN_TEXT_BODY]);
     let control = MockControl::new();
     control.queue_interrupt("wait, also this");
-    let request = test_request();
     let messages = json!([]);
 
-    let result = run_step(&llm, &control, None, &request, &messages, "system")
+    let result = run_step(&llm, &control, None, TEST_TURN_ID,
+        TEST_SESSION_ID, &messages, "system")
         .expect("interrupted iteration");
 
     match result {
@@ -461,10 +455,10 @@ fn run_returns_interrupted_when_user_input_queued() {
 fn run_errors_when_tool_calls_without_capability_invoker() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
-    let request = test_request();
     let messages = json!([]);
 
-    let error = run_step(&llm, &control, None, &request, &messages, "system")
+    let error = run_step(&llm, &control, None, TEST_TURN_ID,
+        TEST_SESSION_ID, &messages, "system")
         .expect_err("expected missing invoker");
 
     assert!(matches!(
@@ -478,10 +472,10 @@ fn run_returns_interrupted_after_tool_call_before_execution() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
     control.deliver_interrupt_on_drain_call(2);
-    let request = test_request();
     let messages = json!([]);
 
-    let result = run_step(&llm, &control, None, &request, &messages, "system")
+    let result = run_step(&llm, &control, None, TEST_TURN_ID,
+        TEST_SESSION_ID, &messages, "system")
         .expect("interrupted after tool call");
 
     match result {
@@ -501,10 +495,10 @@ fn run_returns_interrupted_when_http_aborted_with_queued_input() {
     let control = MockControl::new();
     control.set_interrupt_http_abort(true);
     control.queue_interrupt("stop during http");
-    let request = test_request();
     let messages = json!([]);
 
-    let result = run_step(&llm, &control, None, &request, &messages, "system")
+    let result = run_step(&llm, &control, None, TEST_TURN_ID,
+        TEST_SESSION_ID, &messages, "system")
         .expect("interrupted during http");
 
     match result {
@@ -521,10 +515,10 @@ fn run_returns_interrupted_when_http_aborted_with_queued_input() {
 fn run_propagates_chat_errors_without_interrupt() {
     let llm = test_llm_with_http(Arc::new(FailingHttp));
     let control = MockControl::new();
-    let request = test_request();
     let messages = json!([]);
 
-    let error = run_step(&llm, &control, None, &request, &messages, "system")
+    let error = run_step(&llm, &control, None, TEST_TURN_ID,
+        TEST_SESSION_ID, &messages, "system")
         .expect_err("expected chat transport error");
 
     assert!(matches!(error, IterationLoopError::Chat(_)));
@@ -535,14 +529,14 @@ fn run_records_soft_failing_tool_with_null_name() {
     let llm = test_llm(vec![TOOL_CALL_EMPTY_NAME_BODY]);
     let control = MockControl::new();
     let soft_fail = SoftFailCapability;
-    let request = test_request();
     let messages = json!([]);
 
     let result = run_step(
         &llm,
         &control,
         Some(&soft_fail),
-        &request,
+        TEST_TURN_ID,
+        TEST_SESSION_ID,
         &messages,
         "system",
     )
@@ -567,14 +561,14 @@ fn run_propagates_capability_errors() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
     let failing = FailingCapability;
-    let request = test_request();
     let messages = json!([]);
 
     let error = run_step(
         &llm,
         &control,
         Some(&failing),
-        &request,
+        TEST_TURN_ID,
+        TEST_SESSION_ID,
         &messages,
         "system",
     )
@@ -606,14 +600,14 @@ fn live_plain_text_when_api_key_configured() {
     .expect("live llm init");
 
     let control = MockControl::new();
-    let request = test_request();
     let messages = json!([{"role":"user","content":"Reply with exactly: pong"}]);
 
     let result = run_step(
         &llm,
         &control,
         None,
-        &request,
+        TEST_TURN_ID,
+        TEST_SESSION_ID,
         &messages,
         "You are a test assistant. Be brief.",
     )

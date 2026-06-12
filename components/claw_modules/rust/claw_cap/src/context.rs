@@ -23,6 +23,29 @@ pub struct CapabilityContext {
     pub caller: CapabilityCaller,
 }
 
+/// Minimal context for one LLM tool invocation (Layer 3 only).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolContext {
+    pub turn_id: u32,
+    pub session_id: Option<String>,
+}
+
+impl ToolContext {
+    pub fn session_id_str(&self) -> &str {
+        self.session_id.as_deref().unwrap_or("")
+    }
+
+    /// Adapter for the legacy C capability surface.
+    pub fn to_capability_context(&self) -> CapabilityContext {
+        CapabilityContext {
+            request_id: self.turn_id,
+            session_id: self.session_id.clone(),
+            caller: CapabilityCaller::Agent,
+            ..Default::default()
+        }
+    }
+}
+
 impl CapabilityContext {
     /// Build an agent-originated context from a submitted turn (root/sub-agent
     /// caller refinement happens in the C backend via `cap_user_ctx`).

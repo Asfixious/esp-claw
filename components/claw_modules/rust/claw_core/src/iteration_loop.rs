@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use claw_api::{ChatError, ChatRequest, ClawApi, LlmResponse};
 use claw_cap::{CapabilityError, CapabilityInvokeResult, CapabilityInvoker};
-use crate::request::RequestItem;
+
+use crate::protocol::TurnId;
 
 /// Errors from one [`IterationLoop::run`] step.
 #[derive(Debug, thiserror::Error)]
@@ -103,9 +104,10 @@ impl<'a> ToolSet<'a> {
 }
 
 /// Inputs for exactly one [`IterationLoop::run`]: borrowed OpenAI chat request
-/// fields plus [`RequestItem`] for tool dispatch and interrupt handling.
+/// fields plus turn identity for tool dispatch and interrupt handling.
 pub struct IterationStep<'a> {
-    pub request: &'a RequestItem,
+    pub turn_id: TurnId,
+    pub session_id: &'a str,
     pub system_prompt: SystemPrompt<'a>,
     pub messages: ChatMessages<'a>,
     pub tools: ToolSet<'a>,
@@ -151,9 +153,9 @@ pub struct InterruptedOutcome {
 pub trait RequestControl: Send + Sync {
     fn set_phase(&self, phase: IterationLoopPhase);
     fn abort_flag(&self) -> &Arc<AtomicBool>;
-    fn take_user_interrupt_http_abort(&self, request_id: u32) -> bool;
+    fn take_user_interrupt_http_abort(&self, turn_id: TurnId) -> bool;
     fn dequeue_inserted_user_inputs(&self, session_id: &str, max: usize) -> Vec<String>;
-    fn clear_user_interrupt_abort(&self, request_id: u32);
+    fn clear_user_interrupt_abort(&self, turn_id: TurnId);
 }
 
 /// One-step executor; holds only what a single iteration needs (no [`crate::core::Core`]).
@@ -174,13 +176,15 @@ fn run_one_iteration(
     loop_: &IterationLoop<'_>,
     step: IterationStep<'_>,
 ) -> Result<IterationResult, IterationLoopError> {
-    let request = step.request;
+    let turn_id = step.turn_id;
+    let session_id = step.session_id;
     let mut appended = AppendedMessages::empty();
 
     loop_.control.set_phase(IterationLoopPhase::BeforeLlmHttp);
     if drain_user_interrupts(
         loop_.control,
-        request,
+        turn_id,
+        session_id,
         InterruptDrainPoint::BeforeLlmHttp,
         &mut appended,
     )? {
@@ -198,10 +202,11 @@ fn run_one_iteration(
         Err(llm_err) => {
             if loop_
                 .control
-                .take_user_interrupt_http_abort(request.request_id)
+                .take_user_interrupt_http_abort(turn_id)
                 && drain_user_interrupts(
                     loop_.control,
-                    request,
+                    turn_id,
+                    session_id,
                     InterruptDrainPoint::InLlmHttpAbort,
                     &mut appended,
                 )?
@@ -216,8 +221,8 @@ fn run_one_iteration(
         loop_.control.set_phase(IterationLoopPhase::Finalizing);
         let text = llm_response.text.clone().unwrap_or_default();
         log::info!(
-            "completion request={} status=done raw={}",
-            request.request_id,
+            "completion turn={} status=done raw={}",
+            turn_id,
             crate::util::truncate_for_log(&text)
         );
         return Ok(IterationResult::PlainText(PlainTextOutcome {
@@ -231,7 +236,8 @@ fn run_one_iteration(
         .set_phase(IterationLoopPhase::AfterLlmBeforeTool);
     if drain_user_interrupts(
         loop_.control,
-        request,
+        turn_id,
+        session_id,
         InterruptDrainPoint::AfterLlmBeforeTool,
         &mut appended,
     )? {
@@ -239,20 +245,23 @@ fn run_one_iteration(
     }
 
     loop_.control.set_phase(IterationLoopPhase::RunningTool);
-    log_tool_call_names(request.request_id, &llm_response);
+    log_tool_call_names(turn_id, &llm_response);
 
     append_assistant_tool_calls(&mut appended.0, &llm_response)?;
 
     let Some(invoker) = loop_.capability_invoker else {
         return Err(IterationLoopError::MissingCapabilityInvoker);
     };
-    let context = request.capability_context();
+    let tool_context = claw_cap::ToolContext {
+        turn_id: turn_id.as_request_id(),
+        session_id: Some(session_id.to_string()),
+    };
     let runs = append_tool_results_messages(
         invoker,
-        &context,
+        &tool_context,
         &mut appended.0,
         &llm_response,
-        request,
+        turn_id,
     )?;
 
     Ok(IterationResult::Tools(ToolsOutcome { appended, runs }))
@@ -260,19 +269,20 @@ fn run_one_iteration(
 
 fn drain_user_interrupts(
     control: &dyn RequestControl,
-    request: &RequestItem,
+    turn_id: TurnId,
+    session_id: &str,
     timing: InterruptDrainPoint,
     appended: &mut AppendedMessages,
 ) -> Result<bool, IterationLoopError> {
-    let texts = control.dequeue_inserted_user_inputs(request.session_id_str(), INSERT_QUEUE_LEN);
+    let texts = control.dequeue_inserted_user_inputs(session_id, INSERT_QUEUE_LEN);
     if texts.is_empty() {
         return Ok(false);
     }
-    control.clear_user_interrupt_abort(request.request_id);
+    control.clear_user_interrupt_abort(turn_id);
 
     log::info!(
-        "user_interrupt_triggered request={} timing={:?} count={}",
-        request.request_id,
+        "user_interrupt_triggered turn={} timing={:?} count={}",
+        turn_id,
         timing,
         texts.len()
     );
@@ -312,10 +322,10 @@ fn append_assistant_tool_calls(
 
 fn append_tool_results_messages(
     invoker: &dyn CapabilityInvoker,
-    context: &claw_cap::CapabilityContext,
+    context: &claw_cap::ToolContext,
     runtime_messages: &mut Value,
     response: &LlmResponse,
-    request: &RequestItem,
+    turn_id: TurnId,
 ) -> Result<Vec<ToolRun>, IterationLoopError> {
     let Some(runtime_arr) = runtime_messages.as_array_mut() else {
         return Err(IterationLoopError::MessagesNotArray);
@@ -324,8 +334,8 @@ fn append_tool_results_messages(
 
     for tc in &response.tool_calls {
         log::info!(
-            "tool_call request={} name={} args={}",
-            request.request_id,
+            "tool_call turn={} name={} args={}",
+            turn_id,
             if tc.name.is_empty() { "(null)" } else { &tc.name },
             tc.arguments_json
         );
@@ -334,8 +344,8 @@ fn append_tool_results_messages(
             invoker.invoke(&tc.name, &tc.arguments_json, context)?;
 
         log::info!(
-            "tool_result request={} name={} ok={} output={}",
-            request.request_id,
+            "tool_result turn={} name={} ok={} output={}",
+            turn_id,
             if tc.name.is_empty() { "(null)" } else { &tc.name },
             ok,
             output
@@ -362,7 +372,7 @@ fn append_tool_results_messages(
     Ok(runs)
 }
 
-fn log_tool_call_names(request_id: u32, response: &LlmResponse) {
+fn log_tool_call_names(turn_id: TurnId, response: &LlmResponse) {
     if response.tool_calls.is_empty() {
         return;
     }
@@ -372,8 +382,8 @@ fn log_tool_call_names(request_id: u32, response: &LlmResponse) {
         .map(|tc| if tc.name.is_empty() { "(null)" } else { tc.name.as_str() })
         .collect();
     log::debug!(
-        "llm_tool_calls request={} count={} names={}",
-        request_id,
+        "llm_tool_calls turn={} count={} names={}",
+        turn_id,
         response.tool_calls.len(),
         names.join(",")
     );
@@ -386,7 +396,9 @@ mod tests {
 
     use super::*;
     use claw_api::ToolCall;
-    use claw_cap::CapabilityContext;
+    use claw_cap::ToolContext;
+
+    use crate::protocol::TurnId;
 
     struct DrainControl {
         texts: Mutex<Vec<String>>,
@@ -400,7 +412,7 @@ mod tests {
             &self.abort_flag
         }
 
-        fn take_user_interrupt_http_abort(&self, _request_id: u32) -> bool {
+        fn take_user_interrupt_http_abort(&self, _turn_id: TurnId) -> bool {
             false
         }
 
@@ -410,7 +422,7 @@ mod tests {
             queue.drain(..take).collect()
         }
 
-        fn clear_user_interrupt_abort(&self, _request_id: u32) {}
+        fn clear_user_interrupt_abort(&self, _turn_id: TurnId) {}
     }
 
     #[test]
@@ -433,12 +445,12 @@ mod tests {
             texts: Mutex::new(vec!["first".into(), "second".into()]),
             abort_flag: Arc::new(AtomicBool::new(false)),
         };
-        let request = RequestItem::default();
         let mut appended = AppendedMessages::empty();
 
         assert!(drain_user_interrupts(
             &control,
-            &request,
+            TurnId(1),
+            "sess",
             InterruptDrainPoint::AfterLlmBeforeTool,
             &mut appended,
         )
@@ -511,7 +523,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _input: &str,
-                _context: &CapabilityContext,
+                _context: &ToolContext,
             ) -> Result<CapabilityInvokeResult, CapabilityError> {
                 Ok(CapabilityInvokeResult {
                     output: "done".into(),
@@ -521,8 +533,8 @@ mod tests {
         }
 
         let invoker = OkInvoker;
-        let context = CapabilityContext::default();
-        let request = RequestItem::default();
+        let context = ToolContext::default();
+        let turn_id = TurnId(1);
         let response = LlmResponse {
             text: None,
             reasoning_content: None,
@@ -536,7 +548,7 @@ mod tests {
 
         let mut not_array = Value::Object(Default::default());
         assert!(matches!(
-            append_tool_results_messages(&invoker, &context, &mut not_array, &response, &request)
+            append_tool_results_messages(&invoker, &context, &mut not_array, &response, turn_id)
                 .unwrap_err(),
             IterationLoopError::MessagesNotArray
         ));
@@ -547,7 +559,7 @@ mod tests {
             &context,
             &mut messages,
             &response,
-            &request,
+            turn_id,
         )
         .expect("tool results");
         assert_eq!(runs.len(), 1);
@@ -558,7 +570,7 @@ mod tests {
 
     #[test]
     fn log_tool_call_names_handles_empty_and_null_names() {
-        log_tool_call_names(1, &LlmResponse {
+        log_tool_call_names(TurnId(1), &LlmResponse {
             text: None,
             reasoning_content: None,
             raw_message_json: None,
@@ -566,7 +578,7 @@ mod tests {
         });
 
         log_tool_call_names(
-            2,
+            TurnId(2),
             &LlmResponse {
                 text: None,
                 reasoning_content: None,

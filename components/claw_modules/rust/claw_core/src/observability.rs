@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_spec::{AgentRole, SemanticPhase, StatePatch};
+use crate::agent::{AgentRole, SemanticPhase, StatePatch};
 use crate::runtime::{ActionSummary, HarnessIterationOutput};
 
 /// Named span within one iteration.

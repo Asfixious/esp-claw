@@ -1,10 +1,10 @@
 //! Worker semantic FSM unit tests.
 
-use claw_core::agent_spec::{
+use claw_core::agent::{
     apply_patches, AgentRole, AgentSpec, AgentState, RoleState, RunStatus, TransitionInput,
     TransitionSignal, WorkerPhase,
 };
-use claw_core::agents::WorkerAgentSpec;
+use claw_core::WorkerAgentSpec;
 use claw_core::protocol::{AgentEvent, StepId, TaskId};
 
 const TASK: TaskId = TaskId(1);
@@ -42,8 +42,8 @@ fn worker_verify_pass_advances_or_done() {
     apply_patches(
         &mut state,
         &[
-            claw_core::agent_spec::StatePatch::SetPlanSteps(vec![StepId(1), StepId(2)]),
-            claw_core::agent_spec::StatePatch::SetWorkerPhase(WorkerPhase::Verify),
+            claw_core::agent::StatePatch::SetPlanSteps(vec![StepId(1), StepId(2)]),
+            claw_core::agent::StatePatch::SetWorkerPhase(WorkerPhase::Verify),
         ],
     );
     let out = spec.transition(
@@ -63,7 +63,7 @@ fn worker_verify_pass_advances_or_done() {
 
     apply_patches(
         &mut state,
-        &[claw_core::agent_spec::StatePatch::SetWorkerPhase(WorkerPhase::Verify)],
+        &[claw_core::agent::StatePatch::SetWorkerPhase(WorkerPhase::Verify)],
     );
     let out = spec.transition(
         &state,
@@ -85,7 +85,7 @@ fn worker_verify_fail_returns_to_act() {
     let mut state = AgentState::worker("w1", "run-1", TASK);
     apply_patches(
         &mut state,
-        &[claw_core::agent_spec::StatePatch::SetWorkerPhase(WorkerPhase::Verify)],
+        &[claw_core::agent::StatePatch::SetWorkerPhase(WorkerPhase::Verify)],
     );
     let out = spec.transition(
         &state,
@@ -124,7 +124,7 @@ fn worker_iteration_verify_text_fail() {
     let mut state = AgentState::worker("w1", "run-1", TASK);
     apply_patches(
         &mut state,
-        &[claw_core::agent_spec::StatePatch::SetWorkerPhase(WorkerPhase::Verify)],
+        &[claw_core::agent::StatePatch::SetWorkerPhase(WorkerPhase::Verify)],
     );
     let out = spec.transition(
         &state,

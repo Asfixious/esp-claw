@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::context::CapabilityContext;
+use crate::context::{CapabilityContext, ToolContext};
 use crate::error::CapabilityError;
 use crate::invoker::{CapabilityInvokeResult, CapabilityInvoker};
 
 type RustHandler = Box<
-    dyn Fn(&str, &CapabilityContext) -> Result<CapabilityInvokeResult, CapabilityError> + Send + Sync,
+    dyn Fn(&str, &ToolContext) -> Result<CapabilityInvokeResult, CapabilityError> + Send + Sync,
 >;
 
 /// Second-class backend for C-registered capabilities (`claw_cap.c`).
@@ -52,7 +52,7 @@ impl CapabilityInvoker for Registry {
         &self,
         capability_name: &str,
         input_json: &str,
-        context: &CapabilityContext,
+        context: &ToolContext,
     ) -> Result<CapabilityInvokeResult, CapabilityError> {
         if let Ok(handlers) = self.handlers.read() {
             if let Some(handler) = handlers.get(capability_name) {
@@ -62,6 +62,6 @@ impl CapabilityInvoker for Registry {
         let Some(backend) = &self.backend else {
             return Err(CapabilityError::NotFound);
         };
-        backend.invoke(capability_name, input_json, context)
+        backend.invoke(capability_name, input_json, &context.to_capability_context())
     }
 }

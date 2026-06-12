@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_spec::AgentRole;
+use crate::agent::AgentRole;
 use crate::protocol::TaskId;
 
 /// Logical memory partition.

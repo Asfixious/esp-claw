@@ -1,0 +1,11 @@
+[package]
+name = "claw_message_channel"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-channel message routing for agent ingress and egress"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror = "2"

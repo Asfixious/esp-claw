@@ -15,6 +15,7 @@ stage_verbose = []
 
 [dependencies]
 claw_cap = { path = "../claw_cap" }
+claw_message_channel = { path = "../claw_message_channel" }
 claw_interfaces = { path = "../claw_interfaces" }
 claw-api = { path = "../claw-api" }
 log = "0.4"

@@ -5,23 +5,24 @@ use std::sync::Arc;
 
 use claw_api::ClawApi;
 use claw_cap::CapabilityInvoker;
+use claw_message_channel::{InboundMessage, MessageChannelHub, OutboundMessage};
 
-use crate::agent_spec::{
-    apply_patches, AgentRole, AgentState, ContextBuildInput, RoleState, RunStatus,
-    TransitionInput, TransitionSignal,
+use crate::agent::{
+    apply_patches, AgentRegistry, AgentRole, AgentState, ContextBuildInput, RoleState, RunStatus,
+    StatePatch, TransitionInput, TransitionSignal, WorkerPhase,
 };
-use crate::agents::{FrontendAgentSpec, WorkerAgentSpec};
 use crate::memory::{snapshot_for_role, InMemoryScopedStore};
 use crate::observability::{hash_context, trace_from_iteration, InMemoryTraceSink, SpanName, TraceSink};
 use crate::protocol::{
-    AgentEvent, AgentEventQueue, Command, CommandQueue, SessionId, TaskContract, TaskId, TaskStatus,
-    UserInput, UserInputQueue, WorkerId,
+    AgentEvent, AgentEventQueue, Command, CommandQueue, SessionId, TaskContract, TaskId,
+    TaskStatus, TurnId,
+    WorkerId,
 };
-use crate::agent_registry::AgentRegistry;
-use crate::request::RequestItem;
+use crate::context::ContextAssembler;
 use crate::llm_output::{append_messages, parse_and_validate};
 use crate::runtime::{run_iteration, ActionSummary, HarnessIterationOutput, InstanceControl};
 
+//todo
 const DEFAULT_ENV_MANIFEST: &str = "target=host-dev\nnetwork=limited";
 const DEFAULT_GLOBAL_POLICY: &str = "Follow task contract and visible tools only.";
 const DEFAULT_MAX_LLM_ROUNDS_PER_TICK: u32 = 1;
@@ -45,8 +46,7 @@ impl Default for OrchestratorConfig {
 pub struct AgentInstance {
     pub state: AgentState,
     pub control: Arc<InstanceControl>,
-    pub request: RequestItem,
-    next_request_id: u32,
+    next_turn_id: TurnId,
 }
 
 impl AgentInstance {
@@ -55,11 +55,7 @@ impl AgentInstance {
         Self {
             state: AgentState::frontend(instance_id.clone(), run_id, session_id),
             control: Arc::new(InstanceControl::new()),
-            request: RequestItem {
-                session_id: Some(instance_id),
-                ..Default::default()
-            },
-            next_request_id: 1,
+            next_turn_id: TurnId(1),
         }
     }
 
@@ -68,24 +64,21 @@ impl AgentInstance {
         Self {
             state: AgentState::worker(instance_id.clone(), run_id, task_id),
             control: Arc::new(InstanceControl::new()),
-            request: RequestItem {
-                session_id: Some(instance_id),
-                ..Default::default()
-            },
-            next_request_id: 1,
+            next_turn_id: TurnId(1),
         }
     }
 
-    fn bump_request_id(&mut self) {
-        self.request.request_id = self.next_request_id;
-        self.next_request_id += 1;
+    fn bump_turn_id(&mut self) -> TurnId {
+        let turn_id = self.next_turn_id;
+        self.next_turn_id = TurnId(self.next_turn_id.0 + 1);
+        turn_id
     }
 }
 
 /// Multi-agent runtime orchestrator.
 pub struct RunOrchestrator {
     pub registry: AgentRegistry,
-    pub user_inputs: UserInputQueue,
+    pub message_hub: Arc<MessageChannelHub>,
     pub commands: CommandQueue,
     pub events: AgentEventQueue,
     pub tasks: HashMap<TaskId, TaskContract>,
@@ -101,12 +94,13 @@ pub struct RunOrchestrator {
 
 impl RunOrchestrator {
     pub fn new() -> Self {
-        let mut registry = AgentRegistry::new();
-        registry.register(Arc::new(FrontendAgentSpec::new()));
-        registry.register(Arc::new(WorkerAgentSpec::new()));
+        Self::with_registry(AgentRegistry::with_builtins())
+    }
+
+    pub fn with_registry(registry: AgentRegistry) -> Self {
         Self {
             registry,
-            user_inputs: UserInputQueue::new(),
+            message_hub: Arc::new(MessageChannelHub::new()),
             commands: CommandQueue::new(),
             events: AgentEventQueue::new(),
             tasks: HashMap::new(),
@@ -141,8 +135,20 @@ impl RunOrchestrator {
         self.instances.push(instance);
     }
 
-    pub fn submit_user_input(&self, input: UserInput) {
-        self.user_inputs.push(input);
+    pub fn submit_inbound(&self, msg: InboundMessage) {
+        self.message_hub.submit_inbound(msg);
+    }
+
+    pub fn send_outbound(&self, msg: OutboundMessage) -> Result<(), claw_message_channel::MessageError> {
+        self.message_hub.send(msg)
+    }
+
+    pub fn send_to_session(
+        &self,
+        session_id: &str,
+        text: impl Into<String>,
+    ) -> Result<(), claw_message_channel::MessageError> {
+        self.message_hub.send_to_session(session_id, text)
     }
 
     pub fn submit_command(&self, command: Command) {
@@ -155,7 +161,7 @@ impl RunOrchestrator {
 
     /// One scheduler tick: drain queues, then tick each runnable instance once.
     pub fn tick(&mut self) {
-        self.drain_user_inputs();
+        self.drain_inbound_messages();
         self.drain_commands();
         self.drain_events();
 
@@ -171,15 +177,17 @@ impl RunOrchestrator {
         }
     }
 
-    fn drain_user_inputs(&mut self) {
-        for input in self.user_inputs.drain() {
-            if let Some(instance) = self
-                .instances
-                .iter_mut()
-                .find(|i| matches!(&i.state.role_state, RoleState::Frontend(f) if f.session_id == input.session_id))
-            {
+    fn drain_inbound_messages(&mut self) {
+        for msg in self.message_hub.drain_inbound() {
+            if let Some(instance) = self.instances.iter_mut().find(|i| {
+                matches!(
+                    &i.state.role_state,
+                    RoleState::Frontend(f) if f.session_id.to_wire() == msg.session_id
+                        || i.state.instance_id == msg.session_id
+                )
+            }) {
                 if let RoleState::Frontend(frontend) = &mut instance.state.role_state {
-                    frontend.pending_user_text.push(input.text);
+                    frontend.pending_user_text.push(msg.text);
                 }
             }
         }
@@ -249,9 +257,9 @@ impl RunOrchestrator {
                                 apply_patches(
                                     &mut instance.state,
                                     &[
-                                        crate::agent_spec::StatePatch::SetAwaitingPlanApproval(false),
-                                        crate::agent_spec::StatePatch::SetWorkerPhase(
-                                            crate::agent_spec::WorkerPhase::Act,
+                                        StatePatch::SetAwaitingPlanApproval(false),
+                                        StatePatch::SetWorkerPhase(
+                                            WorkerPhase::Act,
                                         ),
                                     ],
                                 );
@@ -273,12 +281,12 @@ impl RunOrchestrator {
                     apply_patches(
                         &mut instance.state,
                         &[
-                            crate::agent_spec::StatePatch::SetPlanSteps(Vec::new()),
-                            crate::agent_spec::StatePatch::SetWorkerPhase(
-                                crate::agent_spec::WorkerPhase::Plan,
+                            StatePatch::SetPlanSteps(Vec::new()),
+                            StatePatch::SetWorkerPhase(
+                                WorkerPhase::Plan,
                             ),
-                            crate::agent_spec::StatePatch::SetRevisionNote(Some(note.clone())),
-                            crate::agent_spec::StatePatch::SetAwaitingPlanApproval(false),
+                            StatePatch::SetRevisionNote(Some(note.clone())),
+                            StatePatch::SetAwaitingPlanApproval(false),
                         ],
                     );
                     instance.state.run_status = RunStatus::Runnable;
@@ -294,7 +302,7 @@ impl RunOrchestrator {
                     {
                         apply_patches(
                             &mut frontend.state,
-                            &[crate::agent_spec::StatePatch::SetReportDraft(format!(
+                            &[StatePatch::SetReportDraft(format!(
                                 "plan revision requested: {note}"
                             ))],
                         );
@@ -307,11 +315,11 @@ impl RunOrchestrator {
                         matches!(&i.state.role_state, RoleState::Worker(w) if w.task_id == task_id)
                     }) {
                         if let RoleState::Worker(worker) = &instance.state.role_state {
-                            if worker.phase == crate::agent_spec::WorkerPhase::Paused {
+                            if worker.phase == WorkerPhase::Paused {
                                 apply_patches(
                                     &mut instance.state,
-                                    &[crate::agent_spec::StatePatch::SetWorkerPhase(
-                                        crate::agent_spec::WorkerPhase::Act,
+                                    &[StatePatch::SetWorkerPhase(
+                                        WorkerPhase::Act,
                                     )],
                                 );
                                 instance.state.run_status = RunStatus::Runnable;
@@ -414,9 +422,15 @@ impl RunOrchestrator {
             memory_snapshot: &memory_snapshot,
         };
 
-        let schema_name = spec.expected_schema(&build_input).name;
+        let schema = spec.expected_schema(&build_input);
+        let schema_name = schema.name.clone();
         let tools = spec.visible_tools(&build_input);
-        let bundle = spec.build_context(&build_input);
+        let bundle = ContextAssembler::assemble(
+            spec.as_ref(),
+            &build_input,
+            &schema,
+            tools.tools_json.as_deref(),
+        );
         let context_hash = hash_context(&bundle.system_prompt, &bundle.messages.to_string());
         let visible_tools: Vec<String> = tools
             .tools_json
@@ -424,15 +438,16 @@ impl RunOrchestrator {
             .map(|_| vec!["files".to_string()])
             .unwrap_or_default();
 
-        self.instances[idx].bump_request_id();
-        let request = self.instances[idx].request.clone();
+        let turn_id = self.instances[idx].bump_turn_id();
+        let session_id = self.instances[idx].state.instance_id.clone();
         let control = Arc::clone(&self.instances[idx].control);
 
         let mut output = match run_iteration(
             llm.as_ref(),
             self.capability_invoker.as_deref(),
             control.as_ref(),
-            &request,
+            turn_id,
+            &session_id,
             &bundle,
         ) {
             Ok(output) => output,
@@ -467,7 +482,7 @@ impl RunOrchestrator {
         apply_patches(&mut self.instances[idx].state, &transition_out.patches);
         apply_patches(
             &mut self.instances[idx].state,
-            &[crate::agent_spec::StatePatch::BumpIterationId],
+            &[StatePatch::BumpIterationId],
         );
 
         if let Some(worker_id) = self.worker_id_for_index(idx) {

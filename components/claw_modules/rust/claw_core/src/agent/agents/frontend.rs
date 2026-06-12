@@ -1,11 +1,14 @@
 //! Frontend semantic controller: INTAKE / CLARIFY / DELEGATE / WATCH / ASK_APPROVAL / REPORT.
 
-use crate::agent_spec::{
-    AgentRole, AgentSpec, AgentState, ContextBuildInput, ContextBundle, FrontendPhase,
-    OutputSchema, RoleState, RunStatus, SemanticPhase, StatePatch, ToolVisibility, TransitionInput,
-    TransitionOutput, TransitionSignal,
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+
+use crate::agent::{
+    AgentRegistrar, AgentRegistry, AgentRole, AgentSpec, AgentState, ContextBuildInput,
+    FrontendPhase, FrontendState, OutputSchema, RoleState, RunStatus, StatePatch,
+    ToolVisibility, TransitionInput, TransitionOutput, TransitionSignal,
 };
-use crate::context::ContextAssembler;
 use crate::llm_output::{FrontendIntakeAction, ValidatedLlmOutput};
 use crate::protocol::AgentEvent;
 
@@ -28,13 +31,43 @@ impl AgentSpec for FrontendAgentSpec {
         AgentRole::Frontend
     }
 
-    fn phase(&self, state: &AgentState) -> SemanticPhase {
-        state.semantic_phase()
+    fn state_block(&self, input: &ContextBuildInput<'_>) -> String {
+        let RoleState::Frontend(frontend) = &input.state.role_state else {
+            return "# STATE\n(invalid role)".to_string();
+        };
+        format!(
+            "# STATE\ninstance={}\nrun={}\niteration={}\nphase={:?}\ntask_id={:?}\nworker={:?}",
+            input.state.instance_id,
+            input.state.run_id,
+            input.state.iteration_id,
+            frontend.phase,
+            frontend.task_id,
+            frontend.worker_instance_id,
+        )
     }
 
-    fn build_context(&self, input: &ContextBuildInput<'_>) -> ContextBundle {
-        let schema = self.expected_schema(input);
-        ContextAssembler::assemble(input, &schema, None)
+    fn plan_block(&self, input: &ContextBuildInput<'_>) -> String {
+        let header = "# PLAN\n";
+        if let Some(task) = input.task {
+            format!(
+                "{header}task={}\ngoal={}\nstatus={:?}",
+                task.task_id, task.goal, task.status
+            )
+        } else {
+            format!("{header}(no active task)")
+        }
+    }
+
+    fn conversation_messages(&self, input: &ContextBuildInput<'_>) -> Value {
+        let RoleState::Frontend(frontend) = &input.state.role_state else {
+            return Value::Array(Vec::new());
+        };
+        let messages = frontend
+            .pending_user_text
+            .iter()
+            .map(|text| json!({"role": "user", "content": text}))
+            .collect();
+        Value::Array(messages)
     }
 
     fn visible_tools(&self, _input: &ContextBuildInput<'_>) -> ToolVisibility {
@@ -119,7 +152,7 @@ impl AgentSpec for FrontendAgentSpec {
 impl FrontendAgentSpec {
     fn transition_signal(
         &self,
-        frontend: &crate::agent_spec::FrontendState,
+        frontend: &FrontendState,
         signal: &TransitionSignal,
     ) -> TransitionOutput {
         let mut out = TransitionOutput::default();
@@ -143,9 +176,8 @@ impl FrontendAgentSpec {
                     worker_id,
                 },
             ) => {
-                out.patches.push(StatePatch::SetTaskId(task_id.clone()));
-                out.patches
-                    .push(StatePatch::SetWorkerInstanceId(worker_id.clone()));
+                out.patches.push(StatePatch::SetTaskId(*task_id));
+                out.patches.push(StatePatch::SetWorkerInstanceId(*worker_id));
                 out.patches
                     .push(StatePatch::SetFrontendPhase(FrontendPhase::Watch));
             }
@@ -165,7 +197,7 @@ impl FrontendAgentSpec {
 
     fn transition_iteration(
         &self,
-        frontend: &crate::agent_spec::FrontendState,
+        frontend: &FrontendState,
         iter: &crate::runtime::HarnessIterationOutput,
     ) -> TransitionOutput {
         let mut out = TransitionOutput::default();
@@ -202,5 +234,14 @@ impl FrontendAgentSpec {
             _ => {}
         }
         out
+    }
+}
+
+/// Registers [`FrontendAgentSpec`] into a registry.
+pub struct Registrar;
+
+impl AgentRegistrar for Registrar {
+    fn register(&self, registry: &mut AgentRegistry) {
+        registry.register(Arc::new(FrontendAgentSpec::new()));
     }
 }

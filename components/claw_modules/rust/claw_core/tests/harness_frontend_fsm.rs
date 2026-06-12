@@ -1,10 +1,10 @@
 //! Frontend semantic FSM unit tests.
 
-use claw_core::agent_spec::{
+use claw_core::agent::{
     apply_patches, AgentSpec, AgentState, FrontendPhase, RoleState, RunStatus, TransitionInput,
     TransitionSignal,
 };
-use claw_core::agents::FrontendAgentSpec;
+use claw_core::FrontendAgentSpec;
 use claw_core::protocol::{AgentEvent, SessionId, StepId, TaskId, WorkerId};
 
 const SESS: SessionId = SessionId(1);
@@ -36,7 +36,7 @@ fn frontend_delegate_to_watch_on_task_created() {
     let mut state = AgentState::frontend("fe-1", "run-1", SESS);
     apply_patches(
         &mut state,
-        &[claw_core::agent_spec::StatePatch::SetFrontendPhase(
+        &[claw_core::agent::StatePatch::SetFrontendPhase(
             FrontendPhase::Delegate,
         )],
     );
@@ -67,8 +67,8 @@ fn frontend_watch_done_moves_to_report() {
     apply_patches(
         &mut state,
         &[
-            claw_core::agent_spec::StatePatch::SetFrontendPhase(FrontendPhase::Watch),
-            claw_core::agent_spec::StatePatch::SetTaskId(TASK),
+            claw_core::agent::StatePatch::SetFrontendPhase(FrontendPhase::Watch),
+            claw_core::agent::StatePatch::SetTaskId(TASK),
         ],
     );
     let out = spec.handle_event(
@@ -95,8 +95,8 @@ fn frontend_approval_requested_moves_to_ask_approval() {
     apply_patches(
         &mut state,
         &[
-            claw_core::agent_spec::StatePatch::SetFrontendPhase(FrontendPhase::Watch),
-            claw_core::agent_spec::StatePatch::SetTaskId(TASK),
+            claw_core::agent::StatePatch::SetFrontendPhase(FrontendPhase::Watch),
+            claw_core::agent::StatePatch::SetTaskId(TASK),
         ],
     );
     let out = spec.handle_event(
@@ -122,7 +122,7 @@ fn frontend_report_to_done() {
     let mut state = AgentState::frontend("fe-1", "run-1", SESS);
     apply_patches(
         &mut state,
-        &[claw_core::agent_spec::StatePatch::SetFrontendPhase(
+        &[claw_core::agent::StatePatch::SetFrontendPhase(
             FrontendPhase::Report,
         )],
     );

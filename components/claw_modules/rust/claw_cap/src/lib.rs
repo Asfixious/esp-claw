@@ -9,7 +9,7 @@ pub mod error;
 pub mod invoker;
 pub mod registry;
 
-pub use context::{CapabilityCaller, CapabilityContext};
+pub use context::{CapabilityCaller, CapabilityContext, ToolContext};
 pub use error::CapabilityError;
 pub use invoker::{CapabilityInvokeResult, CapabilityInvoker};
 pub use registry::{Registry, RegistryBackend};

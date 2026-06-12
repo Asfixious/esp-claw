@@ -1,6 +1,6 @@
 //! Capability invoke trait and result type.
 
-use crate::context::CapabilityContext;
+use crate::context::ToolContext;
 use crate::error::CapabilityError;
 
 /// Outcome of one capability invocation for the agent tool loop.
@@ -20,6 +20,6 @@ pub trait CapabilityInvoker: Send + Sync {
         &self,
         capability_name: &str,
         input_json: &str,
-        context: &CapabilityContext,
+        context: &ToolContext,
     ) -> Result<CapabilityInvokeResult, CapabilityError>;
 }

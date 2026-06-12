@@ -7,14 +7,13 @@ use claw_api::ClawApi;
 use claw_cap::CapabilityInvoker;
 use serde::{Deserialize, Serialize};
 
-use crate::agent_spec::ContextBundle;
+use crate::agent::ContextBundle;
 use crate::llm_output::ValidatedLlmOutput;
 use crate::iteration_loop::{
     AppendedMessages, ChatMessages, IterationLoop, IterationLoopError, IterationLoopPhase,
     IterationResult, IterationStep, RequestControl, SystemPrompt, ToolSet,
 };
 use crate::observability::SpanName;
-use crate::request::RequestItem;
 
 /// Summary of model action from one iteration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -95,7 +94,7 @@ impl RequestControl for InstanceControl {
         &self.abort_flag
     }
 
-    fn take_user_interrupt_http_abort(&self, _request_id: u32) -> bool {
+    fn take_user_interrupt_http_abort(&self, _turn_id: crate::protocol::TurnId) -> bool {
         false
     }
 
@@ -105,7 +104,7 @@ impl RequestControl for InstanceControl {
         q.drain(..take).collect()
     }
 
-    fn clear_user_interrupt_abort(&self, _request_id: u32) {}
+    fn clear_user_interrupt_abort(&self, _turn_id: crate::protocol::TurnId) {}
 }
 
 /// Map [`IterationResult`] into harness output.
@@ -163,11 +162,13 @@ pub fn run_iteration(
     llm: &ClawApi,
     invoker: Option<&dyn CapabilityInvoker>,
     control: &InstanceControl,
-    request: &RequestItem,
+    turn_id: crate::protocol::TurnId,
+    session_id: &str,
     bundle: &ContextBundle,
 ) -> Result<HarnessIterationOutput, IterationLoopError> {
     let step = IterationStep {
-        request,
+        turn_id,
+        session_id,
         system_prompt: SystemPrompt(&bundle.system_prompt),
         messages: ChatMessages(&bundle.messages),
         tools: ToolSet::new(bundle.tools_json.as_deref()),

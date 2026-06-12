@@ -1,7 +1,7 @@
 //! Strongly typed identifiers.
 //!
 //! In memory these are numeric (`usize`). On the wire (JSON and [`Display`]) they use
-//! prefixed strings: `session-1`, `task-1`, `step-1`, `worker-1`.
+//! prefixed strings: `session-1`, `task-1`, `step-1`, `turn-1`, `worker-1`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -74,7 +74,15 @@ pub enum IdParseError {
 define_prefixed_id!(SessionId, "session-", "session");
 define_prefixed_id!(TaskId, "task-", "task");
 define_prefixed_id!(StepId, "step-", "step");
+define_prefixed_id!(TurnId, "turn-", "turn");
 define_prefixed_id!(WorkerId, "worker-", "worker");
+
+impl TurnId {
+    /// C / capability surface (`claw_cap_call_context_t.request_id`).
+    pub fn as_request_id(self) -> u32 {
+        self.0 as u32
+    }
+}
 
 impl WorkerId {
     /// Default mapping: one worker instance per task, same numeric suffix.
@@ -124,6 +132,12 @@ mod tests {
     }
 
     #[test]
+    fn turn_id_serializes_to_prefixed_string() {
+        let value = serde_json::to_value(TurnId(5)).unwrap();
+        assert_eq!(value, json!("turn-5"));
+    }
+
+    #[test]
     fn worker_id_serializes_to_prefixed_string() {
         let value = serde_json::to_value(WorkerId(5)).unwrap();
         assert_eq!(value, json!("worker-5"));
@@ -134,8 +148,10 @@ mod tests {
         let session: SessionId = serde_json::from_value(json!("session-7")).unwrap();
         let task: TaskId = serde_json::from_value(json!("task-3")).unwrap();
         let step: StepId = serde_json::from_value(json!("step-2")).unwrap();
+        let turn: TurnId = serde_json::from_value(json!("turn-4")).unwrap();
         let worker: WorkerId = serde_json::from_value(json!("worker-9")).unwrap();
         assert_eq!(session, SessionId(7));
+        assert_eq!(turn, TurnId(4));
         assert_eq!(task, TaskId(3));
         assert_eq!(step, StepId(2));
         assert_eq!(worker, WorkerId(9));
@@ -182,6 +198,8 @@ mod tests {
         assert_eq!(SessionId(1).to_string(), "session-1");
         assert_eq!(TaskId(1).to_string(), "task-1");
         assert_eq!(StepId(1).to_string(), "step-1");
+        assert_eq!(TurnId(1).to_string(), "turn-1");
         assert_eq!(WorkerId(1).to_string(), "worker-1");
+        assert_eq!(TurnId(42).as_request_id(), 42);
     }
 }

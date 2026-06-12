@@ -1,57 +1,47 @@
 //! One LLM/tool round-trip per [`IterationLoop`].
 //!
-//! [`IterationLoop`] is stateless and models exactly **one** iteration step:
-//! OpenAI-style chat inputs in, LLM call, optional tool dispatch out. Turn
-//! bookkeeping, context assembly, observers, and stage publishing live above
-//! this layer.
+//! Layer 3 only: pass chat + [`IterationTools`], LLM picks tool calls, we invoke
+//! them, return which tools ran. No session, channel, or routing concepts here.
+//!
+//! On preemption this layer only detects the signal and ends the iteration.
+//! It does not read, format, or return interrupt message content — upper layers
+//! own pending input and context rebuild.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
 
-use claw_api::{ChatError, ChatRequest, ClawApi, LlmResponse};
-use claw_cap::{CapabilityError, CapabilityInvokeResult, CapabilityInvoker};
+use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse};
+use crate::tools::{ToolError, ToolInvocation, ToolOutput};
 
-use crate::protocol::TurnId;
+use crate::protocol::IterationId;
 
 /// Errors from one [`IterationLoop::run`] step.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum IterationLoopError {
     #[error("messages must be a JSON array")]
     MessagesNotArray,
-    #[error("tool calls require a configured capability invoker")]
-    MissingCapabilityInvoker,
     #[error("LLM tool-call response missing raw assistant message JSON")]
     MissingAssistantMessage,
     #[error("LLM raw assistant message JSON is not valid JSON")]
     MalformedAssistantMessage,
+    #[error("LLM issued tool calls but no tools port was supplied")]
+    MissingTools,
     #[error(transparent)]
     Chat(#[from] ChatError),
     #[error(transparent)]
-    Capability(#[from] CapabilityError),
+    Tool(#[from] ToolError),
 }
 
-/// Internal iteration phase for interrupt gating and diagnostics.
+/// Checkpoint where preemption was detected. The iteration is terminal at this point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IterationLoopPhase {
-    Idle,
-    BeforeLlmHttp,
-    InLlmHttp,
-    AfterLlmBeforeTool,
-    RunningTool,
-    Finalizing,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InterruptDrainPoint {
+pub enum IterationCheckpoint {
     BeforeLlmHttp,
     InLlmHttpAbort,
     AfterLlmBeforeTool,
+    BeforeTool,
 }
-
-/// Max user-interrupt messages drained per checkpoint.
-const INSERT_QUEUE_LEN: usize = 4;
 
 /// Borrowed OpenAI-style system prompt for one LLM call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +57,7 @@ impl AsRef<str> for SystemPrompt<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChatMessages<'a>(pub &'a Value);
 
-/// Owned message batch appended by one step (tool round or user interrupt).
+/// Owned message batch appended by one completed step (assistant/tool round).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct AppendedMessages(pub Value);
 
@@ -81,57 +71,66 @@ impl AppendedMessages {
             dest.extend(src.iter().cloned());
         }
     }
-}
 
-/// Borrowed model-facing tool schemas for one iteration step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ToolSet<'a> {
-    tools_json: Option<&'a str>,
-}
-
-impl<'a> ToolSet<'a> {
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    pub fn new(tools_json: Option<&'a str>) -> Self {
-        Self { tools_json }
-    }
-
-    pub fn as_json(self) -> Option<&'a str> {
-        self.tools_json
+    fn as_produced_snapshot(&self) -> Option<AppendedMessages> {
+        match self.0.as_array() {
+            Some(items) if !items.is_empty() => Some(self.clone()),
+            _ => None,
+        }
     }
 }
 
-/// Inputs for exactly one [`IterationLoop::run`]: borrowed OpenAI chat request
-/// fields plus turn identity for tool dispatch and interrupt handling.
+/// Tools available for one iteration: schemas for the LLM plus invoke-by-name.
+pub trait IterationTools: Send + Sync {
+    /// OpenAI-style tools JSON sent to the LLM, if any.
+    fn schemas_json(&self) -> Option<&str>;
+
+    /// Execute one model `tool_call`.
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError>;
+}
+
+/// Inputs for exactly one [`IterationLoop::run`]: chat fields + optional tools.
 pub struct IterationStep<'a> {
-    pub turn_id: TurnId,
-    pub session_id: &'a str,
+    pub iteration_id: IterationId,
     pub system_prompt: SystemPrompt<'a>,
     pub messages: ChatMessages<'a>,
-    pub tools: ToolSet<'a>,
+    pub tools: Option<&'a dyn IterationTools>,
 }
 
-/// Outcome of exactly one [`IterationLoop::run`].
+/// Terminal outcome of exactly one [`IterationLoop::run`] (completed or preempted).
+#[derive(Clone, Debug)]
+pub enum IterationOutcome {
+    Completed(CompletedOutcome),
+    Preempted(PreemptedOutcome),
+}
+
+/// One [`IterationLoop::run`] step: [`IterationOutcome`] or [`IterationLoopError`].
+pub type IterationResult = Result<IterationOutcome, IterationLoopError>;
+
+/// Successful iteration: plain-text answer or executed tool round.
 #[derive(Clone, Debug, PartialEq)]
-pub enum IterationResult {
-    Tools(ToolsOutcome),
-    PlainText(PlainTextOutcome),
-    Interrupted(InterruptedOutcome),
+pub struct CompletedOutcome {
+    pub iteration_id: IterationId,
+    pub kind: CompletedKind,
 }
 
-/// One executed tool call (for turn-level observers above this layer).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompletedKind {
+    PlainText(PlainTextOutcome),
+    Tools(ToolsOutcome),
+}
+
+/// One executed tool call (for iteration-level observers above this layer).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolRun {
     pub name: String,
     pub ok: bool,
 }
 
-/// The model issued tool calls.
+/// The model issued tool calls and they were executed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolsOutcome {
-    /// Assistant + tool messages produced this step (turn layer merges).
+    /// Assistant + tool messages produced this step (iteration layer merges).
     pub appended: AppendedMessages,
     pub runs: Vec<ToolRun>,
 }
@@ -143,162 +142,181 @@ pub struct PlainTextOutcome {
     pub raw_message_json: Option<String>,
 }
 
-/// User interrupts were drained; merge `appended` then re-assemble.
+/// Iteration ended at a preempt checkpoint.
+///
+/// `produced` carries assistant/tool messages already materialized this step
+/// (not interrupt message content). Upper layers decide whether to merge them.
 #[derive(Clone, Debug, PartialEq)]
-pub struct InterruptedOutcome {
-    pub appended: AppendedMessages,
+pub struct PreemptedOutcome {
+    pub iteration_id: IterationId,
+    pub checkpoint: IterationCheckpoint,
+    pub produced: Option<AppendedMessages>,
 }
 
-/// Per-request interrupt, cancel, and phase surface used during one iteration.
-pub trait RequestControl: Send + Sync {
-    fn set_phase(&self, phase: IterationLoopPhase);
-    fn abort_flag(&self) -> &Arc<AtomicBool>;
-    fn take_user_interrupt_http_abort(&self, turn_id: TurnId) -> bool;
-    fn dequeue_inserted_user_inputs(&self, session_id: &str, max: usize) -> Vec<String>;
-    fn clear_user_interrupt_abort(&self, turn_id: TurnId);
+/// User interrupt surface for one in-flight iteration. No message payloads here.
+///
+/// Contract with [`claw_interfaces::http::ClawHttp`]:
+/// - Upper layer sets `interrupt_flag` to request cooperative abort.
+/// - HTTP polls the flag and returns [`claw_interfaces::http::HttpError::Aborted`]
+///   without clearing it (`claw_sys` / ESP HTTP keeps the flag intact).
+/// - [`IterationLoop`] consumes the flag via `swap(false)` when ending preempted.
+pub trait InterruptionControl: Send + Sync {
+    /// Polled at checkpoints (consume) and passed to in-flight LLM HTTP (cooperative abort).
+    fn interrupt_flag(&self) -> &Arc<AtomicBool>;
 }
 
-/// One-step executor; holds only what a single iteration needs (no [`crate::core::Core`]).
+/// One-step executor: LLM + preempt control only. Tools live on [`IterationStep`].
 pub struct IterationLoop<'a> {
     pub llm: &'a ClawApi,
-    pub capability_invoker: Option<&'a dyn CapabilityInvoker>,
-    pub control: &'a dyn RequestControl,
+    pub interruption: &'a dyn InterruptionControl,
 }
 
 impl IterationLoop<'_> {
     /// Execute exactly one iteration: LLM chat → optional tool execution.
-    pub fn run(&self, step: IterationStep<'_>) -> Result<IterationResult, IterationLoopError> {
+    pub fn run(&self, step: IterationStep<'_>) -> IterationResult {
         run_one_iteration(self, step)
     }
 }
 
-fn run_one_iteration(
-    loop_: &IterationLoop<'_>,
-    step: IterationStep<'_>,
-) -> Result<IterationResult, IterationLoopError> {
-    let turn_id = step.turn_id;
-    let session_id = step.session_id;
+fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> IterationResult {
+    let iteration_id = step.iteration_id;
     let mut appended = AppendedMessages::empty();
 
-    loop_.control.set_phase(IterationLoopPhase::BeforeLlmHttp);
-    if drain_user_interrupts(
-        loop_.control,
-        turn_id,
-        session_id,
-        InterruptDrainPoint::BeforeLlmHttp,
-        &mut appended,
-    )? {
-        return Ok(IterationResult::Interrupted(InterruptedOutcome { appended }));
+    if let Some(outcome) = check_preempt_at_checkpoint(
+        loop_.interruption,
+        iteration_id,
+        IterationCheckpoint::BeforeLlmHttp,
+        None,
+    ) {
+        return Ok(IterationOutcome::Preempted(outcome));
     }
 
-    loop_.control.set_phase(IterationLoopPhase::InLlmHttp);
     let chat_request = ChatRequest {
         system_prompt: step.system_prompt.as_ref(),
         messages: step.messages.0,
-        tools_json: step.tools.as_json(),
+        tools_json: step.tools.and_then(|t| t.schemas_json()),
     };
-    let llm_response = match loop_.llm.chat(&chat_request, loop_.control.abort_flag()) {
+    let llm_response = match loop_
+        .llm
+        .chat(&chat_request, loop_.interruption.interrupt_flag())
+    {
         Ok(resp) => resp,
         Err(llm_err) => {
-            if loop_
-                .control
-                .take_user_interrupt_http_abort(turn_id)
-                && drain_user_interrupts(
-                    loop_.control,
-                    turn_id,
-                    session_id,
-                    InterruptDrainPoint::InLlmHttpAbort,
-                    &mut appended,
-                )?
-            {
-                return Ok(IterationResult::Interrupted(InterruptedOutcome { appended }));
+            if llm_http_preempted(loop_.interruption, &llm_err) {
+                return Ok(IterationOutcome::Preempted(PreemptedOutcome {
+                    iteration_id,
+                    checkpoint: IterationCheckpoint::InLlmHttpAbort,
+                    produced: None,
+                }));
             }
             return Err(IterationLoopError::Chat(llm_err));
         }
     };
 
     if llm_response.tool_calls.is_empty() {
-        loop_.control.set_phase(IterationLoopPhase::Finalizing);
+        if let Some(outcome) = check_preempt_at_checkpoint(
+            loop_.interruption,
+            iteration_id,
+            IterationCheckpoint::AfterLlmBeforeTool,
+            None,
+        ) {
+            return Ok(IterationOutcome::Preempted(outcome));
+        }
+
         let text = llm_response.text.clone().unwrap_or_default();
         log::info!(
-            "completion turn={} status=done raw={}",
-            turn_id,
+            "completion iteration={} status=done raw={}",
+            iteration_id,
             crate::util::truncate_for_log(&text)
         );
-        return Ok(IterationResult::PlainText(PlainTextOutcome {
-            text,
-            raw_message_json: llm_response.raw_message_json.clone(),
+        return Ok(IterationOutcome::Completed(CompletedOutcome {
+            iteration_id,
+            kind: CompletedKind::PlainText(PlainTextOutcome {
+                text,
+                raw_message_json: llm_response.raw_message_json.clone(),
+            }),
         }));
     }
 
-    loop_
-        .control
-        .set_phase(IterationLoopPhase::AfterLlmBeforeTool);
-    if drain_user_interrupts(
-        loop_.control,
-        turn_id,
-        session_id,
-        InterruptDrainPoint::AfterLlmBeforeTool,
-        &mut appended,
-    )? {
-        return Ok(IterationResult::Interrupted(InterruptedOutcome { appended }));
+    if let Some(outcome) = check_preempt_at_checkpoint(
+        loop_.interruption,
+        iteration_id,
+        IterationCheckpoint::AfterLlmBeforeTool,
+        None,
+    ) {
+        return Ok(IterationOutcome::Preempted(outcome));
     }
 
-    loop_.control.set_phase(IterationLoopPhase::RunningTool);
-    log_tool_call_names(turn_id, &llm_response);
+    log_tool_call_names(iteration_id, &llm_response);
 
-    append_assistant_tool_calls(&mut appended.0, &llm_response)?;
+    let Some(tools) = step.tools else {
+        return Err(IterationLoopError::MissingTools);
+    };
 
-    let Some(invoker) = loop_.capability_invoker else {
-        return Err(IterationLoopError::MissingCapabilityInvoker);
-    };
-    let tool_context = claw_cap::ToolContext {
-        turn_id: turn_id.as_request_id(),
-        session_id: Some(session_id.to_string()),
-    };
-    let runs = append_tool_results_messages(
-        invoker,
-        &tool_context,
-        &mut appended.0,
+    if let Err(err) = append_assistant_tool_calls(&mut appended.0, &llm_response) {
+        return Err(err);
+    }
+
+    match run_tool_calls(
+        loop_.interruption,
+        tools,
+        &mut appended,
         &llm_response,
-        turn_id,
-    )?;
-
-    Ok(IterationResult::Tools(ToolsOutcome { appended, runs }))
+        iteration_id,
+    ) {
+        ToolRoundResult::Completed { runs } => Ok(IterationOutcome::Completed(CompletedOutcome {
+            iteration_id,
+            kind: CompletedKind::Tools(ToolsOutcome { appended, runs }),
+        })),
+        ToolRoundResult::Preempted(outcome) => Ok(IterationOutcome::Preempted(outcome)),
+        ToolRoundResult::Failed(err) => Err(err),
+    }
 }
 
-fn drain_user_interrupts(
-    control: &dyn RequestControl,
-    turn_id: TurnId,
-    session_id: &str,
-    timing: InterruptDrainPoint,
-    appended: &mut AppendedMessages,
-) -> Result<bool, IterationLoopError> {
-    let texts = control.dequeue_inserted_user_inputs(session_id, INSERT_QUEUE_LEN);
-    if texts.is_empty() {
-        return Ok(false);
+enum ToolRoundResult {
+    Completed { runs: Vec<ToolRun> },
+    Preempted(PreemptedOutcome),
+    Failed(IterationLoopError),
+}
+
+fn take_interrupt(interruption: &dyn InterruptionControl) -> bool {
+    interruption
+        .interrupt_flag()
+        .swap(false, Ordering::AcqRel)
+}
+
+/// True when an in-flight LLM HTTP ended because of user interrupt.
+fn llm_http_preempted(interruption: &dyn InterruptionControl, err: &ChatError) -> bool {
+    if take_interrupt(interruption) {
+        return true;
     }
-    control.clear_user_interrupt_abort(turn_id);
+    matches!(
+        err,
+        ChatError::Api(ClawApiError::Transport(msg)) if msg.contains("aborted")
+    )
+}
+
+fn check_preempt_at_checkpoint(
+    interruption: &dyn InterruptionControl,
+    iteration_id: IterationId,
+    checkpoint: IterationCheckpoint,
+    produced: Option<AppendedMessages>,
+) -> Option<PreemptedOutcome> {
+    if !take_interrupt(interruption) {
+        return None;
+    }
 
     log::info!(
-        "user_interrupt_triggered turn={} timing={:?} count={}",
-        turn_id,
-        timing,
-        texts.len()
+        "iteration_preempted iteration={} checkpoint={:?}",
+        iteration_id,
+        checkpoint
     );
 
-    for text in &texts {
-        append_user_message(&mut appended.0, text)?;
-    }
-    Ok(true)
-}
-
-fn append_user_message(messages: &mut Value, text: &str) -> Result<(), IterationLoopError> {
-    let Some(arr) = messages.as_array_mut() else {
-        return Err(IterationLoopError::MessagesNotArray);
-    };
-    arr.push(serde_json::json!({ "role": "user", "content": text }));
-    Ok(())
+    Some(PreemptedOutcome {
+        iteration_id,
+        checkpoint,
+        produced,
+    })
 }
 
 fn append_assistant_tool_calls(
@@ -320,32 +338,48 @@ fn append_assistant_tool_calls(
     }
 }
 
-fn append_tool_results_messages(
-    invoker: &dyn CapabilityInvoker,
-    context: &claw_cap::ToolContext,
-    runtime_messages: &mut Value,
+fn run_tool_calls(
+    interruption: &dyn InterruptionControl,
+    tools: &dyn IterationTools,
+    appended: &mut AppendedMessages,
     response: &LlmResponse,
-    turn_id: TurnId,
-) -> Result<Vec<ToolRun>, IterationLoopError> {
-    let Some(runtime_arr) = runtime_messages.as_array_mut() else {
-        return Err(IterationLoopError::MessagesNotArray);
-    };
+    iteration_id: IterationId,
+) -> ToolRoundResult {
+    if appended.0.as_array().is_none() {
+        return ToolRoundResult::Failed(IterationLoopError::MessagesNotArray);
+    }
+
     let mut runs: Vec<ToolRun> = Vec::with_capacity(response.tool_calls.len());
 
     for tc in &response.tool_calls {
+        if let Some(outcome) = check_preempt_at_checkpoint(
+            interruption,
+            iteration_id,
+            IterationCheckpoint::BeforeTool,
+            appended.as_produced_snapshot(),
+        ) {
+            return ToolRoundResult::Preempted(outcome);
+        }
+
         log::info!(
-            "tool_call turn={} name={} args={}",
-            turn_id,
+            "tool_call iteration={} name={} args={}",
+            iteration_id,
             if tc.name.is_empty() { "(null)" } else { &tc.name },
             tc.arguments_json
         );
 
-        let CapabilityInvokeResult { output, ok } =
-            invoker.invoke(&tc.name, &tc.arguments_json, context)?;
+        let ToolOutput { output, ok } = match tools.invoke(&ToolInvocation {
+            id: Some(&tc.id),
+            name: &tc.name,
+            arguments_json: &tc.arguments_json,
+        }) {
+            Ok(output) => output,
+            Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
+        };
 
         log::info!(
-            "tool_result turn={} name={} ok={} output={}",
-            turn_id,
+            "tool_result iteration={} name={} ok={} output={}",
+            iteration_id,
             if tc.name.is_empty() { "(null)" } else { &tc.name },
             ok,
             output
@@ -358,6 +392,9 @@ fn append_tool_results_messages(
             "is_error": !ok,
         });
 
+        let Some(runtime_arr) = appended.0.as_array_mut() else {
+            return ToolRoundResult::Failed(IterationLoopError::MessagesNotArray);
+        };
         runtime_arr.push(tool_message);
         runs.push(ToolRun {
             name: if tc.name.is_empty() {
@@ -369,10 +406,10 @@ fn append_tool_results_messages(
         });
     }
 
-    Ok(runs)
+    ToolRoundResult::Completed { runs }
 }
 
-fn log_tool_call_names(turn_id: TurnId, response: &LlmResponse) {
+fn log_tool_call_names(iteration_id: IterationId, response: &LlmResponse) {
     if response.tool_calls.is_empty() {
         return;
     }
@@ -382,8 +419,8 @@ fn log_tool_call_names(turn_id: TurnId, response: &LlmResponse) {
         .map(|tc| if tc.name.is_empty() { "(null)" } else { tc.name.as_str() })
         .collect();
     log::debug!(
-        "llm_tool_calls turn={} count={} names={}",
-        turn_id,
+        "llm_tool_calls iteration={} count={} names={}",
+        iteration_id,
         response.tool_calls.len(),
         names.join(",")
     );
@@ -391,82 +428,82 @@ fn log_tool_call_names(turn_id: TurnId, response: &LlmResponse) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     use super::*;
     use claw_api::ToolCall;
-    use claw_cap::ToolContext;
+    use serde_json::json;
 
-    use crate::protocol::TurnId;
-
-    struct DrainControl {
-        texts: Mutex<Vec<String>>,
-        abort_flag: Arc<AtomicBool>,
+    struct FlagControl {
+        interrupt: Arc<AtomicBool>,
     }
 
-    impl RequestControl for DrainControl {
-        fn set_phase(&self, _phase: IterationLoopPhase) {}
-
-        fn abort_flag(&self) -> &Arc<AtomicBool> {
-            &self.abort_flag
+    impl FlagControl {
+        fn new() -> Self {
+            Self {
+                interrupt: Arc::new(AtomicBool::new(false)),
+            }
         }
 
-        fn take_user_interrupt_http_abort(&self, _turn_id: TurnId) -> bool {
-            false
+        fn signal_interrupt(&self) {
+            self.interrupt.store(true, Ordering::Release);
         }
+    }
 
-        fn dequeue_inserted_user_inputs(&self, _session_id: &str, max: usize) -> Vec<String> {
-            let mut queue = self.texts.lock().unwrap();
-            let take = max.min(queue.len());
-            queue.drain(..take).collect()
+    impl InterruptionControl for FlagControl {
+        fn interrupt_flag(&self) -> &Arc<AtomicBool> {
+            &self.interrupt
         }
-
-        fn clear_user_interrupt_abort(&self, _turn_id: TurnId) {}
     }
 
     #[test]
-    fn tool_set_none_and_as_json() {
-        assert_eq!(ToolSet::none().as_json(), None);
-        let tools = r#"[{"type":"function"}]"#;
-        assert_eq!(ToolSet::new(Some(tools)).as_json(), Some(tools));
-    }
+    fn check_preempt_at_checkpoint_consumes_interrupt_flag() {
+        let interruption = FlagControl::new();
+        interruption.signal_interrupt();
 
-    #[test]
-    fn append_user_message_appends_to_array() {
-        let mut messages = Value::Array(Vec::new());
-        append_user_message(&mut messages, "hi").expect("append");
-        assert_eq!(messages[0]["content"], "hi");
-    }
-
-    #[test]
-    fn drain_user_interrupts_appends_queued_messages() {
-        let control = DrainControl {
-            texts: Mutex::new(vec!["first".into(), "second".into()]),
-            abort_flag: Arc::new(AtomicBool::new(false)),
-        };
-        let mut appended = AppendedMessages::empty();
-
-        assert!(drain_user_interrupts(
-            &control,
-            TurnId(1),
-            "sess",
-            InterruptDrainPoint::AfterLlmBeforeTool,
-            &mut appended,
+        let outcome = check_preempt_at_checkpoint(
+            &interruption,
+            IterationId(1),
+            IterationCheckpoint::AfterLlmBeforeTool,
+            None,
         )
-        .expect("drain"));
+        .expect("preempt");
 
-        let items = appended.0.as_array().expect("array");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["content"], "first");
-        assert_eq!(items[1]["content"], "second");
+        assert_eq!(outcome.checkpoint, IterationCheckpoint::AfterLlmBeforeTool);
+        assert!(outcome.produced.is_none());
+        assert!(!interruption.interrupt_flag().load(Ordering::Acquire));
     }
 
     #[test]
-    fn append_user_message_rejects_non_array() {
-        let mut messages = Value::String("not-an-array".into());
-        let err = append_user_message(&mut messages, "hi").unwrap_err();
-        assert!(matches!(err, IterationLoopError::MessagesNotArray));
+    fn check_preempt_at_checkpoint_returns_produced_snapshot() {
+        let interruption = FlagControl::new();
+        interruption.signal_interrupt();
+
+        let produced = AppendedMessages(json!([
+            {"role": "assistant"},
+            {"role": "tool", "content": "partial"}
+        ]));
+        let outcome = check_preempt_at_checkpoint(
+            &interruption,
+            IterationId(1),
+            IterationCheckpoint::BeforeTool,
+            produced.as_produced_snapshot(),
+        )
+        .expect("preempt");
+
+        let produced = outcome.produced.expect("produced");
+        let items = produced.0.as_array().expect("array");
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn llm_http_preempted_accepts_transport_abort_without_flag() {
+        let interruption = FlagControl::new();
+        let err = ChatError::Api(ClawApiError::Transport(
+            "HTTP transport error: HTTP request aborted by caller".into(),
+        ));
+        assert!(llm_http_preempted(&interruption, &err));
     }
 
     #[test]
@@ -516,25 +553,24 @@ mod tests {
     }
 
     #[test]
-    fn append_tool_results_messages_error_and_empty_name() {
-        struct OkInvoker;
-        impl CapabilityInvoker for OkInvoker {
-            fn invoke(
-                &self,
-                _name: &str,
-                _input: &str,
-                _context: &ToolContext,
-            ) -> Result<CapabilityInvokeResult, CapabilityError> {
-                Ok(CapabilityInvokeResult {
+    fn run_tool_calls_error_and_empty_name() {
+        struct OkTools;
+        impl IterationTools for OkTools {
+            fn schemas_json(&self) -> Option<&str> {
+                None
+            }
+
+            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput {
                     output: "done".into(),
                     ok: false,
                 })
             }
         }
 
-        let invoker = OkInvoker;
-        let context = ToolContext::default();
-        let turn_id = TurnId(1);
+        let interruption = FlagControl::new();
+        let tools = OkTools;
+        let iteration_id = IterationId(1);
         let response = LlmResponse {
             text: None,
             reasoning_content: None,
@@ -546,31 +582,38 @@ mod tests {
             }],
         };
 
-        let mut not_array = Value::Object(Default::default());
+        let mut not_array = AppendedMessages(Value::Object(Default::default()));
         assert!(matches!(
-            append_tool_results_messages(&invoker, &context, &mut not_array, &response, turn_id)
-                .unwrap_err(),
-            IterationLoopError::MessagesNotArray
+            run_tool_calls(&interruption, &tools, &mut not_array, &response, iteration_id),
+            ToolRoundResult::Failed(IterationLoopError::MessagesNotArray)
         ));
 
-        let mut messages = Value::Array(Vec::new());
-        let runs = append_tool_results_messages(
-            &invoker,
-            &context,
-            &mut messages,
-            &response,
-            turn_id,
+        let mut appended = AppendedMessages::empty();
+        append_assistant_tool_calls(
+            &mut appended.0,
+            &LlmResponse {
+                text: None,
+                reasoning_content: None,
+                raw_message_json: Some(r#"{"role":"assistant"}"#.into()),
+                tool_calls: vec![],
+            },
         )
-        .expect("tool results");
+        .expect("assistant");
+
+        let ToolRoundResult::Completed { runs } =
+            run_tool_calls(&interruption, &tools, &mut appended, &response, iteration_id)
+        else {
+            panic!("expected completed tool round");
+        };
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].name, "(null)");
         assert!(!runs[0].ok);
-        assert_eq!(messages[0]["is_error"], true);
+        assert_eq!(appended.0[1]["is_error"], true);
     }
 
     #[test]
     fn log_tool_call_names_handles_empty_and_null_names() {
-        log_tool_call_names(TurnId(1), &LlmResponse {
+        log_tool_call_names(IterationId(1), &LlmResponse {
             text: None,
             reasoning_content: None,
             raw_message_json: None,
@@ -578,7 +621,7 @@ mod tests {
         });
 
         log_tool_call_names(
-            TurnId(2),
+            IterationId(2),
             &LlmResponse {
                 text: None,
                 reasoning_content: None,

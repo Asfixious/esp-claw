@@ -22,6 +22,10 @@ log = "0.4"
 serde_json = "1"
 libc = "0.2"
 
+[features]
+default = []
+legacy-core = []
+
 [lints.rust]
 # `claw_freertos_ext_mem` is set via rustflags from CMake when the IDF option
 # CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is enabled (used by the task ABI).

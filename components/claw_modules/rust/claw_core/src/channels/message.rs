@@ -1,6 +1,10 @@
-//! Owned inbound/outbound message envelopes.
+//! Channel message types and routing metadata.
 
-/// Reply routing snapshot for one agent session (updated on each inbound).
+use crate::protocol::{Command, SessionId};
+
+use thiserror::Error;
+
+/// Reply routing snapshot for one session (updated on each inbound).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplyRoute {
     pub channel: String,
@@ -20,15 +24,20 @@ impl ReplyRoute {
     }
 }
 
+/// Orchestrator command scoped to one session (framework routes by [`SessionId`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundCommand {
+    pub session_id: SessionId,
+    pub command: Command,
+}
+
 /// User or IM message submitted from an external channel adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboundMessage {
     pub message_id: String,
-    /// Routing key matching a registered [`super::channel::MessageChannel`] id.
     pub channel: String,
     pub chat_id: String,
     pub sender_id: Option<String>,
-    /// Agent session resolved by the channel adapter before submit.
     pub session_id: String,
     pub text: String,
 }
@@ -40,4 +49,14 @@ pub struct OutboundMessage {
     pub chat_id: String,
     pub text: String,
     pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ChannelError {
+    #[error("channel not found: {0}")]
+    ChannelNotFound(String),
+    #[error("no reply route for session: {0}")]
+    SessionRouteNotFound(String),
+    #[error("channel send failed: {0}")]
+    SendFailed(String),
 }

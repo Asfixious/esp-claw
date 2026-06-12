@@ -5,8 +5,14 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentRole;
 use crate::protocol::TaskId;
+
+/// Runtime role for memory read policy (agent layer TBD).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RuntimeRole {
+    Frontend,
+    Worker,
+}
 
 /// Logical memory partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,11 +60,17 @@ impl ScopedMemoryStore for InMemoryScopedStore {
 }
 
 /// Returns whether `role` may read `scope`.
-pub fn role_may_read(role: AgentRole, scope: MemoryScope) -> bool {
+pub fn role_may_read(role: RuntimeRole, scope: MemoryScope) -> bool {
     match (role, scope) {
         (_, MemoryScope::GlobalPolicy) => true,
-        (AgentRole::Frontend, MemoryScope::FrontendPrivate | MemoryScope::TaskShared | MemoryScope::ProjectShared) => true,
-        (AgentRole::Worker, MemoryScope::WorkerPrivate | MemoryScope::TaskShared | MemoryScope::ProjectShared) => true,
+        (
+            RuntimeRole::Frontend,
+            MemoryScope::FrontendPrivate | MemoryScope::TaskShared | MemoryScope::ProjectShared,
+        ) => true,
+        (
+            RuntimeRole::Worker,
+            MemoryScope::WorkerPrivate | MemoryScope::TaskShared | MemoryScope::ProjectShared,
+        ) => true,
         _ => false,
     }
 }
@@ -66,7 +78,7 @@ pub fn role_may_read(role: AgentRole, scope: MemoryScope) -> bool {
 /// Build a memory snapshot string for context injection, enforcing read policy.
 pub fn snapshot_for_role(
     store: &dyn ScopedMemoryStore,
-    role: AgentRole,
+    role: RuntimeRole,
     task_id: Option<TaskId>,
 ) -> String {
     let task_prefix = task_id.map(|id| id.to_wire());

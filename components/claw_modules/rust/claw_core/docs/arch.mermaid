@@ -1,7 +1,7 @@
 flowchart TB
       subgraph L1["Layer 1 — orchestrator"]
           Q[UserInput / Command / Event Queue]
-          RO[RunOrchestrator::tick]
+          RO[Orchestrator::tick]
       end
       subgraph L2["Layer 2 — agent"]
           REG[AgentRegistry]

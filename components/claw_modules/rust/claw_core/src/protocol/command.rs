@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::{ApprovalRecord, TaskId};
 
 /// Orchestrator command from user, frontend, or external controller.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     CreateTask {
         task_id: TaskId,

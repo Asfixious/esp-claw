@@ -26,7 +26,7 @@ pub struct CapabilityContext {
 /// Minimal context for one LLM tool invocation (Layer 3 only).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolContext {
-    pub turn_id: u32,
+    pub iteration_id: u32,
     pub session_id: Option<String>,
 }
 
@@ -38,7 +38,7 @@ impl ToolContext {
     /// Adapter for the legacy C capability surface.
     pub fn to_capability_context(&self) -> CapabilityContext {
         CapabilityContext {
-            request_id: self.turn_id,
+            request_id: self.iteration_id,
             session_id: self.session_id.clone(),
             caller: CapabilityCaller::Agent,
             ..Default::default()

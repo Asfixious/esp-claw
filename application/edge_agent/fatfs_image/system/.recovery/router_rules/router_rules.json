@@ -113,7 +113,7 @@
     },
     "actions": [
       {
-        "type": "run_agent",
+        "type": "run_orchestrator",
         "input": {
           "target_channel": "{{event.source_channel}}",
           "session_policy": "chat"
@@ -122,14 +122,14 @@
     ]
   },
   {
-    "id": "agent_stage_im_notify",
-    "description": "Deliver agent stage progress messages to the original IM chat.",
+    "id": "orchestrator_stage_im_notify",
+    "description": "Deliver orchestrator stage progress messages to the original IM chat.",
     "enabled": true,
     "consume_on_match": true,
-    "ack": "{{event.source_channel}} agent stage sent",
+    "ack": "{{event.source_channel}} orchestrator stage sent",
     "match": {
-      "source_cap": "claw_core",
-      "event_type": "agent_stage",
+      "source_cap": "claw_orchestrator",
+      "event_type": "orchestrator_stage",
       "content_type": "text"
     },
     "actions": [

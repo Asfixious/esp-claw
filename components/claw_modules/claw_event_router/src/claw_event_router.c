@@ -17,10 +17,9 @@
 #include <sys/types.h>
 
 #include "cJSON.h"
-#include "claw_agent_mgr.h"
 #include "claw_core.h"
 #include "claw_event_publisher.h"
-#include "claw_session_mgr.h"
+#include "claw_orchestrator.h"
 #include "claw_task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -232,7 +231,7 @@ static const char *claw_event_router_action_kind_to_string(claw_event_router_act
     case CLAW_EVENT_ROUTER_ACTION_CALL_CAP:
         return "call_cap";
     case CLAW_EVENT_ROUTER_ACTION_RUN_AGENT:
-        return "run_agent";
+        return "run_orchestrator";
     case CLAW_EVENT_ROUTER_ACTION_RUN_SCRIPT:
         return "run_script";
     case CLAW_EVENT_ROUTER_ACTION_SEND_MESSAGE:
@@ -638,7 +637,7 @@ static esp_err_t claw_event_router_parse_action(const cJSON *item,
             return ESP_ERR_INVALID_ARG;
         }
         strlcpy(out_action->cap, cap, sizeof(out_action->cap));
-    } else if (strcmp(type, "run_agent") == 0) {
+    } else if (strcmp(type, "run_agent") == 0 || strcmp(type, "run_orchestrator") == 0) {
         out_action->kind = CLAW_EVENT_ROUTER_ACTION_RUN_AGENT;
         if (!input || !cJSON_IsObject(input)) {
             input = cJSON_CreateObject();
@@ -1506,22 +1505,22 @@ static esp_err_t claw_event_router_prepare_session_id(const claw_event_t *event,
                                                               size_t buf_size,
                                                               size_t *out_len)
 {
-    claw_session_build_context_t ctx = {0};
+    int written;
 
     if (!event || !buf || buf_size == 0 || !out_len) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    ctx.agent_id = 0;
-    ctx.session_policy = event->session_policy;
-    ctx.source_cap = event->source_cap;
-    ctx.event_type = event->event_type;
-    ctx.source_channel = event->source_channel;
-    ctx.chat_id = event->chat_id;
-    ctx.message_id = event->message_id;
-    ctx.event_id = event->event_id;
-
-    return claw_session_mgr_build_session_id(&ctx, buf, buf_size, out_len);
+    written = snprintf(buf,
+                       buf_size,
+                       "%s:%s",
+                       event->source_channel ? event->source_channel : "default",
+                       event->chat_id ? event->chat_id : "default");
+    if (written < 0 || (size_t)written >= buf_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    *out_len = (size_t)written;
+    return ESP_OK;
 }
 
 static esp_err_t claw_event_router_default_outbound_resolver(const claw_event_t *event,
@@ -1749,8 +1748,7 @@ static esp_err_t claw_event_router_execute_agent_action(
     const char *target_channel = NULL;
     const char *target_chat_id = NULL;
     const char *session_policy = NULL;
-    claw_event_t agent_event = {0};
-    claw_agent_mgr_root_input_t agent_input = {0};
+    claw_orchestrator_user_message_t user_msg = {0};
     char submit_output[32] = {0};
     esp_err_t err;
 
@@ -1770,40 +1768,34 @@ static esp_err_t claw_event_router_execute_agent_action(
     target_chat_id = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "target_chat_id"));
     session_policy = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "session_policy"));
 
-    agent_event = *event;
-    if (session_policy && session_policy[0]) {
-        claw_event_router_parse_session_policy(session_policy, &agent_event.session_policy);
+    (void)session_policy;
+    (void)target_channel;
+    (void)target_chat_id;
+
+    user_msg.message_id = event->message_id;
+    user_msg.channel = event->source_channel;
+    user_msg.chat_id = event->chat_id;
+    user_msg.sender_id = event->sender_id;
+    user_msg.session_id = NULL;
+    user_msg.text = (text && text[0]) ? text : (event->text ? event->text : "");
+
+    err = claw_orchestrator_push_user_message(&user_msg);
+    if (err == ESP_OK) {
+        err = claw_orchestrator_tick();
     }
 
-    agent_input.session_policy = agent_event.session_policy;
-    agent_input.flags = CLAW_CORE_REQUEST_FLAG_PUBLISH_OUT_MESSAGE |
-                        CLAW_CORE_REQUEST_FLAG_PUBLISH_STAGE_MESSAGE |
-                        CLAW_CORE_REQUEST_FLAG_SKIP_RESPONSE_QUEUE |
-                        CLAW_CORE_REQUEST_FLAG_USER_INTERRUPT;
-    agent_input.request_id = s_runtime->next_request_id++;
-    agent_input.user_text = (text && text[0]) ? text : (event->text ? event->text : "");
-    agent_input.source_cap = event->source_cap;
-    agent_input.event_type = event->event_type;
-    agent_input.source_channel = event->source_channel;
-    agent_input.source_chat_id = event->chat_id;
-    agent_input.source_sender_id = event->sender_id;
-    agent_input.source_message_id = event->message_id;
-    agent_input.event_id = event->event_id;
-    agent_input.target_channel = (target_channel && target_channel[0]) ? target_channel : event->source_channel;
-    agent_input.target_chat_id = (target_chat_id && target_chat_id[0]) ? target_chat_id : event->chat_id;
-
-    err = claw_agent_mgr_submit_root(&agent_input,
-                                     s_runtime->config.agent_submit_timeout_ms);
-
     if (err == ESP_OK) {
-        snprintf(submit_output, sizeof(submit_output), "request_id=%" PRIu32, agent_input.request_id);
+        snprintf(submit_output, sizeof(submit_output), "submitted");
         claw_event_router_update_last_output(ctx,
-                                             "agent",
-                                             agent_input.target_channel,
+                                             "claw_orchestrator",
+                                             event->source_channel,
                                              "submitted",
                                              submit_output);
     } else {
-        claw_event_router_update_last_output(ctx, "agent", agent_input.target_channel, "error",
+        claw_event_router_update_last_output(ctx,
+                                             "claw_orchestrator",
+                                             event->source_channel,
+                                             "error",
                                              esp_err_to_name(err));
     }
 

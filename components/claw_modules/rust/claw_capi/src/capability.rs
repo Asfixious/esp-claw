@@ -12,7 +12,7 @@ use claw_cap::registry::RegistryBackend;
 use claw_cap::Registry;
 use claw_interfaces::error::{EspErr, ESP_ERR_NO_MEM, ESP_OK};
 
-use crate::core_abi::claw_core_handle_t;
+use crate::abi_types::claw_core_handle_t;
 
 fn cstring(value: &str) -> CString {
     CString::new(value).unwrap_or_default()

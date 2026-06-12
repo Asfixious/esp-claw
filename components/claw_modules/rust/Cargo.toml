@@ -9,7 +9,6 @@ members = [
     "claw_paths",
     "claw_task",
     "claw_core",
-    "claw_message_channel",
     "claw_cap",
     "claw_memory",
     "claw_capi",

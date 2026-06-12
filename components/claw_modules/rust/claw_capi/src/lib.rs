@@ -13,11 +13,21 @@
 // off-target they exist for their trait impls but are otherwise unused.
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
+pub mod abi_types;
+pub mod cap_skills;
+pub mod cap_tools;
 pub mod capability;
+#[cfg(feature = "legacy-core")]
 pub mod core_abi;
 pub mod errmap;
+pub mod orchestrator_abi;
+
+pub use cap_skills::CLegacySkills as CapSkills;
+pub use cap_tools::legacy_tools;
 pub mod ffi;
+#[cfg(feature = "legacy-core")]
 pub mod llm;
+#[cfg(feature = "legacy-core")]
 pub mod memory_abi;
 pub mod memory_cap;
 pub mod paths;

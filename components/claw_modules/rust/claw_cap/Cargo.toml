@@ -8,4 +8,5 @@ description = "Capability registry and dispatch (Rust-first; C handlers are adap
 crate-type = ["rlib"]
 
 [dependencies]
+claw_core = { path = "../claw_core" }
 thiserror = "2"

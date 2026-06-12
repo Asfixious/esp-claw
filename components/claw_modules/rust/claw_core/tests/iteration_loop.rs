@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_cap::{CapabilityError, CapabilityInvokeResult, CapabilityInvoker, ToolContext};
+use claw_core::{IterationId, ToolError, ToolInvocation, ToolOutput};
 use claw_core::iteration_loop::{
-    AppendedMessages, ChatMessages, IterationLoop, IterationLoopError, IterationLoopPhase,
-    IterationResult, IterationStep, RequestControl, SystemPrompt, ToolSet,
+    AppendedMessages, ChatMessages, CompletedKind, IterationCheckpoint, IterationLoop,
+    IterationLoopError, IterationOutcome, IterationResult, IterationStep, IterationTools,
+    InterruptionControl, SystemPrompt,
 };
-use claw_core::TurnId;
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use serde_json::{json, Value};
 
@@ -173,126 +173,124 @@ fn test_llm(bodies: Vec<&str>) -> ClawApi {
     .expect("test llm init")
 }
 
-const TEST_TURN_ID: TurnId = TurnId(42);
-const TEST_SESSION_ID: &str = "sess-1";
+const TEST_ITERATION_ID: IterationId = IterationId(42);
 
 struct MockControl {
-    phase: Mutex<IterationLoopPhase>,
-    abort_flag: Arc<AtomicBool>,
-    interrupts: Mutex<VecDeque<String>>,
-    interrupt_on_drain_call: Mutex<Option<usize>>,
-    drain_calls: Mutex<usize>,
-    interrupt_http_abort: AtomicBool,
+    interrupt_flag: Arc<AtomicBool>,
 }
 
 impl MockControl {
     fn new() -> Self {
         MockControl {
-            phase: Mutex::new(IterationLoopPhase::Idle),
-            abort_flag: Arc::new(AtomicBool::new(false)),
-            interrupts: Mutex::new(VecDeque::new()),
-            interrupt_on_drain_call: Mutex::new(None),
-            drain_calls: Mutex::new(0),
-            interrupt_http_abort: AtomicBool::new(false),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn queue_interrupt(&self, text: impl Into<String>) {
-        self.interrupts.lock().unwrap().push_back(text.into());
-    }
-
-    fn deliver_interrupt_on_drain_call(&self, call_number: usize) {
-        *self.interrupt_on_drain_call.lock().unwrap() = Some(call_number);
-    }
-
-    fn set_interrupt_http_abort(&self, enabled: bool) {
-        self.interrupt_http_abort.store(enabled, Ordering::Release);
-    }
-
-    fn phase(&self) -> IterationLoopPhase {
-        *self.phase.lock().unwrap()
+    fn signal_interrupt(&self) {
+        self.interrupt_flag.store(true, Ordering::Release);
     }
 }
 
-impl RequestControl for MockControl {
-    fn set_phase(&self, phase: IterationLoopPhase) {
-        *self.phase.lock().unwrap() = phase;
+impl InterruptionControl for MockControl {
+    fn interrupt_flag(&self) -> &Arc<AtomicBool> {
+        &self.interrupt_flag
     }
-
-    fn abort_flag(&self) -> &Arc<AtomicBool> {
-        &self.abort_flag
-    }
-
-    fn take_user_interrupt_http_abort(&self, _turn_id: TurnId) -> bool {
-        self.interrupt_http_abort.load(Ordering::Acquire)
-    }
-
-    fn dequeue_inserted_user_inputs(&self, _session_id: &str, max: usize) -> Vec<String> {
-        let mut queue = self.interrupts.lock().unwrap();
-        let mut out = Vec::new();
-        while out.len() < max {
-            match queue.pop_front() {
-                Some(text) => out.push(text),
-                None => break,
-            }
-        }
-
-        if out.is_empty() {
-            if let Some(call_number) = *self.interrupt_on_drain_call.lock().unwrap() {
-                let mut calls = self.drain_calls.lock().unwrap();
-                *calls += 1;
-                if *calls == call_number {
-                    out.push("late interrupt".into());
-                }
-            }
-        }
-
-        out
-    }
-
-    fn clear_user_interrupt_abort(&self, _turn_id: TurnId) {}
 }
 
-struct EchoCapability;
+struct ArmInterruptAfterResponseHttp {
+    bodies: Mutex<VecDeque<String>>,
+    interrupt: Arc<AtomicBool>,
+    arm: AtomicBool,
+}
 
-impl CapabilityInvoker for EchoCapability {
-    fn invoke(
+impl ArmInterruptAfterResponseHttp {
+    fn new(interrupt: Arc<AtomicBool>, bodies: Vec<&str>) -> Self {
+        Self {
+            bodies: Mutex::new(bodies.into_iter().map(str::to_string).collect()),
+            interrupt,
+            arm: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.arm.store(true, Ordering::Release);
+    }
+}
+
+impl ClawHttp for ArmInterruptAfterResponseHttp {
+    fn post_json(
         &self,
-        capability_name: &str,
-        input_json: &str,
-        _context: &ToolContext,
-    ) -> Result<CapabilityInvokeResult, CapabilityError> {
-        Ok(CapabilityInvokeResult {
-            output: format!("{capability_name}:{input_json}"),
+        _request: &HttpJsonRequest,
+        _abort: &AtomicBool,
+    ) -> Result<HttpResponse, HttpError> {
+        let body = self
+            .bodies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| PLAIN_TEXT_BODY.into());
+        if self.arm.swap(false, Ordering::AcqRel) {
+            self.interrupt.store(true, Ordering::Release);
+        }
+        Ok(HttpResponse {
+            status_code: 200,
+            body,
+        })
+    }
+}
+
+struct AbortDuringHttp {
+    interrupt: Arc<AtomicBool>,
+}
+
+impl ClawHttp for AbortDuringHttp {
+    fn post_json(
+        &self,
+        _request: &HttpJsonRequest,
+        _abort: &AtomicBool,
+    ) -> Result<HttpResponse, HttpError> {
+        self.interrupt.store(true, Ordering::Release);
+        Err(HttpError::Aborted)
+    }
+}
+
+struct EchoTools;
+
+impl IterationTools for EchoTools {
+    fn schemas_json(&self) -> Option<&str> {
+        None
+    }
+
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            output: format!("{}:{}", call.name, call.arguments_json),
             ok: true,
         })
     }
 }
 
-struct FailingCapability;
+struct FailingTools;
 
-impl CapabilityInvoker for FailingCapability {
-    fn invoke(
-        &self,
-        _capability_name: &str,
-        _input_json: &str,
-        _context: &ToolContext,
-    ) -> Result<CapabilityInvokeResult, CapabilityError> {
-        Err(CapabilityError::NotFound)
+impl IterationTools for FailingTools {
+    fn schemas_json(&self) -> Option<&str> {
+        None
+    }
+
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::NotFound("files".into()))
     }
 }
 
-struct SoftFailCapability;
+struct SoftFailTools;
 
-impl CapabilityInvoker for SoftFailCapability {
-    fn invoke(
-        &self,
-        capability_name: &str,
-        input_json: &str,
-        _context: &ToolContext,
-    ) -> Result<CapabilityInvokeResult, CapabilityError> {
-        Ok(CapabilityInvokeResult {
-            output: format!("soft-fail:{capability_name}:{input_json}"),
+impl IterationTools for SoftFailTools {
+    fn schemas_json(&self) -> Option<&str> {
+        None
+    }
+
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            output: format!("soft-fail:{}:{}", call.name, call.arguments_json),
             ok: false,
         })
     }
@@ -313,28 +311,25 @@ fn test_llm_with_http(http: Arc<dyn ClawHttp>) -> ClawApi {
     .expect("test llm init")
 }
 
-fn run_step<'a>(
-    llm: &'a ClawApi,
-    control: &'a MockControl,
-    capability_invoker: Option<&'a dyn CapabilityInvoker>,
-    turn_id: TurnId,
-    session_id: &'a str,
-    messages: &'a Value,
-    system_prompt: &'a str,
-) -> Result<IterationResult, IterationLoopError> {
+fn run_step(
+    llm: &ClawApi,
+    control: &MockControl,
+    tools: Option<&dyn IterationTools>,
+    iteration_id: IterationId,
+    messages: &Value,
+    system_prompt: &str,
+) -> IterationResult {
     let step = IterationStep {
-        turn_id,
-        session_id,
+        iteration_id,
         system_prompt: SystemPrompt(system_prompt),
         messages: ChatMessages(messages),
-        tools: ToolSet::none(),
+        tools,
     };
-    let iteration = IterationLoop {
+    IterationLoop {
         llm,
-        capability_invoker,
-        control,
-    };
-    iteration.run(step)
+        interruption: control,
+    }
+    .run(step)
 }
 
 #[test]
@@ -359,13 +354,6 @@ fn appended_messages_empty_and_extend() {
 }
 
 #[test]
-fn tool_set_exposes_tools_json() {
-    assert_eq!(ToolSet::none().as_json(), None);
-    let tools = r#"[{"type":"function"}]"#;
-    assert_eq!(ToolSet::new(Some(tools)).as_json(), Some(tools));
-}
-
-#[test]
 fn system_prompt_borrows_text() {
     let prompt = SystemPrompt("You are helpful.");
     assert_eq!(prompt.as_ref(), "You are helpful.");
@@ -377,45 +365,46 @@ fn run_returns_plain_text_outcome() {
     let control = MockControl::new();
     let messages = json!([{"role":"user","content":"hi"}]);
 
-    let result = run_step(&llm, &control, None, TEST_TURN_ID,
-        TEST_SESSION_ID, &messages, "system")
-        .expect("plain text iteration");
+    let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
-    match result {
-        IterationResult::PlainText(outcome) => {
-            assert_eq!(outcome.text, "hello from model");
-            assert!(outcome.raw_message_json.is_some());
+    let Ok(IterationOutcome::Completed(outcome)) = result else {
+        panic!("expected Completed, got {result:?}");
+    };
+    match outcome.kind {
+        CompletedKind::PlainText(text_outcome) => {
+            assert_eq!(text_outcome.text, "hello from model");
+            assert!(text_outcome.raw_message_json.is_some());
         }
         other => panic!("expected PlainText, got {other:?}"),
     }
-    assert_eq!(control.phase(), IterationLoopPhase::Finalizing);
 }
 
 #[test]
 fn run_executes_tools_and_records_runs() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
-    let echo = EchoCapability;
+    let echo = EchoTools;
     let messages = json!([]);
 
     let result = run_step(
         &llm,
         &control,
         Some(&echo),
-        TEST_TURN_ID,
-        TEST_SESSION_ID,
+        TEST_ITERATION_ID,
         &messages,
         "system",
-    )
-    .expect("tool iteration");
+    );
 
-    match result {
-        IterationResult::Tools(outcome) => {
-            assert_eq!(outcome.runs.len(), 1);
-            assert_eq!(outcome.runs[0].name, "files");
-            assert!(outcome.runs[0].ok);
+    let Ok(IterationOutcome::Completed(outcome)) = result else {
+        panic!("expected Completed, got {result:?}");
+    };
+    match outcome.kind {
+        CompletedKind::Tools(tool_outcome) => {
+            assert_eq!(tool_outcome.runs.len(), 1);
+            assert_eq!(tool_outcome.runs[0].name, "files");
+            assert!(tool_outcome.runs[0].ok);
 
-            let appended = outcome.appended.0.as_array().unwrap();
+            let appended = tool_outcome.appended.0.as_array().unwrap();
             assert_eq!(appended.len(), 2);
             assert_eq!(appended[0]["role"], "assistant");
             assert_eq!(appended[1]["role"], "tool");
@@ -425,90 +414,73 @@ fn run_executes_tools_and_records_runs() {
         }
         other => panic!("expected Tools, got {other:?}"),
     }
-    assert_eq!(control.phase(), IterationLoopPhase::RunningTool);
 }
 
 #[test]
-fn run_returns_interrupted_when_user_input_queued() {
+fn run_returns_preempted_when_interrupt_signaled_before_llm() {
     let llm = test_llm(vec![PLAIN_TEXT_BODY]);
     let control = MockControl::new();
-    control.queue_interrupt("wait, also this");
+    control.signal_interrupt();
     let messages = json!([]);
 
-    let result = run_step(&llm, &control, None, TEST_TURN_ID,
-        TEST_SESSION_ID, &messages, "system")
-        .expect("interrupted iteration");
+    let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
-    match result {
-        IterationResult::Interrupted(outcome) => {
-            let appended = outcome.appended.0.as_array().unwrap();
-            assert_eq!(appended.len(), 1);
-            assert_eq!(appended[0]["role"], "user");
-            assert_eq!(appended[0]["content"], "wait, also this");
-        }
-        other => panic!("expected Interrupted, got {other:?}"),
-    }
-    assert_eq!(control.phase(), IterationLoopPhase::BeforeLlmHttp);
+    let Ok(IterationOutcome::Preempted(outcome)) = result else {
+        panic!("expected Preempted, got {result:?}");
+    };
+    assert_eq!(outcome.checkpoint, IterationCheckpoint::BeforeLlmHttp);
+    assert!(outcome.produced.is_none());
 }
 
 #[test]
-fn run_errors_when_tool_calls_without_capability_invoker() {
+fn run_errors_when_tool_calls_without_tools_port() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
     let messages = json!([]);
 
-    let error = run_step(&llm, &control, None, TEST_TURN_ID,
-        TEST_SESSION_ID, &messages, "system")
-        .expect_err("expected missing invoker");
+    let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
     assert!(matches!(
-        error,
-        IterationLoopError::MissingCapabilityInvoker
+        result,
+        Err(IterationLoopError::MissingTools)
     ));
 }
 
 #[test]
-fn run_returns_interrupted_after_tool_call_before_execution() {
-    let llm = test_llm(vec![TOOL_CALL_BODY]);
+fn run_returns_preempted_after_llm_before_tool_execution() {
     let control = MockControl::new();
-    control.deliver_interrupt_on_drain_call(2);
+    let http = Arc::new(ArmInterruptAfterResponseHttp::new(
+        control.interrupt_flag().clone(),
+        vec![TOOL_CALL_BODY],
+    ));
+    http.arm();
+    let llm = test_llm_with_http(http);
     let messages = json!([]);
 
-    let result = run_step(&llm, &control, None, TEST_TURN_ID,
-        TEST_SESSION_ID, &messages, "system")
-        .expect("interrupted after tool call");
+    let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
-    match result {
-        IterationResult::Interrupted(outcome) => {
-            let appended = outcome.appended.0.as_array().unwrap();
-            assert_eq!(appended.len(), 1);
-            assert_eq!(appended[0]["content"], "late interrupt");
-        }
-        other => panic!("expected Interrupted, got {other:?}"),
-    }
-    assert_eq!(control.phase(), IterationLoopPhase::AfterLlmBeforeTool);
+    let Ok(IterationOutcome::Preempted(outcome)) = result else {
+        panic!("expected Preempted, got {result:?}");
+    };
+    assert_eq!(outcome.checkpoint, IterationCheckpoint::AfterLlmBeforeTool);
+    assert!(outcome.produced.is_none());
 }
 
 #[test]
-fn run_returns_interrupted_when_http_aborted_with_queued_input() {
-    let llm = test_llm_with_http(Arc::new(FailingHttp));
+fn run_returns_preempted_when_http_aborted() {
     let control = MockControl::new();
-    control.set_interrupt_http_abort(true);
-    control.queue_interrupt("stop during http");
+    let llm = test_llm_with_http(Arc::new(AbortDuringHttp {
+        interrupt: control.interrupt_flag().clone(),
+    }));
     let messages = json!([]);
 
-    let result = run_step(&llm, &control, None, TEST_TURN_ID,
-        TEST_SESSION_ID, &messages, "system")
-        .expect("interrupted during http");
+    let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
-    match result {
-        IterationResult::Interrupted(outcome) => {
-            let appended = outcome.appended.0.as_array().unwrap();
-            assert_eq!(appended.len(), 1);
-            assert_eq!(appended[0]["content"], "stop during http");
-        }
-        other => panic!("expected Interrupted, got {other:?}"),
-    }
+    let Ok(IterationOutcome::Preempted(outcome)) = result else {
+        panic!("expected Preempted, got {result:?}");
+    };
+    assert_eq!(outcome.checkpoint, IterationCheckpoint::InLlmHttpAbort);
+    assert!(outcome.produced.is_none());
 }
 
 #[test]
@@ -517,38 +489,37 @@ fn run_propagates_chat_errors_without_interrupt() {
     let control = MockControl::new();
     let messages = json!([]);
 
-    let error = run_step(&llm, &control, None, TEST_TURN_ID,
-        TEST_SESSION_ID, &messages, "system")
-        .expect_err("expected chat transport error");
+    let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
-    assert!(matches!(error, IterationLoopError::Chat(_)));
+    assert!(matches!(result, Err(IterationLoopError::Chat(_))));
 }
 
 #[test]
 fn run_records_soft_failing_tool_with_null_name() {
     let llm = test_llm(vec![TOOL_CALL_EMPTY_NAME_BODY]);
     let control = MockControl::new();
-    let soft_fail = SoftFailCapability;
+    let soft_fail = SoftFailTools;
     let messages = json!([]);
 
     let result = run_step(
         &llm,
         &control,
         Some(&soft_fail),
-        TEST_TURN_ID,
-        TEST_SESSION_ID,
+        TEST_ITERATION_ID,
         &messages,
         "system",
-    )
-    .expect("soft-fail tool iteration");
+    );
 
-    match result {
-        IterationResult::Tools(outcome) => {
-            assert_eq!(outcome.runs.len(), 1);
-            assert_eq!(outcome.runs[0].name, "(null)");
-            assert!(!outcome.runs[0].ok);
+    let Ok(IterationOutcome::Completed(outcome)) = result else {
+        panic!("expected Completed, got {result:?}");
+    };
+    match outcome.kind {
+        CompletedKind::Tools(tool_outcome) => {
+            assert_eq!(tool_outcome.runs.len(), 1);
+            assert_eq!(tool_outcome.runs[0].name, "(null)");
+            assert!(!tool_outcome.runs[0].ok);
 
-            let appended = outcome.appended.0.as_array().unwrap();
+            let appended = tool_outcome.appended.0.as_array().unwrap();
             assert_eq!(appended.len(), 2);
             assert_eq!(appended[1]["is_error"], true);
         }
@@ -560,23 +531,21 @@ fn run_records_soft_failing_tool_with_null_name() {
 fn run_propagates_capability_errors() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
-    let failing = FailingCapability;
+    let failing = FailingTools;
     let messages = json!([]);
 
-    let error = run_step(
+    let result = run_step(
         &llm,
         &control,
         Some(&failing),
-        TEST_TURN_ID,
-        TEST_SESSION_ID,
+        TEST_ITERATION_ID,
         &messages,
         "system",
-    )
-    .expect_err("expected capability error");
+    );
 
     assert!(matches!(
-        error,
-        IterationLoopError::Capability(CapabilityError::NotFound)
+        result,
+        Err(IterationLoopError::Tool(claw_core::ToolError::NotFound(_)))
     ));
 }
 
@@ -606,19 +575,20 @@ fn live_plain_text_when_api_key_configured() {
         &llm,
         &control,
         None,
-        TEST_TURN_ID,
-        TEST_SESSION_ID,
+        TEST_ITERATION_ID,
         &messages,
         "You are a test assistant. Be brief.",
-    )
-    .expect("live iteration");
+    );
 
-    match result {
-        IterationResult::PlainText(outcome) => {
+    let Ok(IterationOutcome::Completed(outcome)) = result else {
+        panic!("expected Completed from live model, got {result:?}");
+    };
+    match outcome.kind {
+        CompletedKind::PlainText(text_outcome) => {
             assert!(
-                outcome.text.to_lowercase().contains("pong"),
+                text_outcome.text.to_lowercase().contains("pong"),
                 "unexpected model text: {}",
-                outcome.text
+                text_outcome.text
             );
         }
         other => panic!("expected PlainText from live model, got {other:?}"),

@@ -11,7 +11,6 @@
 //! and is *not* re-mapped here.
 
 use claw_api::{ChatError, InferMediaError, InitError};
-use claw_core::error::CoreError;
 use claw_interfaces::error::{
     EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
     ESP_ERR_NOT_SUPPORTED, ESP_ERR_NO_MEM, ESP_ERR_TIMEOUT, ESP_FAIL, ESP_OK,
@@ -19,22 +18,6 @@ use claw_interfaces::error::{
 use claw_interfaces::http::HttpError;
 use claw_memory::cap::CapStatus;
 use claw_memory::error::MemoryError;
-
-/// Map a [`CoreError`] to the `esp_err_t` the C `claw_core` ABI returns.
-pub fn core_esp_err(err: &CoreError) -> EspErr {
-    match err {
-        CoreError::InvalidArg => ESP_ERR_INVALID_ARG,
-        CoreError::InvalidState => ESP_ERR_INVALID_STATE,
-        CoreError::NoMem => ESP_ERR_NO_MEM,
-        CoreError::Fail => ESP_FAIL,
-        CoreError::NotSupported => ESP_ERR_NOT_SUPPORTED,
-        CoreError::IterationLimit => ESP_ERR_INVALID_STATE,
-        CoreError::Init(e) => init_error_code(e),
-        CoreError::Chat(e) => chat_error_code(e),
-        // Raw code from an injected C callback: reach the boundary unchanged.
-        CoreError::Esp(code) => *code,
-    }
-}
 
 /// Map a [`MemoryError`] to the `esp_err_t` the C `claw_memory` ABI returns.
 pub fn memory_esp_err(err: MemoryError) -> EspErr {

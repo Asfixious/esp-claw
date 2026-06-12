@@ -52,8 +52,8 @@
 #include "cmd_cap_web_search.h"
 #endif
 #include "claw_cap.h"
-#include "claw_agent_mgr.h"
 #include "claw_core.h"
+#include "claw_orchestrator.h"
 #include "claw_event_publisher.h"
 #include "claw_event_router.h"
 #include "cJSON.h"
@@ -127,47 +127,34 @@ static char *join_args_from(int argc, char **argv, int start_index)
 static int submit_and_print(const char *prompt, const char *session_id)
 {
     claw_core_response_t response = {0};
-    uint32_t request_id = 0;
+    claw_orchestrator_user_message_t msg = {
+        .message_id = "cli",
+        .channel = "cli",
+        .chat_id = "local",
+        .sender_id = NULL,
+        .session_id = (session_id && session_id[0]) ? session_id : NULL,
+        .text = prompt,
+    };
     esp_err_t err;
 
-    if (session_id && session_id[0]) {
-        printf("Submitting request %" PRIu32 " [session=%s]...\n",
-               s_next_request_id,
-               session_id);
-    } else {
-        printf("Submitting request %" PRIu32 " [single-turn]...\n", s_next_request_id);
-    }
+    (void)response;
+    printf("Submitting orchestrator turn%s%s...\n",
+           session_id && session_id[0] ? " [session=" : "",
+           session_id && session_id[0] ? session_id : "");
 
-    if (!app_claw_get_core()) {
-        printf("claw_core is not ready\n");
-        return 1;
-    }
-
-    err = claw_agent_mgr_submit_root_text(prompt,
-                                          session_id,
-                                          CLAW_CORE_REQUEST_FLAG_PUBLISH_STAGE_MESSAGE,
-                                          5000,
-                                          &request_id);
+    err = claw_orchestrator_push_user_message(&msg);
     if (err != ESP_OK) {
         printf("submit failed: %s\n", esp_err_to_name(err));
         return 1;
     }
-    s_next_request_id = request_id + 1;
-
-    err = claw_agent_mgr_receive_root_for(request_id, &response, 130000);
+    err = claw_orchestrator_tick();
     if (err != ESP_OK) {
-        printf("receive failed: %s\n", esp_err_to_name(err));
+        printf("orchestrator tick failed: %s\n", esp_err_to_name(err));
         return 1;
     }
 
-    if (response.status == CLAW_CORE_RESPONSE_STATUS_OK && response.text) {
-        printf("\nassistant> %s\n\n", response.text);
-    } else {
-        printf("\nerror> %s\n\n",
-               response.error_message ? response.error_message : "unknown error");
-    }
-
-    claw_core_response_free(&response);
+    s_next_request_id += 1;
+    printf("\n(orchestrator tick complete — response delivery via channel egress)\n\n");
     return 0;
 }
 

@@ -7,11 +7,6 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_FILES} == True
     path: ../../claw_capabilities/cap_files
 
-  cap_agent_mgr:
-    rules:
-      - if: $CONFIG{APP_CLAW_CAP_AGENT_MGR} == True
-    path: ../../claw_capabilities/cap_agent_mgr
-
   cap_im_platform:
     rules:
       - if: >-
@@ -54,11 +49,6 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_SCHEDULER} == True
     path: ../../claw_capabilities/cap_scheduler
 
-  cap_session_mgr:
-    rules:
-      - if: $CONFIG{APP_CLAW_CAP_SESSION_MGR} == True
-    path: ../../claw_capabilities/cap_session_mgr
-
   cap_skill_mgr:
     rules:
       - if: $CONFIG{APP_CLAW_CAP_SKILL_MGR} == True
@@ -92,9 +82,6 @@ dependencies:
 
   claw_event_router:
     path: ../../claw_modules/claw_event_router
-
-  claw_manager:
-    path: ../../claw_modules/claw_manager
 
   claw_memory:
     path: ../../claw_modules/claw_memory

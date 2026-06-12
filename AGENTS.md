@@ -53,6 +53,15 @@ The main entry point is `application/edge_agent/main/main.c`.
 3. `claw_core` builds context from memory, session history, skills, and other providers; calls the configured LLM backend; executes capability tool calls; persists context; and returns responses.
 4. Outbound messages are routed back through registered IM bindings or local/web channels.
 
+### Iteration semantics
+
+- Use `IterationId` only. Do not introduce legacy `TurnId` aliases or `turn_id` fields.
+- An iteration is never resumed after preemption.
+- A preempted iteration is terminal.
+- The next action must happen in a new iteration.
+- `IterationLoop` (Layer 3) only detects preemption, ends the iteration, and returns `patch` + `reason`. Layer 1/2 merge patches, rebuild context, and start the next iteration.
+- Preemption checkpoints in `iteration_loop`: `BeforeLlmHttp`, `InLlmHttpAbort`, `AfterLlmBeforeTool`, `BeforeTool`. While a tool is running (`RunningTool`), do not preempt; let the tool finish and handle new input on the next iteration unless the tool supports cooperative cancellation.
+
 ## Key Subsystems
 
 - **Application shell** (`application/edge_agent/main/main.c`, `components/common/app_claw/`): boot flow, storage paths, capability registration, Lua module registration, CLI, and agent startup.

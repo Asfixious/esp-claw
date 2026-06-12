@@ -15,7 +15,9 @@ use serde_json::Value;
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse};
 use crate::tools::{ToolError, ToolInvocation, ToolOutput};
 
-use crate::protocol::IterationId;
+use crate::util::TruncatedText;
+
+crate::define_prefixed_id!(IterationId, "iteration-", "iteration");
 
 /// Errors from one [`IterationLoop::run`] step.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -227,7 +229,7 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
         log::info!(
             "completion iteration={} status=done raw={}",
             iteration_id,
-            crate::util::truncate_for_log(&text)
+            TruncatedText::new(&text)
         );
         return Ok(IterationOutcome::Completed(CompletedOutcome {
             iteration_id,
@@ -640,6 +642,20 @@ mod tests {
                 ],
             },
         );
+    }
+
+    #[test]
+    fn iteration_id_serializes_to_prefixed_string() {
+        let value = serde_json::to_value(IterationId(5)).unwrap();
+        assert_eq!(value, serde_json::json!("iteration-5"));
+    }
+
+    #[test]
+    fn iteration_id_deserializes_from_prefixed_string() {
+        let iteration: IterationId =
+            serde_json::from_value(serde_json::json!("iteration-4")).unwrap();
+        assert_eq!(iteration, IterationId(4));
+        assert_eq!(iteration.to_string(), "iteration-4");
     }
 
     #[test]

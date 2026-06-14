@@ -9,8 +9,13 @@ use claw_interfaces::http::{ClawHttp, HttpJsonRequest};
 use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
 use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};
 use super::super::media::prepare_asset;
-use super::super::types::{ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
-use super::common::{join_url, parse_openai_chat_response};
+use super::super::types::{
+    ChatJsonRequest, ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig,
+};
+use super::common::{
+    chat_json_prompt_fallback, insert_tools_into_body, join_url, map_http_error,
+    parse_openai_chat_response, single_media_asset,
+};
 
 pub const ID: &str = "openai_compatible";
 pub const CHAT_PATH: &str = "/chat/completions";
@@ -19,7 +24,6 @@ pub const DEFAULT_MAX_TOKENS_FIELD: &str = "max_tokens";
 
 pub fn registration() -> BackendRegistration {
     BackendRegistration {
-        id: ID,
         defaults: BackendDefaults {
             auth_type: AUTH_TYPE,
             chat_path: CHAT_PATH,
@@ -40,19 +44,13 @@ struct OpenAiCompatible {
 }
 
 /// `openai_compatible_init`
+///
+/// Credential/config validation is centralized in [`crate::ClawApi::init`];
+/// `api_key`, `model`, and `base_url` are guaranteed non-empty here.
 fn make(config: &ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError> {
     let api_key = config.api_key.as_deref().unwrap_or("");
-    if api_key.is_empty() {
-        return Err(InitError::MissingApiKey);
-    }
     let model = config.model.as_deref().unwrap_or("");
-    if model.is_empty() {
-        return Err(InitError::MissingModel);
-    }
     let base_url = config.base_url.as_deref().unwrap_or("");
-    if base_url.is_empty() {
-        return Err(InitError::MissingBaseUrl);
-    }
     let auth_type = match config.auth_type.as_deref() {
         Some(a) if !a.is_empty() => a,
         _ => "bearer",
@@ -73,7 +71,9 @@ impl OpenAiCompatible {
     /// `build_chat_body`
     fn build_chat_body(&self, profile: &ModelProfile, request: &ChatRequest) -> Result<String, ChatError> {
         let mut messages: Vec<Value> = Vec::new();
-        messages.push(json!({"role": "system", "content": request.system_prompt}));
+        if !request.system_prompt.is_empty() {
+            messages.push(json!({"role": "system", "content": request.system_prompt}));
+        }
         if let Some(arr) = request.messages.as_array() {
             messages.extend(arr.iter().cloned());
         }
@@ -84,15 +84,45 @@ impl OpenAiCompatible {
         body.insert("messages".to_string(), Value::Array(messages));
 
         if let Some(tools_json) = request.tools_json.filter(|s| !s.is_empty()) {
-            if !profile.supports_tools {
-                return Err(ChatError::ToolsUnsupported);
-            }
-            let tools: Value =
-                serde_json::from_str(tools_json).map_err(|_| ChatError::InvalidToolsJson)?;
-            if !tools.is_array() {
-                return Err(ChatError::InvalidToolsJson);
-            }
-            body.insert("tools".to_string(), tools);
+            insert_tools_into_body(&mut body, profile, tools_json)?;
+        }
+
+        serde_json::to_string(&Value::Object(body))
+            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+    }
+
+    fn build_chat_json_body(
+        &self,
+        profile: &ModelProfile,
+        request: &ChatJsonRequest<'_>,
+        schema_name: &str,
+        schema: &Value,
+    ) -> Result<String, ChatError> {
+        let mut messages: Vec<Value> = Vec::new();
+        if !request.system_prompt.is_empty() {
+            messages.push(json!({"role": "system", "content": request.system_prompt}));
+        }
+        if let Some(arr) = request.messages.as_array() {
+            messages.extend(arr.iter().cloned());
+        }
+
+        let mut body = serde_json::Map::new();
+        body.insert("model".to_string(), json!(self.model));
+        body.insert(profile.max_tokens_field.clone(), json!(self.max_tokens));
+        body.insert("messages".to_string(), Value::Array(messages));
+        body.insert(
+            "response_format".to_string(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": true,
+                    "schema": schema,
+                }
+            }),
+        );
+        if let Some(tools_json) = request.tools_json.filter(|s| !s.is_empty()) {
+            insert_tools_into_body(&mut body, profile, tools_json)?;
         }
 
         serde_json::to_string(&Value::Object(body))
@@ -120,52 +150,25 @@ impl LlmBackend for OpenAiCompatible {
             timeout_ms: self.timeout_ms,
             headers: &[],
         };
-        let response = http
-            .post_json(&http_request, abort)
-            .map_err(|e| ClawApiError::Transport(e.to_string()))?;
+        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
         Ok(parse_openai_chat_response(&response.body)?)
     }
 
-    /// `openai_compatible_infer_media`
-    fn infer_media(
+    fn chat_json(
         &self,
         http: &dyn ClawHttp,
         profile: &ModelProfile,
-        request: &MediaRequest,
-        _abort: &AtomicBool,
-    ) -> Result<String, InferMediaError> {
-        if !profile.supports_vision {
-            return Err(InferMediaError::VisionUnsupported);
-        }
-        let user_prompt = request.user_prompt.unwrap_or("");
-        if user_prompt.is_empty() || request.media.is_empty() {
-            return Err(InferMediaError::IncompleteRequest);
+        request: &ChatJsonRequest<'_>,
+        schema_name: &str,
+        schema: &Value,
+        abort: &AtomicBool,
+    ) -> Result<LlmResponse, ChatError> {
+        if !profile.supports_json_schema {
+            return chat_json_prompt_fallback(self, http, profile, request, schema, abort);
         }
 
-        let prepared = prepare_asset(&request.media[0], profile, self.image_max_bytes)?;
-
-        let body = json!({
-            "model": self.model,
-            // max_tokens field name is dynamic; insert separately below.
-        });
-        let mut body = body.as_object().unwrap().clone();
-        body.insert(profile.max_tokens_field.clone(), json!(self.max_tokens));
-        let messages = json!([
-            {"role": "system", "content": request.system_prompt.unwrap_or("")},
-            {"role": "user", "content": [
-                {"type": "text", "text": user_prompt},
-                {"type": "image_url", "image_url": {"url": prepared.payload}}
-            ]}
-        ]);
-        body.insert("messages".to_string(), messages);
-
-        let post_data = serde_json::to_string(&Value::Object(body)).map_err(|_| {
-            ClawApiError::ApiError("out of memory serializing media request")
-        })?;
+        let post_data = self.build_chat_json_body(profile, request, schema_name, schema)?;
         let url = join_url(&self.base_url, &profile.chat_path);
-
-        // The C media path does not wire an abort flag.
-        let never = AtomicBool::new(false);
         let http_request = HttpJsonRequest {
             url: &url,
             body: &post_data,
@@ -174,9 +177,60 @@ impl LlmBackend for OpenAiCompatible {
             timeout_ms: self.timeout_ms,
             headers: &[],
         };
-        let response = http
-            .post_json(&http_request, &never)
-            .map_err(|e| ClawApiError::Transport(e.to_string()))?;
+        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        parse_openai_chat_response(&response.body).map_err(ChatError::from)
+    }
+
+    /// `openai_compatible_infer_media`
+    fn infer_media(
+        &self,
+        http: &dyn ClawHttp,
+        profile: &ModelProfile,
+        request: &MediaRequest,
+        abort: &AtomicBool,
+    ) -> Result<String, InferMediaError> {
+        if !profile.supports_vision {
+            return Err(InferMediaError::VisionUnsupported);
+        }
+        let user_prompt = request.user_prompt.unwrap_or("");
+        if user_prompt.is_empty() {
+            return Err(InferMediaError::IncompleteRequest);
+        }
+        let asset = single_media_asset(request.media)?;
+
+        let prepared = prepare_asset(asset, profile, self.image_max_bytes)?;
+
+        let body = json!({
+            "model": self.model,
+            // max_tokens field name is dynamic; insert separately below.
+        });
+        let mut body = body.as_object().unwrap().clone();
+        body.insert(profile.max_tokens_field.clone(), json!(self.max_tokens));
+        let mut messages: Vec<Value> = Vec::new();
+        let system = request.system_prompt.unwrap_or("");
+        if !system.is_empty() {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+        messages.push(json!({"role": "user", "content": [
+            {"type": "text", "text": user_prompt},
+            {"type": "image_url", "image_url": {"url": prepared.payload}}
+        ]}));
+        body.insert("messages".to_string(), Value::Array(messages));
+
+        let post_data = serde_json::to_string(&Value::Object(body)).map_err(|_| {
+            ClawApiError::ApiError("out of memory serializing media request")
+        })?;
+        let url = join_url(&self.base_url, &profile.chat_path);
+
+        let http_request = HttpJsonRequest {
+            url: &url,
+            body: &post_data,
+            api_key: Some(&self.api_key),
+            auth_type: Some(&self.auth_type),
+            timeout_ms: self.timeout_ms,
+            headers: &[],
+        };
+        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
 
         let parsed = parse_openai_chat_response(&response.body)?;
         match parsed.text {

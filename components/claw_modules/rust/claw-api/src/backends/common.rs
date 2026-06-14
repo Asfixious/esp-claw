@@ -2,8 +2,75 @@
 
 use serde_json::Value;
 
-use super::super::errors::ClawApiError;
-use super::super::types::{LlmResponse, ToolCall};
+use super::super::errors::{ChatError, ClawApiError, InferMediaError};
+use super::super::json_output::augment_system_with_schema;
+use super::super::types::{ChatJsonRequest, ChatRequest, LlmResponse, MediaAsset, ToolCall};
+use serde_json::Map;
+use super::super::backend::LlmBackend;
+use super::super::types::ModelProfile;
+use claw_interfaces::http::{ClawHttp, HttpError};
+use core::sync::atomic::AtomicBool;
+
+/// HTTP statuses that indicate a transient, retryable server condition.
+const STATUS_REQUEST_TIMEOUT: u16 = 408;
+const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+const STATUS_SERVER_ERROR_MIN: u16 = 500;
+const STATUS_SERVER_ERROR_MAX: u16 = 599;
+
+/// Map a transport [`HttpError`] to a [`ClawApiError`], classifying whether the
+/// failure is transient (retryable) or permanent. The retry decision is made by
+/// the [`crate::ClawApi`] retry loop via [`ClawApiError::is_retryable`].
+pub fn map_http_error(err: HttpError) -> ClawApiError {
+    let message = err.to_string();
+    if is_transient(&err) {
+        ClawApiError::TransientTransport(message)
+    } else {
+        ClawApiError::Transport(message)
+    }
+}
+
+fn is_transient(err: &HttpError) -> bool {
+    match err {
+        HttpError::Aborted | HttpError::InvalidUrl | HttpError::InvalidBody => false,
+        HttpError::ClientInitFailed | HttpError::RequestFailed(_) => true,
+        HttpError::UnexpectedStatus(message) => status_is_transient(message),
+    }
+}
+
+/// Classify a non-200 status message. The transport bakes the status into the
+/// message (e.g. `"HTTP 503: ..."`); treat an unparseable shape as transient.
+fn status_is_transient(message: &str) -> bool {
+    match parse_leading_status(message) {
+        Some(code) => {
+            code == STATUS_REQUEST_TIMEOUT
+                || code == STATUS_TOO_MANY_REQUESTS
+                || (STATUS_SERVER_ERROR_MIN..=STATUS_SERVER_ERROR_MAX).contains(&code)
+        }
+        None => true,
+    }
+}
+
+/// Best-effort extraction of the first 3-digit HTTP status in `message`.
+fn parse_leading_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let run_end = bytes[i..]
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            if run_end - i == 3 {
+                return message[i..run_end].parse::<u16>().ok();
+            }
+            i = run_end;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
 
 /// `join_url` from the backends: join `base_url` and `path` with exactly one
 /// slash between them.
@@ -79,4 +146,52 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, ClawApiErro
     }
 
     Ok(LlmResponse { text, reasoning_content, raw_message_json: Some(raw_message_json), tool_calls })
+}
+
+/// Insert OpenAI-style `tools` into a chat request body map.
+pub fn insert_tools_into_body(
+    body: &mut Map<String, Value>,
+    profile: &ModelProfile,
+    tools_json: &str,
+) -> Result<(), ChatError> {
+    if !profile.supports_tools {
+        return Err(ChatError::ToolsUnsupported);
+    }
+    let tools: Value = serde_json::from_str(tools_json).map_err(|_| ChatError::InvalidToolsJson)?;
+    if !tools.is_array() {
+        return Err(ChatError::InvalidToolsJson);
+    }
+    body.insert("tools".to_string(), tools);
+    Ok(())
+}
+
+/// Prompt-fallback structured chat: inject schema into system prompt, then `chat`.
+pub fn chat_json_prompt_fallback(
+    backend: &dyn LlmBackend,
+    http: &dyn ClawHttp,
+    profile: &ModelProfile,
+    request: &ChatJsonRequest<'_>,
+    schema: &Value,
+    abort: &AtomicBool,
+) -> Result<LlmResponse, ChatError> {
+    let system = augment_system_with_schema(request.system_prompt, schema);
+    let mut chat_req = ChatRequest::new(&system, request.messages);
+    if let Some(tools_json) = request.tools_json.filter(|s| !s.is_empty()) {
+        chat_req = chat_req.with_tools(tools_json);
+    }
+    backend.chat(http, profile, &chat_req, abort)
+}
+
+/// Select the single media asset a backend will send.
+///
+/// An empty asset list is a returnable [`InferMediaError::IncompleteRequest`].
+/// Sending more than one asset in a single request is not implemented yet, so
+/// that path is left explicitly unimplemented rather than silently dropping the
+/// extra assets.
+pub fn single_media_asset(media: &[MediaAsset]) -> Result<&MediaAsset, InferMediaError> {
+    match media {
+        [] => Err(InferMediaError::IncompleteRequest),
+        [asset] => Ok(asset),
+        _ => unimplemented!("multiple media assets per request is not supported yet"),
+    }
 }

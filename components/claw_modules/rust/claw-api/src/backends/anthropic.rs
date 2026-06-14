@@ -2,6 +2,10 @@
 //!
 //! Converts OpenAI-style messages/tools to the Anthropic Messages API shape and
 //! parses the Anthropic content-block response back into a [`LlmResponse`].
+//!
+//! Structured JSON ([`crate::ClawApi::chat_json`]) uses Anthropic
+//! `output_config.format` when [`crate::ModelProfile::supports_json_schema`]
+//! is set; otherwise it falls back to schema-in-prompt via [`super::common::chat_json_prompt_fallback`].
 
 use core::sync::atomic::AtomicBool;
 
@@ -13,9 +17,10 @@ use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
 use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};
 use super::super::media::prepare_asset;
 use super::super::types::{
-    ChatRequest, LlmResponse, MediaRequest, ModelProfile, PreparedKind, ClawApiConfig, ToolCall,
+    ChatJsonRequest, ChatRequest, LlmResponse, MediaRequest, ModelProfile, PreparedKind,
+    ClawApiConfig, ToolCall,
 };
-use super::common::join_url;
+use super::common::{chat_json_prompt_fallback, join_url, map_http_error, single_media_asset};
 
 pub const ID: &str = "anthropic_compatible";
 pub const AUTH_TYPE: &str = "none";
@@ -25,7 +30,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub fn registration() -> BackendRegistration {
     BackendRegistration {
-        id: ID,
         defaults: BackendDefaults {
             auth_type: AUTH_TYPE,
             chat_path: CHAT_PATH,
@@ -45,19 +49,13 @@ struct Anthropic {
 }
 
 /// `anthropic_init`
+///
+/// Credential/config validation is centralized in [`crate::ClawApi::init`];
+/// `api_key`, `model`, and `base_url` are guaranteed non-empty here.
 fn make(config: &ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError> {
     let api_key = config.api_key.as_deref().unwrap_or("");
-    if api_key.is_empty() {
-        return Err(InitError::MissingApiKey);
-    }
     let model = config.model.as_deref().unwrap_or("");
-    if model.is_empty() {
-        return Err(InitError::MissingModel);
-    }
     let base_url = config.base_url.as_deref().unwrap_or("");
-    if base_url.is_empty() {
-        return Err(InitError::MissingBaseUrl);
-    }
     Ok(Box::new(Anthropic {
         api_key: api_key.to_string(),
         model: model.to_string(),
@@ -200,7 +198,10 @@ fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, ClawApiError
 
 /// `convert_tools_to_anthropic`. Returns `None` when there are no tools or the
 /// JSON is invalid (the caller distinguishes the two).
-fn convert_tools_to_anthropic(tools_json: Option<&str>) -> Option<Value> {
+///
+/// When `strict` is true, each tool gets `"strict": true` for Anthropic structured
+/// outputs combined with strict tool use.
+fn convert_tools_to_anthropic(tools_json: Option<&str>, strict: bool) -> Option<Value> {
     let tools_json = tools_json.filter(|s| !s.is_empty())?;
     let parsed: Value = serde_json::from_str(tools_json).ok()?;
     let arr = parsed.as_array()?;
@@ -236,6 +237,9 @@ fn convert_tools_to_anthropic(tools_json: Option<&str>) -> Option<Value> {
             Some(s) => tool.insert("input_schema".to_string(), s.clone()),
             None => tool.insert("input_schema".to_string(), json!({})),
         };
+        if strict {
+            tool.insert("strict".to_string(), json!(true));
+        }
         out.push(Value::Object(tool));
     }
 
@@ -327,11 +331,54 @@ impl Anthropic {
         let mut body = Map::new();
         body.insert("model".to_string(), json!(self.model));
         body.insert("max_tokens".to_string(), json!(self.max_tokens));
-        body.insert("system".to_string(), json!(request.system_prompt));
+        if !request.system_prompt.is_empty() {
+            body.insert("system".to_string(), json!(request.system_prompt));
+        }
         body.insert("messages".to_string(), messages);
 
-        let tools = convert_tools_to_anthropic(request.tools_json);
-        if request.tools_json.map(|s| !s.is_empty()).unwrap_or(false) && tools.is_none() {
+        Self::insert_tools_into_body(&mut body, request.tools_json, false)?;
+
+        serde_json::to_string(&Value::Object(body))
+            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+    }
+
+    fn build_chat_json_body(
+        &self,
+        request: &ChatJsonRequest<'_>,
+        schema: &Value,
+    ) -> Result<String, ChatError> {
+        let messages = convert_messages_to_anthropic(request.messages)?;
+
+        let mut body = Map::new();
+        body.insert("model".to_string(), json!(self.model));
+        body.insert("max_tokens".to_string(), json!(self.max_tokens));
+        if !request.system_prompt.is_empty() {
+            body.insert("system".to_string(), json!(request.system_prompt));
+        }
+        body.insert("messages".to_string(), messages);
+        body.insert(
+            "output_config".to_string(),
+            json!({
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema,
+                }
+            }),
+        );
+
+        Self::insert_tools_into_body(&mut body, request.tools_json, true)?;
+
+        serde_json::to_string(&Value::Object(body))
+            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+    }
+
+    fn insert_tools_into_body(
+        body: &mut Map<String, Value>,
+        tools_json: Option<&str>,
+        strict: bool,
+    ) -> Result<(), ChatError> {
+        let tools = convert_tools_to_anthropic(tools_json, strict);
+        if tools_json.map(|s| !s.is_empty()).unwrap_or(false) && tools.is_none() {
             return Err(ChatError::InvalidToolsJson);
         }
         if let Some(tools) = tools {
@@ -340,9 +387,7 @@ impl Anthropic {
                 body.insert("tool_choice".to_string(), json!({"type": "auto"}));
             }
         }
-
-        serde_json::to_string(&Value::Object(body))
-            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+        Ok(())
     }
 
     fn headers(&self) -> [(&'static str, String); 2] {
@@ -378,9 +423,40 @@ impl LlmBackend for Anthropic {
             timeout_ms: self.timeout_ms,
             headers: &headers,
         };
-        let response = http
-            .post_json(&http_request, abort)
-            .map_err(|e| ClawApiError::Transport(e.to_string()))?;
+        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        Ok(parse_chat_response(&response.body)?)
+    }
+
+    fn chat_json(
+        &self,
+        http: &dyn ClawHttp,
+        profile: &ModelProfile,
+        request: &ChatJsonRequest<'_>,
+        _schema_name: &str,
+        schema: &Value,
+        abort: &AtomicBool,
+    ) -> Result<LlmResponse, ChatError> {
+        if !profile.supports_json_schema {
+            return chat_json_prompt_fallback(self, http, profile, request, schema, abort);
+        }
+
+        let post_data = self.build_chat_json_body(request, schema)?;
+        let url = join_url(&self.base_url, &profile.chat_path);
+        let header_storage = self.headers();
+        let headers: Vec<HttpHeader> = header_storage
+            .iter()
+            .map(|(n, v)| HttpHeader { name: n, value: v })
+            .collect();
+
+        let http_request = HttpJsonRequest {
+            url: &url,
+            body: &post_data,
+            api_key: None,
+            auth_type: Some("none"),
+            timeout_ms: self.timeout_ms,
+            headers: &headers,
+        };
+        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
         Ok(parse_chat_response(&response.body)?)
     }
 
@@ -390,35 +466,42 @@ impl LlmBackend for Anthropic {
         http: &dyn ClawHttp,
         profile: &ModelProfile,
         request: &MediaRequest,
-        _abort: &AtomicBool,
+        abort: &AtomicBool,
     ) -> Result<String, InferMediaError> {
         if !profile.supports_vision {
             return Err(InferMediaError::VisionUnsupported);
         }
         let user_prompt = request.user_prompt.unwrap_or("");
-        if user_prompt.is_empty() || request.media.is_empty() {
+        if user_prompt.is_empty() {
             return Err(InferMediaError::IncompleteRequest);
         }
+        let asset = single_media_asset(request.media)?;
 
-        let prepared = prepare_asset(&request.media[0], profile, self.image_max_bytes)?;
+        let prepared = prepare_asset(asset, profile, self.image_max_bytes)?;
         if prepared.kind != PreparedKind::DataUrl {
             return Err(InferMediaError::RequiresLocalImage);
         }
         let (mime, base64_data) =
             parse_data_url(&prepared.payload).ok_or(InferMediaError::PayloadPrepFailed)?;
 
-        let body = json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "system": request.system_prompt.unwrap_or(""),
-            "messages": [{
+        let mut body = Map::new();
+        body.insert("model".to_string(), json!(self.model));
+        body.insert("max_tokens".to_string(), json!(self.max_tokens));
+        let system = request.system_prompt.unwrap_or("");
+        if !system.is_empty() {
+            body.insert("system".to_string(), json!(system));
+        }
+        body.insert(
+            "messages".to_string(),
+            json!([{
                 "role": "user",
                 "content": [
                     {"type": "text", "text": user_prompt},
                     {"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64_data}}
                 ]
-            }]
-        });
+            }]),
+        );
+        let body = Value::Object(body);
         let post_data = serde_json::to_string(&body).map_err(|_| {
             ClawApiError::ApiError("out of memory serializing media request")
         })?;
@@ -429,7 +512,6 @@ impl LlmBackend for Anthropic {
             .map(|(n, v)| HttpHeader { name: n, value: v })
             .collect();
 
-        let never = AtomicBool::new(false);
         let http_request = HttpJsonRequest {
             url: &url,
             body: &post_data,
@@ -438,9 +520,7 @@ impl LlmBackend for Anthropic {
             timeout_ms: self.timeout_ms,
             headers: &headers,
         };
-        let response = http
-            .post_json(&http_request, &never)
-            .map_err(|e| ClawApiError::Transport(e.to_string()))?;
+        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
 
         let parsed = parse_chat_response(&response.body)?;
         match parsed.text {

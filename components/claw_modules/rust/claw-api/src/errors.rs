@@ -15,10 +15,15 @@ use thiserror::Error;
 /// allocation). `ApiError` is the static-message catch-all.
 #[derive(Debug, Clone, Error)]
 pub enum ClawApiError {
-    /// HTTP transport failure. Carries the backend/transport detail (e.g.
-    /// `"HTTP 401: invalid api key"`), which is inherently dynamic.
+    /// Permanent transport failure (aborts, bad URL/body, 4xx, ...). Carries the
+    /// backend/transport detail (e.g. `"HTTP 401: invalid api key"`), which is
+    /// inherently dynamic. Never retried.
     #[error("HTTP transport error: {0}")]
     Transport(String),
+    /// Transient transport failure (network error, HTTP 408/429/5xx) eligible
+    /// for retry by the [`crate::ClawApi`] retry loop.
+    #[error("transient HTTP transport error: {0}")]
+    TransientTransport(String),
     /// The response body was not valid JSON.
     #[error("failed to parse LLM JSON response")]
     Parse,
@@ -32,6 +37,13 @@ pub enum ClawApiError {
     /// Any other API-side failure (allocation, serialization, ...).
     #[error("{0}")]
     ApiError(&'static str),
+}
+
+impl ClawApiError {
+    /// Whether retrying the same request might succeed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ClawApiError::TransientTransport(_))
+    }
 }
 
 /// Failures from constructing a [`crate::ClawApi`] (config validation + backend
@@ -50,7 +62,53 @@ pub enum InitError {
     UnknownBackend,
 }
 
-/// Failures from a chat completion request.
+/// Failures from a structured JSON chat completion request.
+#[derive(Debug, Clone, Error)]
+pub enum ChatJsonError {
+    /// Tools were requested but the profile does not support them.
+    #[error("selected backend does not support tool calls")]
+    ToolsUnsupported,
+    /// Model returned neither parseable JSON nor tool calls.
+    #[error("LLM returned empty structured output")]
+    EmptyText,
+    /// Parsed text was not valid JSON for the expected output type.
+    #[error("invalid structured output: {0}")]
+    InvalidOutput(String),
+    /// [`crate::ClawApi::chat_json`] was called without
+    /// [`crate::ChatJsonRequest::with_output_schema`].
+    #[error("structured chat requires an output schema")]
+    MissingOutputSchema,
+    /// A shared chat completion failure.
+    #[error(transparent)]
+    Chat(#[from] ChatError),
+}
+
+impl ChatJsonError {
+    /// Retryable only when the underlying chat transport failure is transient;
+    /// schema/parse failures are deterministic and never retried.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ChatJsonError::Chat(err) if err.is_retryable())
+    }
+}
+
+/// Failures from [`crate::ClawApi::chat`].
+///
+/// Transient transport failures are retried automatically per the request's
+/// [`RetryPolicy`](crate::RetryPolicy); a `ChatError` therefore represents a
+/// final failure. Use [`ChatError::is_retryable`] to decide whether retrying
+/// the whole operation (e.g. after rebuilding the request) is worthwhile.
+///
+/// ```
+/// use claw_api::{ChatError, ClawApiError};
+/// fn handle(err: &ChatError) {
+///     match err {
+///         ChatError::Api(ClawApiError::TransientTransport(msg)) => {
+///             eprintln!("transient, may retry: {msg}");
+///         }
+///         other => eprintln!("permanent failure: {other}"),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Error)]
 pub enum ChatError {
     /// The selected backend/profile does not support tool calls.
@@ -62,6 +120,13 @@ pub enum ChatError {
     /// A shared API/transport/parse failure.
     #[error(transparent)]
     Api(#[from] ClawApiError),
+}
+
+impl ChatError {
+    /// Whether retrying the same request might succeed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ChatError::Api(err) if err.is_retryable())
+    }
 }
 
 /// Failures from a one-shot media inference request (includes the media-prep
@@ -113,4 +178,11 @@ pub enum InferMediaError {
     /// A shared API/transport/parse failure.
     #[error(transparent)]
     Api(#[from] ClawApiError),
+}
+
+impl InferMediaError {
+    /// Whether retrying the same request might succeed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, InferMediaError::Api(err) if err.is_retryable())
+    }
 }

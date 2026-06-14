@@ -57,12 +57,30 @@ fn prepare_local_path_asset(
     let encoded = STANDARD.encode(&raw);
     let payload = format!("data:{mime};base64,{encoded}");
 
-    Ok(Prepared {
-        kind: PreparedKind::DataUrl,
-        payload,
-        mime_type: mime.to_string(),
-        original_size: size,
-    })
+    Ok(Prepared { kind: PreparedKind::DataUrl, payload })
+}
+
+fn prepare_inline_bytes_asset(
+    asset: &MediaAsset,
+    image_max_bytes: usize,
+) -> Result<Prepared, InferMediaError> {
+    let bytes = match asset.bytes.as_ref() {
+        Some(b) if !b.is_empty() => b,
+        _ => return Err(InferMediaError::MediaFileEmpty),
+    };
+    let mime = asset
+        .mime_type
+        .as_deref()
+        .ok_or(InferMediaError::UnsupportedMediaType)?;
+
+    if bytes.len() > image_max_bytes {
+        return Err(InferMediaError::MediaTooLarge);
+    }
+
+    let encoded = STANDARD.encode(bytes);
+    let payload = format!("data:{mime};base64,{encoded}");
+
+    Ok(Prepared { kind: PreparedKind::DataUrl, payload })
 }
 
 /// `claw_media_prepare_asset`
@@ -77,14 +95,14 @@ pub fn prepare_asset(
                 Some(u) if !u.is_empty() => u,
                 _ => return Err(InferMediaError::MediaUrlEmpty),
             };
-            Ok(Prepared {
-                kind: PreparedKind::RemoteUrl,
-                payload: url.to_string(),
-                mime_type: String::new(),
-                original_size: 0,
-            })
+            Ok(Prepared { kind: PreparedKind::RemoteUrl, payload: url.to_string() })
         }
-        AssetKind::InlineBytes => Err(InferMediaError::UnsupportedMediaKind),
+        AssetKind::InlineBytes => {
+            if profile.image_remote_url_only {
+                return Err(InferMediaError::RemoteOnlyProfile);
+            }
+            prepare_inline_bytes_asset(asset, image_max_bytes)
+        }
         AssetKind::LocalPath => {
             if profile.image_remote_url_only {
                 return Err(InferMediaError::RemoteOnlyProfile);
@@ -131,7 +149,6 @@ mod tests {
         let p = prepare_asset(&asset, &profile(), 1024).unwrap();
         assert_eq!(p.kind, PreparedKind::DataUrl);
         assert!(p.payload.starts_with("data:image/png;base64,"));
-        assert_eq!(p.mime_type, "image/png");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -159,5 +176,74 @@ mod tests {
         };
         let e = prepare_asset(&asset, &profile(), 1024).unwrap_err();
         assert!(matches!(e, InferMediaError::UnsupportedMediaType));
+    }
+
+    #[test]
+    fn inline_bytes_data_url() {
+        let png_bytes = b"\x89PNG\r\n\x1a\nABCDE";
+        let asset = MediaAsset {
+            kind: AssetKind::InlineBytes,
+            path: None,
+            url: None,
+            bytes: Some(png_bytes.to_vec()),
+            mime_type: Some("image/png".into()),
+        };
+        let p = prepare_asset(&asset, &profile(), 1024).unwrap();
+        assert_eq!(p.kind, PreparedKind::DataUrl);
+        assert!(p.payload.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn inline_bytes_requires_mime() {
+        let asset = MediaAsset {
+            kind: AssetKind::InlineBytes,
+            path: None,
+            url: None,
+            bytes: Some(b"hello".to_vec()),
+            mime_type: None,
+        };
+        let e = prepare_asset(&asset, &profile(), 1024).unwrap_err();
+        assert!(matches!(e, InferMediaError::UnsupportedMediaType));
+    }
+
+    #[test]
+    fn inline_bytes_respects_size_limit() {
+        let asset = MediaAsset {
+            kind: AssetKind::InlineBytes,
+            path: None,
+            url: None,
+            bytes: Some(vec![0u8; 100]),
+            mime_type: Some("image/png".into()),
+        };
+        let e = prepare_asset(&asset, &profile(), 50).unwrap_err();
+        assert!(matches!(e, InferMediaError::MediaTooLarge));
+    }
+
+    #[test]
+    fn inline_bytes_rejects_empty() {
+        let asset = MediaAsset {
+            kind: AssetKind::InlineBytes,
+            path: None,
+            url: None,
+            bytes: Some(vec![]),
+            mime_type: Some("image/png".into()),
+        };
+        let e = prepare_asset(&asset, &profile(), 1024).unwrap_err();
+        assert!(matches!(e, InferMediaError::MediaFileEmpty));
+    }
+
+    #[test]
+    fn inline_bytes_rejects_remote_only_profile() {
+        let mut p = profile();
+        p.image_remote_url_only = true;
+        let asset = MediaAsset {
+            kind: AssetKind::InlineBytes,
+            path: None,
+            url: None,
+            bytes: Some(b"x".to_vec()),
+            mime_type: Some("image/png".into()),
+        };
+        let e = prepare_asset(&asset, &p, 1024).unwrap_err();
+        assert!(matches!(e, InferMediaError::RemoteOnlyProfile));
     }
 }

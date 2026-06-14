@@ -5,10 +5,11 @@
 use core::sync::atomic::AtomicBool;
 
 use claw_interfaces::http::ClawHttp;
+use serde_json::Value;
 
 use super::backends::{anthropic, openai_compatible};
 use super::errors::{ChatError, InferMediaError, InitError};
-use super::types::{ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
+use super::types::{ChatJsonRequest, ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
 
 /// A constructed backend instance (`backend_ctx` + the vtable methods in C).
 pub trait LlmBackend: Send + Sync {
@@ -17,6 +18,18 @@ pub trait LlmBackend: Send + Sync {
         http: &dyn ClawHttp,
         profile: &ModelProfile,
         request: &ChatRequest,
+        abort: &AtomicBool,
+    ) -> Result<LlmResponse, ChatError>;
+
+    /// Structured JSON chat. OpenAI uses API `response_format` when supported;
+    /// Anthropic and others use prompt fallback until API-level support lands.
+    fn chat_json(
+        &self,
+        http: &dyn ClawHttp,
+        profile: &ModelProfile,
+        request: &ChatJsonRequest<'_>,
+        schema_name: &str,
+        schema: &Value,
         abort: &AtomicBool,
     ) -> Result<LlmResponse, ChatError>;
 
@@ -40,7 +53,6 @@ pub struct BackendDefaults {
 /// `claw_llm_backend_registration_t` — the factory replaces the `init` vtable
 /// entry (it constructs the backend instance from the resolved config).
 pub struct BackendRegistration {
-    pub id: &'static str,
     pub defaults: BackendDefaults,
     pub make: fn(&ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError>,
 }

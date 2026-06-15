@@ -1,0 +1,12 @@
+[package]
+name = "claw-utils"
+version = "0.1.0"
+edition = "2021"
+description = "Shared utilities: log-safe text truncation and the prefixed-id newtype macro"
+
+[lib]
+name = "claw_utils"
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror = "2"

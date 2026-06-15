@@ -161,7 +161,9 @@ fn worker_loop(shared: &Shared) {
 /// it. The pool's invariants don't depend on the poisoned data being pristine,
 /// so recovering is preferable to propagating a panic into unrelated workers.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// `Condvar::wait` with the same poison-recovery policy as [`lock`].
@@ -169,5 +171,7 @@ fn wait<'a, T>(
     signal: &Condvar,
     guard: std::sync::MutexGuard<'a, T>,
 ) -> std::sync::MutexGuard<'a, T> {
-    signal.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner())
+    signal
+        .wait(guard)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

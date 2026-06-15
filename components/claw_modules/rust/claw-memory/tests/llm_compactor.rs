@@ -63,7 +63,9 @@ fn summarizes_window_into_one_system_message() {
 
     assert_eq!(out.len(), 1);
     assert_eq!(out[0]["role"], "system");
-    let content = out[0]["content"].as_str().expect("summary content is a string");
+    let content = out[0]["content"]
+        .as_str()
+        .expect("summary content is a string");
     assert!(content.contains("short recap"), "got: {content}");
 }
 

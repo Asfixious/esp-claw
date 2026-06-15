@@ -14,13 +14,13 @@
 //! ```
 //!
 //! The memory owns, oldest-to-newest when rendered:
-//! - `pinned`  — standalone messages never compacted (e.g. a task brief).
-//! - `summary` — the folded summary of retired groups.
-//! - `groups`  — committed turns, verbatim.
+//! - zero or more **compact segments** — each covers a non-overlapping id range
+//!   and carries the summary produced by the [`Compactor`] for that range.
+//! - `groups`  — committed turns kept verbatim (the recent tail).
 //! - the **open group** — the in-progress turn (see [`GroupGuard`]).
 //!
-//! Every group and pin is stamped with a monotonic `id` so its chronological
-//! position is stable across compaction and reloads.
+//! Every group is stamped with a monotonic `id` so its chronological position
+//! is stable across compaction and reloads.
 //!
 //! # Turns are built through a guard
 //!
@@ -28,68 +28,48 @@
 //! [`group`](ConversationMemory::group). The guard buffers the open turn and
 //! commits it as a single record when it drops, so a turn can never be left
 //! half-open and compaction never splits a tool round (it cuts only on group
-//! boundaries):
+//! boundaries).
 //!
-//! ```ignore
-//! {
-//!     let mut turn = memory.group();
-//!     turn.append_user("hi");
-//!     let reply = agent.chat(&turn.messages()); // includes the open turn
-//!     turn.append_assistant(reply.raw_json());
-//!     turn.append_tool_result("call_1", &out, false);
-//! } // drop → the whole turn is committed as one record
-//! ```
+//! # Multi-level compaction
 //!
-//! [`group`](ConversationMemory::group) takes `&mut self`, so the borrow checker
-//! guarantees **at most one open turn at a time**, and — together with the
-//! threading model below — that the foreground is the only writer of the state.
+//! When the total token estimate exceeds [`compact_threshold_tokens`], a
+//! background job is scheduled. The job:
+//!
+//! 1. Determines the **verbatim tail** by walking backwards through the groups,
+//!    accumulating tokens until [`keep_recent_tokens`] is reached (at least one
+//!    group is always kept verbatim).
+//! 2. Finds the **cursor** — the highest id already covered by a compact segment.
+//! 3. Selects aged groups with ids past the cursor, packing them into a chunk of
+//!    up to [`segment_token_budget`] tokens.
+//! 4. Runs the [`Compactor`] on that chunk and parks the result.
+//!
+//! The foreground applies the parked result at the next turn boundary: a new
+//! `compact` record is appended to the data log and the covered groups are
+//! retired. Multiple compact segments accumulate as independent, non-overlapping
+//! summaries; [`messages`](ConversationMemory::messages) interleaves them with
+//! the verbatim tail in chronological order.
+//!
+//! If the token estimate is still above the threshold after applying a compact
+//! and there is nothing left to compact (all aged groups are already covered),
+//! the oldest compact segment is dropped as a last resort to free token budget.
 //!
 //! # Threading: one writer, the pool only computes
 //!
-//! All state mutation (appends, commits, persistence, applying a summary) happens
-//! on the **foreground** thread that owns the memory. The shared
-//! [`MemoryTaskPool`] is a pure *compute* helper: a worker only takes a read
-//! snapshot of the aged window and runs the (slow, possibly networked)
-//! [`Compactor`], then parks the resulting summary in `parked_summary`. It never
-//! touches `groups` / `pending` / the data files. The next
-//! [`group`](ConversationMemory::group) / [`flush`](ConversationMemory::flush)
-//! applies that parked summary on the foreground.
-//!
-//! Because there is exactly one mutator thread, a single `state` mutex is
-//! sufficient and can be held across the (debounced, small) filesystem writes
-//! without a second lock or a release-and-reacquire window — so there is no
-//! check-then-act race between persistence and compaction. The cost is that a
-//! flush happens on the agent thread and that a finished summary is spliced in at
-//! the next turn boundary rather than the instant it is ready. **A single memory
-//! must therefore be driven from one thread.**
+//! All state mutation (appends, commits, persistence, applying a compact)
+//! happens on the **foreground** thread that owns the memory. Pool workers only
+//! read a snapshot and park a result. The state lock is never held across the
+//! [`Compactor`] call. A single memory must therefore be driven from one thread.
 //!
 //! # Identity and persistence
 //!
-//! Each memory is keyed by a `conversation_id`. The id selects two files under
+//! Each memory is keyed by a `conversation_id`. Two files under
 //! [`ConversationConfig::dir`]:
 //!
 //! - `conversation-<id>.jsonl` — the **data log**: one JSON record per line
-//!   (`group` / `pin` / `compact`), **append-only**. The source of truth.
-//! - `conversation-<id>.json` — the **index manifest**: a single JSON object
-//!   listing the byte `(off, len)` of every *live* record plus `covered_len` and
-//!   `next_id`. A rebuildable cache, rewritten atomically only when the live/dead
-//!   structure changes (compaction, collapse, [`flush`](ConversationMemory::flush)).
-//!
-//! Committing a turn appends one `group` record. Compaction is an appended
-//! `compact` record carrying the group-id range it supersedes, so retired groups
-//! become dead bytes; a **collapse** (atomic rewrite of both files from the live
-//! set) reclaims them once dead bytes dominate. Load reads the manifest,
-//! `read_at`s the live records (skipping dead ones), then tail-scans for records
-//! appended since the last manifest write; a missing/short manifest falls back to
-//! a full data-log scan.
-//!
-//! # Hidden auto-compaction
-//!
-//! When committing a turn pushes the size estimate past the threshold, the memory
-//! submits a one-shot job to the shared [`MemoryTaskPool`]; a worker summarizes
-//! the aged groups via the injected [`Compactor`] and parks the summary. The next
-//! foreground turn boundary splices it in (retire the covered groups, append a
-//! `compact` record). The state lock is never held across the [`Compactor`] call.
+//!   (`group` / `compact`), **append-only**. The source of truth.
+//! - `conversation-<id>.json` — the **index manifest**: a rebuildable cache
+//!   listing the byte `(off, len)` of every live record plus `covered_len` and
+//!   `next_id`, rewritten atomically when the live/dead structure changes.
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,8 +86,11 @@ use crate::pool::MemoryTaskPool;
 
 /// Token budget past which a background compaction is scheduled.
 const DEFAULT_COMPACT_THRESHOLD_TOKENS: usize = 6000;
-/// How many of the newest groups (turns) are always kept verbatim.
-const DEFAULT_KEEP_RECENT: usize = 8;
+/// Token budget for the verbatim tail; groups are accumulated newest-first until
+/// this is met. At least one group is always kept verbatim.
+const DEFAULT_KEEP_RECENT_TOKENS: usize = 2000;
+/// Max tokens fed to the compactor per chunk (one background job per chunk).
+const DEFAULT_SEGMENT_TOKEN_BUDGET: usize = 1500;
 /// Minimum gap between persistence writes (flash-wear debounce).
 const DEFAULT_PERSIST_DEBOUNCE: Duration = Duration::from_secs(5);
 /// Rough bytes-per-token divisor for the size estimate. See [`estimate_message_tokens`].
@@ -121,7 +104,7 @@ const MANIFEST_VERSION: u32 = 1;
 /// Don't collapse below this data size — tiny files aren't worth rewriting.
 const COLLAPSE_FLOOR_BYTES: ByteLen = ByteLen(8 * 1024);
 
-/// A monotonic logical identifier for a group or pin.
+/// A monotonic logical identifier for a group.
 ///
 /// This fixes chronological order and is the *only* thing compaction supersedes
 /// (see [`apply_record`]). It is deliberately a distinct type from byte
@@ -200,8 +183,13 @@ pub struct ConversationConfig {
     pub dir: String,
     /// When the estimate exceeds this, compaction is scheduled in the background.
     pub compact_threshold_tokens: usize,
-    /// Newest groups kept out of compaction so recent context stays exact.
-    pub keep_recent: usize,
+    /// Token budget for the verbatim tail. Groups are kept newest-first until
+    /// their cumulative tokens meet this budget; at least one group is always
+    /// kept regardless.
+    pub keep_recent_tokens: usize,
+    /// Max tokens consumed from aged groups per compaction chunk. Controls how
+    /// much history is summarised in one background job.
+    pub segment_token_budget: usize,
     /// Minimum interval between filesystem writes.
     pub persist_debounce: Duration,
 }
@@ -212,7 +200,8 @@ impl ConversationConfig {
         Self {
             dir: dir.into(),
             compact_threshold_tokens: DEFAULT_COMPACT_THRESHOLD_TOKENS,
-            keep_recent: DEFAULT_KEEP_RECENT,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+            segment_token_budget: DEFAULT_SEGMENT_TOKEN_BUDGET,
             persist_debounce: DEFAULT_PERSIST_DEBOUNCE,
         }
     }
@@ -234,8 +223,6 @@ pub struct ConversationDeps {
 enum LogRecord {
     /// A committed turn: its messages in order.
     Group { id: RecordId, msgs: Vec<Value> },
-    /// A standalone pinned message (never compacted).
-    Pin { id: RecordId, msg: Value },
     /// A summary that supersedes groups in `[id_start, id_end]`.
     Compact {
         id_start: RecordId,
@@ -249,11 +236,6 @@ enum LogRecord {
 #[serde(tag = "t", rename_all = "snake_case")]
 enum IndexEntry {
     Group {
-        off: ByteOffset,
-        len: ByteLen,
-        id: RecordId,
-    },
-    Pin {
         off: ByteOffset,
         len: ByteLen,
         id: RecordId,
@@ -276,17 +258,19 @@ struct Manifest {
     live: Vec<IndexEntry>,
 }
 
-/// A pinned message plus its byte location in the data log (once flushed).
-struct StoredPin {
-    id: RecordId,
-    value: Value,
-    loc: Option<(ByteOffset, ByteLen)>,
-}
-
 /// A committed turn plus its byte location in the data log (once flushed).
 struct StoredGroup {
     id: RecordId,
     msgs: Vec<Value>,
+    loc: Option<(ByteOffset, ByteLen)>,
+}
+
+/// A live compact segment: summary messages covering groups in `[id_start, id_end]`.
+struct StoredCompact {
+    id_start: RecordId,
+    id_end: RecordId,
+    messages: Vec<Value>,
+    /// Byte location of this compact record in the data log, once flushed.
     loc: Option<(ByteOffset, ByteLen)>,
 }
 
@@ -295,8 +279,8 @@ struct StoredGroup {
 #[derive(Clone, Copy)]
 enum PendingTarget {
     Group(RecordId),
-    Pin(RecordId),
-    Compact,
+    /// `id_start` of the compact segment this line belongs to.
+    Compact(RecordId),
 }
 
 /// A serialized data line awaiting its append.
@@ -305,12 +289,7 @@ struct Pending {
     target: PendingTarget,
 }
 
-/// A summary computed by a pool worker, parked until the foreground applies it.
-///
-/// The pool only *produces* this; the foreground *consumes* it (retire the
-/// covered groups, append the `compact` record). It carries the group-id range
-/// it covers so application is order-independent and stable even though more
-/// turns may have been committed since the snapshot was taken.
+/// A chunk summary computed by a pool worker, parked until the foreground applies it.
 struct CompactionResult {
     id_start: RecordId,
     id_end: RecordId,
@@ -320,12 +299,8 @@ struct CompactionResult {
 /// The lock-protected contents of the memory.
 #[derive(Default)]
 struct MemoryState {
-    pinned: Vec<StoredPin>,
-    summary: Vec<Value>,
-    /// Group-id range the current summary supersedes, `(id_start, id_end)`.
-    summary_range: Option<(RecordId, RecordId)>,
-    /// Byte location of the live `compact` record, once flushed.
-    summary_loc: Option<(ByteOffset, ByteLen)>,
+    /// Live compact segments, sorted ascending by `id_start`.
+    compacts: Vec<StoredCompact>,
     groups: Vec<StoredGroup>,
     /// The in-progress turn's messages — not yet committed (volatile, no id).
     open_group: Vec<Value>,
@@ -340,10 +315,8 @@ struct MemoryState {
     /// The manifest must be rewritten (a compaction/collapse changed live/dead).
     index_dirty: bool,
 
-    /// A summary a pool worker finished but the foreground has not yet applied.
-    /// Single-slot: single-flight + consume-before-reschedule keep it from being
-    /// overwritten before it is applied.
-    parked_summary: Option<CompactionResult>,
+    /// A compact result a pool worker finished but the foreground has not yet applied.
+    parked_compact: Option<CompactionResult>,
 
     approx_tokens: usize,
     last_persist: Option<Instant>,
@@ -352,15 +325,9 @@ struct MemoryState {
 /// Shared inner state — held behind an `Arc` so the pool worker and the agent
 /// reference the same memory.
 struct MemoryInner {
-    /// Independent identity / storage key for this conversation.
     conversation_id: usize,
-    /// Append-only data log path, derived once from `config.dir` + the id.
     data_path: String,
-    /// Index manifest path.
     index_path: String,
-    /// The single lock: the foreground holds it across mutations and the
-    /// (debounced, small) filesystem writes. The pool only takes it briefly to
-    /// read a snapshot and to park a result.
     state: Mutex<MemoryState>,
     /// Single-flight guard: at most one compaction job in the pool at a time.
     compaction_in_flight: AtomicBool,
@@ -376,13 +343,19 @@ pub struct ConversationMemory {
 impl ConversationMemory {
     /// Build the memory for `conversation_id`, restoring its persisted contents
     /// if present (missing or unreadable files start empty).
-    ///
-    /// Different ids map to different files under [`ConversationConfig::dir`], so
-    /// each conversation is stored independently.
     pub fn new(conversation_id: usize, config: ConversationConfig, deps: ConversationDeps) -> Self {
         let data_path = conversation_path(&config.dir, conversation_id, DATA_EXT);
         let index_path = conversation_path(&config.dir, conversation_id, INDEX_EXT);
-        let state = load_state(deps.fs.as_ref(), &data_path, &index_path);
+        let (mut state, needs_rebuild) = load_state(deps.fs.as_ref(), &data_path, &index_path);
+        if needs_rebuild {
+            write_live_set_to_files(
+                deps.fs.as_ref(),
+                &data_path,
+                &index_path,
+                &mut state,
+                conversation_id,
+            );
+        }
         Self {
             inner: Arc::new(MemoryInner {
                 conversation_id,
@@ -403,20 +376,15 @@ impl ConversationMemory {
 
     /// Open a turn. Append its messages through the returned [`GroupGuard`]; the
     /// whole turn is committed as one group when the guard drops.
-    ///
-    /// Takes `&mut self` so the borrow checker permits only one open turn at a
-    /// time. Reach [`messages`](Self::messages) / [`flush`](Self::flush) through
-    /// the guard while it is alive (it derefs to `&ConversationMemory`).
     pub fn group(&mut self) -> GroupGuard<'_> {
         GroupGuard { memory: self }
     }
 
-    /// The current messages, ready to send to the model: `pinned ++ summary ++
-    /// committed groups ++ open turn`, oldest first.
+    /// The current messages, in chronological order: compact-segment messages
+    /// interleaved with verbatim groups by id, followed by the open turn.
     ///
-    /// Returns an owned, internally consistent snapshot (see the module docs for
-    /// why it is not a borrow). Compaction state is already folded in; the caller
-    /// neither sees nor triggers it.
+    /// Compact segments and groups are non-overlapping by construction, so the
+    /// merge is a simple ordered walk keyed on each segment's starting id.
     // todo: finalize the return shape — owned `Value` snapshot (current), a
     // cached `Arc<Value>` snapshot (cheap clone, invalidated on mutation), or a
     // borrowing guard. The choice trades clone cost against how long the caller
@@ -424,45 +392,53 @@ impl ConversationMemory {
     pub fn messages(&self) -> Value {
         let state = self.lock_state();
         let mut out = Vec::new();
-        out.extend(state.pinned.iter().map(|p| p.value.clone()));
-        out.extend(state.summary.iter().cloned());
-        for group in &state.groups {
-            out.extend(group.msgs.iter().cloned());
+
+        let mut compact_idx = 0usize;
+        let mut group_idx = 0usize;
+
+        loop {
+            let next_compact = state.compacts.get(compact_idx);
+            let next_group = state.groups.get(group_idx);
+            match (next_compact, next_group) {
+                (None, None) => break,
+                (Some(compact), None) => {
+                    out.extend(compact.messages.iter().cloned());
+                    compact_idx = compact_idx.saturating_add(1);
+                }
+                (None, Some(group)) => {
+                    out.extend(group.msgs.iter().cloned());
+                    group_idx = group_idx.saturating_add(1);
+                }
+                (Some(compact), Some(group)) => {
+                    if compact.id_start < group.id {
+                        out.extend(compact.messages.iter().cloned());
+                        compact_idx = compact_idx.saturating_add(1);
+                    } else {
+                        out.extend(group.msgs.iter().cloned());
+                        group_idx = group_idx.saturating_add(1);
+                    }
+                }
+            }
         }
+
         out.extend(state.open_group.iter().cloned());
         Value::Array(out)
     }
 
-    /// Apply any finished summary, force any pending changes to disk now
-    /// (ignoring the debounce), refresh the index manifest, and reclaim space.
-    ///
-    /// Persists only **committed** turns; an open turn is committed when its
-    /// [`GroupGuard`] drops. The clean-shutdown order is therefore "drop the
-    /// guard, then `flush`". This is the manual, immediate form of the automatic
-    /// debounced persistence — same writes, just now.
+    /// Apply any parked compact, force pending changes to disk, and reclaim space.
     pub fn flush(&self) {
-        apply_parked_summary(&self.inner);
+        apply_parked_compact(&self.inner);
         persist(&self.inner, true);
         maybe_collapse(&self.inner);
     }
 
-    // -----------------------------------------------------------------------
-    // Internals — never exposed.
-    // -----------------------------------------------------------------------
-
-    /// Queue a summarization-compute job, unless one is already queued/running
-    /// (single-flight).
-    ///
-    /// The worker only reads a snapshot and runs the [`Compactor`]; it parks the
-    /// result for the foreground to apply. The `keep_recent` work-gate lives in
-    /// [`compute_summary`].
     fn schedule_compaction(&self) {
         if self.inner.compaction_in_flight.swap(true, Ordering::AcqRel) {
             return;
         }
         let inner = Arc::clone(&self.inner);
         self.inner.deps.pool.submit(Box::new(move || {
-            compute_summary(&inner);
+            compute_compact_chunk(&inner);
             inner.compaction_in_flight.store(false, Ordering::Release);
         }));
     }
@@ -474,16 +450,12 @@ impl ConversationMemory {
 
 /// An open turn. Append messages through it; the turn is committed as one group
 /// record when the guard drops (or on an explicit [`commit`](Self::commit)).
-///
-/// Holds `&mut ConversationMemory`, so only one can be live at a time. It derefs
-/// to `&ConversationMemory`, so `turn.messages()` / `turn.flush()` work while the
-/// turn is open.
 pub struct GroupGuard<'a> {
     memory: &'a mut ConversationMemory,
 }
 
 impl GroupGuard<'_> {
-    /// Append a user / addon message to the open turn.
+    /// Append a user (or addon) message to the open turn.
     pub fn append_user(&self, content: impl Into<String>) {
         self.push_open(json!({ "role": "user", "content": content.into() }));
     }
@@ -503,6 +475,9 @@ impl GroupGuard<'_> {
     }
 
     /// Append a tool result for the call `tool_call_id` to the open turn.
+    ///
+    /// Set `is_error` when the tool failed, so the model can see the call did
+    /// not succeed.
     pub fn append_tool_result(&self, tool_call_id: &str, content: &str, is_error: bool) {
         self.push_open(json!({
             "role": "tool",
@@ -513,6 +488,8 @@ impl GroupGuard<'_> {
     }
 
     /// Append a whole batch of messages to the open turn (e.g. one tool round).
+    ///
+    /// `messages` must be a JSON array; a non-array value is logged and ignored.
     pub fn append_patch(&self, messages: &Value) {
         let Some(items) = messages.as_array() else {
             log::warn!(
@@ -526,49 +503,13 @@ impl GroupGuard<'_> {
         }
     }
 
-    /// Pin a message: a standalone record, never compacted, always rendered
-    /// first. Independent of the open turn — persisted on its own.
-    pub fn pin(&self, message: Value) {
-        let inner = &self.memory.inner;
-        let should_persist = {
-            let mut state = lock_state(inner);
-            let id = next_id(&mut state);
-            state.approx_tokens = state
-                .approx_tokens
-                .saturating_add(estimate_message_tokens(&message));
-            enqueue(
-                &mut state,
-                &LogRecord::Pin {
-                    id,
-                    msg: message.clone(),
-                },
-                PendingTarget::Pin(id),
-                inner.conversation_id,
-            );
-            state.pinned.push(StoredPin {
-                id,
-                value: message,
-                loc: None,
-            });
-            persist_due(inner, &state)
-        };
-        if should_persist {
-            persist(inner, false);
-        }
-    }
-
-    /// Commit the open turn now as one group record and start a fresh one.
+    /// Commit the open turn now as one group record.
     ///
-    /// Called automatically on drop; use it to seal a turn early without leaving
-    /// scope. A no-op when the open turn is empty and nothing else is due.
-    ///
-    /// Order matters: a summary a worker finished earlier is applied *first* (so
-    /// the new `compact` record lands before this turn's `group` record), then
-    /// the turn is committed, then we (maybe) schedule the next summarization and
-    /// persist on this foreground thread.
+    /// A parked compact is applied first, then the turn is committed, then we
+    /// maybe schedule the next compaction chunk and persist.
     pub fn commit(&self) {
         let inner = &self.memory.inner;
-        let applied = apply_parked_summary(inner);
+        let applied = apply_parked_compact(inner);
         let (should_compact, due) = {
             let mut state = lock_state(inner);
             if !state.open_group.is_empty() {
@@ -583,22 +524,20 @@ impl GroupGuard<'_> {
                     PendingTarget::Group(id),
                     inner.conversation_id,
                 );
-                state.groups.push(StoredGroup { id, msgs, loc: None });
+                state.groups.push(StoredGroup {
+                    id,
+                    msgs,
+                    loc: None,
+                });
             }
-            // Compaction is triggered only by committing a turn, only when the
-            // estimate exceeds the budget, and only when no summary is already
-            // parked. Single-flight in `schedule_compaction` and the `keep_recent`
-            // work-gate in `compute_summary` enforce the rest.
             let should_compact = state.approx_tokens > inner.config.compact_threshold_tokens
-                && state.parked_summary.is_none();
+                && state.parked_compact.is_none();
             (should_compact, persist_due(inner, &state))
         };
         if should_compact {
             self.memory.schedule_compaction();
         }
         if applied {
-            // Applying a summary is significant and creates dead bytes: checkpoint
-            // it and reclaim space, ignoring the debounce.
             persist(inner, true);
             maybe_collapse(inner);
         } else if due {
@@ -606,7 +545,6 @@ impl GroupGuard<'_> {
         }
     }
 
-    /// Buffer one message into the open turn (committed later, as a unit).
     fn push_open(&self, message: Value) {
         let mut state = lock_state(&self.memory.inner);
         state.approx_tokens = state
@@ -632,7 +570,7 @@ impl Deref for GroupGuard<'_> {
     }
 }
 
-/// Allocate the next monotonic id (shared by groups and pins).
+/// Allocate the next monotonic id.
 fn next_id(state: &mut MemoryState) -> RecordId {
     let id = state.next_id;
     state.next_id = id.next();
@@ -655,51 +593,84 @@ fn enqueue(
     }
 }
 
-/// Compute a summary on a pool worker — the *only* compaction work the pool
-/// does. It reads a snapshot and runs the [`Compactor`]; it does **not** mutate
-/// `groups` / `pending` or write files. The result is parked for the foreground
-/// to apply (see [`apply_parked_summary`]).
+/// How many of the newest groups form the verbatim tail under `keep_recent_tokens`.
 ///
-/// Strategy: **rolling (fold-forward) summarization** over whole groups. The
-/// window is the aged set — every committed group except the newest
-/// `keep_recent` (`pinned` and the open turn are never compacted) — with the
-/// *existing* summary folded in: `previous_summary ++ flattened aged groups`.
-///
-/// Cutting on **group boundaries** is what makes this tool-safe: a tool round
-/// lives inside one group, so compaction can never split an assistant
-/// `tool_calls` from its `tool` results. (A group can still be *internally*
-/// unbalanced if a turn was aborted mid-round — that is append discipline, not
-/// compaction's concern.) The covered range `[id_start, id_end]` is stable
-/// regardless of turns committed after this snapshot, because ids are monotonic.
-fn compute_summary(inner: &MemoryInner) {
-    let keep = inner.config.keep_recent;
+/// Accumulates tokens newest-first, stopping when the budget is met. Always
+/// returns at least 1 (when groups is non-empty) so there is always something
+/// verbatim to give the model.
+fn compute_verbatim_count(state: &MemoryState, keep_recent_tokens: usize) -> usize {
+    if state.groups.is_empty() {
+        return 0;
+    }
+    let mut tokens = 0usize;
+    let mut count = 0usize;
+    for group in state.groups.iter().rev() {
+        let group_tokens: usize = group.msgs.iter().map(estimate_message_tokens).sum();
+        tokens = tokens.saturating_add(group_tokens);
+        count = count.saturating_add(1);
+        if tokens >= keep_recent_tokens {
+            break;
+        }
+    }
+    count.max(1)
+}
 
-    // Snapshot the window to summarize (brief lock; no mutation).
-    let (window, id_start, id_end) = {
+/// Compute one compaction chunk on a pool worker and park the result.
+///
+/// Strategy: find the next window of aged groups not yet covered by a compact
+/// segment (advancing-cursor approach), pack up to `segment_token_budget` tokens
+/// from that window, and summarise it. The verbatim tail is always excluded.
+///
+/// Returns without touching state if there is nothing to compact.
+fn compute_compact_chunk(inner: &MemoryInner) {
+    let keep_recent_tokens = inner.config.keep_recent_tokens;
+    let segment_budget = inner.config.segment_token_budget;
+
+    // Snapshot what to compact (brief lock; no mutation).
+    let (chunk, id_start, id_end) = {
         let state = lock_state(inner);
-        // Work-gate: only summarize when groups have aged out past `keep_recent`.
-        if state.groups.len() <= keep {
+
+        // Cursor: highest id already covered by a compact segment.
+        let cursor: Option<RecordId> = state.compacts.iter().map(|c| c.id_end).max();
+
+        let verbatim_count = compute_verbatim_count(&state, keep_recent_tokens);
+        let verbatim_start_idx = state.groups.len().saturating_sub(verbatim_count);
+        let aged = state.groups.get(..verbatim_start_idx).unwrap_or(&[]);
+
+        // Candidates: aged groups whose ids come after the cursor.
+        let candidates: Vec<&StoredGroup> = aged
+            .iter()
+            .filter(|g| cursor.map_or(true, |c| g.id > c))
+            .collect();
+
+        if candidates.is_empty() {
             return;
         }
-        let aged_count = state.groups.len().saturating_sub(keep);
-        let aged = state.groups.get(..aged_count).unwrap_or(&[]);
-        let (Some(first), Some(last)) = (aged.first(), aged.last()) else {
-            return;
-        };
-        // Fold-forward: the summary keeps covering everything from the original
-        // start, so its range start stays put across rounds.
-        let id_start = state.summary_range.map(|(a, _)| a).unwrap_or(first.id);
-        let id_end = last.id;
-        let mut window = Vec::new();
-        window.extend(state.summary.iter().cloned());
-        for group in aged {
-            window.extend(group.msgs.iter().cloned());
+
+        // Fill a chunk up to segment_budget tokens.
+        let mut chunk_msgs: Vec<Value> = Vec::new();
+        let mut chunk_id_end = candidates[0].id;
+        let mut tokens = 0usize;
+
+        for group in &candidates {
+            let group_tokens: usize = group.msgs.iter().map(estimate_message_tokens).sum();
+            if !chunk_msgs.is_empty() && tokens.saturating_add(group_tokens) > segment_budget {
+                break;
+            }
+            chunk_msgs.extend(group.msgs.iter().cloned());
+            chunk_id_end = group.id;
+            tokens = tokens.saturating_add(group_tokens);
         }
-        (window, id_start, id_end)
+
+        let chunk_id_start = candidates[0].id;
+        (chunk_msgs, chunk_id_start, chunk_id_end)
     };
 
-    // Summarize with the lock released (may hit the network).
-    let summary = match inner.deps.compactor.compact(&window) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    let summary = match inner.deps.compactor.compact(&chunk) {
         Ok(summary) => summary,
         Err(err) => {
             log::warn!(
@@ -710,59 +681,108 @@ fn compute_summary(inner: &MemoryInner) {
         }
     };
 
-    // Park the result; the foreground applies it at the next turn boundary.
-    lock_state(inner).parked_summary = Some(CompactionResult {
+    lock_state(inner).parked_compact = Some(CompactionResult {
         id_start,
         id_end,
         summary,
     });
 }
 
-/// Apply a parked summary on the foreground: retire the covered groups, append a
-/// `compact` record, fold the summary in. Returns whether anything was applied.
+/// Apply a parked compact result on the foreground.
 ///
-/// Application is by id range, so it is correct even though the foreground may
-/// have committed more turns since the worker took its snapshot (those have
-/// higher ids and are untouched). Covered groups that are still unflushed are
-/// dropped from `pending` (their content is in the summary, so they must never
-/// be written); covered groups already in the data log stay there as dead bytes
-/// before the new `compact` record — the replay order that keeps supersession
-/// correct.
-fn apply_parked_summary(inner: &MemoryInner) -> bool {
+/// Retires covered groups, adds the new compact segment, and enqueues the
+/// compact record for the next persist.
+///
+/// # Coverage continuity invariant
+///
+/// Each parked chunk starts at `cursor + 1` (the oldest aged group not yet
+/// covered — see [`compute_compact_chunk`]), so applying it keeps the compact
+/// segments **contiguous and abutting the verbatim groups**: the live set
+/// always covers the entire id range `[1, next_id)` with no gaps and no
+/// overlaps. Nothing here drops a segment — losing the oldest compact would
+/// strand the ids it covered (their groups are already retired), leaving a hole
+/// in the index. Unbounded summary growth is a job for re-compacting compacts
+/// ("leveling"), never for deleting coverage.
+fn apply_parked_compact(inner: &MemoryInner) -> bool {
     let mut state = lock_state(inner);
-    let Some(result) = state.parked_summary.take() else {
+    let Some(result) = state.parked_compact.take() else {
         return false;
     };
     let (id_start, id_end) = (result.id_start, result.id_end);
 
+    // Retire covered groups and any pending writes for them.
     state.groups.retain(|g| g.id < id_start || g.id > id_end);
     state.pending.retain(|p| match p.target {
         PendingTarget::Group(id) => id < id_start || id > id_end,
-        _ => true,
+        PendingTarget::Compact(_) => true,
     });
-    state.summary = result.summary;
-    state.summary_range = Some((id_start, id_end));
-    state.summary_loc = None;
+
+    // Insert the new compact segment in sorted order.
+    let insert_pos = state.compacts.partition_point(|c| c.id_start < id_start);
+    state.compacts.insert(
+        insert_pos,
+        StoredCompact {
+            id_start,
+            id_end,
+            messages: result.summary.clone(),
+            loc: None,
+        },
+    );
+
     let record = LogRecord::Compact {
         id_start,
         id_end,
-        summary: state.summary.clone(),
+        summary: result.summary,
     };
-    enqueue(&mut state, &record, PendingTarget::Compact, inner.conversation_id);
+    enqueue(
+        &mut state,
+        &record,
+        PendingTarget::Compact(id_start),
+        inner.conversation_id,
+    );
     state.approx_tokens = estimate_state_tokens(&state);
-    // Dead records now exist; the manifest must be refreshed to exclude them.
     state.index_dirty = true;
+
+    debug_assert!(
+        coverage_is_contiguous(&state),
+        "compaction left a hole in id coverage: compacts={:?} groups={:?}",
+        state
+            .compacts
+            .iter()
+            .map(|c| (c.id_start, c.id_end))
+            .collect::<Vec<_>>(),
+        state.groups.iter().map(|g| g.id).collect::<Vec<_>>(),
+    );
+
+    true
+}
+
+/// Whether the live compact segments and verbatim groups cover a contiguous run
+/// of ids with no gaps and no overlaps — the invariant the index must satisfy.
+///
+/// Used by a `debug_assert!` in [`apply_parked_compact`]; cheap and only walks
+/// the (small) live set.
+fn coverage_is_contiguous(state: &MemoryState) -> bool {
+    // Merge compact ranges and single-group ids into one ascending list of
+    // (start, end) spans, then check each span begins exactly where the last ended.
+    let mut spans: Vec<(RecordId, RecordId)> = Vec::new();
+    spans.extend(state.compacts.iter().map(|c| (c.id_start, c.id_end)));
+    spans.extend(state.groups.iter().map(|g| (g.id, g.id)));
+    spans.sort_by_key(|(start, _)| *start);
+
+    let mut expected_next: Option<RecordId> = None;
+    for (start, end) in spans {
+        if let Some(next) = expected_next {
+            if start != next {
+                return false; // gap or overlap
+            }
+        }
+        expected_next = Some(end.next());
+    }
     true
 }
 
 /// Flush pending records (one `append`) and, when needed, rewrite the manifest.
-///
-/// Foreground-only: the single `state` lock is held across the filesystem writes,
-/// so offsets, appends, and manifest stay consistent with no second lock and no
-/// release-and-reacquire window. Data is always appended *before* the manifest
-/// is updated, so the manifest's `covered_len` never points past the end of the
-/// data log. On a failed data append the pending records are left in place to
-/// retry on the next persist — nothing is committed.
 fn persist(inner: &MemoryInner, force_manifest: bool) {
     let mut state = lock_state(inner);
     let want_manifest = force_manifest || state.index_dirty;
@@ -770,7 +790,6 @@ fn persist(inner: &MemoryInner, force_manifest: bool) {
         return;
     }
 
-    // Append the pending data lines, then record each record's byte location.
     if !state.pending.is_empty() {
         let mut data_buf = Vec::new();
         let mut locs = Vec::with_capacity(state.pending.len());
@@ -786,7 +805,7 @@ fn persist(inner: &MemoryInner, force_manifest: bool) {
                 "conversation {}: data append failed: {err}",
                 inner.conversation_id
             );
-            return; // keep pending; retry next persist
+            return;
         }
         state.data_len = off.as_len();
         for (target, off, len) in locs {
@@ -796,7 +815,6 @@ fn persist(inner: &MemoryInner, force_manifest: bool) {
     }
     state.last_persist = Some(Instant::now());
 
-    // Manifest second, so it never describes more than the data log holds.
     if want_manifest {
         if let Some(bytes) = build_manifest_bytes(&state, inner.conversation_id) {
             match inner.deps.fs.write_atomic(&inner.index_path, &bytes) {
@@ -809,15 +827,14 @@ fn persist(inner: &MemoryInner, force_manifest: bool) {
                         "conversation {}: index write failed: {err}",
                         inner.conversation_id
                     );
-                    state.index_dirty = true; // rebuilt on next persist or load
+                    state.index_dirty = true;
                 }
             }
         }
     }
 }
 
-/// Rewrite both files from the live set when dead bytes dominate, reclaiming the
-/// space left by superseded records. Foreground-only, like [`persist`].
+/// Rewrite both files when dead bytes dominate.
 fn maybe_collapse(inner: &MemoryInner) {
     let collapse = {
         let state = lock_state(inner);
@@ -829,51 +846,37 @@ fn maybe_collapse(inner: &MemoryInner) {
     }
 }
 
-/// Rewrite `.jsonl` + `.json` from the in-memory live set.
-///
-/// Rare and small (the live set is `pinned + one summary + keep_recent` groups),
-/// so this holds the single state lock across the writes for simplicity.
-fn collapse_locked(inner: &MemoryInner) {
-    let mut state = lock_state(inner);
-
+/// Rewrite `.jsonl` + `.json` from the in-memory live set, updating state locs
+/// to the new layout on success. Compact segments are written first (sorted by
+/// id_start), then groups in id order.
+fn write_live_set_to_files(
+    fs: &dyn ClawFs,
+    data_path: &str,
+    index_path: &str,
+    state: &mut MemoryState,
+    conversation_id: usize,
+) {
     let mut data_buf = Vec::new();
     let mut live = Vec::new();
     let mut locs: Vec<(PendingTarget, ByteOffset, ByteLen)> = Vec::new();
     let mut off = ByteOffset::default();
 
-    // Order: pins, then the summary, then groups — all in id order.
-    for pin in &state.pinned {
-        let record = LogRecord::Pin {
-            id: pin.id,
-            msg: pin.value.clone(),
-        };
-        let Some(len) = append_line(&mut data_buf, &record, inner.conversation_id) else {
-            return;
-        };
-        live.push(IndexEntry::Pin {
-            off,
-            len,
-            id: pin.id,
-        });
-        locs.push((PendingTarget::Pin(pin.id), off, len));
-        off = off.advance(len);
-    }
-    if let (false, Some((id_start, id_end))) = (state.summary.is_empty(), state.summary_range) {
+    for compact in &state.compacts {
         let record = LogRecord::Compact {
-            id_start,
-            id_end,
-            summary: state.summary.clone(),
+            id_start: compact.id_start,
+            id_end: compact.id_end,
+            summary: compact.messages.clone(),
         };
-        let Some(len) = append_line(&mut data_buf, &record, inner.conversation_id) else {
+        let Some(len) = append_line(&mut data_buf, &record, conversation_id) else {
             return;
         };
         live.push(IndexEntry::Compact {
             off,
             len,
-            id_start,
-            id_end,
+            id_start: compact.id_start,
+            id_end: compact.id_end,
         });
-        locs.push((PendingTarget::Compact, off, len));
+        locs.push((PendingTarget::Compact(compact.id_start), off, len));
         off = off.advance(len);
     }
     for group in &state.groups {
@@ -881,7 +884,7 @@ fn collapse_locked(inner: &MemoryInner) {
             id: group.id,
             msgs: group.msgs.clone(),
         };
-        let Some(len) = append_line(&mut data_buf, &record, inner.conversation_id) else {
+        let Some(len) = append_line(&mut data_buf, &record, conversation_id) else {
             return;
         };
         live.push(IndexEntry::Group {
@@ -903,44 +906,45 @@ fn collapse_locked(inner: &MemoryInner) {
         Ok(bytes) => bytes,
         Err(err) => {
             log::warn!(
-                "conversation {}: collapse manifest serialize failed: {err}",
-                inner.conversation_id
+                "conversation {conversation_id}: write_live manifest serialize failed: {err}"
             );
             return;
         }
     };
 
-    if let Err(err) = inner.deps.fs.write_atomic(&inner.data_path, &data_buf) {
-        log::warn!(
-            "conversation {}: collapse data write failed: {err}",
-            inner.conversation_id
-        );
+    if let Err(err) = fs.write_atomic(data_path, &data_buf) {
+        log::warn!("conversation {conversation_id}: write_live data write failed: {err}");
         return;
     }
-    if let Err(err) = inner.deps.fs.write_atomic(&inner.index_path, &manifest_bytes) {
-        log::warn!(
-            "conversation {}: collapse index write failed: {err}",
-            inner.conversation_id
-        );
-        // The data file is the fresh truth; the stale manifest is rebuilt on load.
+    if let Err(err) = fs.write_atomic(index_path, &manifest_bytes) {
+        log::warn!("conversation {conversation_id}: write_live index write failed: {err}");
+        // Data file is the fresh truth; stale manifest is rebuilt on next load.
     }
 
-    // Commit: every live record now lives at its fresh offset; pending lines were
-    // duplicates of in-memory records and are subsumed by the rewrite.
     state.pending.clear();
     state.data_len = off.as_len();
     state.manifest_covered_len = off.as_len();
     state.index_dirty = false;
-    state.summary_loc = None;
-    for pin in &mut state.pinned {
-        pin.loc = None;
+    for compact in &mut state.compacts {
+        compact.loc = None;
     }
     for group in &mut state.groups {
         group.loc = None;
     }
     for (target, off, len) in locs {
-        set_loc(&mut state, target, off, len);
+        set_loc(state, target, off, len);
     }
+}
+
+fn collapse_locked(inner: &MemoryInner) {
+    let mut state = lock_state(inner);
+    write_live_set_to_files(
+        inner.deps.fs.as_ref(),
+        &inner.data_path,
+        &inner.index_path,
+        &mut state,
+        inner.conversation_id,
+    );
 }
 
 /// Serialize `record` into `buf` with a trailing newline; returns the line length.
@@ -967,38 +971,26 @@ fn set_loc(state: &mut MemoryState, target: PendingTarget, off: ByteOffset, len:
                 group.loc = Some((off, len));
             }
         }
-        PendingTarget::Pin(id) => {
-            if let Some(pin) = state.pinned.iter_mut().find(|p| p.id == id) {
-                pin.loc = Some((off, len));
+        PendingTarget::Compact(id_start) => {
+            if let Some(compact) = state.compacts.iter_mut().find(|c| c.id_start == id_start) {
+                compact.loc = Some((off, len));
             }
         }
-        PendingTarget::Compact => state.summary_loc = Some((off, len)),
     }
 }
 
 /// Build the manifest of the current live records (those already on disk).
 fn build_manifest_bytes(state: &MemoryState, conversation_id: usize) -> Option<Vec<u8>> {
     let mut live = Vec::new();
-    for pin in &state.pinned {
-        if let Some((off, len)) = pin.loc {
-            live.push(IndexEntry::Pin {
+    for compact in &state.compacts {
+        if let Some((off, len)) = compact.loc {
+            live.push(IndexEntry::Compact {
                 off,
                 len,
-                id: pin.id,
+                id_start: compact.id_start,
+                id_end: compact.id_end,
             });
         }
-    }
-    if let (false, Some((off, len)), Some((id_start, id_end))) = (
-        state.summary.is_empty(),
-        state.summary_loc,
-        state.summary_range,
-    ) {
-        live.push(IndexEntry::Compact {
-            off,
-            len,
-            id_start,
-            id_end,
-        });
     }
     for group in &state.groups {
         if let Some((off, len)) = group.loc {
@@ -1027,13 +1019,8 @@ fn build_manifest_bytes(state: &MemoryState, conversation_id: usize) -> Option<V
 /// Total bytes of records currently considered live and present on disk.
 fn live_bytes(state: &MemoryState) -> ByteLen {
     let mut total = ByteLen::default();
-    for pin in &state.pinned {
-        if let Some((_, len)) = pin.loc {
-            total = total.saturating_add(len);
-        }
-    }
-    if !state.summary.is_empty() {
-        if let Some((_, len)) = state.summary_loc {
+    for compact in &state.compacts {
+        if let Some((_, len)) = compact.loc {
             total = total.saturating_add(len);
         }
     }
@@ -1045,7 +1032,6 @@ fn live_bytes(state: &MemoryState) -> ByteLen {
     total
 }
 
-/// Whether a memory has unwritten work past its debounce window.
 fn persist_due(inner: &MemoryInner, state: &MemoryState) -> bool {
     if state.pending.is_empty() && !state.index_dirty {
         return false;
@@ -1056,58 +1042,108 @@ fn persist_due(inner: &MemoryInner, state: &MemoryState) -> bool {
     }
 }
 
-/// Load and rehydrate persisted state: manifest live records by `read_at`, then a
-/// tail-scan for records appended since the manifest was written. A missing or
-/// short manifest degrades to a full data-log scan.
-fn load_state(fs: &dyn ClawFs, data_path: &str, index_path: &str) -> MemoryState {
+/// Return true if `record` is the type and id that `entry` claims.
+fn verify_entry(entry: &IndexEntry, record: &LogRecord) -> bool {
+    match (entry, record) {
+        (IndexEntry::Group { id: eid, .. }, LogRecord::Group { id: rid, .. }) => eid == rid,
+        (
+            IndexEntry::Compact {
+                id_start: es,
+                id_end: ee,
+                ..
+            },
+            LogRecord::Compact {
+                id_start: rs,
+                id_end: re,
+                ..
+            },
+        ) => es == rs && ee == re,
+        _ => false,
+    }
+}
+
+/// Load and rehydrate persisted state. Returns `(state, needs_rebuild)`.
+/// `needs_rebuild` is true when a manifest existed but its entries did not match
+/// the data log — the caller should rewrite both files from the recovered state.
+fn load_state(fs: &dyn ClawFs, data_path: &str, index_path: &str) -> (MemoryState, bool) {
     let mut state = MemoryState::default();
     let mut covered_len = ByteLen::default();
     let mut manifest_next_id = RecordId::default();
+    let mut mismatch = false;
 
     if let Ok(bytes) = fs.read(index_path) {
         if let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes) {
             covered_len = manifest.covered_len;
             manifest_next_id = manifest.next_id;
-            for entry in &manifest.live {
+            'entries: for entry in &manifest.live {
                 let (off, len) = entry_loc(entry);
                 match fs.read_at(data_path, off.as_u64(), len.as_usize()) {
-                    Ok(buf) => {
-                        if let Some(record) = parse_record(&buf) {
+                    Ok(buf) => match parse_record(&buf) {
+                        Some(record) if verify_entry(entry, &record) => {
                             apply_record(&mut state, record, Some((off, len)));
                         }
+                        Some(_) => {
+                            log::error!(
+                                "conversation load: manifest entry at offset {} does not match \
+                                 data log record; rebuilding",
+                                off.as_u64()
+                            );
+                            mismatch = true;
+                            break 'entries;
+                        }
+                        None => {
+                            log::error!(
+                                "conversation load: manifest entry at offset {} could not be \
+                                 parsed; rebuilding",
+                                off.as_u64()
+                            );
+                            mismatch = true;
+                            break 'entries;
+                        }
+                    },
+                    Err(err) => {
+                        log::error!(
+                            "conversation load: manifest entry at offset {} could not be read: \
+                             {err}; rebuilding",
+                            off.as_u64()
+                        );
+                        mismatch = true;
+                        break 'entries;
                     }
-                    Err(err) => log::warn!(
-                        "conversation load: read_at offset {} failed: {err}",
-                        off.as_u64()
-                    ),
                 }
             }
         }
     }
 
+    if mismatch {
+        state = MemoryState::default();
+        covered_len = ByteLen::default();
+        manifest_next_id = RecordId::default();
+    }
+
     let data_len = ByteLen::from_file_len(fs.len(data_path).unwrap_or(0));
     if data_len > covered_len {
         let extra = data_len.saturating_sub(covered_len);
-        if let Ok(tail) = fs.read_at(data_path, covered_len.as_offset().as_u64(), extra.as_usize())
-        {
+        if let Ok(tail) = fs.read_at(
+            data_path,
+            covered_len.as_offset().as_u64(),
+            extra.as_usize(),
+        ) {
             scan_tail(&mut state, &tail, covered_len.as_offset());
         }
-        // The manifest no longer reflects the live/dead structure; refresh it on
-        // the next persist so future loads can skip dead records again.
         state.index_dirty = true;
     }
 
     state.data_len = data_len;
     state.manifest_covered_len = covered_len;
-    state.pinned.sort_by_key(|p| p.id);
     state.groups.sort_by_key(|g| g.id);
+    state.compacts.sort_by_key(|c| c.id_start);
     state.next_id = manifest_next_id.max(max_seen_id(&state).next());
     state.approx_tokens = estimate_state_tokens(&state);
-    state
+    (state, mismatch)
 }
 
-/// Parse a newline-delimited tail buffer, applying each complete record. A torn
-/// trailing line (no newline) is discarded.
+/// Parse a newline-delimited tail buffer, applying each complete record.
 fn scan_tail(state: &mut MemoryState, tail: &[u8], base_off: ByteOffset) {
     let mut start = 0usize;
     let mut pos = base_off;
@@ -1128,50 +1164,52 @@ fn scan_tail(state: &mut MemoryState, tail: &[u8], base_off: ByteOffset) {
 /// Fold one decoded record into the live state, applying supersession.
 ///
 /// Supersession is keyed on [`RecordId`] only; `loc` is the byte address of the
-/// record and is never used to decide order. Keep it that way — making this
-/// positional would make correctness depend on physical offset order.
+/// record and is never used to decide order.
 fn apply_record(state: &mut MemoryState, record: LogRecord, loc: Option<(ByteOffset, ByteLen)>) {
     match record {
-        LogRecord::Group { id, msgs } => state.groups.push(StoredGroup { id, msgs, loc }),
-        LogRecord::Pin { id, msg } => state.pinned.push(StoredPin {
-            id,
-            value: msg,
-            loc,
-        }),
+        LogRecord::Group { id, msgs } => {
+            // A group already covered by a compact segment is a dead record
+            // (superseded). Skip it rather than adding and immediately removing it.
+            let covered = state
+                .compacts
+                .iter()
+                .any(|c| id >= c.id_start && id <= c.id_end);
+            if !covered {
+                state.groups.push(StoredGroup { id, msgs, loc });
+            }
+        }
         LogRecord::Compact {
             id_start,
             id_end,
             summary,
         } => {
-            // The summary supersedes groups in its range; pins are never in it.
+            // Retire any groups now covered by this compact segment.
             state.groups.retain(|g| g.id < id_start || g.id > id_end);
-            state.summary = summary;
-            state.summary_range = Some((id_start, id_end));
-            state.summary_loc = loc;
+            state.compacts.push(StoredCompact {
+                id_start,
+                id_end,
+                messages: summary,
+                loc,
+            });
         }
     }
 }
 
-/// Highest id currently represented (live group/pin or summary range end).
+/// Highest id currently represented (live group or compact range end).
 fn max_seen_id(state: &MemoryState) -> RecordId {
-    let mut max = RecordId::default();
-    for pin in &state.pinned {
-        max = max.max(pin.id);
-    }
-    for group in &state.groups {
-        max = max.max(group.id);
-    }
-    if let Some((_, id_end)) = state.summary_range {
-        max = max.max(id_end);
-    }
-    max
+    let group_max = state.groups.iter().map(|g| g.id).max().unwrap_or_default();
+    let compact_max = state
+        .compacts
+        .iter()
+        .map(|c| c.id_end)
+        .max()
+        .unwrap_or_default();
+    group_max.max(compact_max)
 }
 
 fn entry_loc(entry: &IndexEntry) -> (ByteOffset, ByteLen) {
     match *entry {
-        IndexEntry::Group { off, len, .. }
-        | IndexEntry::Pin { off, len, .. }
-        | IndexEntry::Compact { off, len, .. } => (off, len),
+        IndexEntry::Group { off, len, .. } | IndexEntry::Compact { off, len, .. } => (off, len),
     }
 }
 
@@ -1196,7 +1234,6 @@ fn conversation_path(dir: &str, conversation_id: usize, ext: &str) -> String {
     )
 }
 
-/// Lock the state, recovering the guard if a worker panicked while holding it.
 fn lock_state(inner: &MemoryInner) -> MutexGuard<'_, MemoryState> {
     inner
         .state
@@ -1212,12 +1249,12 @@ fn estimate_message_tokens(message: &Value) -> usize {
 }
 
 fn estimate_state_tokens(state: &MemoryState) -> usize {
-    let pinned: usize = state
-        .pinned
+    let compacts: usize = state
+        .compacts
         .iter()
-        .map(|p| estimate_message_tokens(&p.value))
+        .flat_map(|c| c.messages.iter())
+        .map(estimate_message_tokens)
         .sum();
-    let summary: usize = state.summary.iter().map(estimate_message_tokens).sum();
     let groups: usize = state
         .groups
         .iter()
@@ -1225,8 +1262,5 @@ fn estimate_state_tokens(state: &MemoryState) -> usize {
         .map(estimate_message_tokens)
         .sum();
     let open: usize = state.open_group.iter().map(estimate_message_tokens).sum();
-    pinned
-        .saturating_add(summary)
-        .saturating_add(groups)
-        .saturating_add(open)
+    compacts.saturating_add(groups).saturating_add(open)
 }

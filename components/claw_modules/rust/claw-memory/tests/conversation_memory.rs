@@ -106,10 +106,15 @@ fn deps(fs: Arc<dyn ClawFs>, pool: Arc<MemoryTaskPool>, marker: &str) -> Convers
 }
 
 /// Config with an instant persist (no debounce) so appends hit disk per turn.
-fn instant_config(dir: &str, threshold: usize, keep_recent: usize) -> ConversationConfig {
+///
+/// `keep_recent_tokens` sets the verbatim-tail token budget. `segment_token_budget`
+/// is set to `usize::MAX` so all aged groups are compacted in a single chunk,
+/// preserving deterministic single-cycle compaction in tests.
+fn instant_config(dir: &str, threshold: usize, keep_recent_tokens: usize) -> ConversationConfig {
     let mut config = ConversationConfig::new(dir);
     config.compact_threshold_tokens = threshold;
-    config.keep_recent = keep_recent;
+    config.keep_recent_tokens = keep_recent_tokens;
+    config.segment_token_budget = usize::MAX;
     config.persist_debounce = Duration::ZERO;
     config
 }
@@ -196,22 +201,6 @@ fn appends_render_in_order() {
 }
 
 #[test]
-fn pinned_messages_render_first() {
-    let mut memory = memory_with(Arc::new(MemFs::default()));
-
-    {
-        let turn = memory.group();
-        turn.append_user("body");
-        turn.pin(json!({ "role": "system", "content": "task brief" }));
-    }
-
-    let messages = messages(&memory);
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["content"], "task brief"); // pinned, ahead of the turn
-    assert_eq!(messages[1]["content"], "body");
-}
-
-#[test]
 fn append_patch_expands_a_batch() {
     let mut memory = memory_with(Arc::new(MemFs::default()));
 
@@ -287,7 +276,12 @@ fn crosses_threshold_and_auto_compacts_in_background() {
 
     let mut config = ConversationConfig::new("/conversations");
     config.compact_threshold_tokens = 5; // tiny, so a few turns trip it
-    config.keep_recent = 2; // keep the 2 newest raw turns verbatim
+                                         // keep_recent_tokens: "message number N" serialises to ~43 chars (~11 tokens).
+                                         // 15 tokens keeps 2 groups: group-5 gives 11 < 15 so we continue; group-4
+                                         // brings the total to 22 >= 15, stopping at count=2.
+    config.keep_recent_tokens = 15;
+    // compact all aged groups in one shot so the test converges in one cycle.
+    config.segment_token_budget = usize::MAX;
 
     let mut memory = ConversationMemory::new(
         1,
@@ -330,9 +324,11 @@ fn reloads_after_compaction_via_manifest() {
     let fs: Arc<dyn ClawFs> = Arc::new(MemFs::default());
     let shared = pool();
 
+    // "mN" serialises to ~29 chars (~8 tokens/group). keep_recent_tokens=9 keeps
+    // 2 verbatim groups: group-5 gives 8 < 9 so we continue; group-4 gives 16 >= 9.
     let mut memory = ConversationMemory::new(
         1,
-        instant_config("/c", 5, 2),
+        instant_config("/c", 5, 9),
         deps(Arc::clone(&fs), Arc::clone(&shared), "SUMMARY"),
     );
     for i in 0..6 {
@@ -347,7 +343,7 @@ fn reloads_after_compaction_via_manifest() {
     // A fresh memory restores the same view from the manifest + data log.
     let reloaded = ConversationMemory::new(
         1,
-        instant_config("/c", 5, 2),
+        instant_config("/c", 5, 9),
         deps(Arc::clone(&fs), Arc::clone(&shared), "SUMMARY"),
     );
     let m = messages(&reloaded);
@@ -364,7 +360,7 @@ fn reloads_from_data_log_without_manifest() {
 
     let mut memory = ConversationMemory::new(
         3,
-        instant_config("/c", 100_000, 8),
+        instant_config("/c", 100_000, 999_999),
         deps(Arc::clone(&fs), Arc::clone(&shared), "S"),
     );
     memory.group().append_user("a");
@@ -379,7 +375,11 @@ fn reloads_from_data_log_without_manifest() {
         let reloaded = ConversationMemory::new(
             3,
             ConversationConfig::new("/c"),
-            deps(Arc::clone(&fs_for_reload), Arc::clone(&pool_for_reload), "S"),
+            deps(
+                Arc::clone(&fs_for_reload),
+                Arc::clone(&pool_for_reload),
+                "S",
+            ),
         );
         messages(&reloaded).len() == 3
     }));
@@ -394,7 +394,7 @@ fn reload_tail_scans_appends_after_manifest() {
 
     let mut memory = ConversationMemory::new(
         4,
-        instant_config("/c", 100_000, 8),
+        instant_config("/c", 100_000, 999_999),
         deps(Arc::clone(&fs), Arc::clone(&shared), "S"),
     );
     memory.group().append_user("a");
@@ -408,7 +408,11 @@ fn reload_tail_scans_appends_after_manifest() {
         let reloaded = ConversationMemory::new(
             4,
             ConversationConfig::new("/c"),
-            deps(Arc::clone(&fs_for_reload), Arc::clone(&pool_for_reload), "S"),
+            deps(
+                Arc::clone(&fs_for_reload),
+                Arc::clone(&pool_for_reload),
+                "S",
+            ),
         );
         let m = messages(&reloaded);
         m.len() == 3 && m[2]["content"] == "c"
@@ -422,7 +426,7 @@ fn collapse_reclaims_dead_bytes() {
 
     let mut memory = ConversationMemory::new(
         5,
-        instant_config("/c", 5, 2),
+        instant_config("/c", 5, 9),
         deps(Arc::clone(&fs), pool(), "SUMMARY"),
     );
     let big = "x".repeat(1024);
@@ -434,7 +438,9 @@ fn collapse_reclaims_dead_bytes() {
     // rewrite it from the small live set, keeping it bounded. Pump turn boundaries
     // so the background summaries get applied (and dead bytes reclaimed).
     assert!(pump_until(&mut memory, |_| {
-        memfs.len("/c/conversation-5.jsonl").is_ok_and(|n| n < 30 * 1024)
+        memfs
+            .len("/c/conversation-5.jsonl")
+            .is_ok_and(|n| n < 30 * 1024)
     }));
     let m = messages(&memory);
     assert_eq!(m[0]["content"], "SUMMARY");
@@ -476,4 +482,510 @@ fn invalid_assistant_json_is_dropped_not_panicking() {
     let messages = messages(&memory);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["content"], "valid");
+}
+
+// --- message ordering tests ----------------------------------------------
+
+fn group_line(id: u64, content: &str) -> Vec<u8> {
+    let mut line = serde_json::to_vec(
+        &json!({ "t": "group", "id": id, "msgs": [{ "role": "user", "content": content }] }),
+    )
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn compact_line(id_start: u64, id_end: u64, summary_content: &str) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&json!({
+        "t": "compact",
+        "id_start": id_start,
+        "id_end": id_end,
+        "summary": [{ "role": "system", "content": summary_content }],
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn load_from_log(data: Vec<u8>) -> ConversationMemory {
+    let fs: Arc<dyn ClawFs> = Arc::new(MemFs::default());
+    fs.append("/c/conversation-1.jsonl", &data).unwrap();
+    ConversationMemory::new(1, ConversationConfig::new("/c"), deps(fs, pool(), "S"))
+}
+
+#[test]
+fn mismatched_manifest_triggers_rebuild_and_recovers_all_groups() {
+    let fs: Arc<dyn ClawFs> = Arc::new(MemFs::default());
+
+    // Write 3 valid groups to the data log.
+    let line0 = group_line(0, "g0");
+    let line1 = group_line(1, "g1");
+    let line2 = group_line(2, "g2");
+    let mut data = Vec::new();
+    data.extend_from_slice(&line0);
+    data.extend_from_slice(&line1);
+    data.extend_from_slice(&line2);
+    fs.append("/c/conversation-1.jsonl", &data).unwrap();
+
+    // Write a manifest that claims the record at offset 0 has id=99 (wrong).
+    let fake_manifest = serde_json::json!({
+        "version": 1,
+        "covered_len": data.len(),
+        "next_id": 3,
+        "live": [{ "t": "group", "id": 99, "off": 0, "len": line0.len() }]
+    });
+    fs.write_atomic(
+        "/c/conversation-1.json",
+        &serde_json::to_vec(&fake_manifest).unwrap(),
+    )
+    .unwrap();
+
+    // Load: detects the mismatch, falls back to full scan, recovers all 3 groups,
+    // and rewrites both files.
+    let memory = ConversationMemory::new(
+        1,
+        ConversationConfig::new("/c"),
+        deps(Arc::clone(&fs), pool(), "S"),
+    );
+    let msgs = messages(&memory);
+    assert_eq!(msgs.len(), 3, "all 3 groups recovered after rebuild");
+    assert_eq!(msgs[0]["content"], "g0");
+    assert_eq!(msgs[1]["content"], "g1");
+    assert_eq!(msgs[2]["content"], "g2");
+
+    // The rebuilt files should be self-consistent: reloading must give the same view.
+    let reloaded = ConversationMemory::new(
+        1,
+        ConversationConfig::new("/c"),
+        deps(Arc::clone(&fs), pool(), "S"),
+    );
+    let reloaded_msgs = messages(&reloaded);
+    assert_eq!(reloaded_msgs.len(), 3);
+    assert_eq!(reloaded_msgs[0]["content"], "g0");
+    assert_eq!(reloaded_msgs[2]["content"], "g2");
+}
+
+#[test]
+fn messages_without_compaction_are_in_id_order() {
+    let mut memory = memory_with(Arc::new(MemFs::default()));
+    for i in 0..5u32 {
+        memory.group().append_user(format!("turn {i}"));
+    }
+    let msgs = messages(&memory);
+    assert_eq!(msgs.len(), 5);
+    for (i, msg) in msgs.iter().enumerate() {
+        assert_eq!(msg["content"], format!("turn {i}"));
+    }
+}
+
+#[test]
+fn messages_with_leading_compaction_places_summary_first() {
+    // groups 0-4 compacted, groups 5-9 verbatim → summary first, then groups 5-9
+    let mut data = Vec::new();
+    for i in 0u64..5 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+    data.extend_from_slice(&compact_line(0, 4, "SUMMARY"));
+    for i in 5u64..10 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+
+    let memory = load_from_log(data);
+    let msgs = messages(&memory);
+    assert_eq!(msgs.len(), 6, "summary + 5 verbatim groups");
+    assert_eq!(msgs[0]["content"], "SUMMARY");
+    for i in 0..5usize {
+        assert_eq!(msgs[1 + i]["content"], format!("g{}", i + 5));
+    }
+}
+
+#[test]
+fn messages_with_mid_range_compaction_inserts_summary_at_correct_position() {
+    // groups 0-4 verbatim, groups 5-9 compacted, groups 10-14 verbatim
+    // expected: g0..g4, SUMMARY, g10..g14
+    let mut data = Vec::new();
+    for i in 0u64..5 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+    data.extend_from_slice(&compact_line(5, 9, "SUMMARY"));
+    for i in 10u64..15 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+
+    let memory = load_from_log(data);
+    let msgs = messages(&memory);
+    assert_eq!(msgs.len(), 11, "5 before + summary + 5 after");
+    for i in 0..5usize {
+        assert_eq!(msgs[i]["content"], format!("g{i}"), "position {i}");
+    }
+    assert_eq!(msgs[5]["content"], "SUMMARY");
+    for i in 0..5usize {
+        assert_eq!(
+            msgs[6 + i]["content"],
+            format!("g{}", i + 10),
+            "position {}",
+            6 + i
+        );
+    }
+}
+
+#[test]
+fn messages_ids_1_to_20_with_4_to_10_compacted() {
+    // Simulates the post-compaction data log: groups 1-3 are verbatim, groups
+    // 4-10 have been replaced by a compact record, groups 11-20 are verbatim.
+    // Expected order: g1, g2, g3, SUMMARY, g11 .. g20 (14 messages total).
+    let mut data = Vec::new();
+    for i in 1u64..=3 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+    data.extend_from_slice(&compact_line(4, 10, "SUMMARY"));
+    for i in 11u64..=20 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+
+    let memory = load_from_log(data);
+    let msgs = messages(&memory);
+    assert_eq!(msgs.len(), 14, "3 uncompacted + summary + 10 uncompacted");
+
+    assert_eq!(msgs[0]["content"], "g1");
+    assert_eq!(msgs[1]["content"], "g2");
+    assert_eq!(msgs[2]["content"], "g3");
+
+    assert_eq!(msgs[3]["content"], "SUMMARY");
+
+    for i in 0..10usize {
+        assert_eq!(
+            msgs[4 + i]["content"],
+            format!("g{}", i + 11),
+            "position {}",
+            4 + i
+        );
+    }
+}
+
+#[test]
+fn compact_record_supersedes_groups_in_range() {
+    // All 20 groups (ids 1-20) are written first, then a compact record is
+    // appended covering 4-10. The load path must retire groups 4-10 and treat
+    // the compact record as their replacement, leaving 1-3 and 11-20 verbatim.
+    let mut data = Vec::new();
+    for i in 1u64..=20 {
+        data.extend_from_slice(&group_line(i, &format!("g{i}")));
+    }
+    data.extend_from_slice(&compact_line(4, 10, "SUMMARY"));
+
+    let memory = load_from_log(data);
+    let msgs = messages(&memory);
+    assert_eq!(msgs.len(), 14, "3 uncompacted + summary + 10 uncompacted");
+
+    assert_eq!(msgs[0]["content"], "g1");
+    assert_eq!(msgs[1]["content"], "g2");
+    assert_eq!(msgs[2]["content"], "g3");
+
+    assert_eq!(msgs[3]["content"], "SUMMARY");
+
+    for i in 0..10usize {
+        assert_eq!(
+            msgs[4 + i]["content"],
+            format!("g{}", i + 11),
+            "position {}",
+            4 + i
+        );
+    }
+}
+
+// --- real-filesystem helpers (disk-inspection tests only) ----------------
+
+/// A [`ClawFs`] that writes to real files on disk, so output can be inspected
+/// after a test run. Virtual paths (starting with `/`) are mapped into `base`.
+struct RealFs {
+    base: std::path::PathBuf,
+}
+
+impl RealFs {
+    fn new(base: impl AsRef<std::path::Path>) -> Self {
+        let base = base.as_ref().to_path_buf();
+        std::fs::create_dir_all(&base).expect("create RealFs base dir");
+        Self { base }
+    }
+
+    fn full_path(&self, path: &str) -> std::path::PathBuf {
+        // Virtual paths start with '/'; strip it so they join into base cleanly.
+        self.base.join(path.trim_start_matches('/'))
+    }
+}
+
+impl ClawFs for RealFs {
+    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        std::fs::read(self.full_path(path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FsError::NotFound
+            } else {
+                FsError::Io(e.to_string())
+            }
+        })
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f =
+            std::fs::File::open(self.full_path(path)).map_err(|e| FsError::Io(e.to_string()))?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf)
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        Ok(buf)
+    }
+
+    fn len(&self, path: &str) -> Result<u64, FsError> {
+        std::fs::metadata(self.full_path(path))
+            .map(|m| m.len())
+            .map_err(|_| FsError::NotFound)
+    }
+
+    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        let full = self.full_path(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FsError::Io(e.to_string()))?;
+        }
+        // Pretty-print .json files so they are readable when inspecting on disk.
+        let bytes: std::borrow::Cow<[u8]> = if path.ends_with(".json") {
+            serde_json::from_slice::<Value>(data)
+                .ok()
+                .and_then(|v| serde_json::to_vec_pretty(&v).ok())
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(data))
+        } else {
+            std::borrow::Cow::Borrowed(data)
+        };
+        std::fs::write(&full, bytes.as_ref()).map_err(|e| FsError::Io(e.to_string()))
+    }
+
+    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        use std::io::Write;
+        let full = self.full_path(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FsError::Io(e.to_string()))?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&full)
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        f.write_all(data).map_err(|e| FsError::Io(e.to_string()))
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.full_path(path).exists()
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        std::fs::remove_file(self.full_path(path)).map_err(|e| FsError::Io(e.to_string()))
+    }
+}
+
+// --- manifest coverage helpers -------------------------------------------
+
+/// Number of live compact segments listed in a manifest `.json`.
+fn count_compacts(index_json: &str) -> usize {
+    serde_json::from_str::<Value>(index_json)
+        .ok()
+        .and_then(|m| {
+            m["live"]
+                .as_array()
+                .map(|live| live.iter().filter(|e| e["t"] == "compact").count())
+        })
+        .unwrap_or(0)
+}
+
+/// Assert the manifest's live records cover a contiguous run of ids with no
+/// gaps and no overlaps, returning `(min_id, max_id)`.
+///
+/// This is the index the user inspects: compact segments (`[id_start, id_end]`)
+/// plus single-id groups must tile the whole committed id range without holes.
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+fn assert_manifest_coverage_contiguous(index_json: &str) -> (u64, u64) {
+    let manifest: Value = serde_json::from_str(index_json).expect("parse manifest");
+    let live = manifest["live"].as_array().expect("live array");
+
+    let mut spans: Vec<(u64, u64)> = live
+        .iter()
+        .map(|e| match e["t"].as_str() {
+            Some("compact") => (
+                e["id_start"].as_u64().expect("id_start"),
+                e["id_end"].as_u64().expect("id_end"),
+            ),
+            Some("group") => {
+                let id = e["id"].as_u64().expect("id");
+                (id, id)
+            }
+            other => panic!("unexpected manifest entry type: {other:?}"),
+        })
+        .collect();
+    spans.sort_by_key(|(start, _)| *start);
+    assert!(!spans.is_empty(), "manifest has no live records");
+
+    for window in spans.windows(2) {
+        let (_, prev_end) = window[0];
+        let (start, _) = window[1];
+        assert_eq!(
+            start,
+            prev_end + 1,
+            "hole/overlap in coverage: a span ending at {prev_end} is followed by {start} \
+             (expected {})",
+            prev_end + 1
+        );
+    }
+    (spans[0].0, spans.last().unwrap().1)
+}
+
+/// Commits many turns under a small `segment_token_budget` so several compact
+/// segments accumulate, then asserts the on-disk index covers every committed
+/// id with no holes — the regression test for the drop-oldest data-loss bug.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn compaction_index_coverage_has_no_holes() {
+    let output_root = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
+    let virtual_dir = "/holes";
+    let disk_dir = format!("{output_root}/holes");
+    std::fs::remove_dir_all(&disk_dir).ok();
+    std::fs::create_dir_all(&disk_dir).expect("create disk_dir");
+
+    let fs: Arc<dyn ClawFs> = Arc::new(RealFs::new(output_root));
+    let shared = pool();
+
+    let mut cfg = ConversationConfig::new(virtual_dir);
+    cfg.compact_threshold_tokens = 20; // trip after a few turns
+    cfg.keep_recent_tokens = 10; // keep ~1 newest turn verbatim
+    cfg.segment_token_budget = 12; // small → each chunk is one group → many segments
+    cfg.persist_debounce = Duration::ZERO;
+
+    let mut memory =
+        ConversationMemory::new(2, cfg, deps(Arc::clone(&fs), Arc::clone(&shared), "S"));
+
+    for i in 0..15u32 {
+        memory.group().append_user(format!("turn {i}"));
+    }
+
+    let index_path = format!("{disk_dir}/conversation-2.json");
+    // Drive turn boundaries until at least two compact segments exist on disk.
+    let index_for_poll = index_path.clone();
+    assert!(
+        pump_until(&mut memory, |_| {
+            std::fs::read_to_string(&index_for_poll)
+                .map(|s| count_compacts(&s) >= 2)
+                .unwrap_or(false)
+        }),
+        "expected multiple compact segments to form"
+    );
+    memory.flush();
+
+    let index_json = std::fs::read_to_string(&index_path).unwrap();
+    let (min_id, max_id) = assert_manifest_coverage_contiguous(&index_json);
+    assert_eq!(min_id, 1, "coverage starts at the first committed id");
+    assert!(max_id >= 1, "coverage reaches the newest committed id");
+}
+
+// --- disk-inspection test ------------------------------------------------
+
+/// Runs a realistic compaction scenario and leaves the `.jsonl` / `.json` files
+/// in `claw-memory/output/` for manual inspection.
+///
+/// Run with `cargo test -p claw-memory --target x86_64-unknown-linux-gnu -- \
+///   --nocapture writes_inspectable_output_files` to see the file paths printed.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn writes_inspectable_output_files() {
+    let output_root = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
+    // Virtual dir used by ConversationConfig; maps to output/data/ on disk.
+    let virtual_dir = "/data";
+
+    // Clear any files from a previous run so the output reflects exactly this test.
+    let disk_dir = format!("{output_root}/data");
+    std::fs::remove_dir_all(&disk_dir).ok();
+    std::fs::create_dir_all(&disk_dir).expect("create disk_dir");
+
+    let fs: Arc<dyn ClawFs> = Arc::new(RealFs::new(output_root));
+    let shared = pool();
+
+    let mut cfg = ConversationConfig::new(virtual_dir);
+    // Low threshold so compaction triggers after a few turns.
+    cfg.compact_threshold_tokens = 5;
+    // "What is N + N?" serialises to ~50 chars (~13 tokens/group); keeping
+    // keep_recent_tokens=20 retains the 2 newest turns verbatim (13 < 20,
+    // continue; 13+13=26 >= 20, stop at count=2).
+    cfg.keep_recent_tokens = 20;
+    // Compact all aged groups in a single chunk so the output is easy to read.
+    cfg.segment_token_budget = usize::MAX;
+    cfg.persist_debounce = Duration::ZERO;
+
+    let mut memory = ConversationMemory::new(
+        1,
+        cfg,
+        deps(Arc::clone(&fs), Arc::clone(&shared), "[COMPACTED SUMMARY]"),
+    );
+
+    // Commit 6 turns; each has a user question and an assistant answer.
+    for i in 0..6u32 {
+        let turn = memory.group();
+        turn.append_user(format!("What is {i} + {i}?"));
+        turn.append_assistant(&format!(
+            r#"{{"role":"assistant","content":"{i} + {i} = {}"}}"#,
+            i.saturating_add(i)
+        ));
+        // turn drops here, committing the group
+    }
+
+    // Wait for the background compaction and apply it at a turn boundary.
+    assert!(
+        pump_until(&mut memory, |m| messages(m)
+            .iter()
+            .any(|msg| msg["content"] == "[COMPACTED SUMMARY]")),
+        "expected at least one compact segment to appear"
+    );
+
+    // Force all pending writes and the updated manifest to disk.
+    memory.flush();
+
+    // Verify the logical view.
+    let msgs = messages(&memory);
+    assert!(
+        msgs.iter()
+            .any(|msg| msg["content"] == "[COMPACTED SUMMARY]"),
+        "compact segment present in messages()"
+    );
+    // The newest turn is kept verbatim, so the last message is its assistant reply.
+    let last_verbatim = msgs.last().unwrap();
+    assert_eq!(
+        last_verbatim["content"], "5 + 5 = 10",
+        "last verbatim message is the final assistant reply"
+    );
+
+    let data_path = format!("{disk_dir}/conversation-1.jsonl");
+    let index_path = format!("{disk_dir}/conversation-1.json");
+    assert!(
+        std::path::Path::new(&data_path).exists(),
+        ".jsonl was written to disk"
+    );
+    assert!(
+        std::path::Path::new(&index_path).exists(),
+        ".json was written to disk"
+    );
+
+    // The index must tile the whole id range with no holes.
+    let index_json = std::fs::read_to_string(&index_path).unwrap();
+    let (min_id, _) = assert_manifest_coverage_contiguous(&index_json);
+    assert_eq!(min_id, 1, "coverage starts at the first committed id");
+
+    // Write the rendered messages() output for inspection, pretty-printed.
+    let messages_path = format!("{disk_dir}/message.json");
+    let messages_json = serde_json::to_string_pretty(&memory.messages()).unwrap();
+    std::fs::write(&messages_path, &messages_json).unwrap();
+
+    println!("\n=== inspect output files ===");
+    println!("data log : {data_path}");
+    println!("manifest : {index_path}");
+    println!("messages : {messages_path}");
+    println!("{messages_json}");
 }

@@ -153,6 +153,31 @@ fn messages(memory: &ConversationMemory) -> Vec<Value> {
         .expect("messages() returns an array")
 }
 
+/// True when `messages` is the stable compacted shape: one or more leading
+/// `SUMMARY` system segments followed by exactly `verbatim_tail` verbatim
+/// messages in order.
+///
+/// Compaction runs one chunk per background job, so the number of summary
+/// segments is timing-dependent (a single job may cover all aged groups, or
+/// several jobs may each cover a slice). Tests therefore assert on the tail and
+/// on "everything before it is a summary", not on an exact message count.
+fn is_compacted_with_tail(
+    messages: &[Value],
+    summary_marker: &str,
+    verbatim_tail: &[&str],
+) -> bool {
+    if messages.len() < verbatim_tail.len() + 1 {
+        return false; // need at least one summary segment plus the tail
+    }
+    let split = messages.len() - verbatim_tail.len();
+    let (summaries, tail) = messages.split_at(split);
+    summaries.iter().all(|m| m["content"] == summary_marker)
+        && tail
+            .iter()
+            .zip(verbatim_tail)
+            .all(|(message, expected)| message["content"] == *expected)
+}
+
 /// Drive turn boundaries until `predicate` holds or a deadline passes.
 ///
 /// Compaction is computed in the background and only *applied* on the next turn
@@ -299,24 +324,22 @@ fn crosses_threshold_and_auto_compacts_in_background() {
     }
 
     // The summary is computed on a pool worker and applied at a later turn
-    // boundary, so drive boundaries until it settles: summary + the `keep_recent`
-    // newest verbatim turns.
+    // boundary, so drive boundaries until it settles: one or more summary
+    // segments followed by the `keep_recent_tokens` newest verbatim turns.
     assert!(
         pump_until(&mut memory, |m| {
-            let messages = messages(m);
-            messages.len() == 3 && messages[0]["content"] == "SUMMARY"
+            is_compacted_with_tail(
+                &messages(m),
+                "SUMMARY",
+                &["message number 4", "message number 5"],
+            )
         }),
-        "expected summary + 2 recent messages, got {:?}",
+        "expected summary segments + 2 recent messages, got {:?}",
         messages(&memory),
     );
 
     // The Compactor ran on the pool, off the append path.
     assert!(compactor.calls.load(Ordering::SeqCst) >= 1);
-
-    let messages = messages(&memory);
-    assert_eq!(messages[0]["content"], "SUMMARY");
-    assert_eq!(messages[1]["content"], "message number 4");
-    assert_eq!(messages[2]["content"], "message number 5");
 }
 
 #[test]
@@ -335,10 +358,10 @@ fn reloads_after_compaction_via_manifest() {
         memory.group().append_user(format!("m{i}"));
     }
     assert!(pump_until(&mut memory, |m| {
-        let m = messages(m);
-        m.len() == 3 && m[0]["content"] == "SUMMARY"
+        is_compacted_with_tail(&messages(m), "SUMMARY", &["m4", "m5"])
     }));
     memory.flush();
+    let before = messages(&memory);
 
     // A fresh memory restores the same view from the manifest + data log.
     let reloaded = ConversationMemory::new(
@@ -346,11 +369,12 @@ fn reloads_after_compaction_via_manifest() {
         instant_config("/c", 5, 9),
         deps(Arc::clone(&fs), Arc::clone(&shared), "SUMMARY"),
     );
-    let m = messages(&reloaded);
-    assert_eq!(m.len(), 3);
-    assert_eq!(m[0]["content"], "SUMMARY");
-    assert_eq!(m[1]["content"], "m4");
-    assert_eq!(m[2]["content"], "m5");
+    let after = messages(&reloaded);
+    assert_eq!(
+        after, before,
+        "reload reproduces the pre-flush view exactly"
+    );
+    assert!(is_compacted_with_tail(&after, "SUMMARY", &["m4", "m5"]));
 }
 
 #[test]

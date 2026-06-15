@@ -1,5 +1,6 @@
 [package]
 name = "claw-api"
+authors = ["Finn(Ziheng) Sheng"]
 version = "0.1.0"
 edition = "2021"
 description = "LLM client (OpenAI-/Anthropic-compatible chat + media inference over the ClawHttp trait), extracted from claw_core::llm"

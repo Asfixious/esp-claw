@@ -71,6 +71,28 @@ struct Queue {
 }
 
 /// A fixed pool of background workers for memory jobs.
+///
+/// Create one at boot with [`MemoryTaskPool::new`] and share it (via `Arc`)
+/// across every memory type; submit work with [`submit`](Self::submit). Workers
+/// run until the pool is dropped.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::{Arc, mpsc};
+///
+/// use claw_memory::{MemoryTaskPool, PoolConfig};
+///
+/// let pool = MemoryTaskPool::new(PoolConfig::default())?;
+///
+/// // Submit a job and wait for it to run on a worker thread.
+/// let (tx, rx) = mpsc::channel();
+/// pool.submit(Box::new(move || {
+///     tx.send(2 + 2).unwrap();
+/// }));
+/// assert_eq!(rx.recv().unwrap(), 4);
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct MemoryTaskPool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
@@ -81,6 +103,17 @@ impl MemoryTaskPool {
     ///
     /// Returns the OS error if a worker thread cannot be spawned; on device that
     /// means the task/stack allocation failed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use claw_memory::{MemoryTaskPool, PoolConfig};
+    ///
+    /// // One worker is enough for serialized compaction; raise `workers` for more.
+    /// let pool = MemoryTaskPool::new(PoolConfig { workers: 2, ..PoolConfig::default() })?;
+    /// # let _ = pool;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn new(config: PoolConfig) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {

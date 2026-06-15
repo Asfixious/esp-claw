@@ -35,6 +35,42 @@ pub struct LlmCompactor {
 
 impl LlmCompactor {
     /// Build a compactor over the given LLM client.
+    ///
+    /// Typically the `api` is the same [`ClawApi`] the agent already uses, wired
+    /// into `ConversationDeps.compactor` so compaction summarizes through the
+    /// configured backend.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use claw_api::{ClawApi, ClawApiConfig};
+    /// use claw_memory::{Compactor, LlmCompactor};
+    /// # use std::sync::atomic::AtomicBool;
+    /// # use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    /// # struct StubHttp;
+    /// # impl ClawHttp for StubHttp {
+    /// #     fn post_json(&self, _: &HttpJsonRequest, _: &AtomicBool) -> Result<HttpResponse, HttpError> {
+    /// #         Ok(HttpResponse { status_code: 200, body: "{}".into() })
+    /// #     }
+    /// # }
+    /// let api = ClawApi::init(
+    ///     ClawApiConfig {
+    ///         backend_type: "openai_compatible".into(),
+    ///         api_key: Some("sk-test".into()),
+    ///         model: Some("gpt-4o-mini".into()),
+    ///         base_url: Some("https://api.openai.com/v1".into()),
+    ///         ..Default::default()
+    ///     },
+    ///     Arc::new(StubHttp),
+    /// )
+    /// .expect("init");
+    ///
+    /// // A ready-to-inject `Compactor`.
+    /// let compactor: Arc<dyn Compactor> = Arc::new(LlmCompactor::new(Arc::new(api)));
+    /// # let _ = compactor;
+    /// ```
     pub fn new(api: Arc<ClawApi>) -> Self {
         Self { api }
     }

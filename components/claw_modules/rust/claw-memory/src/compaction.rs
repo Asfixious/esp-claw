@@ -16,26 +16,58 @@ use serde_json::Value;
 
 /// Failure from a [`Compactor`].
 ///
-/// Compaction is best-effort: on error the tape keeps the un-compacted messages
+/// Compaction is best-effort: on error the tape keeps the un-compacted groups
 /// and tries again later, so the only thing a caller needs is a displayable
 /// reason for logs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompactError {
+    /// The summarization backend (e.g. the LLM client) failed; carries a
+    /// displayable reason for logging.
     #[error("compaction backend failed: {0}")]
     Backend(String),
 }
 
-/// Turns an aged window of chat messages into a compact summary.
+/// Turns one chunk of aged chat messages into a compact summary.
 ///
 /// `window` is a self-contained snapshot (already detached from the tape's
-/// lock): the previous summary followed by the oldest raw messages being retired.
-/// The returned messages *replace* the tape's summary section, so an
-/// implementation is free to re-summarize the whole window into one message or a
-/// small handful.
+/// lock) of the oldest groups being retired in this round — bounded by the
+/// tape's `segment_token_budget`. It contains only raw messages; the tape does
+/// **not** fold a previous summary in, because each chunk becomes its own
+/// independent, non-overlapping compact segment covering a distinct id range.
+///
+/// The returned messages *are* that segment, so an implementation is free to
+/// fold the chunk into a single message or a small handful. Returning an empty
+/// `Vec` is allowed but produces an empty segment; prefer a concise summary.
 ///
 /// Implementations must be `Send + Sync`: the call runs on a memory-pool worker,
 /// off the agent's tick path, and may block (e.g. on the network).
+///
+/// # Examples
+///
+/// A trivial compactor that records how many messages it folded:
+///
+/// ```
+/// use claw_memory::{CompactError, Compactor};
+/// use serde_json::{json, Value};
+///
+/// struct CountingCompactor;
+///
+/// impl Compactor for CountingCompactor {
+///     fn compact(&self, window: &[Value]) -> Result<Vec<Value>, CompactError> {
+///         Ok(vec![json!({
+///             "role": "system",
+///             "content": format!("summary of {} earlier messages", window.len()),
+///         })])
+///     }
+/// }
+///
+/// let summary = CountingCompactor
+///     .compact(&[json!({ "role": "user", "content": "hi" })])
+///     .unwrap();
+/// assert_eq!(summary[0]["content"], "summary of 1 earlier messages");
+/// ```
 pub trait Compactor: Send + Sync {
-    /// Summarize `window`. Returning an empty `Vec` clears the summary section.
+    /// Summarize one chunk of aged messages into the messages of a single
+    /// compact segment.
     fn compact(&self, window: &[Value]) -> Result<Vec<Value>, CompactError>;
 }

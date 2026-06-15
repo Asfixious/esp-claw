@@ -32,15 +32,18 @@
 //!
 //! # Multi-level compaction
 //!
-//! When the total token estimate exceeds [`compact_threshold_tokens`], a
+//! When the total token estimate exceeds
+//! [`compact_threshold_tokens`](ConversationConfig::compact_threshold_tokens), a
 //! background job is scheduled. The job:
 //!
 //! 1. Determines the **verbatim tail** by walking backwards through the groups,
-//!    accumulating tokens until [`keep_recent_tokens`] is reached (at least one
-//!    group is always kept verbatim).
+//!    accumulating tokens until
+//!    [`keep_recent_tokens`](ConversationConfig::keep_recent_tokens) is reached
+//!    (at least one group is always kept verbatim).
 //! 2. Finds the **cursor** — the highest id already covered by a compact segment.
-//! 3. Selects aged groups with ids past the cursor, packing them into a chunk of
-//!    up to [`segment_token_budget`] tokens.
+//! 3. Selects aged groups with ids past the cursor (so the chunk always starts at
+//!    `cursor + 1`), packing them into a chunk of up to
+//!    [`segment_token_budget`](ConversationConfig::segment_token_budget) tokens.
 //! 4. Runs the [`Compactor`] on that chunk and parks the result.
 //!
 //! The foreground applies the parked result at the next turn boundary: a new
@@ -49,9 +52,12 @@
 //! summaries; [`messages`](ConversationMemory::messages) interleaves them with
 //! the verbatim tail in chronological order.
 //!
-//! If the token estimate is still above the threshold after applying a compact
-//! and there is nothing left to compact (all aged groups are already covered),
-//! the oldest compact segment is dropped as a last resort to free token budget.
+//! **Coverage continuity:** because each chunk starts at `cursor + 1`, the
+//! compact segments stay contiguous and abut the verbatim groups — the live set
+//! always covers the entire id range with no gaps and no overlaps. Compaction
+//! never drops a segment (that would strand the ids it covered); bounding the
+//! growth of the summaries themselves is a future job for re-compacting compacts
+//! ("leveling"), not for deleting coverage.
 //!
 //! # Threading: one writer, the pool only computes
 //!
@@ -177,6 +183,27 @@ impl ByteLen {
 }
 
 /// Tuning for a [`ConversationMemory`].
+///
+/// Construct with [`ConversationConfig::new`] for sensible defaults, then
+/// override individual fields as needed.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use claw_memory::ConversationConfig;
+///
+/// // Defaults, then tighten the compaction trigger and disable the write debounce.
+/// let config = ConversationConfig {
+///     compact_threshold_tokens: 4_000,
+///     persist_debounce: Duration::ZERO,
+///     ..ConversationConfig::new("/data/conversations")
+/// };
+///
+/// assert_eq!(config.dir, "/data/conversations");
+/// assert_eq!(config.compact_threshold_tokens, 4_000);
+/// ```
 pub struct ConversationConfig {
     /// Base directory for per-conversation files, already resolved against the
     /// DATA root by the caller. The filenames are derived from the conversation id.
@@ -196,6 +223,19 @@ pub struct ConversationConfig {
 
 impl ConversationConfig {
     /// Config for conversation files under `dir`, with default tuning otherwise.
+    ///
+    /// `dir` is the base directory for the per-conversation files; the filenames
+    /// themselves are derived from the conversation id. Accepts anything
+    /// `Into<String>` (`&str`, `String`, …).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use claw_memory::ConversationConfig;
+    ///
+    /// let config = ConversationConfig::new("/data/conversations");
+    /// assert_eq!(config.dir, "/data/conversations");
+    /// ```
     pub fn new(dir: impl Into<String>) -> Self {
         Self {
             dir: dir.into(),
@@ -335,7 +375,61 @@ struct MemoryInner {
     deps: ConversationDeps,
 }
 
-/// The agent's short-term conversation memory. See the module docs.
+/// The agent's short-term conversation memory. See the module docs for the
+/// storage layout and the compaction model.
+///
+/// Build one with [`new`](Self::new), append turns through the
+/// [`GroupGuard`] returned by [`group`](Self::group), read the model-ready
+/// transcript with [`messages`](Self::messages), and checkpoint with
+/// [`flush`](Self::flush). Drive a single memory from one thread.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use claw_interfaces::{ClawFs, FsError};
+/// # use claw_memory::{
+/// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
+/// #     ConversationMemory, MemoryTaskPool, PoolConfig,
+/// # };
+/// # use serde_json::Value;
+/// # struct StubFs;
+/// # impl ClawFs for StubFs {
+/// #     fn read(&self, _: &str) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+/// #     fn read_at(&self, _: &str, _: u64, _: usize) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+/// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
+/// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+/// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+/// #     fn exists(&self, _: &str) -> bool { false }
+/// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
+/// # }
+/// # struct StubCompactor;
+/// # impl Compactor for StubCompactor {
+/// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
+/// # }
+/// let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+/// let mut memory = ConversationMemory::new(
+///     42,
+///     ConversationConfig::new("/data/conversations"),
+///     ConversationDeps {
+///         fs: Arc::new(StubFs),
+///         pool: Arc::clone(&pool),
+///         compactor: Arc::new(StubCompactor),
+///     },
+/// );
+///
+/// // One turn = one `group()`; the whole turn commits when the guard drops.
+/// {
+///     let turn = memory.group();
+///     turn.append_user("what's the weather?");
+///     turn.append_assistant(r#"{"role":"assistant","content":"Sunny."}"#);
+/// }
+///
+/// let rendered = memory.messages();
+/// assert_eq!(rendered.as_array().map(|m| m.len()), Some(2));
+/// memory.flush(); // checkpoint, e.g. on a clean shutdown
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct ConversationMemory {
     inner: Arc<MemoryInner>,
 }
@@ -343,6 +437,45 @@ pub struct ConversationMemory {
 impl ConversationMemory {
     /// Build the memory for `conversation_id`, restoring its persisted contents
     /// if present (missing or unreadable files start empty).
+    ///
+    /// Different ids map to different files under [`ConversationConfig::dir`], so
+    /// each conversation is stored independently. A mismatched or unreadable
+    /// index is rebuilt from the data log during construction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_memory::{
+    /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
+    /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
+    /// # };
+    /// # use serde_json::Value;
+    /// # struct StubFs;
+    /// # impl ClawFs for StubFs {
+    /// #     fn read(&self, _: &str) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn read_at(&self, _: &str, _: u64, _: usize) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
+    /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn exists(&self, _: &str) -> bool { false }
+    /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
+    /// # }
+    /// # struct StubCompactor;
+    /// # impl Compactor for StubCompactor {
+    /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
+    /// # }
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// let memory = ConversationMemory::new(
+    ///     7,
+    ///     ConversationConfig::new("/data/conversations"),
+    ///     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// );
+    /// assert_eq!(memory.conversation_id(), 7);
+    /// assert!(memory.messages().as_array().unwrap().is_empty()); // missing files start empty
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn new(conversation_id: usize, config: ConversationConfig, deps: ConversationDeps) -> Self {
         let data_path = conversation_path(&config.dir, conversation_id, DATA_EXT);
         let index_path = conversation_path(&config.dir, conversation_id, INDEX_EXT);
@@ -376,15 +509,103 @@ impl ConversationMemory {
 
     /// Open a turn. Append its messages through the returned [`GroupGuard`]; the
     /// whole turn is committed as one group when the guard drops.
+    ///
+    /// Takes `&mut self`, so the borrow checker allows only one open turn at a
+    /// time. The guard derefs to `&ConversationMemory`, so
+    /// [`messages`](Self::messages) is reachable through it while the turn is
+    /// open (and includes the in-progress turn).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_memory::{
+    /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
+    /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
+    /// # };
+    /// # use serde_json::Value;
+    /// # struct StubFs;
+    /// # impl ClawFs for StubFs {
+    /// #     fn read(&self, _: &str) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn read_at(&self, _: &str, _: u64, _: usize) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
+    /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn exists(&self, _: &str) -> bool { false }
+    /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
+    /// # }
+    /// # struct StubCompactor;
+    /// # impl Compactor for StubCompactor {
+    /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
+    /// # }
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let mut memory = ConversationMemory::new(
+    /// #     1,
+    /// #     ConversationConfig::new("/data/conversations"),
+    /// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// # );
+    /// {
+    ///     let turn = memory.group();
+    ///     turn.append_user("hi");
+    ///     turn.append_assistant(r#"{"role":"assistant","content":"hello"}"#);
+    ///     turn.append_tool_result("call_1", "{\"ok\":true}", false);
+    /// } // drop → the 3 messages commit as one group
+    ///
+    /// assert_eq!(memory.messages().as_array().map(|m| m.len()), Some(3));
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn group(&mut self) -> GroupGuard<'_> {
         GroupGuard { memory: self }
     }
 
-    /// The current messages, in chronological order: compact-segment messages
-    /// interleaved with verbatim groups by id, followed by the open turn.
+    /// The current messages, ready to send to the model in chronological order:
+    /// compact-segment messages interleaved with verbatim groups by id, followed
+    /// by the in-progress open turn. Returns an owned, internally consistent
+    /// JSON array snapshot; compaction state is already folded in.
     ///
     /// Compact segments and groups are non-overlapping by construction, so the
     /// merge is a simple ordered walk keyed on each segment's starting id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_memory::{
+    /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
+    /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
+    /// # };
+    /// # use serde_json::Value;
+    /// # struct StubFs;
+    /// # impl ClawFs for StubFs {
+    /// #     fn read(&self, _: &str) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn read_at(&self, _: &str, _: u64, _: usize) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
+    /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn exists(&self, _: &str) -> bool { false }
+    /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
+    /// # }
+    /// # struct StubCompactor;
+    /// # impl Compactor for StubCompactor {
+    /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
+    /// # }
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let mut memory = ConversationMemory::new(
+    /// #     1,
+    /// #     ConversationConfig::new("/data/conversations"),
+    /// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// # );
+    /// memory.group().append_user("first");
+    /// memory.group().append_user("second");
+    ///
+    /// let rendered = memory.messages();
+    /// let items = rendered.as_array().unwrap();
+    /// assert_eq!(items[0]["content"], "first"); // oldest first
+    /// assert_eq!(items[1]["content"], "second");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     // todo: finalize the return shape — owned `Value` snapshot (current), a
     // cached `Arc<Value>` snapshot (cheap clone, invalidated on mutation), or a
     // borrowing guard. The choice trades clone cost against how long the caller
@@ -425,7 +646,48 @@ impl ConversationMemory {
         Value::Array(out)
     }
 
-    /// Apply any parked compact, force pending changes to disk, and reclaim space.
+    /// Apply any parked compact, force pending changes to disk now (ignoring the
+    /// debounce), refresh the index manifest, and reclaim dead space.
+    ///
+    /// Persists only **committed** turns; an open turn is committed when its
+    /// [`GroupGuard`] drops. The clean-shutdown order is therefore "drop the
+    /// guard, then `flush`". This is the manual, immediate form of the automatic
+    /// debounced persistence — same writes, just now.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_memory::{
+    /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
+    /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
+    /// # };
+    /// # use serde_json::Value;
+    /// # struct StubFs;
+    /// # impl ClawFs for StubFs {
+    /// #     fn read(&self, _: &str) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn read_at(&self, _: &str, _: u64, _: usize) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+    /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
+    /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn exists(&self, _: &str) -> bool { false }
+    /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
+    /// # }
+    /// # struct StubCompactor;
+    /// # impl Compactor for StubCompactor {
+    /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
+    /// # }
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let mut memory = ConversationMemory::new(
+    /// #     1,
+    /// #     ConversationConfig::new("/data/conversations"),
+    /// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// # );
+    /// memory.group().append_user("remember this");
+    /// memory.flush(); // committed turn is now on disk
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn flush(&self) {
         apply_parked_compact(&self.inner);
         persist(&self.inner, true);
@@ -450,6 +712,53 @@ impl ConversationMemory {
 
 /// An open turn. Append messages through it; the turn is committed as one group
 /// record when the guard drops (or on an explicit [`commit`](Self::commit)).
+///
+/// Obtained from [`ConversationMemory::group`]. It holds `&mut ConversationMemory`,
+/// so only one can be live at a time, and derefs to `&ConversationMemory` so
+/// reads like [`messages`](ConversationMemory::messages) work while the turn is
+/// open.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use claw_interfaces::{ClawFs, FsError};
+/// # use claw_memory::{
+/// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
+/// #     ConversationMemory, MemoryTaskPool, PoolConfig,
+/// # };
+/// # use serde_json::{json, Value};
+/// # struct StubFs;
+/// # impl ClawFs for StubFs {
+/// #     fn read(&self, _: &str) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+/// #     fn read_at(&self, _: &str, _: u64, _: usize) -> Result<Vec<u8>, FsError> { Err(FsError::NotFound) }
+/// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
+/// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+/// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+/// #     fn exists(&self, _: &str) -> bool { false }
+/// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
+/// # }
+/// # struct StubCompactor;
+/// # impl Compactor for StubCompactor {
+/// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
+/// # }
+/// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+/// # let mut memory = ConversationMemory::new(
+/// #     1,
+/// #     ConversationConfig::new("/data/conversations"),
+/// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+/// # );
+/// let turn = memory.group();
+/// turn.append_user("call the weather tool");
+/// turn.append_patch(&json!([
+///     { "role": "assistant", "content": "calling tool" },
+///     { "role": "tool", "tool_call_id": "c1", "content": "{\"temp_c\":21}" },
+/// ]));
+/// // Reads see the open turn before it commits.
+/// assert_eq!(turn.messages().as_array().map(|m| m.len()), Some(3));
+/// turn.commit(); // or just let it drop
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct GroupGuard<'a> {
     memory: &'a mut ConversationMemory,
 }

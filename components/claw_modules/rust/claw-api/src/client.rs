@@ -17,8 +17,8 @@ use super::backends::{anthropic, openai_compatible};
 use super::errors::{ChatError, ChatJsonError, ClawApiError, InferMediaError, InitError};
 use super::retry::run_with_retry;
 use super::types::{
-    ChatJsonRequest, ChatJsonResponse, ChatRequest, LlmResponse, MediaRequest, ModelProfile,
-    ClawApiConfig,
+    ChatJsonRequest, ChatJsonResponse, ChatRequest, ClawApiConfig, LlmResponse, MediaRequest,
+    ModelProfile,
 };
 
 /// Message used when the abort flag fires during a retry backoff sleep. Kept
@@ -145,8 +145,7 @@ impl ClawApi {
         let supports_json_schema = match config.supports_json_schema {
             Some(enabled) => enabled,
             None => {
-                config.backend_type == openai_compatible::ID
-                    || config.backend_type == anthropic::ID
+                config.backend_type == openai_compatible::ID || config.backend_type == anthropic::ID
             }
         };
 
@@ -161,7 +160,11 @@ impl ClawApi {
 
         let backend = (registration.make)(&config)?;
 
-        Ok(ClawApi { profile, backend, http })
+        Ok(ClawApi {
+            profile,
+            backend,
+            http,
+        })
     }
 
     /// Run a chat completion. (Port of `claw_llm_runtime_chat`.)
@@ -197,14 +200,21 @@ impl ClawApi {
     /// }
     /// # Ok::<(), claw_api::ChatError>(())
     /// ```
-    pub fn chat(&self, request: &ChatRequest, abort: &AtomicBool) -> Result<LlmResponse, ChatError> {
+    pub fn chat(
+        &self,
+        request: &ChatRequest,
+        abort: &AtomicBool,
+    ) -> Result<LlmResponse, ChatError> {
         let policy = request.retry.unwrap_or_default();
         run_with_retry(
             &policy,
             abort,
             ChatError::is_retryable,
             || ChatError::Api(ClawApiError::Transport(ABORTED_DURING_BACKOFF.to_string())),
-            || self.backend.chat(self.http.as_ref(), &self.profile, request, abort),
+            || {
+                self.backend
+                    .chat(self.http.as_ref(), &self.profile, request, abort)
+            },
         )
     }
 
@@ -280,9 +290,11 @@ impl ClawApi {
             &policy,
             abort,
             ChatJsonError::is_retryable,
-            || ChatJsonError::Chat(ChatError::Api(ClawApiError::Transport(
-                ABORTED_DURING_BACKOFF.to_string(),
-            ))),
+            || {
+                ChatJsonError::Chat(ChatError::Api(ClawApiError::Transport(
+                    ABORTED_DURING_BACKOFF.to_string(),
+                )))
+            },
             || {
                 let response = self
                     .backend
@@ -363,7 +375,10 @@ impl ClawApi {
             abort,
             InferMediaError::is_retryable,
             || InferMediaError::Api(ClawApiError::Transport(ABORTED_DURING_BACKOFF.to_string())),
-            || self.backend.infer_media(self.http.as_ref(), &self.profile, request, abort),
+            || {
+                self.backend
+                    .infer_media(self.http.as_ref(), &self.profile, request, abort)
+            },
         )
     }
 

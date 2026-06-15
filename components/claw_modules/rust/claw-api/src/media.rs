@@ -57,7 +57,10 @@ fn prepare_local_path_asset(
     let encoded = STANDARD.encode(&raw);
     let payload = format!("data:{mime};base64,{encoded}");
 
-    Ok(Prepared { kind: PreparedKind::DataUrl, payload })
+    Ok(Prepared {
+        kind: PreparedKind::DataUrl,
+        payload,
+    })
 }
 
 fn prepare_inline_bytes_asset(
@@ -80,7 +83,10 @@ fn prepare_inline_bytes_asset(
     let encoded = STANDARD.encode(bytes);
     let payload = format!("data:{mime};base64,{encoded}");
 
-    Ok(Prepared { kind: PreparedKind::DataUrl, payload })
+    Ok(Prepared {
+        kind: PreparedKind::DataUrl,
+        payload,
+    })
 }
 
 /// `claw_media_prepare_asset`
@@ -95,7 +101,10 @@ pub fn prepare_asset(
                 Some(u) if !u.is_empty() => u,
                 _ => return Err(InferMediaError::MediaUrlEmpty),
             };
-            Ok(Prepared { kind: PreparedKind::RemoteUrl, payload: url.to_string() })
+            Ok(Prepared {
+                kind: PreparedKind::RemoteUrl,
+                payload: url.to_string(),
+            })
         }
         AssetKind::InlineBytes => {
             if profile.image_remote_url_only {
@@ -117,7 +126,10 @@ mod tests {
     use super::*;
 
     fn profile() -> ModelProfile {
-        ModelProfile { supports_vision: true, ..Default::default() }
+        ModelProfile {
+            supports_vision: true,
+            ..Default::default()
+        }
     }
 
     #[test]

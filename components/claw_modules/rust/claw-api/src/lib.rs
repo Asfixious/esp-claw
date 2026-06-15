@@ -106,7 +106,9 @@ pub use types::{
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatError, ChatRequest, ClawApi, ClawApiConfig, ClawApiError, InitError, RetryPolicy};
+    use super::{
+        ChatError, ChatRequest, ClawApi, ClawApiConfig, ClawApiError, InitError, RetryPolicy,
+    };
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use core::sync::atomic::AtomicBool;
     use serde_json::{json, Value};
@@ -136,7 +138,10 @@ mod tests {
         ) -> Result<HttpResponse, HttpError> {
             *self.last_body.lock().unwrap() = Some(request.body.to_string());
             *self.last_url.lock().unwrap() = Some(request.url.to_string());
-            Ok(HttpResponse { status_code: 200, body: self.reply.clone() })
+            Ok(HttpResponse {
+                status_code: 200,
+                body: self.reply.clone(),
+            })
         }
     }
 
@@ -154,16 +159,27 @@ mod tests {
 
     #[test]
     fn openai_chat_text() {
-        let http = MockHttp::new(r#"{"choices":[{"message":{"role":"assistant","content":"hi there"}}]}"#);
-        let rt = ClawApi::init(cfg("openai_compatible", "https://api.example.com/v1"), http.clone()).unwrap();
+        let http =
+            MockHttp::new(r#"{"choices":[{"message":{"role":"assistant","content":"hi there"}}]}"#);
+        let rt = ClawApi::init(
+            cfg("openai_compatible", "https://api.example.com/v1"),
+            http.clone(),
+        )
+        .unwrap();
         let messages = json!([{"role": "user", "content": "hello"}]);
         let abort = AtomicBool::new(false);
-        let resp = rt.chat(&ChatRequest::new("sys", &messages), &abort).unwrap();
+        let resp = rt
+            .chat(&ChatRequest::new("sys", &messages), &abort)
+            .unwrap();
         assert_eq!(resp.text.as_deref(), Some("hi there"));
 
         // URL joined with one slash; body carries system + user messages.
-        assert_eq!(http.last_url.lock().unwrap().as_deref(), Some("https://api.example.com/v1/chat/completions"));
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        assert_eq!(
+            http.last_url.lock().unwrap().as_deref(),
+            Some("https://api.example.com/v1/chat/completions")
+        );
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "sys");
@@ -191,7 +207,11 @@ mod tests {
         let reply = r#"{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"done"},
             {"type":"tool_use","id":"tu1","name":"foo","input":{"a":1}}]}"#;
         let http = MockHttp::new(reply);
-        let rt = ClawApi::init(cfg("anthropic_compatible", "https://api.anthropic.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(
+            cfg("anthropic_compatible", "https://api.anthropic.com/v1"),
+            http.clone(),
+        )
+        .unwrap();
 
         // assistant with tool_calls, then a tool result message
         let messages = json!([
@@ -202,7 +222,9 @@ mod tests {
             {"role": "tool", "tool_call_id": "tu1", "content": "result-text"}
         ]);
         let abort = AtomicBool::new(false);
-        let resp = rt.chat(&ChatRequest::new("sys", &messages), &abort).unwrap();
+        let resp = rt
+            .chat(&ChatRequest::new("sys", &messages), &abort)
+            .unwrap();
         assert_eq!(resp.text.as_deref(), Some("done"));
         assert_eq!(resp.reasoning_content.as_deref(), Some("hmm"));
         assert_eq!(resp.tool_calls.len(), 1);
@@ -210,14 +232,17 @@ mod tests {
 
         // Verify the request conversion: tool role becomes a user message with a
         // tool_result block; assistant carries a tool_use block.
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["system"], "sys");
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
         let assistant = &msgs[1];
         assert_eq!(assistant["role"], "assistant");
         let a_blocks = assistant["content"].as_array().unwrap();
-        assert!(a_blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "foo"));
+        assert!(a_blocks
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "foo"));
         let tool_user = &msgs[2];
         assert_eq!(tool_user["role"], "user");
         let t_blocks = tool_user["content"].as_array().unwrap();
@@ -229,13 +254,18 @@ mod tests {
     #[test]
     fn anthropic_converts_tools() {
         let http = MockHttp::new(r#"{"content":[{"type":"text","text":"ok"}]}"#);
-        let rt = ClawApi::init(cfg("anthropic_compatible", "https://api.anthropic.com"), http.clone()).unwrap();
+        let rt = ClawApi::init(
+            cfg("anthropic_compatible", "https://api.anthropic.com"),
+            http.clone(),
+        )
+        .unwrap();
         let messages = json!([{"role": "user", "content": "hi"}]);
         let tools = r#"[{"type":"function","function":{"name":"foo","description":"d","parameters":{"type":"object"}}}]"#;
         let abort = AtomicBool::new(false);
         rt.chat(&ChatRequest::new("s", &messages).with_tools(tools), &abort)
             .unwrap();
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         let tools_out = body["tools"].as_array().unwrap();
         assert_eq!(tools_out[0]["name"], "foo");
         assert_eq!(tools_out[0]["description"], "d");
@@ -277,7 +307,11 @@ mod tests {
     fn openai_chat_json_uses_response_format() {
         let reply = r#"{"choices":[{"message":{"role":"assistant","content":"{\"action\":\"ok\",\"value\":7}"}}]}"#;
         let http = MockHttp::new(reply);
-        let rt = ClawApi::init(cfg("openai_compatible", "https://api.example.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(
+            cfg("openai_compatible", "https://api.example.com/v1"),
+            http.clone(),
+        )
+        .unwrap();
         assert!(rt.profile().supports_json_schema);
 
         let messages = json!([{"role": "user", "content": "go"}]);
@@ -288,7 +322,8 @@ mod tests {
         assert_eq!(out.output.as_ref().unwrap().action, "ok");
         assert_eq!(out.output.as_ref().unwrap().value, 7);
 
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["name"], "demo_out");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
@@ -299,7 +334,11 @@ mod tests {
     fn anthropic_chat_json_uses_output_config() {
         let reply = r#"{"content":[{"type":"text","text":"{\"action\":\"ok\",\"value\":3}"}]}"#;
         let http = MockHttp::new(reply);
-        let rt = ClawApi::init(cfg("anthropic_compatible", "https://api.anthropic.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(
+            cfg("anthropic_compatible", "https://api.anthropic.com/v1"),
+            http.clone(),
+        )
+        .unwrap();
         assert!(rt.profile().supports_json_schema);
 
         let messages = json!([{"role": "user", "content": "go"}]);
@@ -309,7 +348,8 @@ mod tests {
             .unwrap();
         assert_eq!(out.output.as_ref().unwrap().value, 3);
 
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["output_config"]["format"]["schema"]["type"], "object");
         assert_eq!(body["system"], "sys");
@@ -332,7 +372,8 @@ mod tests {
             .unwrap();
         assert_eq!(out.output.as_ref().unwrap().value, 3);
 
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert!(body.get("output_config").is_none());
         let system = body["system"].as_str().unwrap();
         assert!(system.contains("Respond with a single JSON object"));
@@ -343,7 +384,11 @@ mod tests {
     fn anthropic_chat_json_sends_tools_with_output_config() {
         let reply = r#"{"content":[{"type":"text","text":"{\"action\":\"ok\",\"value\":5}"}]}"#;
         let http = MockHttp::new(reply);
-        let rt = ClawApi::init(cfg("anthropic_compatible", "https://api.anthropic.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(
+            cfg("anthropic_compatible", "https://api.anthropic.com/v1"),
+            http.clone(),
+        )
+        .unwrap();
         let messages = json!([{"role": "user", "content": "go"}]);
         let tools = r#"[{"type":"function","function":{"name":"files","description":"d","parameters":{"type":"object"}}}]"#;
         let abort = AtomicBool::new(false);
@@ -353,7 +398,8 @@ mod tests {
             .unwrap();
         assert_eq!(out.output.as_ref().unwrap().value, 5);
 
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"][0]["name"], "files");
@@ -377,7 +423,11 @@ mod tests {
     fn openai_chat_json_sends_tools_with_response_format() {
         let reply = r#"{"choices":[{"message":{"role":"assistant","content":"{\"action\":\"ok\",\"value\":1}"}}]}"#;
         let http = MockHttp::new(reply);
-        let rt = ClawApi::init(cfg("openai_compatible", "https://api.example.com/v1"), http.clone()).unwrap();
+        let rt = ClawApi::init(
+            cfg("openai_compatible", "https://api.example.com/v1"),
+            http.clone(),
+        )
+        .unwrap();
         let messages = json!([{"role": "user", "content": "go"}]);
         let tools = r#"[{"type":"function","function":{"name":"files","description":"d","parameters":{"type":"object"}}}]"#;
         let abort = AtomicBool::new(false);
@@ -387,7 +437,8 @@ mod tests {
             .unwrap();
         assert_eq!(out.output.as_ref().unwrap().value, 1);
 
-        let body: Value = serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(http.last_body.lock().unwrap().as_deref().unwrap()).unwrap();
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"][0]["function"]["name"], "files");
@@ -442,13 +493,18 @@ mod tests {
                 *remaining -= 1;
                 return Err(self.error.clone());
             }
-            Ok(HttpResponse { status_code: 200, body: self.reply.clone() })
+            Ok(HttpResponse {
+                status_code: 200,
+                body: self.reply.clone(),
+            })
         }
     }
 
     /// Zero-backoff policy so retry tests don't actually sleep.
     fn instant_retry(max_retries: u32) -> RetryPolicy {
-        RetryPolicy::new(max_retries).with_interval_ms(0).with_max_backoff_ms(0)
+        RetryPolicy::new(max_retries)
+            .with_interval_ms(0)
+            .with_max_backoff_ms(0)
     }
 
     #[test]
@@ -487,7 +543,10 @@ mod tests {
         let abort = AtomicBool::new(false);
 
         let resp = rt
-            .chat(&ChatRequest::new("s", &messages).with_retry(instant_retry(3)), &abort)
+            .chat(
+                &ChatRequest::new("s", &messages).with_retry(instant_retry(3)),
+                &abort,
+            )
             .unwrap();
         assert_eq!(resp.text.as_deref(), Some("ok"));
         assert_eq!(*http.calls.lock().unwrap(), 3);
@@ -501,22 +560,35 @@ mod tests {
         let abort = AtomicBool::new(false);
 
         let err = rt
-            .chat(&ChatRequest::new("s", &messages).with_retry(instant_retry(2)), &abort)
+            .chat(
+                &ChatRequest::new("s", &messages).with_retry(instant_retry(2)),
+                &abort,
+            )
             .unwrap_err();
-        assert!(matches!(err, ChatError::Api(ClawApiError::TransientTransport(_))));
+        assert!(matches!(
+            err,
+            ChatError::Api(ClawApiError::TransientTransport(_))
+        ));
         // first attempt + 2 retries
         assert_eq!(*http.calls.lock().unwrap(), 3);
     }
 
     #[test]
     fn retry_skips_non_retryable_status() {
-        let http = FlakyHttp::new(9, HttpError::UnexpectedStatus("HTTP 401: bad key".into()), "{}");
+        let http = FlakyHttp::new(
+            9,
+            HttpError::UnexpectedStatus("HTTP 401: bad key".into()),
+            "{}",
+        );
         let rt = flaky_rt(http.clone());
         let messages = json!([{"role": "user", "content": "hi"}]);
         let abort = AtomicBool::new(false);
 
         let err = rt
-            .chat(&ChatRequest::new("s", &messages).with_retry(instant_retry(5)), &abort)
+            .chat(
+                &ChatRequest::new("s", &messages).with_retry(instant_retry(5)),
+                &abort,
+            )
             .unwrap_err();
         assert!(matches!(err, ChatError::Api(ClawApiError::Transport(_))));
         assert_eq!(*http.calls.lock().unwrap(), 1);
@@ -534,7 +606,10 @@ mod tests {
         let abort = AtomicBool::new(false);
 
         let resp = rt
-            .chat(&ChatRequest::new("s", &messages).with_retry(instant_retry(3)), &abort)
+            .chat(
+                &ChatRequest::new("s", &messages).with_retry(instant_retry(3)),
+                &abort,
+            )
             .unwrap();
         assert_eq!(resp.text.as_deref(), Some("recovered"));
         assert_eq!(*http.calls.lock().unwrap(), 2);
@@ -548,7 +623,10 @@ mod tests {
         let abort = AtomicBool::new(false);
 
         let err = rt
-            .chat(&ChatRequest::new("s", &messages).with_retry(instant_retry(5)), &abort)
+            .chat(
+                &ChatRequest::new("s", &messages).with_retry(instant_retry(5)),
+                &abort,
+            )
             .unwrap_err();
         // Abort maps to a permanent Transport error containing "aborted".
         assert!(matches!(
@@ -571,7 +649,9 @@ mod tests {
         // Pre-aborted means the first transient failure stops at the backoff
         // sleep, so we observe exactly one attempt — proving default retry is
         // wired (the loop entered) without sleeping.
-        let err = rt.chat(&ChatRequest::new("s", &messages), &abort).unwrap_err();
+        let err = rt
+            .chat(&ChatRequest::new("s", &messages), &abort)
+            .unwrap_err();
         assert!(matches!(
             &err,
             ChatError::Api(ClawApiError::Transport(msg)) if msg.contains("aborted")

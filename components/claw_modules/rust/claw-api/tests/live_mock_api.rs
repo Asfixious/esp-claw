@@ -49,12 +49,16 @@ struct ReqwestHttp {
 impl ReqwestHttp {
     /// Transport that MockAI routes to its OpenAI-compatible endpoint.
     fn openai() -> Arc<Self> {
-        Arc::new(ReqwestHttp { user_agent: "claw-api-itest OpenAI/1.0".into() })
+        Arc::new(ReqwestHttp {
+            user_agent: "claw-api-itest OpenAI/1.0".into(),
+        })
     }
 
     /// Transport that MockAI routes to its Anthropic endpoint.
     fn anthropic() -> Arc<Self> {
-        Arc::new(ReqwestHttp { user_agent: "claw-api-itest Anthropic/1.0".into() })
+        Arc::new(ReqwestHttp {
+            user_agent: "claw-api-itest Anthropic/1.0".into(),
+        })
     }
 }
 
@@ -99,7 +103,9 @@ impl ClawHttp for ReqwestHttp {
             .map_err(|error| HttpError::RequestFailed(error.to_string()))?;
 
         if !(200..300).contains(&status_code) {
-            return Err(HttpError::UnexpectedStatus(format!("HTTP {status_code}: {body}")));
+            return Err(HttpError::UnexpectedStatus(format!(
+                "HTTP {status_code}: {body}"
+            )));
         }
         Ok(HttpResponse { status_code, body })
     }
@@ -114,16 +120,36 @@ struct Provider {
 }
 
 const OPENAI_COMPATIBLE_PROVIDERS: &[Provider] = &[
-    Provider { name: "OpenAI", model: "gpt-4o-mini", real_base_url: "https://api.openai.com/v1" },
-    Provider { name: "DeepSeek", model: "deepseek-chat", real_base_url: "https://api.deepseek.com" },
+    Provider {
+        name: "OpenAI",
+        model: "gpt-4o-mini",
+        real_base_url: "https://api.openai.com/v1",
+    },
+    Provider {
+        name: "DeepSeek",
+        model: "deepseek-chat",
+        real_base_url: "https://api.deepseek.com",
+    },
     Provider {
         name: "Qwen",
         model: "qwen-plus",
         real_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     },
-    Provider { name: "MiniMax", model: "MiniMax-Text-01", real_base_url: "https://api.minimaxi.com/v1" },
-    Provider { name: "Kimi", model: "moonshot-v1-8k", real_base_url: "https://api.moonshot.cn/v1" },
-    Provider { name: "GLM", model: "glm-4", real_base_url: "https://open.bigmodel.cn/api/paas/v4" },
+    Provider {
+        name: "MiniMax",
+        model: "MiniMax-Text-01",
+        real_base_url: "https://api.minimaxi.com/v1",
+    },
+    Provider {
+        name: "Kimi",
+        model: "moonshot-v1-8k",
+        real_base_url: "https://api.moonshot.cn/v1",
+    },
+    Provider {
+        name: "GLM",
+        model: "glm-4",
+        real_base_url: "https://open.bigmodel.cn/api/paas/v4",
+    },
 ];
 
 fn openai_compatible_api(model: &str) -> ClawApi {

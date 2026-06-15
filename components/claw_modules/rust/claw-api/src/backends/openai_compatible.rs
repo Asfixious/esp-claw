@@ -10,7 +10,7 @@ use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
 use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};
 use super::super::media::prepare_asset;
 use super::super::types::{
-    ChatJsonRequest, ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig,
+    ChatJsonRequest, ChatRequest, ClawApiConfig, LlmResponse, MediaRequest, ModelProfile,
 };
 use super::common::{
     chat_json_prompt_fallback, insert_tools_into_body, join_url, map_http_error,
@@ -69,7 +69,11 @@ fn make(config: &ClawApiConfig) -> Result<Box<dyn LlmBackend>, InitError> {
 
 impl OpenAiCompatible {
     /// `build_chat_body`
-    fn build_chat_body(&self, profile: &ModelProfile, request: &ChatRequest) -> Result<String, ChatError> {
+    fn build_chat_body(
+        &self,
+        profile: &ModelProfile,
+        request: &ChatRequest,
+    ) -> Result<String, ChatError> {
         let mut messages: Vec<Value> = Vec::new();
         if !request.system_prompt.is_empty() {
             messages.push(json!({"role": "system", "content": request.system_prompt}));
@@ -87,8 +91,9 @@ impl OpenAiCompatible {
             insert_tools_into_body(&mut body, profile, tools_json)?;
         }
 
-        serde_json::to_string(&Value::Object(body))
-            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+        serde_json::to_string(&Value::Object(body)).map_err(|_| {
+            ChatError::Api(ClawApiError::ApiError("out of memory serializing request"))
+        })
     }
 
     fn build_chat_json_body(
@@ -125,8 +130,9 @@ impl OpenAiCompatible {
             insert_tools_into_body(&mut body, profile, tools_json)?;
         }
 
-        serde_json::to_string(&Value::Object(body))
-            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+        serde_json::to_string(&Value::Object(body)).map_err(|_| {
+            ChatError::Api(ClawApiError::ApiError("out of memory serializing request"))
+        })
     }
 }
 
@@ -150,7 +156,9 @@ impl LlmBackend for OpenAiCompatible {
             timeout_ms: self.timeout_ms,
             headers: &[],
         };
-        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        let response = http
+            .post_json(&http_request, abort)
+            .map_err(map_http_error)?;
         Ok(parse_openai_chat_response(&response.body)?)
     }
 
@@ -177,7 +185,9 @@ impl LlmBackend for OpenAiCompatible {
             timeout_ms: self.timeout_ms,
             headers: &[],
         };
-        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        let response = http
+            .post_json(&http_request, abort)
+            .map_err(map_http_error)?;
         parse_openai_chat_response(&response.body).map_err(ChatError::from)
     }
 
@@ -217,9 +227,8 @@ impl LlmBackend for OpenAiCompatible {
         ]}));
         body.insert("messages".to_string(), Value::Array(messages));
 
-        let post_data = serde_json::to_string(&Value::Object(body)).map_err(|_| {
-            ClawApiError::ApiError("out of memory serializing media request")
-        })?;
+        let post_data = serde_json::to_string(&Value::Object(body))
+            .map_err(|_| ClawApiError::ApiError("out of memory serializing media request"))?;
         let url = join_url(&self.base_url, &profile.chat_path);
 
         let http_request = HttpJsonRequest {
@@ -230,7 +239,9 @@ impl LlmBackend for OpenAiCompatible {
             timeout_ms: self.timeout_ms,
             headers: &[],
         };
-        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        let response = http
+            .post_json(&http_request, abort)
+            .map_err(map_http_error)?;
 
         let parsed = parse_openai_chat_response(&response.body)?;
         match parsed.text {

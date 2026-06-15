@@ -17,8 +17,8 @@ use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
 use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};
 use super::super::media::prepare_asset;
 use super::super::types::{
-    ChatJsonRequest, ChatRequest, LlmResponse, MediaRequest, ModelProfile, PreparedKind,
-    ClawApiConfig, ToolCall,
+    ChatJsonRequest, ChatRequest, ClawApiConfig, LlmResponse, MediaRequest, ModelProfile,
+    PreparedKind, ToolCall,
 };
 use super::common::{chat_json_prompt_fallback, join_url, map_http_error, single_media_asset};
 
@@ -85,7 +85,9 @@ fn make_tool_use_block(tool_call: &Value) -> Option<Value> {
     }
     let id = str_field(tool_call, "id")?;
     let function = tool_call.get("function");
-    let name = function.and_then(|f| f.get("name")).and_then(|n| n.as_str())?;
+    let name = function
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())?;
     let args = function
         .and_then(|f| f.get("arguments"))
         .and_then(|a| a.as_str());
@@ -99,8 +101,11 @@ fn make_tool_use_block(tool_call: &Value) -> Option<Value> {
 /// `anthropic_duplicate_supported_block`
 fn duplicate_supported_block(block: &Value) -> Option<Value> {
     let ty = str_field(block, "type")?;
-    matches!(ty, "text" | "tool_use" | "tool_result" | "thinking" | "redacted_thinking")
-        .then(|| block.clone())
+    matches!(
+        ty,
+        "text" | "tool_use" | "tool_result" | "thinking" | "redacted_thinking"
+    )
+    .then(|| block.clone())
 }
 
 /// `convert_messages_to_anthropic`
@@ -132,7 +137,10 @@ fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, ClawApiError
                 }
                 let tid = str_field(inner, "tool_call_id").unwrap_or("");
                 let content = str_field(inner, "content").unwrap_or("");
-                let is_error = inner.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_error = inner
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 tool_blocks.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tid,
@@ -217,7 +225,11 @@ fn convert_tools_to_anthropic(tools_json: Option<&str>, strict: bool) -> Option<
                     function.and_then(|f| f.get("parameters")),
                 )
             } else {
-                (item.get("name"), item.get("description"), item.get("input_schema"))
+                (
+                    item.get("name"),
+                    item.get("description"),
+                    item.get("input_schema"),
+                )
             }
         } else {
             (None, None, None)
@@ -302,7 +314,11 @@ fn parse_chat_response(body: &str) -> Result<LlmResponse, ClawApiError> {
                         .map_err(|_| ClawApiError::ApiError("out of memory copying tool call"))?,
                     None => "{}".to_string(),
                 };
-                tool_calls.push(ToolCall { id: id.to_string(), name: name.to_string(), arguments_json });
+                tool_calls.push(ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments_json,
+                });
             }
             _ => {}
         }
@@ -338,8 +354,9 @@ impl Anthropic {
 
         Self::insert_tools_into_body(&mut body, request.tools_json, false)?;
 
-        serde_json::to_string(&Value::Object(body))
-            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+        serde_json::to_string(&Value::Object(body)).map_err(|_| {
+            ChatError::Api(ClawApiError::ApiError("out of memory serializing request"))
+        })
     }
 
     fn build_chat_json_body(
@@ -368,8 +385,9 @@ impl Anthropic {
 
         Self::insert_tools_into_body(&mut body, request.tools_json, true)?;
 
-        serde_json::to_string(&Value::Object(body))
-            .map_err(|_| ChatError::Api(ClawApiError::ApiError("out of memory serializing request")))
+        serde_json::to_string(&Value::Object(body)).map_err(|_| {
+            ChatError::Api(ClawApiError::ApiError("out of memory serializing request"))
+        })
     }
 
     fn insert_tools_into_body(
@@ -423,7 +441,9 @@ impl LlmBackend for Anthropic {
             timeout_ms: self.timeout_ms,
             headers: &headers,
         };
-        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        let response = http
+            .post_json(&http_request, abort)
+            .map_err(map_http_error)?;
         Ok(parse_chat_response(&response.body)?)
     }
 
@@ -456,7 +476,9 @@ impl LlmBackend for Anthropic {
             timeout_ms: self.timeout_ms,
             headers: &headers,
         };
-        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        let response = http
+            .post_json(&http_request, abort)
+            .map_err(map_http_error)?;
         Ok(parse_chat_response(&response.body)?)
     }
 
@@ -502,9 +524,8 @@ impl LlmBackend for Anthropic {
             }]),
         );
         let body = Value::Object(body);
-        let post_data = serde_json::to_string(&body).map_err(|_| {
-            ClawApiError::ApiError("out of memory serializing media request")
-        })?;
+        let post_data = serde_json::to_string(&body)
+            .map_err(|_| ClawApiError::ApiError("out of memory serializing media request"))?;
         let url = join_url(&self.base_url, &profile.chat_path);
         let header_storage = self.headers();
         let headers: Vec<HttpHeader> = header_storage
@@ -520,7 +541,9 @@ impl LlmBackend for Anthropic {
             timeout_ms: self.timeout_ms,
             headers: &headers,
         };
-        let response = http.post_json(&http_request, abort).map_err(map_http_error)?;
+        let response = http
+            .post_json(&http_request, abort)
+            .map_err(map_http_error)?;
 
         let parsed = parse_chat_response(&response.body)?;
         match parsed.text {

@@ -286,7 +286,10 @@ impl<'a> ChatJsonRequest<'a> {
 
     /// Attach a static JSON Schema (`name` + schema JSON string).
     pub fn with_output_schema(mut self, name: &'a str, schema_json: &'a str) -> Self {
-        self.output_schema = Some(StaticOutputSchema { name, json: schema_json });
+        self.output_schema = Some(StaticOutputSchema {
+            name,
+            json: schema_json,
+        });
         self
     }
 
@@ -341,7 +344,12 @@ pub struct ChatRequest<'a> {
 impl<'a> ChatRequest<'a> {
     /// A tool-less chat request.
     pub fn new(system_prompt: &'a str, messages: &'a serde_json::Value) -> Self {
-        ChatRequest { system_prompt, messages, tools_json: None, retry: None }
+        ChatRequest {
+            system_prompt,
+            messages,
+            tools_json: None,
+            retry: None,
+        }
     }
 
     /// Attach an OpenAI-style tools JSON array.
@@ -456,7 +464,12 @@ pub struct MediaRequest<'a> {
 impl<'a> MediaRequest<'a> {
     /// A media request over the given assets, with no prompts set yet.
     pub fn new(media: &'a [MediaAsset]) -> Self {
-        MediaRequest { system_prompt: None, user_prompt: None, media, retry: None }
+        MediaRequest {
+            system_prompt: None,
+            user_prompt: None,
+            media,
+            retry: None,
+        }
     }
 
     /// Set the system prompt / instructions.

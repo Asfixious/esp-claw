@@ -9,7 +9,9 @@ use serde_json::Value;
 
 use super::backends::{anthropic, openai_compatible};
 use super::errors::{ChatError, InferMediaError, InitError};
-use super::types::{ChatJsonRequest, ChatRequest, LlmResponse, MediaRequest, ModelProfile, ClawApiConfig};
+use super::types::{
+    ChatJsonRequest, ChatRequest, ClawApiConfig, LlmResponse, MediaRequest, ModelProfile,
+};
 
 /// A constructed backend instance (`backend_ctx` + the vtable methods in C).
 pub trait LlmBackend: Send + Sync {

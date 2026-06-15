@@ -2,14 +2,14 @@
 
 use serde_json::Value;
 
+use super::super::backend::LlmBackend;
 use super::super::errors::{ChatError, ClawApiError, InferMediaError};
 use super::super::json_output::augment_system_with_schema;
-use super::super::types::{ChatJsonRequest, ChatRequest, LlmResponse, MediaAsset, ToolCall};
-use serde_json::Map;
-use super::super::backend::LlmBackend;
 use super::super::types::ModelProfile;
+use super::super::types::{ChatJsonRequest, ChatRequest, LlmResponse, MediaAsset, ToolCall};
 use claw_interfaces::http::{ClawHttp, HttpError};
 use core::sync::atomic::AtomicBool;
+use serde_json::Map;
 
 /// HTTP statuses that indicate a transient, retryable server condition.
 const STATUS_REQUEST_TIMEOUT: u16 = 408;
@@ -102,7 +102,9 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, ClawApiErro
     };
 
     if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-        return Err(ClawApiError::MalformedResponse("response message is not assistant"));
+        return Err(ClawApiError::MalformedResponse(
+            "response message is not assistant",
+        ));
     }
 
     let raw_message_json = serde_json::to_string(message)
@@ -130,7 +132,11 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, ClawApiErro
             if id.is_none() || function.is_none() || name.is_none() || args.is_none() {
                 return Err(ClawApiError::MalformedResponse("malformed tool call"));
             }
-            match (id.unwrap().as_str(), name.unwrap().as_str(), args.unwrap().as_str()) {
+            match (
+                id.unwrap().as_str(),
+                name.unwrap().as_str(),
+                args.unwrap().as_str(),
+            ) {
                 (Some(id), Some(name), Some(args)) => tool_calls.push(ToolCall {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -145,7 +151,12 @@ pub fn parse_openai_chat_response(body: &str) -> Result<LlmResponse, ClawApiErro
         return Err(ClawApiError::EmptyResponse);
     }
 
-    Ok(LlmResponse { text, reasoning_content, raw_message_json: Some(raw_message_json), tool_calls })
+    Ok(LlmResponse {
+        text,
+        reasoning_content,
+        raw_message_json: Some(raw_message_json),
+        tool_calls,
+    })
 }
 
 /// Insert OpenAI-style `tools` into a chat request body map.

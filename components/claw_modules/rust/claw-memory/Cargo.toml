@@ -1,0 +1,23 @@
+[package]
+name = "claw-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Agent memory subsystem: conversation tape, compaction, and the shared memory task pool"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# The default `LlmCompactor` pulls in `claw-api`. Disable to keep the crate
+# LLM-free (inject your own `Compactor`).
+default = ["llm"]
+llm = ["dep:claw-api"]
+
+[dependencies]
+claw_interfaces = { path = "../claw_interfaces" }
+claw_sys = { path = "../claw_sys" }
+claw-api = { path = "../claw-api", optional = true }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

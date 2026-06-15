@@ -4,15 +4,15 @@ members = [
     "claw_platform",
     "claw_platform_espidf",
     "claw_interfaces",
+    "claw-utils",
     "claw-api",
     "claw_sys",
     "claw_paths",
     "claw_task",
     "claw_core",
     "claw_cap",
-    "claw_memory",
+    "claw-memory",
     "claw_capi",
-    "claw_rt",
 ]
 
 # Device images are built with the release profile (panic = abort, since the

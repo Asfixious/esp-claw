@@ -49,10 +49,12 @@ pub fn parse_prefixed_id(
         return Err(IdParseError::Empty);
     }
 
-    let rest = trimmed.strip_prefix(prefix).ok_or_else(|| IdParseError::Invalid {
-        kind,
-        value: value.to_string(),
-    })?;
+    let rest = trimmed
+        .strip_prefix(prefix)
+        .ok_or_else(|| IdParseError::Invalid {
+            kind,
+            value: value.to_string(),
+        })?;
 
     rest.parse::<usize>().map_err(|_| IdParseError::Invalid {
         kind,
@@ -102,10 +104,7 @@ macro_rules! define_prefixed_id {
         }
 
         impl ::serde::Serialize for $name {
-            fn serialize<S: ::serde::Serializer>(
-                &self,
-                serializer: S,
-            ) -> Result<S::Ok, S::Error> {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 serializer.serialize_str(&self.to_wire())
             }
         }

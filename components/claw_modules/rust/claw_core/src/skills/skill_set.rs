@@ -72,11 +72,13 @@ impl SkillSet {
 
     /// Load one skill under `group`. No-op if already loaded.
     ///
-    /// Returns [`SkillError::NotFound`] if the registry has no such skill, so a
-    /// bad id surfaces immediately rather than at the next context rebuild.
+    /// # Errors
+    ///
+    /// [`SkillError::NotFound`] if the registry has no such skill, so a bad id
+    /// surfaces here rather than at the next context rebuild.
     pub fn load(&mut self, group: &'static str, id: SkillId) -> Result<(), SkillError> {
         if self.registry.metadata(&id).is_none() {
-            return Err(SkillError::NotFound(id.to_string()));
+            return Err(SkillError::NotFound(id));
         }
         if self.loaded.iter().any(|loaded| loaded.id == id) {
             return Ok(());
@@ -87,6 +89,11 @@ impl SkillSet {
     }
 
     /// Load every skill in `group`.
+    ///
+    /// # Errors
+    ///
+    /// [`SkillError::NotFound`] for the first skill in the group the registry
+    /// does not have (later skills in the group are not loaded).
     pub fn load_group(&mut self, group: SkillGroup) -> Result<(), SkillError> {
         let name = group.name;
         for id in group.skills {
@@ -108,8 +115,14 @@ impl SkillSet {
     ///
     /// Borrowed from the internal cache — no owned copy is handed out. `&mut self`
     /// because a stale cache is rebuilt in place; the agent calls this inside its
-    /// `tick(&mut self)`. Returns the read on success; a document that fails to
-    /// load surfaces as [`SkillError`] and leaves the cache stale for retry.
+    /// `tick(&mut self)`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`SkillError`] from [`SkillRegistry::document`] when a loaded skill's
+    /// document is (re)read during a rebuild — e.g. [`SkillError::ReadFailed`] or
+    /// a malformed-front-matter error. The cache is left stale so the next read
+    /// retries.
     pub fn context(&mut self) -> Result<&str, SkillError> {
         if self.dirty {
             self.cache = self.build()?;

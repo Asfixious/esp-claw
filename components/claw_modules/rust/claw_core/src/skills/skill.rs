@@ -14,6 +14,7 @@
 //! The catalog (id + description + cap groups + manage mode) lives entirely in
 //! that head, so it is read without touching the potentially large body.
 
+use claw_interfaces::FsError;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -83,18 +84,34 @@ impl SkillMetadata {
     }
 }
 
-/// Failure reading or parsing a skill.
+/// Failure reading, parsing, or resolving a skill.
+///
+/// Each variant pins down a specific failure so a caller can tell a missing
+/// directory from malformed front-matter from a JSON error — and the underlying
+/// [`FsError`] is wrapped, not flattened into a string.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum SkillError {
-    /// Underlying filesystem failure (carries the `FsError` display).
-    #[error("skill filesystem error: {0}")]
-    Fs(String),
-    /// `SKILL.md` front-matter is absent or not valid JSON.
-    #[error("skill '{0}' has malformed front-matter: {1}")]
-    Malformed(String, String),
+    /// Listing the skills root directory failed (root, cause).
+    #[error("failed to scan skills root '{0}': {1}")]
+    ScanFailed(String, FsError),
+    /// Reading a skill's `SKILL.md` failed (skill id, cause).
+    #[error("failed to read skill '{0}': {1}")]
+    ReadFailed(SkillId, FsError),
+    /// A skill's `SKILL.md` bytes were not valid UTF-8.
+    #[error("skill '{0}' is not valid UTF-8")]
+    InvalidUtf8(SkillId),
+    /// A skill's front-matter is missing its opening `---` fence.
+    #[error("skill '{0}' is missing the opening '---' front-matter fence")]
+    MissingOpeningFence(SkillId),
+    /// A skill's front-matter is missing its closing `---` fence.
+    #[error("skill '{0}' is missing the closing '---' front-matter fence")]
+    MissingClosingFence(SkillId),
+    /// A skill's front-matter block is not valid JSON (skill id, parser message).
+    #[error("skill '{0}' has invalid front-matter JSON: {1}")]
+    InvalidJson(SkillId, String),
     /// No skill with the given id is registered.
     #[error("skill not found: {0}")]
-    NotFound(String),
+    NotFound(SkillId),
 }
 
 /// The JSON shape of a `SKILL.md` front-matter block.
@@ -119,10 +136,16 @@ struct FrontMatterMetadata {
 /// `head` must begin with the file's first bytes (a bounded prefix is enough —
 /// the metadata lives between the first two `---` fences). The `id` comes from
 /// the skill directory name, not the file.
+///
+/// # Errors
+///
+/// - [`SkillError::MissingOpeningFence`] / [`SkillError::MissingClosingFence`] if
+///   the `---` fences are absent.
+/// - [`SkillError::InvalidJson`] if the fenced block is not valid JSON.
 pub(crate) fn parse_front_matter(id: SkillId, head: &str) -> Result<SkillMetadata, SkillError> {
-    let json = front_matter_json(id.as_str(), head)?;
+    let json = front_matter_json(&id, head)?;
     let front_matter: FrontMatter = serde_json::from_str(json.trim())
-        .map_err(|error| SkillError::Malformed(id.0.clone(), error.to_string()))?;
+        .map_err(|error| SkillError::InvalidJson(id.clone(), error.to_string()))?;
     Ok(SkillMetadata {
         id,
         description: front_matter.description,
@@ -132,26 +155,34 @@ pub(crate) fn parse_front_matter(id: SkillId, head: &str) -> Result<SkillMetadat
 }
 
 /// The JSON text between the opening and closing `---` fences.
-fn front_matter_json<'a>(id: &str, text: &'a str) -> Result<&'a str, SkillError> {
+fn front_matter_json<'a>(id: &SkillId, text: &'a str) -> Result<&'a str, SkillError> {
     let after_open = text
         .trim_start()
         .strip_prefix("---")
-        .ok_or_else(|| SkillError::Malformed(id.to_string(), "missing opening '---' fence".into()))?;
-    let close = after_open.find("\n---").ok_or_else(|| {
-        SkillError::Malformed(id.to_string(), "missing closing '---' fence".into())
-    })?;
+        .ok_or_else(|| SkillError::MissingOpeningFence(id.clone()))?;
+    let close = after_open
+        .find("\n---")
+        .ok_or_else(|| SkillError::MissingClosingFence(id.clone()))?;
     Ok(after_open.get(..close).unwrap_or(""))
 }
 
 /// Return the markdown body of a `SKILL.md` — everything after the closing fence.
-pub(crate) fn strip_front_matter<'a>(id: &str, text: &'a str) -> Result<&'a str, SkillError> {
+///
+/// # Errors
+///
+/// [`SkillError::MissingOpeningFence`] / [`SkillError::MissingClosingFence`] if
+/// the `---` fences are absent.
+pub(crate) fn strip_front_matter<'a>(
+    id: &SkillId,
+    text: &'a str,
+) -> Result<&'a str, SkillError> {
     let after_open = text
         .trim_start()
         .strip_prefix("---")
-        .ok_or_else(|| SkillError::Malformed(id.to_string(), "missing opening '---' fence".into()))?;
-    let close = after_open.find("\n---").ok_or_else(|| {
-        SkillError::Malformed(id.to_string(), "missing closing '---' fence".into())
-    })?;
+        .ok_or_else(|| SkillError::MissingOpeningFence(id.clone()))?;
+    let close = after_open
+        .find("\n---")
+        .ok_or_else(|| SkillError::MissingClosingFence(id.clone()))?;
     // From the closing fence, skip the rest of that fence line, then the body.
     let from_fence = after_open.get(close..).unwrap_or("");
     let body = from_fence
@@ -170,15 +201,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_opening_fence_is_malformed() {
+    fn missing_opening_fence_errors() {
         let error = parse_front_matter(SkillId::new("x"), "no front matter").unwrap_err();
-        assert!(matches!(error, SkillError::Malformed(_, _)));
+        assert!(matches!(error, SkillError::MissingOpeningFence(_)));
     }
 
     #[test]
-    fn missing_close_fence_is_malformed() {
+    fn missing_close_fence_errors() {
         let error = parse_front_matter(SkillId::new("x"), "---\n{}\n").unwrap_err();
-        assert!(matches!(error, SkillError::Malformed(_, _)));
+        assert!(matches!(error, SkillError::MissingClosingFence(_)));
+    }
+
+    #[test]
+    fn invalid_json_errors() {
+        let error = parse_front_matter(SkillId::new("x"), "---\nnot json\n---\nbody").unwrap_err();
+        assert!(matches!(error, SkillError::InvalidJson(_, _)));
     }
 
     #[test]

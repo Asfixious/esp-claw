@@ -226,7 +226,7 @@ impl BaseAgent {
                 self.effective_prompt_dirty = true;
                 Ok(())
             }
-            None => Err(SkillError::NotFound(id.to_string())),
+            None => Err(SkillError::NotFound(id)),
         }
     }
 

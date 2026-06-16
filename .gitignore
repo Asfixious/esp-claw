@@ -47,3 +47,4 @@ docs/**/*.bin
 
 # Rust
 target/
+output/

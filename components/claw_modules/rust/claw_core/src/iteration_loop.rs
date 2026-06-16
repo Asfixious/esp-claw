@@ -15,7 +15,7 @@ use serde_json::Value;
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse};
 use crate::tools::{ToolError, ToolInvocation, ToolOutput};
 
-use crate::util::TruncatedText;
+use claw_utils::TruncatedText;
 
 crate::define_prefixed_id!(IterationId, "iteration-", "iteration");
 
@@ -197,6 +197,7 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
         system_prompt: step.system_prompt.as_ref(),
         messages: step.messages.0,
         tools_json: step.tools.and_then(|t| t.schemas_json()),
+        retry: None,
     };
     let llm_response = match loop_
         .llm

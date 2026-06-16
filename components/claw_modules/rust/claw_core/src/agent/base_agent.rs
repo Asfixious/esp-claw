@@ -1,30 +1,35 @@
 //! Layer 2 base agent: drives a multi-iteration task, one iteration per `tick`.
 //!
 //! Split of responsibilities:
-//! - [`BaseAgent::new`] takes only the agent's owned LLM client.
+//! - [`BaseAgent::new`] takes the agent's owned LLM client, the shared memory
+//!   task pool singleton, and a [`BaseAgentConfig`] that controls conversation
+//!   identity and persistence. The agent builds its [`ConversationMemory`]
+//!   internally.
 //! - [`BaseAgent::run`] is pure setup for one task: it injects the per-task
-//!   context (system prompt, tools, skills, goal), seeds the working context,
-//!   and resets state. No iteration runs here.
+//!   context (system prompt, tools, skills), appends the user's goal to memory,
+//!   and resets iteration state. No iteration runs here.
 //! - The driver (orchestrator) then pumps [`BaseAgent::tick`] until it returns a
 //!   terminal [`BaseAgentState`]. Each `tick` performs exactly one
 //!   [`IterationLoop`] round-trip, so the driver can interleave new commands and
 //!   other agents between ticks (cooperative scheduling).
 //!
-//! The agent **owns** its LLM client, interrupt flag, and the per-task context
-//! set by `run` (system prompt, tools, skills), so it carries no lifetime
-//! parameter and can be stored and driven over time. Only the goal in
-//! [`RunParams`] is borrowed, just for seeding.
+//! The agent **owns** its LLM client, interrupt flag, conversation memory, and
+//! the per-task context set by `run` (system prompt, tools, skills), so it
+//! carries no lifetime parameter and can be stored and driven over time. Only the
+//! goal in [`RunParams`] is borrowed, just for seeding.
 //!
 //! Outbound results ride on the value [`tick`](BaseAgent::tick) returns — one
 //! user-facing output per tick. Internal tool-round messages are *context*, not
-//! output: they are merged back into the working messages, never surfaced.
+//! output: they are committed to memory and fed back in on the next iteration.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use claw_api::ClawApi;
+use claw_interfaces::ClawFs;
+use claw_memory::{
+    Compactor, ConversationConfig, ConversationDeps, ConversationMemory, GroupGuard, MemoryTaskPool,
+};
 
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, InterruptionControl, IterationId, IterationLoop,
@@ -32,6 +37,8 @@ use crate::iteration_loop::{
     SystemPrompt,
 };
 use crate::skills::Skills;
+
+crate::define_prefixed_id!(AgentId, "agent-", "agent");
 
 /// Result of a single [`BaseAgent::tick`].
 ///
@@ -47,8 +54,7 @@ pub enum BaseAgentState {
     Working,
     /// This tick's iteration was preempted (an interrupt landed). The agent has
     /// merged what was produced and will rebuild context on the next tick — the
-    /// task is *not* over, so keep ticking. This is the truthful confirmation
-    /// that an [`AgentInterruptHandle::interrupt`] took effect.
+    /// task is *not* over, so keep ticking.
     Interrupted,
     /// Terminal: the task finished with this final answer.
     Completed(String),
@@ -112,6 +118,18 @@ pub enum AgentError {
     Busy,
 }
 
+/// Configuration for a [`BaseAgent`]'s conversation memory.
+pub struct BaseAgentConfig {
+    /// Agent identity, used as the key for the conversation transcript files.
+    pub agent_id: AgentId,
+    /// Base directory for per-conversation files.
+    pub memory_dir: String,
+    /// Filesystem backend for persisting the conversation transcript.
+    pub fs: Arc<dyn ClawFs>,
+    /// Compactor for background conversation summarization.
+    pub compactor: Arc<dyn Compactor>,
+}
+
 /// Per-task input for [`BaseAgent::run`].
 ///
 /// The owned fields are moved into the agent (used across the task's ticks); the
@@ -133,33 +151,39 @@ pub struct BaseAgent {
     // --- owned capabilities, fixed at construction ---
     llm: ClawApi,
     interruption: AgentInterruption,
+    memory: ConversationMemory,
     system_prompt: String,
     tools: Option<Arc<dyn IterationTools>>,
     skills: Option<Arc<dyn Skills>>,
-
-    // --- working set owned by the agent ---
-    messages: Value,
+    /// Open group guard started in `run()` with the user's goal appended.
+    /// Kept alive until the first response lands so user+reply commit as one
+    /// group — preventing compaction from orphaning a reply with no user turn.
+    open_turn: Option<GroupGuard>,
     next_iteration: IterationId,
     lifecycle: Lifecycle,
 }
 
 impl BaseAgent {
-    /// Construct an idle agent from its owned LLM client.
-    ///
-    /// Per-task context (system prompt, tools, skills) is supplied later by
-    /// [`run`](BaseAgent::run). The agent owns its interrupt flag and builds the
-    /// Layer-3 [`IterationLoop`] executor internally per tick; callers never
-    /// construct or see either.
-    pub fn new(llm: ClawApi) -> Self {
+    pub fn new(llm: ClawApi, pool: Arc<MemoryTaskPool>, config: BaseAgentConfig) -> Self {
+        let memory = ConversationMemory::new(
+            config.agent_id.0,
+            ConversationConfig::new(config.memory_dir),
+            ConversationDeps {
+                fs: config.fs,
+                pool,
+                compactor: config.compactor,
+            },
+        );
         Self {
             llm,
             interruption: AgentInterruption {
                 flag: Arc::new(AtomicBool::new(false)),
             },
+            memory,
             system_prompt: String::new(),
             tools: None,
             skills: None,
-            messages: Value::Array(Vec::new()),
+            open_turn: None,
             next_iteration: IterationId(0),
             lifecycle: Lifecycle::Idle,
         }
@@ -192,7 +216,9 @@ impl BaseAgent {
         self.tools = params.tools;
         self.skills = params.skills;
         self.next_iteration = IterationId(0);
-        self.messages = self.seed_messages(params.goal);
+        let turn = self.memory.group();
+        turn.append_user(params.goal);
+        self.open_turn = Some(turn);
         self.lifecycle = Lifecycle::Running;
         Ok(())
     }
@@ -208,8 +234,8 @@ impl BaseAgent {
         let iteration_id = self.next_iteration;
         self.next_iteration = IterationId(iteration_id.0.saturating_add(1));
 
-        // Build the Layer-3 executor for just this tick; its borrows of `self`
-        // are scoped here so the transition methods below get `&mut self`.
+        let messages = self.memory.messages();
+
         let outcome = {
             let iteration_loop = IterationLoop {
                 llm: &self.llm,
@@ -218,7 +244,7 @@ impl BaseAgent {
             let step = IterationStep {
                 iteration_id,
                 system_prompt: SystemPrompt(self.system_prompt.as_str()),
-                messages: ChatMessages(&self.messages),
+                messages: ChatMessages(&messages),
                 tools: self.tools.as_deref(),
             };
             iteration_loop.run(step)
@@ -239,13 +265,21 @@ impl BaseAgent {
     fn on_completed(&mut self, kind: CompletedKind) -> BaseAgentState {
         match kind {
             CompletedKind::PlainText(answer) => {
+                let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+                match answer.raw_message_json.as_deref() {
+                    Some(raw) => turn.append_assistant(raw),
+                    None => turn.append_patch(&serde_json::json!([{
+                        "role": "assistant",
+                        "content": answer.text
+                    }])),
+                }
+                drop(turn);
                 self.lifecycle = Lifecycle::Terminal;
                 BaseAgentState::Completed(answer.text)
             }
             CompletedKind::Tools(tools) => {
-                // Tool round: fold the produced assistant/tool messages back into
-                // the context and keep iterating. Nothing user-facing this tick.
-                self.merge_messages(tools.appended.0);
+                let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+                turn.append_patch(&tools.appended.0);
                 BaseAgentState::Working
             }
         }
@@ -257,7 +291,8 @@ impl BaseAgent {
     /// merge whatever was produced, rebuild context, and continue ticking.
     fn on_preempted(&mut self, outcome: PreemptedOutcome) -> BaseAgentState {
         if let Some(produced) = outcome.produced {
-            self.merge_messages(produced.0);
+            let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+            turn.append_patch(&produced.0);
         }
         // todo: rebuild context from pending input/memories before the next iteration.
         BaseAgentState::Interrupted
@@ -268,18 +303,5 @@ impl BaseAgent {
         log::warn!("base_agent iteration failed: {err}");
         self.lifecycle = Lifecycle::Terminal;
         BaseAgentState::Failed(err)
-    }
-
-    /// Build the initial `messages` array for a new task.
-    fn seed_messages(&self, goal: &str) -> Value {
-        let _ = (goal, self.skills.as_ref());
-        todo!("seed initial chat context from goal, skills, and memories")
-    }
-
-    /// Append a produced message batch (a JSON array) into the working context.
-    fn merge_messages(&mut self, appended: Value) {
-        if let (Some(dest), Some(src)) = (self.messages.as_array_mut(), appended.as_array()) {
-            dest.extend(src.iter().cloned());
-        }
     }
 }

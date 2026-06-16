@@ -391,8 +391,10 @@ fn reloads_from_data_log_without_manifest() {
     memory.group().append_user("b");
     memory.group().append_user("c");
 
-    // Appends are append-only; without a flush/compaction no manifest is written.
-    // A fresh load must reconstruct purely from a full data-log scan.
+    // Simulate the no-manifest scenario (e.g. process crash after append but before
+    // the manifest is synced). A fresh load must reconstruct purely from a data-log scan.
+    fs.remove("/c/conversation-3.json").ok();
+
     let fs_for_reload = Arc::clone(&fs);
     let pool_for_reload = Arc::clone(&shared);
     assert!(wait_until(move || {
@@ -408,7 +410,6 @@ fn reloads_from_data_log_without_manifest() {
         messages(&reloaded).len() == 3
     }));
     assert!(fs.exists("/c/conversation-3.jsonl"));
-    assert!(!fs.exists("/c/conversation-3.json"));
 }
 
 #[test]

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "cli",
     "claw_platform",
     "claw_platform_espidf",
     "claw_interfaces",

@@ -15,7 +15,7 @@ claw-api = { path = "../claw-api" }
 claw_sys = { path = "../claw_sys" }
 claw_cap = { path = "../claw_cap" }
 claw_core = { path = "../claw_core" }
-claw_memory = { path = "../claw_memory" }
+claw_memory = { package = "claw-memory", path = "../claw-memory" }
 claw_paths = { path = "../claw_paths" }
 claw_task = { path = "../claw_task" }
 log = "0.4"

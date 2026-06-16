@@ -75,7 +75,8 @@
 //!     turn.append_assistant(r#"{"role":"assistant","content":"Sunny."}"#);
 //!     turn.append_tool_result("call_1", "{\"temp_c\":21}", false);
 //!
-//!     let messages = turn.messages(); // includes the open turn; feed to the model
+//!     // memory.messages() includes the open turn; feed to the model.
+//!     let messages = memory.messages();
 //!     let _ = messages;
 //! } // drop → the turn is committed
 //!

@@ -174,8 +174,16 @@ ESP-Claw is still under active development. Feel free to open an issue to report
 
 [Click here to view our TODO List (in Chinese)](https://fcn5wbhnyubf.feishu.cn/wiki/SRlgwWUYei4WmykU8uMcUtzTnFf?table=tblWSgzWcyW7jv7B&view=vewaP9B0KX) and vote for the features or issues you care about. That helps us prioritize them sooner.
 
+## Roadmap
 
-
+- [ ] Preempt Base Agent State
+- [ ] Resumable Agents
+- [ ] Permission
+- [ ] Evals
+- [ ] GuardRails
+- [ ] Obsevability
+- [ ] Virtual Drivers for Hardware Capability
+ 
 ## 📷 Follow Us
 
 If this project helps you, please consider giving it a star. ⭐⭐⭐⭐⭐

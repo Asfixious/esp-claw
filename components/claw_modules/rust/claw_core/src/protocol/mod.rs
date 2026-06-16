@@ -9,6 +9,6 @@ mod task;
 pub use command::Command;
 pub use event::AgentEvent;
 pub use crate::iteration_loop::IterationId;
-pub use ids::{IdParseError, SessionId, StepId, TaskId, WorkerId};
+pub use ids::{IdParseError, StepId, TaskId, WorkerId};
 pub use queues::{AgentEventQueue, CommandQueue};
 pub use task::{ApprovalRecord, TaskContract, TaskStatus};

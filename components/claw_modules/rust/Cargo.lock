@@ -67,6 +67,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-chat"
+version = "0.1.0"
+dependencies = [
+ "claw-api",
+ "claw-memory",
+ "claw_core",
+ "claw_interfaces",
+ "dotenvy",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
 name = "claw-memory"
 version = "0.1.0"
 dependencies = [
@@ -116,6 +129,7 @@ name = "claw_core"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw-memory",
  "claw-utils",
  "claw_cap",
  "claw_interfaces",

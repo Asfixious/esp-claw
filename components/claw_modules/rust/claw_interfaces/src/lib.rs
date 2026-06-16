@@ -8,8 +8,10 @@
 
 pub mod error;
 pub mod event;
+pub mod fs;
 pub mod http;
 
 pub use error::*;
 pub use event::{ClawEvent, EventPublisher, SessionPolicy};
+pub use fs::{ClawFs, FsError};
 pub use http::{ClawHttp, HttpError, HttpHeader, HttpJsonRequest, HttpResponse};

@@ -10,9 +10,9 @@ use claw_api::ClawApi;
 use crate::channels::{
     ChannelEgress, ChannelEgressHub, ChannelIngressSink, InboundCommand, InboundMessage,
 };
-use crate::protocol::{Command, SessionId};
+use crate::protocol::Command;
 use crate::session::{
-    DeliverError, SessionError, SessionMessage, SessionOut, SessionRoutes, SessionStore,
+    DeliverError, SessionError, SessionId, SessionMessage, SessionOut, SessionRoutes, SessionStore,
 };
 
 pub struct Orchestrator {

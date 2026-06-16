@@ -3,9 +3,8 @@
 //! In memory these are numeric (`usize`). On the wire (JSON and [`Display`]) they use
 //! prefixed strings: `session-1`, `task-1`, `step-1`, `worker-1`.
 
-pub use crate::util::IdParseError;
+pub use claw_utils::IdParseError;
 
-crate::define_prefixed_id!(SessionId, "session-", "session");
 crate::define_prefixed_id!(TaskId, "task-", "task");
 crate::define_prefixed_id!(StepId, "step-", "step");
 crate::define_prefixed_id!(WorkerId, "worker-", "worker");
@@ -21,12 +20,6 @@ impl WorkerId {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn session_id_serializes_to_prefixed_string() {
-        let value = serde_json::to_value(SessionId(1)).unwrap();
-        assert_eq!(value, json!("session-1"));
-    }
 
     #[test]
     fn task_id_serializes_to_prefixed_string() {
@@ -48,11 +41,9 @@ mod tests {
 
     #[test]
     fn ids_deserialize_from_prefixed_string() {
-        let session: SessionId = serde_json::from_value(json!("session-7")).unwrap();
         let task: TaskId = serde_json::from_value(json!("task-3")).unwrap();
         let step: StepId = serde_json::from_value(json!("step-2")).unwrap();
         let worker: WorkerId = serde_json::from_value(json!("worker-9")).unwrap();
-        assert_eq!(session, SessionId(7));
         assert_eq!(task, TaskId(3));
         assert_eq!(step, StepId(2));
         assert_eq!(worker, WorkerId(9));
@@ -61,11 +52,8 @@ mod tests {
 
     #[test]
     fn ids_reject_non_prefixed_wire_values() {
-        assert!(serde_json::from_value::<SessionId>(json!("sess-7")).is_err());
-        assert!(serde_json::from_value::<SessionId>(json!(7)).is_err());
         assert!(serde_json::from_value::<TaskId>(json!(3)).is_err());
         assert!(serde_json::from_value::<StepId>(json!("S1")).is_err());
-        assert!(SessionId::from_wire("7").is_err());
         assert!(StepId::from_wire("step-").is_err());
     }
 
@@ -96,7 +84,6 @@ mod tests {
 
     #[test]
     fn display_matches_wire_format() {
-        assert_eq!(SessionId(1).to_string(), "session-1");
         assert_eq!(TaskId(1).to_string(), "task-1");
         assert_eq!(StepId(1).to_string(), "step-1");
         assert_eq!(WorkerId(1).to_string(), "worker-1");

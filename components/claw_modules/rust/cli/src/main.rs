@@ -1,0 +1,262 @@
+//! Interactive chat CLI backed by [`BaseAgent`] with persistent memory.
+//!
+//! Reads LLM config from `claw_core/.env.local` (same file as the integration
+//! tests). Conversation memory is written to `claw_core/output/chat/`.
+//!
+//! ```
+//! cargo run -p claw-chat --target x86_64-unknown-linux-gnu
+//! ```
+
+use std::io::{self, BufRead, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use claw_api::{ClawApi, ClawApiConfig};
+use claw_core::agent::{AgentId, BaseAgent, BaseAgentConfig, BaseAgentState, RunParams};
+use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+use claw_interfaces::{ClawFs, FsError};
+use claw_memory::{CompactError, Compactor, MemoryTaskPool, PoolConfig};
+use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// ClawFs: real disk
+// ---------------------------------------------------------------------------
+
+struct DiskFs;
+
+impl ClawFs for DiskFs {
+    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        std::fs::read(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FsError::NotFound
+            } else {
+                FsError::Io(e.to_string())
+            }
+        })
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).map_err(|e| FsError::Io(e.to_string()))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        Ok(buf)
+    }
+
+    fn len(&self, path: &str) -> Result<u64, FsError> {
+        std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|_| FsError::NotFound)
+    }
+
+    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        let tmp = format!("{path}.tmp");
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FsError::Io(e.to_string()))?;
+        }
+        std::fs::write(&tmp, data).map_err(|e| FsError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| FsError::Io(e.to_string()))
+    }
+
+    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        use std::io::Write;
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FsError::Io(e.to_string()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        file.write_all(data).map_err(|e| FsError::Io(e.to_string()))
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        Path::new(path).exists()
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FsError::Io(e.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClawHttp: real network via reqwest blocking
+// ---------------------------------------------------------------------------
+
+struct LiveHttp;
+
+impl ClawHttp for LiveHttp {
+    fn post_json(
+        &self,
+        request: &HttpJsonRequest,
+        abort: &AtomicBool,
+    ) -> Result<HttpResponse, HttpError> {
+        if abort.load(Ordering::Acquire) {
+            return Err(HttpError::Aborted);
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(u64::from(request.timeout_ms)))
+            .build()
+            .map_err(|_| HttpError::ClientInitFailed)?;
+
+        let mut builder = client
+            .post(request.url)
+            .header("Content-Type", "application/json")
+            .body(request.body.to_string());
+
+        if let Some(key) = request.api_key.filter(|v| !v.is_empty()) {
+            builder = builder.header("Authorization", format!("Bearer {key}"));
+        }
+        for header in request.headers {
+            builder = builder.header(header.name, header.value);
+        }
+
+        let response = builder
+            .send()
+            .map_err(|err| HttpError::RequestFailed(err.to_string()))?;
+        let status_code = i32::from(response.status().as_u16());
+        let body = response
+            .text()
+            .map_err(|err| HttpError::RequestFailed(err.to_string()))?;
+
+        if status_code != 200 {
+            return Err(HttpError::UnexpectedStatus(format!(
+                "HTTP {status_code}: {body}"
+            )));
+        }
+        Ok(HttpResponse { status_code, body })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compactor: stub (no background summarisation)
+// ---------------------------------------------------------------------------
+
+struct StubCompactor;
+
+impl Compactor for StubCompactor {
+    fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
+        Ok(Vec::new())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+fn load_env() {
+    let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../claw_core/.env.local");
+    if env_path.is_file() {
+        dotenvy::from_path(&env_path)
+            .unwrap_or_else(|e| panic!("failed to load {}: {e}", env_path.display()));
+    }
+}
+
+fn make_llm() -> ClawApi {
+    let api_key = std::env::var("CLAW_LLM_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .expect("CLAW_LLM_API_KEY must be set");
+    let base_url = std::env::var("CLAW_LLM_BASE_URL")
+        .expect("CLAW_LLM_BASE_URL must be set");
+    let model = std::env::var("CLAW_LLM_MODEL")
+        .expect("CLAW_LLM_MODEL must be set");
+
+    ClawApi::init(
+        ClawApiConfig {
+            api_key: Some(api_key),
+            backend_type: "openai_compatible".into(),
+            model: Some(model),
+            base_url: Some(base_url),
+            supports_tools: false,
+            timeout_ms: 60_000,
+            ..Default::default()
+        },
+        Arc::new(LiveHttp),
+    )
+    .expect("failed to init LLM client")
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+const MEMORY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../claw_core/output/chat");
+const SYSTEM_PROMPT: &str = "You are a helpful, concise assistant.";
+
+
+fn main() {
+    load_env();
+
+    let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
+
+    let mut agent = BaseAgent::new(
+        make_llm(),
+        Arc::clone(&pool),
+        BaseAgentConfig {
+            agent_id: AgentId(1),
+            memory_dir: MEMORY_DIR.into(),
+            fs: Arc::new(DiskFs),
+            compactor: Arc::new(StubCompactor),
+        },
+    );
+
+    eprintln!("Memory: {MEMORY_DIR}");
+    eprintln!("Type your message and press Enter. Empty line or Ctrl-D to quit.\n");
+
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        io::stdout().flush().expect("flush stdout");
+
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let input = line.trim();
+        if input.is_empty() {
+            break;
+        }
+
+        if let Err(err) = agent.run(RunParams {
+            goal: input,
+            system_prompt: SYSTEM_PROMPT.into(),
+            tools: None,
+            skills: None,
+        }) {
+            eprintln!("run error: {err}");
+            continue;
+        }
+
+        loop {
+            match agent.tick() {
+                BaseAgentState::Completed(text) => {
+                    println!("\n{text}\n");
+                    break;
+                }
+                BaseAgentState::Working => continue,
+                BaseAgentState::Failed(err) => {
+                    eprintln!("agent error: {err}");
+                    break;
+                }
+                other => {
+                    eprintln!("unexpected state: {other:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    eprintln!("Goodbye.");
+}

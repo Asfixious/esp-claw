@@ -77,7 +77,6 @@
 //!   listing the byte `(off, len)` of every live record plus `covered_len` and
 //!   `next_id`, rewritten atomically when the live/dead structure changes.
 
-use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -430,6 +429,7 @@ struct MemoryInner {
 /// memory.flush(); // checkpoint, e.g. on a clean shutdown
 /// # Ok::<(), std::io::Error>(())
 /// ```
+#[derive(Clone)]
 pub struct ConversationMemory {
     inner: Arc<MemoryInner>,
 }
@@ -555,8 +555,8 @@ impl ConversationMemory {
     /// assert_eq!(memory.messages().as_array().map(|m| m.len()), Some(3));
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn group(&mut self) -> GroupGuard<'_> {
-        GroupGuard { memory: self }
+    pub fn group(&self) -> GroupGuard {
+        GroupGuard { inner: Arc::clone(&self.inner) }
     }
 
     /// The current messages, ready to send to the model in chronological order:
@@ -695,14 +695,7 @@ impl ConversationMemory {
     }
 
     fn schedule_compaction(&self) {
-        if self.inner.compaction_in_flight.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let inner = Arc::clone(&self.inner);
-        self.inner.deps.pool.submit(Box::new(move || {
-            compute_compact_chunk(&inner);
-            inner.compaction_in_flight.store(false, Ordering::Release);
-        }));
+        schedule_compaction(&self.inner);
     }
 
     fn lock_state(&self) -> MutexGuard<'_, MemoryState> {
@@ -755,15 +748,23 @@ impl ConversationMemory {
 ///     { "role": "tool", "tool_call_id": "c1", "content": "{\"temp_c\":21}" },
 /// ]));
 /// // Reads see the open turn before it commits.
-/// assert_eq!(turn.messages().as_array().map(|m| m.len()), Some(3));
+/// assert_eq!(memory.messages().as_array().map(|m| m.len()), Some(3));
 /// turn.commit(); // or just let it drop
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct GroupGuard<'a> {
-    memory: &'a mut ConversationMemory,
+/// An open turn. Append messages through it; the turn is committed as one group
+/// record when the guard drops (or on an explicit [`commit`](Self::commit)).
+///
+/// Obtained from [`ConversationMemory::group`]. Holds an `Arc` into the memory's
+/// inner state so it carries no lifetime and can be stored across async boundaries
+/// or inside structs like `BaseAgent`.  Only one group should be open at a time per
+/// memory instance; behaviour is unspecified if two live `GroupGuard`s share the
+/// same memory (their messages interleave in the single `open_group` buffer).
+pub struct GroupGuard {
+    inner: Arc<MemoryInner>,
 }
 
-impl GroupGuard<'_> {
+impl GroupGuard {
     /// Append a user (or addon) message to the open turn.
     pub fn append_user(&self, content: impl Into<String>) {
         self.push_open(json!({ "role": "user", "content": content.into() }));
@@ -778,7 +779,7 @@ impl GroupGuard<'_> {
             Ok(message) => self.push_open(message),
             Err(err) => log::warn!(
                 "conversation {}: invalid assistant json: {err}",
-                self.memory.inner.conversation_id
+                self.inner.conversation_id
             ),
         }
     }
@@ -803,7 +804,7 @@ impl GroupGuard<'_> {
         let Some(items) = messages.as_array() else {
             log::warn!(
                 "conversation {}: append_patch expected a JSON array",
-                self.memory.inner.conversation_id
+                self.inner.conversation_id
             );
             return;
         };
@@ -817,7 +818,7 @@ impl GroupGuard<'_> {
     /// A parked compact is applied first, then the turn is committed, then we
     /// maybe schedule the next compaction chunk and persist.
     pub fn commit(&self) {
-        let inner = &self.memory.inner;
+        let inner = &self.inner;
         let applied = apply_parked_compact(inner);
         let (should_compact, due) = {
             let mut state = lock_state(inner);
@@ -844,7 +845,7 @@ impl GroupGuard<'_> {
             (should_compact, persist_due(inner, &state))
         };
         if should_compact {
-            self.memory.schedule_compaction();
+            schedule_compaction(inner);
         }
         if applied {
             persist(inner, true);
@@ -855,7 +856,7 @@ impl GroupGuard<'_> {
     }
 
     fn push_open(&self, message: Value) {
-        let mut state = lock_state(&self.memory.inner);
+        let mut state = lock_state(&self.inner);
         state.approx_tokens = state
             .approx_tokens
             .saturating_add(estimate_message_tokens(&message));
@@ -863,19 +864,9 @@ impl GroupGuard<'_> {
     }
 }
 
-impl Drop for GroupGuard<'_> {
+impl Drop for GroupGuard {
     fn drop(&mut self) {
-        // todo: this commits whatever was buffered even on a panic-unwind, so an
-        // aborted turn is still persisted. We deliberately do not special-case
-        // `std::thread::panicking()`; revisit if half-turn persistence matters.
         self.commit();
-    }
-}
-
-impl Deref for GroupGuard<'_> {
-    type Target = ConversationMemory;
-    fn deref(&self) -> &ConversationMemory {
-        self.memory
     }
 }
 
@@ -929,6 +920,17 @@ fn compute_verbatim_count(state: &MemoryState, keep_recent_tokens: usize) -> usi
 /// Strategy: find the next window of aged groups not yet covered by a compact
 /// segment (advancing-cursor approach), pack up to `segment_token_budget` tokens
 /// from that window, and summarise it. The verbatim tail is always excluded.
+fn schedule_compaction(inner: &Arc<MemoryInner>) {
+    if inner.compaction_in_flight.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let task_inner = Arc::clone(inner);
+    inner.deps.pool.submit(Box::new(move || {
+        compute_compact_chunk(&task_inner);
+        task_inner.compaction_in_flight.store(false, Ordering::Release);
+    }));
+}
+
 ///
 /// Returns without touching state if there is nothing to compact.
 fn compute_compact_chunk(inner: &MemoryInner) {
@@ -1094,8 +1096,12 @@ fn coverage_is_contiguous(state: &MemoryState) -> bool {
 /// Flush pending records (one `append`) and, when needed, rewrite the manifest.
 fn persist(inner: &MemoryInner, force_manifest: bool) {
     let mut state = lock_state(inner);
-    let want_manifest = force_manifest || state.index_dirty;
-    if state.pending.is_empty() && !want_manifest {
+    // Pending data always makes the manifest stale: after the append the
+    // data log has records the index doesn't know about. Fold that into
+    // want_manifest so the two files stay in sync on every write.
+    let has_pending = !state.pending.is_empty();
+    let want_manifest = force_manifest || state.index_dirty || has_pending;
+    if !has_pending && !want_manifest {
         return;
     }
 

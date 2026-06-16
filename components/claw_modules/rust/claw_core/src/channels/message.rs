@@ -1,6 +1,7 @@
 //! Channel message types and routing metadata.
 
-use crate::protocol::{Command, SessionId};
+use crate::protocol::Command;
+use crate::session::SessionId;
 
 use thiserror::Error;
 

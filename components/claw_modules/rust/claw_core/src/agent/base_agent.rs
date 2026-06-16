@@ -32,7 +32,7 @@ use crate::iteration_loop::{
     ChatMessages, CompletedKind, InterruptionControl, IterationId, IterationLoop,
     IterationLoopError, IterationOutcome, IterationStep, PreemptedOutcome, SystemPrompt,
 };
-use crate::skills::Skills;
+use crate::skills::{SkillError, SkillGroup, SkillId, SkillSet};
 use crate::tools::ToolSet;
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
@@ -55,8 +55,23 @@ pub enum BaseAgentState {
     Interrupted,
     /// Terminal: the task finished with this final answer.
     Completed(String),
-    /// Terminal: the task failed; carries the iteration cause.
-    Failed(IterationLoopError),
+    /// Terminal: the task failed; carries the cause.
+    Failed(AgentRunError),
+}
+
+/// Cause of a terminal [`BaseAgentState::Failed`].
+///
+/// Wraps the lower-level errors a tick can hit: a failed LLM/tool iteration, or
+/// a failure assembling the loaded skills' context before the iteration runs.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum AgentRunError {
+    /// The LLM/tool iteration itself failed.
+    #[error(transparent)]
+    Iteration(#[from] IterationLoopError),
+    /// Assembling the skill context failed (e.g. a loaded skill's document could
+    /// not be read).
+    #[error(transparent)]
+    Skill(#[from] SkillError),
 }
 
 /// Internal lifecycle, kept separate from the rich [`BaseAgentState`] so it stays
@@ -141,8 +156,14 @@ pub struct BaseAgent {
     interruption: AgentInterruption,
     memory: ConversationMemory,
     tools: Option<ToolSet>,
-    skills: Option<Arc<dyn Skills>>,
+    skills: Option<SkillSet>,
     system_prompt: String,
+    /// Cached `system_prompt` + skills context, assembled once and reused across
+    /// ticks. Empty means "no skill content, borrow `system_prompt` directly".
+    /// Rebuilt only when [`effective_prompt_dirty`](Self::effective_prompt_dirty)
+    /// is set — by `run` (new base prompt) or a skill load/unload.
+    effective_prompt: String,
+    effective_prompt_dirty: bool,
     /// Open group guard kept alive from `run()` until the first response, so
     /// the user turn and the assistant reply commit as one group — preventing
     /// compaction from orphaning a reply with no user turn.
@@ -188,6 +209,8 @@ impl BaseAgent {
             tools: None,
             skills: None,
             system_prompt: String::new(),
+            effective_prompt: String::new(),
+            effective_prompt_dirty: false,
             open_turn: None,
             next_iteration: IterationId(0),
             lifecycle: Lifecycle::Idle,
@@ -205,12 +228,49 @@ impl BaseAgent {
         self
     }
 
-    /// Set the skill context provider for the agent.
+    /// Set the agent's skills.
     ///
-    /// The `Arc` is shared — the agent holds a reference, not a copy.
-    pub fn with_skills(mut self, skills: Arc<dyn Skills>) -> Self {
+    /// The [`SkillSet`] is the agent's loaded-skill state; it stays mutable so
+    /// skills can be loaded or unloaded at runtime via
+    /// [`load_skill`](Self::load_skill) / [`unload_skill`](Self::unload_skill).
+    pub fn with_skills(mut self, skills: SkillSet) -> Self {
         self.skills = Some(skills);
         self
+    }
+
+    /// Load one skill into context at runtime (no restart).
+    ///
+    /// Returns [`SkillError::NotFound`] if no skill set is configured or the
+    /// registry has no such skill.
+    pub fn load_skill(&mut self, group: &'static str, id: SkillId) -> Result<(), SkillError> {
+        match self.skills.as_mut() {
+            Some(skills) => {
+                skills.load(group, id)?;
+                self.effective_prompt_dirty = true;
+                Ok(())
+            }
+            None => Err(SkillError::NotFound(id.to_string())),
+        }
+    }
+
+    /// Load a whole [`SkillGroup`] into context at runtime.
+    pub fn load_skill_group(&mut self, group: SkillGroup) -> Result<(), SkillError> {
+        match self.skills.as_mut() {
+            Some(skills) => {
+                skills.load_group(group)?;
+                self.effective_prompt_dirty = true;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Unload a skill from context at runtime. No-op if absent.
+    pub fn unload_skill(&mut self, id: &SkillId) {
+        if let Some(skills) = self.skills.as_mut() {
+            skills.unload(id);
+            self.effective_prompt_dirty = true;
+        }
     }
 
     /// True while a task is loaded and still has iterations to run.
@@ -237,6 +297,7 @@ impl BaseAgent {
             return Err(AgentError::Busy);
         }
         self.system_prompt = params.system_prompt;
+        self.effective_prompt_dirty = true;
         self.next_iteration = IterationId(0);
         let turn = self.memory.group();
         turn.append_user(params.goal);
@@ -256,6 +317,13 @@ impl BaseAgent {
         let iteration_id = self.next_iteration;
         self.next_iteration = IterationId(iteration_id.0.saturating_add(1));
 
+        // Rebuild the combined prompt only when the base prompt or skills changed;
+        // otherwise this is a no-op and we reuse the cached string below.
+        if let Err(error) = self.refresh_effective_prompt() {
+            return self.on_skill_error(error);
+        }
+        let system_prompt = self.effective_prompt();
+
         let messages = self.memory.messages();
 
         let outcome = {
@@ -265,7 +333,7 @@ impl BaseAgent {
             };
             let step = IterationStep {
                 iteration_id,
-                system_prompt: SystemPrompt(self.system_prompt.as_str()),
+                system_prompt: SystemPrompt(system_prompt),
                 messages: ChatMessages(&messages),
                 tools: self.tools.as_ref(),
             };
@@ -276,6 +344,43 @@ impl BaseAgent {
             Ok(IterationOutcome::Completed(outcome)) => self.on_completed(outcome.kind),
             Ok(IterationOutcome::Preempted(outcome)) => self.on_preempted(outcome),
             Err(err) => self.on_error(err),
+        }
+    }
+
+    /// Rebuild the cached combined prompt if it is stale; otherwise a no-op.
+    ///
+    /// When the loaded skills produce content, the cache holds `system_prompt`
+    /// concatenated with it (allocated once per change). When there is none, the
+    /// cache is left empty as the signal to borrow `system_prompt` directly — see
+    /// [`effective_prompt`](Self::effective_prompt).
+    fn refresh_effective_prompt(&mut self) -> Result<(), SkillError> {
+        if !self.effective_prompt_dirty {
+            return Ok(());
+        }
+        let skill_context = match self.skills.as_mut() {
+            Some(skills) => skills.context()?,
+            None => "",
+        };
+        self.effective_prompt.clear();
+        if !skill_context.is_empty() {
+            self.effective_prompt.push_str(&self.system_prompt);
+            self.effective_prompt.push_str("\n\n");
+            self.effective_prompt.push_str(skill_context);
+        }
+        self.effective_prompt_dirty = false;
+        Ok(())
+    }
+
+    /// The prompt to send this iteration — the cached combined prompt when skills
+    /// contributed content, else the base prompt borrowed with no copy.
+    ///
+    /// Assumes [`refresh_effective_prompt`](Self::refresh_effective_prompt) ran
+    /// this tick so the cache is current.
+    fn effective_prompt(&self) -> &str {
+        if self.effective_prompt.is_empty() {
+            &self.system_prompt
+        } else {
+            &self.effective_prompt
         }
     }
 
@@ -324,6 +429,13 @@ impl BaseAgent {
     fn on_error(&mut self, err: IterationLoopError) -> BaseAgentState {
         log::warn!("base_agent iteration failed: {err}");
         self.lifecycle = Lifecycle::Terminal;
-        BaseAgentState::Failed(err)
+        BaseAgentState::Failed(AgentRunError::Iteration(err))
+    }
+
+    /// A failure assembling skill context ends the task before the iteration.
+    fn on_skill_error(&mut self, err: SkillError) -> BaseAgentState {
+        log::warn!("base_agent skill context failed: {err}");
+        self.lifecycle = Lifecycle::Terminal;
+        BaseAgentState::Failed(AgentRunError::Skill(err))
     }
 }

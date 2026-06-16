@@ -9,11 +9,9 @@ pub mod context;
 pub mod error;
 pub mod invoker;
 pub mod registry;
-pub mod skills_adapter;
 
 pub use context::{CapabilityCaller, CapabilityContext, ToolContext};
 pub use error::CapabilityError;
 pub use invoker::{CapabilityInvokeResult, CapabilityInvoker};
 pub use registry::{Registry, RegistryBackend};
 pub use channel_adapters::{CapChannelIngress, CapChannelTransport};
-pub use skills_adapter::{EmptySkills, StaticSkills};

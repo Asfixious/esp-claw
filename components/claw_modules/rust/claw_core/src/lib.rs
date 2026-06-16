@@ -28,8 +28,8 @@ pub use session::{
 };
 pub use protocol::Command;
 pub use skills::{
-    ActiveSkillDoc, NoSkills, PromptSection, PromptSlot, SkillCatalogEntry, SkillError,
-    SkillPrompt, Skills,
+    FsSkillRegistry, ManageMode, SkillError, SkillGroup, SkillId, SkillMetadata, SkillRegistry,
+    SkillSet,
 };
 pub use tools::{
     Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet, ToolSetError,

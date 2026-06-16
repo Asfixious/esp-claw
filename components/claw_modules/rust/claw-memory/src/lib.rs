@@ -38,6 +38,7 @@
 //!     fn append(&self, _path: &str, _data: &[u8]) -> Result<(), FsError> { Ok(()) }
 //!     fn exists(&self, _path: &str) -> bool { false }
 //!     fn remove(&self, _path: &str) -> Result<(), FsError> { Ok(()) }
+//!     fn list_dir(&self, _path: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }
 //! }
 //!
 //! // 2. A compactor that folds an aged window into a summary (e.g. an LLM call).

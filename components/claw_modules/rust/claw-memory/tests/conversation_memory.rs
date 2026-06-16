@@ -60,6 +60,18 @@ impl ClawFs for MemFs {
         self.lock().remove(path);
         Ok(())
     }
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let mut names = std::collections::BTreeSet::new();
+        for key in self.lock().keys() {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                if let Some(name) = rest.split('/').next().filter(|n| !n.is_empty()) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
 }
 
 impl MemFs {
@@ -807,6 +819,24 @@ impl ClawFs for RealFs {
 
     fn remove(&self, path: &str) -> Result<(), FsError> {
         std::fs::remove_file(self.full_path(path)).map_err(|e| FsError::Io(e.to_string()))
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+        let entries = std::fs::read_dir(self.full_path(path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FsError::NotFound
+            } else {
+                FsError::Io(e.to_string())
+            }
+        })?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
     }
 }
 

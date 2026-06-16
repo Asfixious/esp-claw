@@ -80,4 +80,13 @@ pub trait ClawFs: Send + Sync {
 
     /// Remove `path`. Removing a missing path succeeds (idempotent).
     fn remove(&self, path: &str) -> Result<(), FsError>;
+
+    /// List the immediate entry names within directory `path`.
+    ///
+    /// Returns only the final path component of each entry (e.g. `"light_switch"`),
+    /// not joined paths, and in unspecified order — callers that need ordering
+    /// sort themselves. Both files and subdirectories are included. Returns
+    /// [`FsError::NotFound`] when `path` does not exist. Used to enumerate the
+    /// skills root (one directory per skill) without reading any file.
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError>;
 }

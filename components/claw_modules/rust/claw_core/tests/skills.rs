@@ -1,0 +1,241 @@
+//! Data-driven tests for the skill registry over real `SKILL.md` fixtures.
+//!
+//! - Input fixtures:  `tests/data/skills/<id>/SKILL.md` (+ bundled scripts)
+//! - Golden expected: `tests/data/skills_expected/catalog.json` and
+//!   `tests/data/skills_expected/<id>/document.md`
+//!
+//! The registry is scanned over a `DiskFs` rooted at `tests/data` with the
+//! virtual root `skills`, so `{CUR_SKILL_DIR}` expands to a stable, portable
+//! `skills/<id>` — no absolute machine paths leak into the golden files.
+//!
+//! The whole skills folder is discovered dynamically (nothing is hard-coded per
+//! skill), so dropping a new skill into `tests/data/skills/` and regenerating the
+//! goldens is all it takes to cover it.
+//!
+//! Run with `CLAW_UPDATE_GOLDEN=1` to (re)generate the golden files.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use claw_core::{FsSkillRegistry, ManageMode, SkillId, SkillRegistry, SkillSet};
+use claw_interfaces::{ClawFs, FsError};
+use serde_json::json;
+
+/// Virtual skills root handed to the registry; maps onto `tests/data/skills`.
+const SKILLS_ROOT: &str = "skills";
+
+// ---------------------------------------------------------------------------
+// DiskFs rooted at a base directory (so virtual paths stay portable).
+// ---------------------------------------------------------------------------
+
+struct DiskFs {
+    base: PathBuf,
+}
+
+impl DiskFs {
+    fn full_path(&self, path: &str) -> PathBuf {
+        self.base.join(path)
+    }
+}
+
+impl ClawFs for DiskFs {
+    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        std::fs::read(self.full_path(path)).map_err(map_io)
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        let mut file = std::fs::File::open(self.full_path(path)).map_err(map_io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| FsError::Io(error.to_string()))?;
+        let mut buffer = vec![0u8; len];
+        file.read_exact(&mut buffer)
+            .map_err(|error| FsError::Io(error.to_string()))?;
+        Ok(buffer)
+    }
+
+    fn len(&self, path: &str) -> Result<u64, FsError> {
+        std::fs::metadata(self.full_path(path))
+            .map(|metadata| metadata.len())
+            .map_err(map_io)
+    }
+
+    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        std::fs::write(self.full_path(path), data).map_err(|error| FsError::Io(error.to_string()))
+    }
+
+    fn append(&self, _path: &str, _data: &[u8]) -> Result<(), FsError> {
+        Err(FsError::Io("append unsupported in skills test fs".into()))
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.full_path(path).exists()
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        match std::fs::remove_file(self.full_path(path)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(FsError::Io(error.to_string())),
+        }
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+        let entries = std::fs::read_dir(self.full_path(path)).map_err(map_io)?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| FsError::Io(error.to_string()))?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+}
+
+fn map_io(error: std::io::Error) -> FsError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        FsError::NotFound
+    } else {
+        FsError::Io(error.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture paths + helpers
+// ---------------------------------------------------------------------------
+
+fn data_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data")
+}
+
+fn expected_dir() -> PathBuf {
+    data_dir().join("skills_expected")
+}
+
+fn update_golden() -> bool {
+    std::env::var_os("CLAW_UPDATE_GOLDEN").is_some()
+}
+
+fn registry() -> FsSkillRegistry {
+    FsSkillRegistry::scan(Arc::new(DiskFs { base: data_dir() }), SKILLS_ROOT)
+        .expect("scan skills fixtures")
+}
+
+fn manage_mode_str(mode: ManageMode) -> &'static str {
+    match mode {
+        ManageMode::ReadOnly => "readonly",
+        ManageMode::Runtime => "runtime",
+    }
+}
+
+/// The catalog rendered as canonical pretty JSON (trailing newline) for golden
+/// comparison.
+fn catalog_json(registry: &FsSkillRegistry) -> String {
+    let entries: Vec<_> = registry
+        .catalog()
+        .iter()
+        .map(|metadata| {
+            json!({
+                "id": metadata.id().as_str(),
+                "description": metadata.description(),
+                "capability_groups": metadata.capability_groups(),
+                "manage_mode": manage_mode_str(metadata.manage_mode()),
+            })
+        })
+        .collect();
+    let mut rendered = serde_json::to_string_pretty(&json!(entries)).expect("serialize catalog");
+    rendered.push('\n');
+    rendered
+}
+
+/// Assert `actual` equals the golden at `path`, or write it when updating.
+fn assert_golden(path: &Path, actual: &str, label: &str) {
+    if update_golden() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create golden dir");
+        }
+        std::fs::write(path, actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read_to_string(path).unwrap_or_else(|_| {
+        panic!(
+            "missing golden for {label}: {} — run with CLAW_UPDATE_GOLDEN=1 to generate",
+            path.display()
+        )
+    });
+    assert_eq!(actual, &expected, "{label} does not match golden {}", path.display());
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn catalog_matches_golden() {
+    let registry = registry();
+    assert!(
+        !registry.catalog().is_empty(),
+        "no skills scanned from tests/data/skills"
+    );
+    assert_golden(
+        &expected_dir().join("catalog.json"),
+        &catalog_json(&registry),
+        "catalog",
+    );
+}
+
+#[test]
+fn documents_match_golden() {
+    let registry = registry();
+    for metadata in registry.catalog() {
+        let id = metadata.id();
+        let document = registry.document(id).expect("read skill document");
+        assert!(
+            !document.contains("{CUR_SKILL_DIR}"),
+            "placeholder not expanded for {id}"
+        );
+        assert!(
+            !document.starts_with("---"),
+            "front-matter not stripped for {id}"
+        );
+        assert_golden(
+            &expected_dir().join(id.as_str()).join("document.md"),
+            &document,
+            &format!("document for {id}"),
+        );
+    }
+}
+
+#[test]
+fn skill_set_loads_unloads_and_caches() {
+    let shared: Arc<dyn SkillRegistry> = Arc::new(registry());
+    // Pick the first fixture skill dynamically rather than hard-coding an id.
+    let first = shared
+        .catalog()
+        .first()
+        .expect("at least one fixture skill")
+        .id()
+        .clone();
+
+    let mut set = SkillSet::new(Arc::clone(&shared));
+    assert!(set.context().expect("empty context").is_empty());
+
+    set.load("test", first.clone()).expect("load skill");
+    let loaded = set.context().expect("loaded context").to_string();
+    assert!(loaded.contains(first.as_str()), "loaded context omits the skill id");
+    // A second read with nothing changed returns the same cached content.
+    assert_eq!(set.context().expect("cached context"), loaded);
+
+    set.unload(&first);
+    assert!(set.context().expect("post-unload context").is_empty());
+}
+
+#[test]
+fn loading_unknown_skill_is_not_found() {
+    let shared: Arc<dyn SkillRegistry> = Arc::new(registry());
+    let mut set = SkillSet::new(shared);
+    assert!(set.load("test", SkillId::new("does_not_exist")).is_err());
+}

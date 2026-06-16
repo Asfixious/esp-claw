@@ -14,12 +14,8 @@ use claw_interfaces::error::{
 };
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 
-use crate::cap_skills::CLegacySkills;
-
 struct OrchestratorState {
     orchestrator: Mutex<Orchestrator>,
-    #[allow(dead_code)]
-    skills: Arc<dyn claw_core::Skills>,
 }
 
 static ORCHESTRATOR: OnceLock<Mutex<OrchestratorState>> = OnceLock::new();
@@ -125,7 +121,6 @@ pub extern "C" fn claw_orchestrator_init(cap_user_ctx: *mut c_void) -> EspErr {
     }
 
     let _ = cap_user_ctx;
-    let skills: Arc<dyn claw_core::Skills> = Arc::new(CLegacySkills);
     let egress: Arc<dyn claw_core::ChannelEgress> = Arc::new(ChannelEgressHub::new());
 
     let orchestrator = Orchestrator::builder()
@@ -135,7 +130,6 @@ pub extern "C" fn claw_orchestrator_init(cap_user_ctx: *mut c_void) -> EspErr {
 
     let state = OrchestratorState {
         orchestrator: Mutex::new(orchestrator),
-        skills,
     };
     let _ = ORCHESTRATOR.set(Mutex::new(state));
     ESP_OK

@@ -14,14 +14,12 @@
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
 pub mod abi_types;
-pub mod cap_skills;
 pub mod capability;
 #[cfg(feature = "legacy-core")]
 pub mod core_abi;
 pub mod errmap;
 pub mod orchestrator_abi;
 
-pub use cap_skills::CLegacySkills as CapSkills;
 pub mod ffi;
 #[cfg(feature = "legacy-core")]
 pub mod llm;

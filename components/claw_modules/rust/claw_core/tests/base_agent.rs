@@ -154,6 +154,24 @@ impl ClawFs for DiskFs {
             Err(e) => Err(FsError::Io(e.to_string())),
         }
     }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+        let entries = std::fs::read_dir(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FsError::NotFound
+            } else {
+                FsError::Io(e.to_string())
+            }
+        })?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
 }
 
 // ---------------------------------------------------------------------------

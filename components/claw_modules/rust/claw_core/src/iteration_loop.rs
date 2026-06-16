@@ -1,6 +1,6 @@
 //! One LLM/tool round-trip per [`IterationLoop`].
 //!
-//! Layer 3 only: pass chat + [`IterationTools`], LLM picks tool calls, we invoke
+//! Layer 3 only: pass chat + a [`ToolSet`], LLM picks tool calls, we invoke
 //! them, return which tools ran. No session, channel, or routing concepts here.
 //!
 //! On preemption this layer only detects the signal and ends the iteration.
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse};
-use crate::tools::{ToolError, ToolInvocation, ToolOutput};
+use crate::tools::{ToolError, ToolInvocation, ToolOutput, ToolSet};
 
 use claw_utils::TruncatedText;
 
@@ -82,21 +82,12 @@ impl AppendedMessages {
     }
 }
 
-/// Tools available for one iteration: schemas for the LLM plus invoke-by-name.
-pub trait IterationTools: Send + Sync {
-    /// OpenAI-style tools JSON sent to the LLM, if any.
-    fn schemas_json(&self) -> Option<&str>;
-
-    /// Execute one model `tool_call`.
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError>;
-}
-
 /// Inputs for exactly one [`IterationLoop::run`]: chat fields + optional tools.
 pub struct IterationStep<'a> {
     pub iteration_id: IterationId,
     pub system_prompt: SystemPrompt<'a>,
     pub messages: ChatMessages<'a>,
-    pub tools: Option<&'a dyn IterationTools>,
+    pub tools: Option<&'a ToolSet>,
 }
 
 /// Terminal outcome of exactly one [`IterationLoop::run`] (completed or preempted).
@@ -343,7 +334,7 @@ fn append_assistant_tool_calls(
 
 fn run_tool_calls(
     interruption: &dyn InterruptionControl,
-    tools: &dyn IterationTools,
+    tools: &ToolSet,
     appended: &mut AppendedMessages,
     response: &LlmResponse,
     iteration_id: IterationId,
@@ -435,6 +426,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::tools::{Tool, ToolGroup, ToolHandler};
     use claw_api::ToolCall;
     use serde_json::json;
 
@@ -557,10 +549,16 @@ mod tests {
 
     #[test]
     fn run_tool_calls_error_and_empty_name() {
-        struct OkTools;
-        impl IterationTools for OkTools {
-            fn schemas_json(&self) -> Option<&str> {
-                None
+        // The model emits an empty tool name; register a tool under that name so
+        // dispatch lands and we exercise the "(null)" display + is_error path.
+        struct FailingTool;
+        impl ToolHandler for FailingTool {
+            fn name(&self) -> &'static str {
+                ""
+            }
+
+            fn schema(&self) -> &'static str {
+                "{}"
             }
 
             fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -572,7 +570,8 @@ mod tests {
         }
 
         let interruption = FlagControl::new();
-        let tools = OkTools;
+        let tools = ToolSet::from_groups([ToolGroup::new("g", [Tool::new(FailingTool)])])
+            .expect("tool set");
         let iteration_id = IterationId(1);
         let response = LlmResponse {
             text: None,

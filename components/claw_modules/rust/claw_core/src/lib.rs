@@ -31,8 +31,8 @@ pub use skills::{
     ActiveSkillDoc, NoSkills, PromptSection, PromptSlot, SkillCatalogEntry, SkillError,
     SkillPrompt, Skills,
 };
-pub use iteration_loop::IterationTools;
 pub use tools::{
-    ToolCaller, ToolCatalog, ToolError, ToolInvocation, ToolOutput, Tools, TurnContext,
+    Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet, ToolSetError,
+    DEFAULT_TOOL_GROUP,
 };
 pub use protocol::{IdParseError, IterationId, StepId, TaskId, WorkerId};

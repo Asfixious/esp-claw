@@ -2,8 +2,6 @@
 
 use thiserror::Error;
 
-use crate::tools::TurnContext;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillCatalogEntry {
     pub id: String,
@@ -63,14 +61,14 @@ pub enum SkillError {
 }
 
 pub trait Skills: Send + Sync {
-    fn prompt(&self, ctx: &TurnContext) -> SkillPrompt;
+    fn prompt(&self) -> SkillPrompt;
 }
 
 /// No skill context (default orchestrator wiring).
 pub struct NoSkills;
 
 impl Skills for NoSkills {
-    fn prompt(&self, _ctx: &TurnContext) -> SkillPrompt {
+    fn prompt(&self) -> SkillPrompt {
         SkillPrompt::default()
     }
 }

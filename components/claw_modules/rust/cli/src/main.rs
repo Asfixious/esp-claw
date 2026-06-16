@@ -246,8 +246,6 @@ fn main() {
         if let Err(err) = agent.run(RunParams {
             goal: input,
             system_prompt: SYSTEM_PROMPT.into(),
-            tools: None,
-            skills: None,
         }) {
             eprintln!("run error: {err}");
             continue;

@@ -1,12 +1,12 @@
 //! [`Skills`] port adapters.
 
-use claw_core::{SkillPrompt, Skills, TurnContext};
+use claw_core::{SkillPrompt, Skills};
 
 /// No skill context (host tests without skill registry).
 pub struct EmptySkills;
 
 impl Skills for EmptySkills {
-    fn prompt(&self, _ctx: &TurnContext) -> SkillPrompt {
+    fn prompt(&self) -> SkillPrompt {
         SkillPrompt::default()
     }
 }
@@ -17,7 +17,7 @@ pub struct StaticSkills {
 }
 
 impl Skills for StaticSkills {
-    fn prompt(&self, _ctx: &TurnContext) -> SkillPrompt {
+    fn prompt(&self) -> SkillPrompt {
         self.prompt.clone()
     }
 }

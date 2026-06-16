@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_core::{IterationId, ToolError, ToolInvocation, ToolOutput};
+use claw_core::{
+    IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
+};
 use claw_core::iteration_loop::{
     AppendedMessages, ChatMessages, CompletedKind, IterationCheckpoint, IterationLoop,
-    IterationLoopError, IterationOutcome, IterationResult, IterationStep, IterationTools,
-    InterruptionControl, SystemPrompt,
+    IterationLoopError, IterationOutcome, IterationResult, IterationStep, InterruptionControl,
+    SystemPrompt,
 };
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use serde_json::{json, Value};
@@ -254,13 +256,16 @@ impl ClawHttp for AbortDuringHttp {
     }
 }
 
-struct EchoTools;
+/// Tool named `files` that echoes `name:args` and succeeds.
+struct EchoTool;
 
-impl IterationTools for EchoTools {
-    fn schemas_json(&self) -> Option<&str> {
-        None
+impl ToolHandler for EchoTool {
+    fn name(&self) -> &'static str {
+        "files"
     }
-
+    fn schema(&self) -> &'static str {
+        r#"{"type":"function","function":{"name":"files"}}"#
+    }
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             output: format!("{}:{}", call.name, call.arguments_json),
@@ -269,31 +274,43 @@ impl IterationTools for EchoTools {
     }
 }
 
-struct FailingTools;
+/// Tool named `files` whose invoke fails, to test error propagation.
+struct FailingTool;
 
-impl IterationTools for FailingTools {
-    fn schemas_json(&self) -> Option<&str> {
-        None
+impl ToolHandler for FailingTool {
+    fn name(&self) -> &'static str {
+        "files"
     }
-
+    fn schema(&self) -> &'static str {
+        r#"{"type":"function","function":{"name":"files"}}"#
+    }
     fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         Err(ToolError::NotFound("files".into()))
     }
 }
 
-struct SoftFailTools;
+/// Tool registered under the empty name (matching an empty-name tool_call) that
+/// returns `ok: false`, to test the soft-fail / "(null)" display path.
+struct SoftFailTool;
 
-impl IterationTools for SoftFailTools {
-    fn schemas_json(&self) -> Option<&str> {
-        None
+impl ToolHandler for SoftFailTool {
+    fn name(&self) -> &'static str {
+        ""
     }
-
+    fn schema(&self) -> &'static str {
+        "{}"
+    }
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             output: format!("soft-fail:{}:{}", call.name, call.arguments_json),
             ok: false,
         })
     }
+}
+
+/// Wrap a single tool in a one-group [`ToolSet`] for tests.
+fn tool_set(tool: impl ToolHandler + 'static) -> ToolSet {
+    ToolSet::from_groups([ToolGroup::new("test", [Tool::new(tool)])]).expect("tool set")
 }
 
 fn test_llm_with_http(http: Arc<dyn ClawHttp>) -> ClawApi {
@@ -314,7 +331,7 @@ fn test_llm_with_http(http: Arc<dyn ClawHttp>) -> ClawApi {
 fn run_step(
     llm: &ClawApi,
     control: &MockControl,
-    tools: Option<&dyn IterationTools>,
+    tools: Option<&ToolSet>,
     iteration_id: IterationId,
     messages: &Value,
     system_prompt: &str,
@@ -383,7 +400,7 @@ fn run_returns_plain_text_outcome() {
 fn run_executes_tools_and_records_runs() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
-    let echo = EchoTools;
+    let echo = tool_set(EchoTool);
     let messages = json!([]);
 
     let result = run_step(
@@ -498,7 +515,7 @@ fn run_propagates_chat_errors_without_interrupt() {
 fn run_records_soft_failing_tool_with_null_name() {
     let llm = test_llm(vec![TOOL_CALL_EMPTY_NAME_BODY]);
     let control = MockControl::new();
-    let soft_fail = SoftFailTools;
+    let soft_fail = tool_set(SoftFailTool);
     let messages = json!([]);
 
     let result = run_step(
@@ -531,7 +548,7 @@ fn run_records_soft_failing_tool_with_null_name() {
 fn run_propagates_capability_errors() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
-    let failing = FailingTools;
+    let failing = tool_set(FailingTool);
     let messages = json!([]);
 
     let result = run_step(

@@ -1,22 +1,19 @@
 //! Layer 2 base agent: drives a multi-iteration task, one iteration per `tick`.
 //!
 //! Split of responsibilities:
-//! - [`BaseAgent::new`] takes the agent's owned LLM client, the shared memory
-//!   task pool singleton, and a [`BaseAgentConfig`] that controls conversation
-//!   identity and persistence. The agent builds its [`ConversationMemory`]
-//!   internally.
-//! - [`BaseAgent::run`] is pure setup for one task: it injects the per-task
-//!   context (system prompt, tools, skills), appends the user's goal to memory,
-//!   and resets iteration state. No iteration runs here.
-//! - The driver (orchestrator) then pumps [`BaseAgent::tick`] until it returns a
-//!   terminal [`BaseAgentState`]. Each `tick` performs exactly one
-//!   [`IterationLoop`] round-trip, so the driver can interleave new commands and
-//!   other agents between ticks (cooperative scheduling).
+//! - [`BaseAgent::new`] / [`BaseAgent::with_memory`] construct the agent.
+//!   Tools and skills are agent-level config, set once via the builder methods
+//!   [`with_tools`](BaseAgent::with_tools) and [`with_skills`](BaseAgent::with_skills).
+//! - [`BaseAgent::run`] is pure setup for one task: it injects the system prompt
+//!   and appends the user's goal to memory. No iteration runs here.
+//! - The driver pumps [`BaseAgent::tick`] until it returns a terminal
+//!   [`BaseAgentState`]. Each `tick` performs exactly one [`IterationLoop`]
+//!   round-trip, so the driver can interleave new commands and other agents
+//!   between ticks (cooperative scheduling).
 //!
-//! The agent **owns** its LLM client, interrupt flag, conversation memory, and
-//! the per-task context set by `run` (system prompt, tools, skills), so it
-//! carries no lifetime parameter and can be stored and driven over time. Only the
-//! goal in [`RunParams`] is borrowed, just for seeding.
+//! The agent **owns** its LLM client, interrupt flag, conversation memory, tools,
+//! skills, and the per-task system prompt set by `run`. Only the goal in
+//! [`RunParams`] is borrowed, just for seeding.
 //!
 //! Outbound results ride on the value [`tick`](BaseAgent::tick) returns — one
 //! user-facing output per tick. Internal tool-round messages are *context*, not
@@ -33,10 +30,10 @@ use claw_memory::{
 
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, InterruptionControl, IterationId, IterationLoop,
-    IterationLoopError, IterationOutcome, IterationStep, IterationTools, PreemptedOutcome,
-    SystemPrompt,
+    IterationLoopError, IterationOutcome, IterationStep, PreemptedOutcome, SystemPrompt,
 };
 use crate::skills::Skills;
+use crate::tools::ToolSet;
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
 
@@ -131,33 +128,24 @@ pub struct BaseAgentConfig {
 }
 
 /// Per-task input for [`BaseAgent::run`].
-///
-/// The owned fields are moved into the agent (used across the task's ticks); the
-/// goal is borrowed only for the duration of `run` (copied into the working
-/// context). Per-task memories will live here.
 pub struct RunParams<'a> {
     /// The task goal / initial user prompt.
     pub goal: &'a str,
-    /// System prompt / instructions for the task.
+    /// System prompt / instructions for this task.
     pub system_prompt: String,
-    /// Tools available for the task, if any.
-    pub tools: Option<Arc<dyn IterationTools>>,
-    /// Skill context provider, if any.
-    pub skills: Option<Arc<dyn Skills>>,
 }
 
 /// A base agent that runs one task at a time as a sequence of iterations.
 pub struct BaseAgent {
-    // --- owned capabilities, fixed at construction ---
     llm: ClawApi,
     interruption: AgentInterruption,
     memory: ConversationMemory,
-    system_prompt: String,
-    tools: Option<Arc<dyn IterationTools>>,
+    tools: Option<ToolSet>,
     skills: Option<Arc<dyn Skills>>,
-    /// Open group guard started in `run()` with the user's goal appended.
-    /// Kept alive until the first response lands so user+reply commit as one
-    /// group — preventing compaction from orphaning a reply with no user turn.
+    system_prompt: String,
+    /// Open group guard kept alive from `run()` until the first response, so
+    /// the user turn and the assistant reply commit as one group — preventing
+    /// compaction from orphaning a reply with no user turn.
     open_turn: Option<GroupGuard>,
     next_iteration: IterationId,
     lifecycle: Lifecycle,
@@ -197,13 +185,32 @@ impl BaseAgent {
                 flag: Arc::new(AtomicBool::new(false)),
             },
             memory,
-            system_prompt: String::new(),
             tools: None,
             skills: None,
+            system_prompt: String::new(),
             open_turn: None,
             next_iteration: IterationId(0),
             lifecycle: Lifecycle::Idle,
         }
+    }
+
+    /// Set the tools available to the agent across all tasks.
+    ///
+    /// Takes a pre-built [`ToolSet`] so construction (which can fail on duplicate
+    /// names) stays in one place; build it with
+    /// [`ToolSet::from_groups`](crate::tools::ToolSet::from_groups) or
+    /// [`ToolSet::new`](crate::tools::ToolSet::new).
+    pub fn with_tools(mut self, tools: ToolSet) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set the skill context provider for the agent.
+    ///
+    /// The `Arc` is shared — the agent holds a reference, not a copy.
+    pub fn with_skills(mut self, skills: Arc<dyn Skills>) -> Self {
+        self.skills = Some(skills);
+        self
     }
 
     /// True while a task is loaded and still has iterations to run.
@@ -230,8 +237,6 @@ impl BaseAgent {
             return Err(AgentError::Busy);
         }
         self.system_prompt = params.system_prompt;
-        self.tools = params.tools;
-        self.skills = params.skills;
         self.next_iteration = IterationId(0);
         let turn = self.memory.group();
         turn.append_user(params.goal);
@@ -262,7 +267,7 @@ impl BaseAgent {
                 iteration_id,
                 system_prompt: SystemPrompt(self.system_prompt.as_str()),
                 messages: ChatMessages(&messages),
-                tools: self.tools.as_deref(),
+                tools: self.tools.as_ref(),
             };
             iteration_loop.run(step)
         };

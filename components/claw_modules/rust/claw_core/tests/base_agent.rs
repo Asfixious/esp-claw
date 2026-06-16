@@ -17,7 +17,7 @@ use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_interfaces::{ClawFs, FsError};
 use claw_memory::{CompactError, Compactor, MemoryTaskPool, PoolConfig};
 use claw_core::agent::{AgentError, AgentId, BaseAgent, BaseAgentConfig, BaseAgentState, RunParams};
-use claw_core::{IterationTools, ToolError, ToolInvocation, ToolOutput};
+use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -304,11 +304,14 @@ impl Compactor for StubCompactor {
 // Helpers: tools
 // ---------------------------------------------------------------------------
 
-struct EchoTools;
+struct EchoTool;
 
-impl IterationTools for EchoTools {
-    fn schemas_json(&self) -> Option<&str> {
-        None
+impl ToolHandler for EchoTool {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+    fn schema(&self) -> &'static str {
+        r#"{"type":"function","function":{"name":"echo","description":"Echo the arguments back"}}"#
     }
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
@@ -424,8 +427,6 @@ fn run_returns_busy_while_task_in_progress() {
     agent.run(RunParams {
         goal: "first",
         system_prompt: String::new(),
-        tools: None,
-        skills: None,
     }).expect("first run");
 
     assert!(agent.is_running());
@@ -434,8 +435,6 @@ fn run_returns_busy_while_task_in_progress() {
         .run(RunParams {
             goal: "second",
             system_prompt: String::new(),
-            tools: None,
-            skills: None,
         })
         .unwrap_err();
     assert!(matches!(error, AgentError::Busy));
@@ -453,8 +452,6 @@ fn single_turn_returns_completed() {
     agent.run(RunParams {
         goal: "say pong",
         system_prompt: "You are a test assistant.".into(),
-        tools: None,
-        skills: None,
     }).expect("run");
 
     assert!(agent.is_running());
@@ -468,13 +465,14 @@ fn tool_round_returns_working_then_completed() {
     let dir = test_output_dir("tool_round_returns_working_then_completed");
     // First LLM call returns a tool call; second returns plain text.
     let llm = scripted_llm(vec![TOOL_CALL_BODY, PLAIN_TEXT_BODY]);
-    let mut agent = BaseAgent::new(llm, test_pool(), agent_config(AgentId(1), dir.display().to_string()));
+    let tools = ToolSet::from_groups([ToolGroup::new("echo_group", [Tool::new(EchoTool)])])
+        .expect("build tool set");
+    let mut agent = BaseAgent::new(llm, test_pool(), agent_config(AgentId(1), dir.display().to_string()))
+        .with_tools(tools);
 
     agent.run(RunParams {
         goal: "use the echo tool then answer",
         system_prompt: String::new(),
-        tools: Some(Arc::new(EchoTools)),
-        skills: None,
     }).expect("run");
 
     // First tick: LLM asks for tool → tools execute → Working (tool round done,
@@ -497,8 +495,6 @@ fn failed_http_transitions_to_failed_state() {
     agent.run(RunParams {
         goal: "hello",
         system_prompt: String::new(),
-        tools: None,
-        skills: None,
     }).expect("run");
 
     assert!(matches!(agent.tick(), BaseAgentState::Failed(_)));
@@ -517,8 +513,6 @@ fn interrupt_before_tick_returns_interrupted() {
     agent.run(RunParams {
         goal: "hello",
         system_prompt: String::new(),
-        tools: None,
-        skills: None,
     }).expect("run");
 
     agent.interrupt_handle().interrupt();
@@ -541,7 +535,7 @@ fn tick_is_idle_after_terminal_state() {
         agent_config(AgentId(1), dir.display().to_string()),
     );
 
-    agent.run(RunParams { goal: "hi", system_prompt: String::new(), tools: None, skills: None })
+    agent.run(RunParams { goal: "hi", system_prompt: String::new() })
         .expect("run");
     assert!(matches!(agent.tick(), BaseAgentState::Completed(_)));
 
@@ -567,8 +561,6 @@ fn memory_written_to_disk_after_turn() {
     agent.run(RunParams {
         goal: "write something to disk",
         system_prompt: String::new(),
-        tools: None,
-        skills: None,
     }).expect("run");
     run_to_completion(&mut agent);
 
@@ -598,8 +590,6 @@ fn second_turn_includes_first_turn_context() {
         agent.run(RunParams {
             goal: "my secret word is BANANA",
             system_prompt: String::new(),
-            tools: None,
-            skills: None,
         }).expect("run turn 1");
         run_to_completion(&mut agent);
     }
@@ -615,8 +605,6 @@ fn second_turn_includes_first_turn_context() {
         agent.run(RunParams {
             goal: "what was my secret word?",
             system_prompt: String::new(),
-            tools: None,
-            skills: None,
         }).expect("run turn 2");
         run_to_completion(&mut agent);
     }
@@ -650,8 +638,6 @@ fn live_two_turn_chat_uses_memory() {
         agent.run(RunParams {
             goal: "Remember this code word: FLAMINGO. Reply with exactly: acknowledged",
             system_prompt: "You are a test assistant. Be brief and exact.".into(),
-            tools: None,
-            skills: None,
         }).expect("run turn 1");
 
         let text = run_to_completion(&mut agent);
@@ -671,8 +657,6 @@ fn live_two_turn_chat_uses_memory() {
         agent.run(RunParams {
             goal: "What was the code word I gave you?",
             system_prompt: "You are a test assistant. Be brief and exact.".into(),
-            tools: None,
-            skills: None,
         }).expect("run turn 2");
 
         let text = run_to_completion(&mut agent);

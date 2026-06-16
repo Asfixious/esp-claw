@@ -230,7 +230,9 @@ fn main() {
         },
     );
     let memory_view = memory.clone();
-    let mut agent = BaseAgent::with_memory(make_llm(), memory);
+    let mut agent = BaseAgent::builder(make_llm(), memory)
+        .with_system_prompt(SYSTEM_PROMPT)
+        .build();
 
     eprintln!("Memory: {MEMORY_DIR}");
     eprintln!("Type your message and press Enter. Empty line or Ctrl-D to quit.\n");
@@ -261,10 +263,7 @@ fn main() {
             continue;
         }
 
-        if let Err(err) = agent.run(RunParams {
-            goal: input,
-            system_prompt: SYSTEM_PROMPT.into(),
-        }) {
+        if let Err(err) = agent.run(RunParams { goal: input }) {
             eprintln!("run error: {err}");
             continue;
         }

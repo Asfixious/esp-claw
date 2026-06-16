@@ -1,9 +1,9 @@
 //! Layer 2 base agent: drives a multi-iteration task, one iteration per `tick`.
 //!
 //! Split of responsibilities:
-//! - [`BaseAgent::new`] / [`BaseAgent::with_memory`] construct the agent.
-//!   Tools and skills are agent-level config, set once via the builder methods
-//!   [`with_tools`](BaseAgent::with_tools) and [`with_skills`](BaseAgent::with_skills).
+//! - [`BaseAgent::builder`] starts construction; [`BaseAgentBuilder`] collects
+//!   optional tools and skills and [`build`](BaseAgentBuilder::build)s the agent.
+//!   This keeps the *build* phase separate from the *run* phase.
 //! - [`BaseAgent::run`] is pure setup for one task: it injects the system prompt
 //!   and appends the user's goal to memory. No iteration runs here.
 //! - The driver pumps [`BaseAgent::tick`] until it returns a terminal
@@ -23,10 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use claw_api::ClawApi;
-use claw_interfaces::ClawFs;
-use claw_memory::{
-    Compactor, ConversationConfig, ConversationDeps, ConversationMemory, GroupGuard, MemoryTaskPool,
-};
+use claw_memory::{ConversationMemory, GroupGuard};
 
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, InterruptionControl, IterationId, IterationLoop,
@@ -126,42 +123,64 @@ impl InterruptionControl for AgentInterruption {
 /// [`BaseAgentState::Failed`] from a `tick`.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum AgentError {
+    /// [`run`](BaseAgent::run) was called while the previous task is still
+    /// running (it has not reached a terminal [`BaseAgentState`]).
     #[error("run() called while a task is still in progress")]
     Busy,
 }
 
-/// Configuration for a [`BaseAgent`]'s conversation memory.
-pub struct BaseAgentConfig {
-    /// Agent identity, used as the key for the conversation transcript files.
-    pub agent_id: AgentId,
-    /// Base directory for per-conversation files.
-    pub memory_dir: String,
-    /// Filesystem backend for persisting the conversation transcript.
-    pub fs: Arc<dyn ClawFs>,
-    /// Compactor for background conversation summarization.
-    pub compactor: Arc<dyn Compactor>,
-}
-
 /// Per-task input for [`BaseAgent::run`].
+///
+/// The agent's identity (its system prompt) is agent-level config, set once via
+/// [`BaseAgentBuilder::with_system_prompt`]; only the goal varies per task.
 pub struct RunParams<'a> {
     /// The task goal / initial user prompt.
     pub goal: &'a str,
-    /// System prompt / instructions for this task.
-    pub system_prompt: String,
 }
 
 /// A base agent that runs one task at a time as a sequence of iterations.
+///
+/// Lifecycle, in three phases:
+/// 1. **Build** once via [`BaseAgent::builder`] — set the system prompt, tools,
+///    and skills, then [`build`](BaseAgentBuilder::build). The built agent is
+///    long-lived and reused across tasks; its conversation memory accumulates.
+/// 2. **Run** a task with [`run`](BaseAgent::run) — seeds the goal, no iteration
+///    happens yet.
+/// 3. **Pump** [`tick`](BaseAgent::tick) until it returns a terminal
+///    [`BaseAgentState`] ([`Completed`](BaseAgentState::Completed) /
+///    [`Failed`](BaseAgentState::Failed)); `Working`/`Interrupted` mean keep going.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut agent = BaseAgent::builder(llm, memory)
+///     .with_system_prompt("You are a helpful assistant.")
+///     .with_tools(tools)
+///     .build();
+///
+/// agent.run(RunParams { goal: "summarize today's news" })?;
+/// let answer = loop {
+///     match agent.tick() {
+///         BaseAgentState::Completed(text) => break text,
+///         BaseAgentState::Failed(error) => return Err(error.into()),
+///         // Working / Interrupted: an internal tool round or a preemption —
+///         // keep pumping until terminal.
+///         _ => continue,
+///     }
+/// };
+/// ```
 pub struct BaseAgent {
     llm: ClawApi,
     interruption: AgentInterruption,
     memory: ConversationMemory,
     tools: Option<ToolSet>,
     skills: Option<SkillSet>,
+    /// Agent-level system prompt (its persona/identity), fixed across tasks.
     system_prompt: String,
     /// Cached `system_prompt` + skills context, assembled once and reused across
     /// ticks. Empty means "no skill content, borrow `system_prompt` directly".
     /// Rebuilt only when [`effective_prompt_dirty`](Self::effective_prompt_dirty)
-    /// is set — by `run` (new base prompt) or a skill load/unload.
+    /// is set — at build, or on a skill load/unload.
     effective_prompt: String,
     effective_prompt_dirty: bool,
     /// Open group guard kept alive from `run()` until the first response, so
@@ -173,69 +192,27 @@ pub struct BaseAgent {
 }
 
 impl BaseAgent {
-    pub fn new(llm: ClawApi, pool: Arc<MemoryTaskPool>, config: BaseAgentConfig) -> Self {
-        let memory = ConversationMemory::new(
-            config.agent_id.0,
-            ConversationConfig::new(config.memory_dir),
-            ConversationDeps {
-                fs: config.fs,
-                pool,
-                compactor: config.compactor,
-            },
-        );
-        Self::with_memory(llm, memory)
-    }
-
-    /// Construct with a caller-owned [`ConversationMemory`].
+    /// Start building an agent over a caller-owned [`ConversationMemory`].
     ///
-    /// Use this when the caller needs to inspect the conversation without going
-    /// through `BaseAgent`. Clone the memory before passing it in — the clone
-    /// shares the same live `Arc`-backed state:
+    /// The agent's only construction inputs are its LLM client and its memory;
+    /// how the memory is built (and keyed) is the caller's concern, via
+    /// [`ConversationMemory::new`]. The caller may keep a clone of the memory to
+    /// inspect the conversation without going through `BaseAgent`:
     ///
     /// ```ignore
     /// let memory = ConversationMemory::new(agent_id, config, deps);
     /// let view = memory.clone();
-    /// let agent = BaseAgent::with_memory(llm, memory);
-    /// // later:
-    /// let messages = view.messages();
+    /// let agent = BaseAgent::builder(llm, memory).build();
+    /// // later: let messages = view.messages();
     /// ```
-    pub fn with_memory(llm: ClawApi, memory: ConversationMemory) -> Self {
-        Self {
+    pub fn builder(llm: ClawApi, memory: ConversationMemory) -> BaseAgentBuilder {
+        BaseAgentBuilder {
             llm,
-            interruption: AgentInterruption {
-                flag: Arc::new(AtomicBool::new(false)),
-            },
             memory,
             tools: None,
             skills: None,
             system_prompt: String::new(),
-            effective_prompt: String::new(),
-            effective_prompt_dirty: false,
-            open_turn: None,
-            next_iteration: IterationId(0),
-            lifecycle: Lifecycle::Idle,
         }
-    }
-
-    /// Set the tools available to the agent across all tasks.
-    ///
-    /// Takes a pre-built [`ToolSet`] so construction (which can fail on duplicate
-    /// names) stays in one place; build it with
-    /// [`ToolSet::from_groups`](crate::tools::ToolSet::from_groups) or
-    /// [`ToolSet::new`](crate::tools::ToolSet::new).
-    pub fn with_tools(mut self, tools: ToolSet) -> Self {
-        self.tools = Some(tools);
-        self
-    }
-
-    /// Set the agent's skills.
-    ///
-    /// The [`SkillSet`] is the agent's loaded-skill state; it stays mutable so
-    /// skills can be loaded or unloaded at runtime via
-    /// [`load_skill`](Self::load_skill) / [`unload_skill`](Self::unload_skill).
-    pub fn with_skills(mut self, skills: SkillSet) -> Self {
-        self.skills = Some(skills);
-        self
     }
 
     /// Load one skill into context at runtime (no restart).
@@ -253,7 +230,10 @@ impl BaseAgent {
         }
     }
 
-    /// Load a whole [`SkillGroup`] into context at runtime.
+    /// Load a whole [`SkillGroup`] into context at runtime. No-op if the agent
+    /// has no skill set configured.
+    ///
+    /// Returns [`SkillError`] if a skill in the group is not in the registry.
     pub fn load_skill_group(&mut self, group: SkillGroup) -> Result<(), SkillError> {
         match self.skills.as_mut() {
             Some(skills) => {
@@ -296,8 +276,6 @@ impl BaseAgent {
         if self.lifecycle == Lifecycle::Running {
             return Err(AgentError::Busy);
         }
-        self.system_prompt = params.system_prompt;
-        self.effective_prompt_dirty = true;
         self.next_iteration = IterationId(0);
         let turn = self.memory.group();
         turn.append_user(params.goal);
@@ -437,5 +415,72 @@ impl BaseAgent {
         log::warn!("base_agent skill context failed: {err}");
         self.lifecycle = Lifecycle::Terminal;
         BaseAgentState::Failed(AgentRunError::Skill(err))
+    }
+}
+
+/// Builder for a [`BaseAgent`], collecting all construction-time configuration.
+///
+/// Separates the *build* phase from the *run* phase: tools and skills are set
+/// here (optional, any order), and [`build`](Self::build) produces a finished
+/// `BaseAgent` that exposes only the runtime API (`run`/`tick`/`load_skill`/…).
+/// You cannot drive an agent before building it, and the consuming setters can't
+/// be mixed with the agent's `&mut self` methods — the misuse that the two-phase
+/// split prevents.
+#[must_use = "a BaseAgentBuilder does nothing until `.build()` is called"]
+pub struct BaseAgentBuilder {
+    llm: ClawApi,
+    memory: ConversationMemory,
+    tools: Option<ToolSet>,
+    skills: Option<SkillSet>,
+    system_prompt: String,
+}
+
+impl BaseAgentBuilder {
+    /// Set the tools available to the agent across all tasks.
+    ///
+    /// Takes a pre-built [`ToolSet`] so construction (which can fail on duplicate
+    /// names) stays in one place; build it with
+    /// [`ToolSet::from_groups`](crate::tools::ToolSet::from_groups) or
+    /// [`ToolSet::new`](crate::tools::ToolSet::new).
+    pub fn with_tools(mut self, tools: ToolSet) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set the agent's skills.
+    ///
+    /// The [`SkillSet`] is the agent's loaded-skill state; it stays mutable after
+    /// build so skills can be loaded or unloaded at runtime via
+    /// [`BaseAgent::load_skill`] / [`BaseAgent::unload_skill`].
+    pub fn with_skills(mut self, skills: SkillSet) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    /// Set the agent's system prompt — its instructions/persona, fixed across
+    /// all of its tasks. Defaults to empty.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = system_prompt.into();
+        self
+    }
+
+    /// Finish configuration and produce a runnable [`BaseAgent`].
+    pub fn build(self) -> BaseAgent {
+        BaseAgent {
+            llm: self.llm,
+            interruption: AgentInterruption {
+                flag: Arc::new(AtomicBool::new(false)),
+            },
+            memory: self.memory,
+            tools: self.tools,
+            skills: self.skills,
+            system_prompt: self.system_prompt,
+            effective_prompt: String::new(),
+            // Build the combined prompt on the first tick.
+            effective_prompt_dirty: true,
+            open_turn: None,
+            next_iteration: IterationId(0),
+            lifecycle: Lifecycle::Idle,
+        }
     }
 }

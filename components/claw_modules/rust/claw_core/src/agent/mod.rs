@@ -3,6 +3,6 @@
 pub mod base_agent;
 
 pub use base_agent::{
-    AgentError, AgentId, AgentInterruptHandle, AgentRunError, BaseAgent, BaseAgentConfig,
+    AgentError, AgentId, AgentInterruptHandle, AgentRunError, BaseAgent, BaseAgentBuilder,
     BaseAgentState, RunParams,
 };

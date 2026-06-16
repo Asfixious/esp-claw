@@ -149,7 +149,7 @@ pub enum ToolSetError {
 /// A set of [`Tool`]s, organized by group, ready for one or more iterations.
 ///
 /// Built once from groups; precomputes the combined schemas JSON and a flat
-/// name→[`Entry`] dispatch map. Keys are the tools' own `&'static str` names —
+/// flat name→tool dispatch map. Keys are the tools' own `&'static str` names —
 /// borrowed, never cloned — and each entry carries its group label (also
 /// borrowed). Dispatch is O(1) and flat across all groups; the group is metadata
 /// only. This is the aggregate the iteration loop consumes directly, via

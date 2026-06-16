@@ -15,8 +15,13 @@ use std::time::Duration;
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_interfaces::{ClawFs, FsError};
-use claw_memory::{CompactError, Compactor, MemoryTaskPool, PoolConfig};
-use claw_core::agent::{AgentError, AgentId, BaseAgent, BaseAgentConfig, BaseAgentState, RunParams};
+use claw_memory::{
+    CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
+    MemoryTaskPool, PoolConfig,
+};
+use claw_core::agent::{
+    AgentError, AgentId, BaseAgent, BaseAgentBuilder, BaseAgentState, RunParams,
+};
 use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
 use serde_json::{json, Value};
 
@@ -386,13 +391,25 @@ fn live_llm() -> ClawApi {
     .expect("live llm")
 }
 
-fn agent_config(agent_id: AgentId, dir: impl Into<String>) -> BaseAgentConfig {
-    BaseAgentConfig {
-        agent_id,
-        memory_dir: dir.into(),
-        fs: Arc::new(DiskFs),
-        compactor: Arc::new(StubCompactor),
-    }
+fn test_memory(
+    agent_id: AgentId,
+    dir: impl Into<String>,
+    pool: Arc<MemoryTaskPool>,
+) -> ConversationMemory {
+    ConversationMemory::new(
+        agent_id.0,
+        ConversationConfig::new(dir),
+        ConversationDeps {
+            fs: Arc::new(DiskFs),
+            pool,
+            compactor: Arc::new(StubCompactor),
+        },
+    )
+}
+
+/// Builder over a fresh memory pool — the common single-agent test path.
+fn agent_builder(llm: ClawApi, agent_id: AgentId, dir: impl Into<String>) -> BaseAgentBuilder {
+    BaseAgent::builder(llm, test_memory(agent_id, dir, test_pool()))
 }
 
 fn run_to_completion(agent: &mut BaseAgent) -> String {
@@ -431,7 +448,7 @@ fn agent_id_serializes_to_prefixed_string() {
 #[test]
 fn tick_returns_idle_before_run() {
     let dir = test_output_dir("tick_returns_idle_before_run");
-    let mut agent = BaseAgent::new(scripted_llm(vec![]), test_pool(), agent_config(AgentId(1), dir.display().to_string()));
+    let mut agent = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build();
 
     assert!(!agent.is_running());
     assert!(matches!(agent.tick(), BaseAgentState::Idle));
@@ -440,11 +457,10 @@ fn tick_returns_idle_before_run() {
 #[test]
 fn run_returns_busy_while_task_in_progress() {
     let dir = test_output_dir("run_returns_busy_while_task_in_progress");
-    let mut agent = BaseAgent::new(scripted_llm(vec![]), test_pool(), agent_config(AgentId(1), dir.display().to_string()));
+    let mut agent = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build();
 
     agent.run(RunParams {
         goal: "first",
-        system_prompt: String::new(),
     }).expect("first run");
 
     assert!(agent.is_running());
@@ -452,7 +468,6 @@ fn run_returns_busy_while_task_in_progress() {
     let error = agent
         .run(RunParams {
             goal: "second",
-            system_prompt: String::new(),
         })
         .unwrap_err();
     assert!(matches!(error, AgentError::Busy));
@@ -461,16 +476,11 @@ fn run_returns_busy_while_task_in_progress() {
 #[test]
 fn single_turn_returns_completed() {
     let dir = test_output_dir("single_turn_returns_completed");
-    let mut agent = BaseAgent::new(
-        scripted_llm(vec![PLAIN_TEXT_BODY]),
-        test_pool(),
-        agent_config(AgentId(1), dir.display().to_string()),
-    );
+    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+        .with_system_prompt("You are a test assistant.")
+        .build();
 
-    agent.run(RunParams {
-        goal: "say pong",
-        system_prompt: "You are a test assistant.".into(),
-    }).expect("run");
+    agent.run(RunParams { goal: "say pong" }).expect("run");
 
     assert!(agent.is_running());
     let text = run_to_completion(&mut agent);
@@ -485,12 +495,12 @@ fn tool_round_returns_working_then_completed() {
     let llm = scripted_llm(vec![TOOL_CALL_BODY, PLAIN_TEXT_BODY]);
     let tools = ToolSet::from_groups([ToolGroup::new("echo_group", [Tool::new(EchoTool)])])
         .expect("build tool set");
-    let mut agent = BaseAgent::new(llm, test_pool(), agent_config(AgentId(1), dir.display().to_string()))
-        .with_tools(tools);
+    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
+        .with_tools(tools)
+        .build();
 
     agent.run(RunParams {
         goal: "use the echo tool then answer",
-        system_prompt: String::new(),
     }).expect("run");
 
     // First tick: LLM asks for tool → tools execute → Working (tool round done,
@@ -508,11 +518,10 @@ fn tool_round_returns_working_then_completed() {
 fn failed_http_transitions_to_failed_state() {
     let dir = test_output_dir("failed_http_transitions_to_failed_state");
     let llm = make_llm(Arc::new(FailingHttp));
-    let mut agent = BaseAgent::new(llm, test_pool(), agent_config(AgentId(1), dir.display().to_string()));
+    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string()).build();
 
     agent.run(RunParams {
         goal: "hello",
-        system_prompt: String::new(),
     }).expect("run");
 
     assert!(matches!(agent.tick(), BaseAgentState::Failed(_)));
@@ -522,15 +531,11 @@ fn failed_http_transitions_to_failed_state() {
 #[test]
 fn interrupt_before_tick_returns_interrupted() {
     let dir = test_output_dir("interrupt_before_tick_returns_interrupted");
-    let mut agent = BaseAgent::new(
-        scripted_llm(vec![PLAIN_TEXT_BODY]),
-        test_pool(),
-        agent_config(AgentId(1), dir.display().to_string()),
-    );
+    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+        .build();
 
     agent.run(RunParams {
         goal: "hello",
-        system_prompt: String::new(),
     }).expect("run");
 
     agent.interrupt_handle().interrupt();
@@ -547,13 +552,10 @@ fn interrupt_before_tick_returns_interrupted() {
 #[test]
 fn tick_is_idle_after_terminal_state() {
     let dir = test_output_dir("tick_is_idle_after_terminal_state");
-    let mut agent = BaseAgent::new(
-        scripted_llm(vec![PLAIN_TEXT_BODY]),
-        test_pool(),
-        agent_config(AgentId(1), dir.display().to_string()),
-    );
+    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+        .build();
 
-    agent.run(RunParams { goal: "hi", system_prompt: String::new() })
+    agent.run(RunParams { goal: "hi" })
         .expect("run");
     assert!(matches!(agent.tick(), BaseAgentState::Completed(_)));
 
@@ -570,15 +572,11 @@ fn memory_written_to_disk_after_turn() {
     let dir = test_output_dir("memory_written_to_disk_after_turn");
     let data_file = dir.join("conversation-1.jsonl");
 
-    let mut agent = BaseAgent::new(
-        scripted_llm(vec![PLAIN_TEXT_BODY]),
-        test_pool(),
-        agent_config(AgentId(1), dir.display().to_string()),
-    );
+    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+        .build();
 
     agent.run(RunParams {
         goal: "write something to disk",
-        system_prompt: String::new(),
     }).expect("run");
     run_to_completion(&mut agent);
 
@@ -600,14 +598,14 @@ fn second_turn_includes_first_turn_context() {
     // Turn 1: complete a turn so the user + assistant messages are committed.
     {
         let http = CapturingHttp::new(vec![PLAIN_TEXT_BODY]);
-        let mut agent = BaseAgent::new(
+        let mut agent = agent_builder(
             make_llm(Arc::clone(&http) as Arc<dyn ClawHttp>),
-            test_pool(),
-            agent_config(AgentId(1), dir.display().to_string()),
-        );
+            AgentId(1),
+            dir.display().to_string(),
+        )
+        .build();
         agent.run(RunParams {
             goal: "my secret word is BANANA",
-            system_prompt: String::new(),
         }).expect("run turn 1");
         run_to_completion(&mut agent);
     }
@@ -615,14 +613,14 @@ fn second_turn_includes_first_turn_context() {
     // Turn 2: new agent instance, same agent_id and dir → loads persisted transcript.
     let http2 = CapturingHttp::new(vec![PLAIN_TEXT_BODY]);
     {
-        let mut agent = BaseAgent::new(
+        let mut agent = agent_builder(
             make_llm(Arc::clone(&http2) as Arc<dyn ClawHttp>),
-            test_pool(),
-            agent_config(AgentId(1), dir.display().to_string()),
-        );
+            AgentId(1),
+            dir.display().to_string(),
+        )
+        .build();
         agent.run(RunParams {
             goal: "what was my secret word?",
-            system_prompt: String::new(),
         }).expect("run turn 2");
         run_to_completion(&mut agent);
     }
@@ -648,14 +646,14 @@ fn live_two_turn_chat_uses_memory() {
 
     // Turn 1 — plant a memorable fact.
     {
-        let mut agent = BaseAgent::new(
+        let mut agent = BaseAgent::builder(
             live_llm(),
-            Arc::clone(&pool),
-            agent_config(AgentId(1), dir.display().to_string()),
-        );
+            test_memory(AgentId(1), dir.display().to_string(), Arc::clone(&pool)),
+        )
+        .with_system_prompt("You are a test assistant. Be brief and exact.")
+        .build();
         agent.run(RunParams {
             goal: "Remember this code word: FLAMINGO. Reply with exactly: acknowledged",
-            system_prompt: "You are a test assistant. Be brief and exact.".into(),
         }).expect("run turn 1");
 
         let text = run_to_completion(&mut agent);
@@ -667,14 +665,14 @@ fn live_two_turn_chat_uses_memory() {
 
     // Turn 2 — new agent instance loads the persisted transcript and recalls the fact.
     {
-        let mut agent = BaseAgent::new(
+        let mut agent = BaseAgent::builder(
             live_llm(),
-            pool,
-            agent_config(AgentId(1), dir.display().to_string()),
-        );
+            test_memory(AgentId(1), dir.display().to_string(), pool),
+        )
+        .with_system_prompt("You are a test assistant. Be brief and exact.")
+        .build();
         agent.run(RunParams {
             goal: "What was the code word I gave you?",
-            system_prompt: "You are a test assistant. Be brief and exact.".into(),
         }).expect("run turn 2");
 
         let text = run_to_completion(&mut agent);

@@ -174,6 +174,23 @@ impl BaseAgent {
                 compactor: config.compactor,
             },
         );
+        Self::with_memory(llm, memory)
+    }
+
+    /// Construct with a caller-owned [`ConversationMemory`].
+    ///
+    /// Use this when the caller needs to inspect the conversation without going
+    /// through `BaseAgent`. Clone the memory before passing it in — the clone
+    /// shares the same live `Arc`-backed state:
+    ///
+    /// ```ignore
+    /// let memory = ConversationMemory::new(agent_id, config, deps);
+    /// let view = memory.clone();
+    /// let agent = BaseAgent::with_memory(llm, memory);
+    /// // later:
+    /// let messages = view.messages();
+    /// ```
+    pub fn with_memory(llm: ClawApi, memory: ConversationMemory) -> Self {
         Self {
             llm,
             interruption: AgentInterruption {

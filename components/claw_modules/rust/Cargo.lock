@@ -67,7 +67,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "claw-chat"
+name = "claw-base-agent"
 version = "0.1.0"
 dependencies = [
  "claw-api",

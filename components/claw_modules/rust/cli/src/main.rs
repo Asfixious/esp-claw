@@ -4,7 +4,7 @@
 //! tests). Conversation memory is written to `claw_core/output/chat/`.
 //!
 //! ```
-//! cargo run -p claw-chat --target x86_64-unknown-linux-gnu
+//! cargo run -p claw-base-agent --target x86_64-unknown-linux-gnu
 //! ```
 
 use std::io::{self, BufRead, Write};
@@ -14,10 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_core::agent::{AgentId, BaseAgent, BaseAgentConfig, BaseAgentState, RunParams};
+use claw_core::agent::{BaseAgent, BaseAgentState, RunParams};
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_interfaces::{ClawFs, FsError};
-use claw_memory::{CompactError, Compactor, MemoryTaskPool, PoolConfig};
+use claw_memory::{
+    CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
+    MemoryTaskPool, PoolConfig,
+};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -193,23 +196,23 @@ fn make_llm() -> ClawApi {
 
 const MEMORY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../claw_core/output/chat");
 const SYSTEM_PROMPT: &str = "You are a helpful, concise assistant.";
-
+const AGENT_ID: usize = 1;
 
 fn main() {
     load_env();
 
     let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
-
-    let mut agent = BaseAgent::new(
-        make_llm(),
-        Arc::clone(&pool),
-        BaseAgentConfig {
-            agent_id: AgentId(1),
-            memory_dir: MEMORY_DIR.into(),
+    let memory = ConversationMemory::new(
+        AGENT_ID,
+        ConversationConfig::new(MEMORY_DIR),
+        ConversationDeps {
             fs: Arc::new(DiskFs),
+            pool,
             compactor: Arc::new(StubCompactor),
         },
     );
+    let memory_view = memory.clone();
+    let mut agent = BaseAgent::with_memory(make_llm(), memory);
 
     eprintln!("Memory: {MEMORY_DIR}");
     eprintln!("Type your message and press Enter. Empty line or Ctrl-D to quit.\n");
@@ -227,6 +230,17 @@ fn main() {
         let input = line.trim();
         if input.is_empty() {
             break;
+        }
+
+        if input == "/messages" {
+            let messages = memory_view.messages();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&messages)
+                    .unwrap_or_else(|e| format!("(serialize error: {e})"))
+            );
+            println!();
+            continue;
         }
 
         if let Err(err) = agent.run(RunParams {

@@ -19,9 +19,7 @@ use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
 };
-use claw_core::agent::{
-    AgentError, AgentId, BaseAgent, BaseAgentBuilder, BaseAgentState, RunParams,
-};
+use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, CancelReason, TickOutcome};
 use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
 use serde_json::{json, Value};
 
@@ -187,6 +185,8 @@ const PLAIN_TEXT_BODY: &str =
     r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
 
 const TOOL_CALL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"t1","function":{"name":"echo","arguments":"{\"input\":\"hello\"}"}}]}}]}"#;
+
+const END_CONVERSATION_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"e1","function":{"name":"end_conversation","arguments":"{\"final_message\":\"all done\"}"}}]}}]}"#;
 
 struct ScriptedHttp {
     bodies: Mutex<VecDeque<String>>,
@@ -412,12 +412,16 @@ fn agent_builder(llm: ClawApi, agent_id: AgentId, dir: impl Into<String>) -> Bas
     BaseAgent::builder(llm, test_memory(agent_id, dir, test_pool()))
 }
 
+/// Pump until the task hands back an answer (Yielded) or ends (Ended), returning
+/// that text.
 fn run_to_completion(agent: &mut BaseAgent) -> String {
     loop {
         match agent.tick() {
-            BaseAgentState::Completed(text) => return text,
-            BaseAgentState::Working => continue,
-            other => panic!("unexpected state: {other:?}"),
+            TickOutcome::Working => continue,
+            TickOutcome::Yielded { text } => return text,
+            TickOutcome::Ended { final_message } => return final_message,
+            TickOutcome::Failed(error) => panic!("unexpected agent error: {error}"),
+            other => panic!("unexpected outcome: {other:?}"),
         }
     }
 }
@@ -448,119 +452,152 @@ fn agent_id_serializes_to_prefixed_string() {
 #[test]
 fn tick_returns_idle_before_run() {
     let dir = test_output_dir("tick_returns_idle_before_run");
-    let mut agent = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build();
+    let mut agent =
+        agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build().expect("build");
 
     assert!(!agent.is_running());
-    assert!(matches!(agent.tick(), BaseAgentState::Idle));
+    assert!(matches!(agent.tick(), TickOutcome::Idle));
 }
 
 #[test]
-fn run_returns_busy_while_task_in_progress() {
-    let dir = test_output_dir("run_returns_busy_while_task_in_progress");
-    let mut agent = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build();
+fn cancel_reports_cancelled_and_goes_idle() {
+    let dir = test_output_dir("cancel_reports_cancelled_and_goes_idle");
+    let mut agent =
+        agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build().expect("build");
 
-    agent.run(RunParams {
-        goal: "first",
-    }).expect("first run");
+    agent.run("do something");
+    agent.cancel(CancelReason::UserRequested);
 
-    assert!(agent.is_running());
-
-    let error = agent
-        .run(RunParams {
-            goal: "second",
-        })
-        .unwrap_err();
-    assert!(matches!(error, AgentError::Busy));
+    // The first tick drains AppendMessage then Cancel, never calling the LLM (so
+    // the empty script is fine).
+    assert!(matches!(
+        agent.tick(),
+        TickOutcome::Cancelled {
+            reason: CancelReason::UserRequested
+        }
+    ));
+    assert!(!agent.is_running());
 }
 
 #[test]
-fn single_turn_returns_completed() {
-    let dir = test_output_dir("single_turn_returns_completed");
-    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-        .with_system_prompt("You are a test assistant.")
-        .build();
+fn single_turn_yields_answer() {
+    let dir = test_output_dir("single_turn_yields_answer");
+    let mut agent =
+        agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .expect("build");
 
-    agent.run(RunParams { goal: "say pong" }).expect("run");
-
-    assert!(agent.is_running());
+    agent.run("say pong");
     let text = run_to_completion(&mut agent);
+    // A plain-text answer is non-terminal: the agent goes idle, not done.
     assert!(!agent.is_running());
     assert_eq!(text, "pong");
 }
 
 #[test]
-fn tool_round_returns_working_then_completed() {
-    let dir = test_output_dir("tool_round_returns_working_then_completed");
+fn tool_round_works_then_yields() {
+    let dir = test_output_dir("tool_round_works_then_yields");
     // First LLM call returns a tool call; second returns plain text.
     let llm = scripted_llm(vec![TOOL_CALL_BODY, PLAIN_TEXT_BODY]);
     let tools = ToolSet::from_groups([ToolGroup::new("echo_group", [Tool::new(EchoTool)])])
         .expect("build tool set");
     let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
         .with_tools(tools)
-        .build();
+        .build()
+        .expect("build");
 
-    agent.run(RunParams {
-        goal: "use the echo tool then answer",
-    }).expect("run");
+    agent.run("use the echo tool then answer");
 
-    // First tick: LLM asks for tool → tools execute → Working (tool round done,
-    // no user-facing answer yet).
-    assert!(matches!(agent.tick(), BaseAgentState::Working));
-    // Agent is still running after a tool round.
+    // First tick: append + tool round → Working (tool detail stays internal).
+    assert!(matches!(agent.tick(), TickOutcome::Working));
     assert!(agent.is_running());
 
-    // Second tick: LLM returns plain text → Completed.
-    assert!(matches!(agent.tick(), BaseAgentState::Completed(_)));
+    // Second tick: plain text → Yielded → idle.
+    assert!(matches!(agent.tick(), TickOutcome::Yielded { .. }));
     assert!(!agent.is_running());
 }
 
 #[test]
-fn failed_http_transitions_to_failed_state() {
-    let dir = test_output_dir("failed_http_transitions_to_failed_state");
+fn end_conversation_tool_ends_task() {
+    let dir = test_output_dir("end_conversation_tool_ends_task");
+    let mut agent =
+        agent_builder(scripted_llm(vec![END_CONVERSATION_BODY]), AgentId(1), dir.display().to_string())
+            .build()
+            .expect("build");
+
+    agent.run("finish up");
+
+    // The internal end_conversation tool runs and the signal it raises ends the
+    // task in the same tick.
+    assert!(matches!(
+        agent.tick(),
+        TickOutcome::Ended { final_message } if final_message == "all done"
+    ));
+    assert!(!agent.is_running());
+}
+
+#[test]
+fn append_after_end_starts_fresh_task() {
+    let dir = test_output_dir("append_after_end_starts_fresh_task");
+    let llm = scripted_llm(vec![END_CONVERSATION_BODY, PLAIN_TEXT_BODY]);
+    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string()).build().expect("build");
+
+    agent.run("first");
+    assert!(agent.tick().is_terminal());
+
+    // Re-task the same (now idle) agent: AppendMessage starts a fresh task.
+    agent.run("second");
+    let text = run_to_completion(&mut agent);
+    assert_eq!(text, "pong");
+}
+
+#[test]
+fn failed_http_reports_failed_and_goes_idle() {
+    let dir = test_output_dir("failed_http_reports_failed_and_goes_idle");
     let llm = make_llm(Arc::new(FailingHttp));
-    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string()).build();
+    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string()).build().expect("build");
 
-    agent.run(RunParams {
-        goal: "hello",
-    }).expect("run");
+    agent.run("hello");
 
-    assert!(matches!(agent.tick(), BaseAgentState::Failed(_)));
+    assert!(matches!(agent.tick(), TickOutcome::Failed(_)));
     assert!(!agent.is_running());
 }
 
 #[test]
-fn interrupt_before_tick_returns_interrupted() {
-    let dir = test_output_dir("interrupt_before_tick_returns_interrupted");
-    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-        .build();
+fn abort_before_iteration_reruns_next_tick() {
+    let dir = test_output_dir("abort_before_iteration_reruns_next_tick");
+    let mut agent =
+        agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+            .build()
+            .expect("build");
 
-    agent.run(RunParams {
-        goal: "hello",
-    }).expect("run");
+    agent.run("hello");
+    agent.abort_handle().abort();
 
-    agent.interrupt_handle().interrupt();
-    // Interrupted — preempted before LLM HTTP, so the agent stays running
-    // and will attempt the next iteration on the following tick.
-    assert!(matches!(agent.tick(), BaseAgentState::Interrupted));
+    // Preempted before the LLM call: stays running and re-iterates next tick.
+    assert!(matches!(agent.tick(), TickOutcome::Working));
     assert!(agent.is_running());
 
-    // The interrupt flag was consumed; the next tick proceeds to the LLM.
-    assert!(matches!(agent.tick(), BaseAgentState::Completed(_)));
+    // The flag was consumed; the next tick reaches the LLM and yields.
+    assert!(matches!(agent.tick(), TickOutcome::Yielded { .. }));
     assert!(!agent.is_running());
 }
 
 #[test]
-fn tick_is_idle_after_terminal_state() {
-    let dir = test_output_dir("tick_is_idle_after_terminal_state");
-    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-        .build();
+fn tick_stays_idle_after_yield() {
+    let dir = test_output_dir("tick_stays_idle_after_yield");
+    let mut agent =
+        agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
+            .build()
+            .expect("build");
 
-    agent.run(RunParams { goal: "hi" })
-        .expect("run");
-    assert!(matches!(agent.tick(), BaseAgentState::Completed(_)));
+    agent.run("hi");
+    assert!(matches!(agent.tick(), TickOutcome::Yielded { .. }));
 
-    assert!(matches!(agent.tick(), BaseAgentState::Idle));
-    assert!(matches!(agent.tick(), BaseAgentState::Idle));
+    // No further work and no new input: subsequent ticks stay idle (no LLM call).
+    assert!(matches!(agent.tick(), TickOutcome::Idle));
+    assert!(matches!(agent.tick(), TickOutcome::Idle));
 }
 
 // ---------------------------------------------------------------------------
@@ -573,11 +610,10 @@ fn memory_written_to_disk_after_turn() {
     let data_file = dir.join("conversation-1.jsonl");
 
     let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-        .build();
+        .build()
+        .expect("build");
 
-    agent.run(RunParams {
-        goal: "write something to disk",
-    }).expect("run");
+    agent.run("write something to disk");
     run_to_completion(&mut agent);
 
     // The conversation data file must exist and contain JSONL records.
@@ -603,10 +639,9 @@ fn second_turn_includes_first_turn_context() {
             AgentId(1),
             dir.display().to_string(),
         )
-        .build();
-        agent.run(RunParams {
-            goal: "my secret word is BANANA",
-        }).expect("run turn 1");
+        .build()
+        .expect("build");
+        agent.run("my secret word is BANANA");
         run_to_completion(&mut agent);
     }
 
@@ -618,10 +653,9 @@ fn second_turn_includes_first_turn_context() {
             AgentId(1),
             dir.display().to_string(),
         )
-        .build();
-        agent.run(RunParams {
-            goal: "what was my secret word?",
-        }).expect("run turn 2");
+        .build()
+        .expect("build");
+        agent.run("what was my secret word?");
         run_to_completion(&mut agent);
     }
 
@@ -651,10 +685,9 @@ fn live_two_turn_chat_uses_memory() {
             test_memory(AgentId(1), dir.display().to_string(), Arc::clone(&pool)),
         )
         .with_system_prompt("You are a test assistant. Be brief and exact.")
-        .build();
-        agent.run(RunParams {
-            goal: "Remember this code word: FLAMINGO. Reply with exactly: acknowledged",
-        }).expect("run turn 1");
+        .build()
+        .expect("build");
+        agent.run("Remember this code word: FLAMINGO. Reply with exactly: acknowledged");
 
         let text = run_to_completion(&mut agent);
         assert!(
@@ -670,10 +703,9 @@ fn live_two_turn_chat_uses_memory() {
             test_memory(AgentId(1), dir.display().to_string(), pool),
         )
         .with_system_prompt("You are a test assistant. Be brief and exact.")
-        .build();
-        agent.run(RunParams {
-            goal: "What was the code word I gave you?",
-        }).expect("run turn 2");
+        .build()
+        .expect("build");
+        agent.run("What was the code word I gave you?");
 
         let text = run_to_completion(&mut agent);
         assert!(

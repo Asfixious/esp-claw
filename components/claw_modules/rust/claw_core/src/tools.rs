@@ -209,6 +209,56 @@ impl ToolSet {
         })
     }
 
+    /// An empty set — no tools, no schemas. The infallible base other groups are
+    /// merged onto with [`extend_with_group`](Self::extend_with_group).
+    pub fn empty() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            schemas_json: None,
+        }
+    }
+
+    /// Merge another [`ToolGroup`] into this set, re-checking the flat-unique-name
+    /// rule against the tools already present.
+    ///
+    /// Used to fold an agent's built-in (internal) tool group onto the caller's
+    /// tools after construction. The combined schema array is rebuilt once here.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolSetError::DuplicateToolName`] if a tool in `group` collides with one
+    /// already in the set (or another in the same group); no tool is inserted past
+    /// the collision and the existing schema array is left intact.
+    pub fn extend_with_group(&mut self, group: ToolGroup) -> Result<(), ToolSetError> {
+        let group_name = group.name;
+        for tool in group.tools {
+            let name = tool.name();
+            if self.by_name.contains_key(name) {
+                return Err(ToolSetError::DuplicateToolName(name));
+            }
+            let schema = tool.schema();
+            debug_assert!(
+                serde_json::from_str::<Value>(schema).is_ok_and(|value| value.is_object()),
+                "tool '{name}' returned an invalid JSON object schema: {schema}"
+            );
+            self.by_name.insert(
+                name,
+                Entry {
+                    tool,
+                    group: group_name,
+                },
+            );
+        }
+        self.rebuild_schemas();
+        Ok(())
+    }
+
+    /// Re-serialize the combined `[schema, …]` array from the current entries.
+    fn rebuild_schemas(&mut self) {
+        let schemas: Vec<&str> = self.by_name.values().map(|entry| entry.tool.schema()).collect();
+        self.schemas_json = (!schemas.is_empty()).then(|| format!("[{}]", schemas.join(",")));
+    }
+
     /// True when no tools were added.
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()

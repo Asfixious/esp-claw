@@ -1,65 +1,167 @@
-//! Layer 2 base agent: drives a multi-iteration task, one iteration per `tick`.
+//! Layer 2 base agent: a black box that takes **commands** in and reports an
+//! outcome out, driven one iteration per [`tick`](BaseAgent::tick).
 //!
-//! Split of responsibilities:
-//! - [`BaseAgent::builder`] starts construction; [`BaseAgentBuilder`] collects
-//!   optional tools and skills and [`build`](BaseAgentBuilder::build)s the agent.
-//!   This keeps the *build* phase separate from the *run* phase.
-//! - [`BaseAgent::run`] is pure setup for one task: it injects the system prompt
-//!   and appends the user's goal to memory. No iteration runs here.
-//! - The driver pumps [`BaseAgent::tick`] until it returns a terminal
-//!   [`BaseAgentState`]. Each `tick` performs exactly one [`IterationLoop`]
-//!   round-trip, so the driver can interleave new commands and other agents
-//!   between ticks (cooperative scheduling).
+//! # Command in, outcome out
 //!
-//! The agent **owns** its LLM client, interrupt flag, conversation memory, tools,
-//! skills, and the per-task system prompt set by `run`. Only the goal in
-//! [`RunParams`] is borrowed, just for seeding.
+//! Everything entering the agent is an [`AgentCommand`]. Convenience methods
+//! ([`run`](BaseAgent::run), [`append_message`](BaseAgent::append_message),
+//! [`cancel`](BaseAgent::cancel), …) are thin wrappers that only
+//! [`send_command`](BaseAgent::send_command) — they hold no state logic of their
+//! own. Commands queue on an inbox and are reduced by the single funnel
+//! `apply_inbound`. Each [`tick`](BaseAgent::tick) returns one [`TickOutcome`]:
+//! the agent never has a side-channel of events, because everything it has to
+//! report coincides with the moment a tick hands control back.
 //!
-//! Outbound results ride on the value [`tick`](BaseAgent::tick) returns — one
-//! user-facing output per tick. Internal tool-round messages are *context*, not
-//! output: they are committed to memory and fed back in on the next iteration.
+//! This keeps the agent a uniform unit suitable as the core of a multi-agent
+//! system: an orchestrator drives many agents through the identical
+//! `send_command` / `tick` triple and never reaches into their internals.
+//!
+//! # Driving
+//!
+//! [`tick`](BaseAgent::tick) returns what happened this tick. `Working` means
+//! "pump again now"; `Idle` means "nothing to do, wait for a command"; every
+//! other variant is a result the driver acts on:
+//!
+//! ```ignore
+//! loop {
+//!     match agent.tick() {
+//!         TickOutcome::Working => continue,
+//!         TickOutcome::Idle => wait_for_command(),
+//!         TickOutcome::Yielded { text } => { print(text); wait_for_command(); }
+//!         TickOutcome::AwaitingApproval { id, .. } => decide(id),
+//!         TickOutcome::Ended { final_message } => { print(final_message); break; }
+//!         TickOutcome::Cancelled { .. } => break,
+//!         TickOutcome::Failed(error) => { report(error); break; }
+//!     }
+//! }
+//! ```
+//!
+//! # Termination
+//!
+//! A plain-text answer is [`Yielded`](TickOutcome::Yielded) — **non-terminal** —
+//! and the agent goes idle awaiting the next message. A task ends only when the
+//! agent decides so itself (the built-in `end_conversation` tool →
+//! [`Ended`](TickOutcome::Ended)), when the orchestrator hard-stops it
+//! ([`Cancel`](AgentCommand::Cancel) → [`Cancelled`](TickOutcome::Cancelled)), or
+//! on [`Failed`](TickOutcome::Failed). The outside never preempts the agent's
+//! reasoning; it only appends information and lets the agent re-decide. A terminal
+//! outcome is reported once and leaves the agent **idle and reusable** — the next
+//! [`AppendMessage`](AgentCommand::AppendMessage) starts a fresh task over the
+//! same memory and identity.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use claw_api::ClawApi;
 use claw_memory::{ConversationMemory, GroupGuard};
+use serde_json::{json, Value};
 
+use crate::agent::internal_tools::{internal_tool_group, ControlSignal, ControlSink};
 use crate::iteration_loop::{
-    ChatMessages, CompletedKind, InterruptionControl, IterationId, IterationLoop,
-    IterationLoopError, IterationOutcome, IterationStep, PreemptedOutcome, SystemPrompt,
+    ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
+    IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
+    PreemptedOutcome, SystemPrompt,
 };
 use crate::skills::{SkillError, SkillGroup, SkillId, SkillSet};
-use crate::tools::ToolSet;
+use crate::tools::{ToolSet, ToolSetError};
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
+crate::define_prefixed_id!(ApprovalId, "approval-", "approval");
 
-/// Result of a single [`BaseAgent::tick`].
+// ===========================================================================
+// Public command / outcome vocabulary
+// ===========================================================================
+
+/// Inbound: a control input handed to the agent. This is the agent's entire
+/// external surface — the outside drives the agent only through these.
 ///
-/// This is the agent's *outbound* surface: at most one user-facing output per
-/// tick. The driver pumps `tick` while it returns [`Working`](BaseAgentState::Working)
-/// and stops on a terminal variant.
+/// Notably there is **no `Preempt`**: outside input never ends or interrupts the
+/// agent's reasoning, it only adds information ([`AppendMessage`](Self::AppendMessage))
+/// and lets the agent re-decide. Hard termination is [`Cancel`](Self::Cancel).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentCommand {
+    /// Append a user message. Starts a fresh task when the agent is idle;
+    /// otherwise it joins the in-progress task.
+    AppendMessage(String),
+    /// Abandon the current task. (Orchestrator-initiated hard stop — distinct from
+    /// the agent ending itself via `end_conversation`.)
+    Cancel { reason: CancelReason },
+    /// Stop scheduling iterations until [`Resume`](Self::Resume). No-op unless the
+    /// agent is actively running.
+    Pause,
+    /// Resume a [`Pause`](Self::Pause)d agent.
+    Resume,
+    /// Deliver a human decision for a pending [`TickOutcome::AwaitingApproval`].
+    /// Ignored unless the agent is awaiting this exact approval.
+    ApprovalResult {
+        id: ApprovalId,
+        decision: ApprovalDecision,
+    },
+}
+
+/// Why a task was [`Cancel`](AgentCommand::Cancel)led, carried on the resulting
+/// [`TickOutcome::Cancelled`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancelReason {
+    /// A human asked to stop.
+    UserRequested,
+    /// The orchestrator replaced this task with a newer one.
+    Superseded,
+    /// The host is shutting the agent down.
+    Shutdown,
+}
+
+/// A human's answer to an approval request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approved,
+    Rejected(String),
+}
+
+/// What one [`tick`](BaseAgent::tick) did — the agent's sole output channel.
+///
+/// `Working`/`Idle` are liveness for the driver loop; the rest are one-shot
+/// results reported on the tick that produced them. A single tick yields exactly
+/// one of these (tool execution is internal — it shows up only as `Working`).
 #[derive(Clone, Debug)]
-pub enum BaseAgentState {
-    /// No task loaded (or the previous task already finished). Nothing to do.
-    Idle,
-    /// The iteration advanced but produced nothing user-facing this tick
-    /// (e.g. an internal tool round). Keep ticking.
+#[must_use]
+pub enum TickOutcome {
+    /// Progress was made; call `tick` again promptly.
     Working,
-    /// This tick's iteration was preempted (an interrupt landed). The agent has
-    /// merged what was produced and will rebuild context on the next tick — the
-    /// task is *not* over, so keep ticking.
-    Interrupted,
-    /// Terminal: the task finished with this final answer.
-    Completed(String),
-    /// Terminal: the task failed; carries the cause.
+    /// Nothing to do right now (waiting for input, paused, or awaiting approval).
+    Idle,
+    /// The model returned a user-facing answer and handed control back.
+    /// **Non-terminal** — the agent goes idle awaiting the next message.
+    Yielded { text: String },
+    /// The agent called `request_approval` and is paused for a human decision.
+    /// Resolve it with [`approve`](BaseAgent::approve) / [`reject`](BaseAgent::reject).
+    AwaitingApproval { id: ApprovalId, summary: String },
+    /// Terminal: the agent ended the task itself (via `end_conversation`). The
+    /// agent returns to idle and may be re-tasked.
+    Ended { final_message: String },
+    /// Terminal: the task was cancelled by the orchestrator.
+    Cancelled { reason: CancelReason },
+    /// Terminal: the task failed.
     Failed(AgentRunError),
 }
 
-/// Cause of a terminal [`BaseAgentState::Failed`].
+impl TickOutcome {
+    /// True for the terminal outcomes ([`Ended`](Self::Ended) /
+    /// [`Cancelled`](Self::Cancelled) / [`Failed`](Self::Failed)) — the task is
+    /// over, though the agent stays reusable.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TickOutcome::Ended { .. } | TickOutcome::Cancelled { .. } | TickOutcome::Failed(_)
+        )
+    }
+}
+
+/// Cause of a terminal [`TickOutcome::Failed`].
 ///
-/// Wraps the lower-level errors a tick can hit: a failed LLM/tool iteration, or
-/// a failure assembling the loaded skills' context before the iteration runs.
+/// Wraps the lower-level errors a tick can hit: a failed LLM/tool iteration, or a
+/// failure assembling the loaded skills' context before the iteration runs.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum AgentRunError {
     /// The LLM/tool iteration itself failed.
@@ -71,41 +173,62 @@ pub enum AgentRunError {
     Skill(#[from] SkillError),
 }
 
-/// Internal lifecycle, kept separate from the rich [`BaseAgentState`] so it stays
-/// `Copy` and can gate `tick`/`run` without owning any payload.
+/// Failure assembling a [`BaseAgent`] in [`BaseAgentBuilder::build`].
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum BaseAgentBuildError {
+    /// Merging the built-in tool group onto the caller's tools hit a name clash.
+    #[error(transparent)]
+    Tools(#[from] ToolSetError),
+    /// Tools were provided but the configured LLM does not support tool calls, so
+    /// they could never be used — surfaced rather than silently dropped.
+    #[error("tools were provided but the configured LLM does not support tools")]
+    ToolsUnsupported,
+}
+
+// ===========================================================================
+// Internals
+// ===========================================================================
+
+/// Internal lifecycle. `Idle` means "no active iteration, awaiting input" — both
+/// before the first task and after one finishes (terminal outcomes leave the
+/// agent idle and reusable).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lifecycle {
     Idle,
     Running,
-    Terminal,
+    Paused,
+    AwaitingApproval,
 }
 
-/// A cloneable handle for raising an agent's interrupt flag from another task.
+/// One item on the agent's inbox: either an external [`AgentCommand`] or an
+/// internal [`ControlSignal`] raised by a built-in tool. Both flow through the
+/// one reducer, but only `Command` is constructible by outside callers.
+enum Inbound {
+    Command(AgentCommand),
+    Control(ControlSignal),
+}
+
+/// A cloneable handle to abort an agent's in-flight LLM/tool round from another
+/// task.
 ///
-/// Obtain it via [`BaseAgent::interrupt_handle`] **before** entering the tick
-/// loop: you cannot borrow the agent while a `tick` holds `&mut self`. Once held,
-/// it can be raised from anywhere — including while a `tick` is blocked on the
-/// LLM HTTP — because it shares the same `Arc<AtomicBool>` that
-/// [`IterationLoop`] polls at its preemption checkpoints.
+/// Obtain it via [`BaseAgent::abort_handle`] **before** the tick loop (you cannot
+/// borrow the agent while a `tick` holds `&mut self`). It shares the same
+/// `Arc<AtomicBool>` the [`IterationLoop`] polls at its checkpoints, so it can
+/// stop a `tick` blocked on the LLM HTTP. It is plumbing for stopping a now-stale
+/// call — the *content* of the new input still arrives as an [`AgentCommand`].
 #[derive(Clone)]
-pub struct AgentInterruptHandle {
+pub struct AgentAbortHandle {
     flag: Arc<AtomicBool>,
 }
 
-impl AgentInterruptHandle {
-    /// Request cooperative interruption of the in-flight (or next) iteration.
-    ///
-    /// The current iteration ends preempted (terminal); the agent merges what was
-    /// produced, rebuilds context, and continues on the next `tick`.
-    pub fn interrupt(&self) {
+impl AgentAbortHandle {
+    /// Abort the in-flight (or next) iteration at its next checkpoint.
+    pub fn abort(&self) {
         self.flag.store(true, Ordering::Release);
     }
 }
 
-/// The agent's own interrupt flag, fed to the per-tick [`IterationLoop`].
-///
-/// The agent owns this (it is the thing that gets interrupted); callers never
-/// supply it. [`BaseAgent::interrupt_handle`] hands out cloned references.
+/// The agent's own abort flag, fed to the per-tick [`IterationLoop`].
 struct AgentInterruption {
     flag: Arc<AtomicBool>,
 }
@@ -116,39 +239,15 @@ impl InterruptionControl for AgentInterruption {
     }
 }
 
-/// Error from [`BaseAgent::run`] (task setup only).
-///
-/// Per the 1-to-1 error rule, this carries only what `run` can actually return.
-/// Iteration failures are *not* here — they surface as
-/// [`BaseAgentState::Failed`] from a `tick`.
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum AgentError {
-    /// [`run`](BaseAgent::run) was called while the previous task is still
-    /// running (it has not reached a terminal [`BaseAgentState`]).
-    #[error("run() called while a task is still in progress")]
-    Busy,
-}
-
-/// Per-task input for [`BaseAgent::run`].
-///
-/// The agent's identity (its system prompt) is agent-level config, set once via
-/// [`BaseAgentBuilder::with_system_prompt`]; only the goal varies per task.
-pub struct RunParams<'a> {
-    /// The task goal / initial user prompt.
-    pub goal: &'a str,
-}
+// ===========================================================================
+// BaseAgent
+// ===========================================================================
 
 /// A base agent that runs one task at a time as a sequence of iterations.
 ///
-/// Lifecycle, in three phases:
-/// 1. **Build** once via [`BaseAgent::builder`] — set the system prompt, tools,
-///    and skills, then [`build`](BaseAgentBuilder::build). The built agent is
-///    long-lived and reused across tasks; its conversation memory accumulates.
-/// 2. **Run** a task with [`run`](BaseAgent::run) — seeds the goal, no iteration
-///    happens yet.
-/// 3. **Pump** [`tick`](BaseAgent::tick) until it returns a terminal
-///    [`BaseAgentState`] ([`Completed`](BaseAgentState::Completed) /
-///    [`Failed`](BaseAgentState::Failed)); `Working`/`Interrupted` mean keep going.
+/// Build once via [`BaseAgent::builder`]; then drive it with commands and ticks.
+/// The agent is long-lived and reused across tasks — its conversation memory and
+/// identity persist, so finishing a task leaves it ready for the next.
 ///
 /// # Examples
 ///
@@ -156,18 +255,18 @@ pub struct RunParams<'a> {
 /// let mut agent = BaseAgent::builder(llm, memory)
 ///     .with_system_prompt("You are a helpful assistant.")
 ///     .with_tools(tools)
-///     .build();
+///     .build()?;
 ///
-/// agent.run(RunParams { goal: "summarize today's news" })?;
-/// let answer = loop {
+/// agent.run("summarize today's news");
+/// loop {
 ///     match agent.tick() {
-///         BaseAgentState::Completed(text) => break text,
-///         BaseAgentState::Failed(error) => return Err(error.into()),
-///         // Working / Interrupted: an internal tool round or a preemption —
-///         // keep pumping until terminal.
-///         _ => continue,
+///         TickOutcome::Working => continue,
+///         TickOutcome::Yielded { text } => { println!("{text}"); break; }
+///         TickOutcome::Ended { final_message } => { println!("{final_message}"); break; }
+///         TickOutcome::Failed(error) => return Err(error.into()),
+///         _ => break,
 ///     }
-/// };
+/// }
 /// ```
 pub struct BaseAgent {
     llm: ClawApi,
@@ -177,32 +276,37 @@ pub struct BaseAgent {
     skills: Option<SkillSet>,
     /// Agent-level system prompt (its persona/identity), fixed across tasks.
     system_prompt: String,
-    /// Cached `system_prompt` + skills context, assembled once and reused across
-    /// ticks. Empty means "no skill content, borrow `system_prompt` directly".
-    /// Rebuilt only when [`effective_prompt_dirty`](Self::effective_prompt_dirty)
-    /// is set — at build, or on a skill load/unload.
+    /// Cached `system_prompt` + skills context. Empty means "no skill content,
+    /// borrow `system_prompt` directly". Rebuilt only when `effective_prompt_dirty`.
     effective_prompt: String,
     effective_prompt_dirty: bool,
-    /// Open group guard kept alive from `run()` until the first response, so
-    /// the user turn and the assistant reply commit as one group — preventing
-    /// compaction from orphaning a reply with no user turn.
+    /// Open group guard from task start until the first response, so the user turn
+    /// and the assistant reply commit as one group (compaction never orphans a
+    /// reply with no user turn).
     open_turn: Option<GroupGuard>,
     next_iteration: IterationId,
+    next_approval: usize,
+    pending_approval: Option<ApprovalId>,
     lifecycle: Lifecycle,
+    /// The actionable outcome produced during the current tick, if any. Reset at
+    /// the start of each tick; a single tick produces at most one.
+    outcome: Option<TickOutcome>,
+    /// Sink the built-in tools push [`ControlSignal`]s onto; drained each tick.
+    control: ControlSink,
+    inbox: VecDeque<Inbound>,
 }
 
 impl BaseAgent {
     /// Start building an agent over a caller-owned [`ConversationMemory`].
     ///
-    /// The agent's only construction inputs are its LLM client and its memory;
-    /// how the memory is built (and keyed) is the caller's concern, via
-    /// [`ConversationMemory::new`]. The caller may keep a clone of the memory to
-    /// inspect the conversation without going through `BaseAgent`:
+    /// The caller decides how the memory is built and keyed (via
+    /// [`ConversationMemory::new`]) and may keep a clone to inspect the
+    /// conversation without going through `BaseAgent`:
     ///
     /// ```ignore
     /// let memory = ConversationMemory::new(agent_id, config, deps);
     /// let view = memory.clone();
-    /// let agent = BaseAgent::builder(llm, memory).build();
+    /// let agent = BaseAgent::builder(llm, memory).build()?;
     /// // later: let messages = view.messages();
     /// ```
     pub fn builder(llm: ClawApi, memory: ConversationMemory) -> BaseAgentBuilder {
@@ -215,10 +319,55 @@ impl BaseAgent {
         }
     }
 
+    // -- Inbound: the kernel + ergonomic wrappers ---------------------------
+
+    /// Queue a command. The single inbound entry point; everything else wraps it.
+    pub fn send_command(&mut self, command: AgentCommand) {
+        self.inbox.push_back(Inbound::Command(command));
+    }
+
+    /// Start (or continue) a task with `goal`. Convenience for
+    /// [`AppendMessage`](AgentCommand::AppendMessage).
+    pub fn run(&mut self, goal: impl Into<String>) {
+        self.send_command(AgentCommand::AppendMessage(goal.into()));
+    }
+
+    /// Append a user message. Convenience for
+    /// [`AppendMessage`](AgentCommand::AppendMessage).
+    pub fn append_message(&mut self, message: impl Into<String>) {
+        self.send_command(AgentCommand::AppendMessage(message.into()));
+    }
+
+    /// Abandon the current task. Convenience for [`Cancel`](AgentCommand::Cancel).
+    pub fn cancel(&mut self, reason: CancelReason) {
+        self.send_command(AgentCommand::Cancel { reason });
+    }
+
+    /// Pause iteration scheduling. Convenience for [`Pause`](AgentCommand::Pause).
+    pub fn pause(&mut self) {
+        self.send_command(AgentCommand::Pause);
+    }
+
+    /// Resume after a pause. Convenience for [`Resume`](AgentCommand::Resume).
+    pub fn resume(&mut self) {
+        self.send_command(AgentCommand::Resume);
+    }
+
+    /// Resolve a pending approval request. Convenience for
+    /// [`ApprovalResult`](AgentCommand::ApprovalResult); pass
+    /// [`ApprovalDecision::Approved`] or [`ApprovalDecision::Rejected`].
+    pub fn resolve_approval(&mut self, id: ApprovalId, decision: ApprovalDecision) {
+        self.send_command(AgentCommand::ApprovalResult { id, decision });
+    }
+
+    // -- Skills (agent config, not conversation drive) ----------------------
+
     /// Load one skill into context at runtime (no restart).
     ///
-    /// Returns [`SkillError::NotFound`] if no skill set is configured or the
-    /// registry has no such skill.
+    /// # Errors
+    ///
+    /// [`SkillError::NotFound`] if no skill set is configured or the registry has
+    /// no such skill.
     pub fn load_skill(&mut self, group: &'static str, id: SkillId) -> Result<(), SkillError> {
         match self.skills.as_mut() {
             Some(skills) => {
@@ -230,10 +379,12 @@ impl BaseAgent {
         }
     }
 
-    /// Load a whole [`SkillGroup`] into context at runtime. No-op if the agent
-    /// has no skill set configured.
+    /// Load a whole [`SkillGroup`] into context at runtime. No-op if the agent has
+    /// no skill set configured.
     ///
-    /// Returns [`SkillError`] if a skill in the group is not in the registry.
+    /// # Errors
+    ///
+    /// [`SkillError`] if a skill in the group is not in the registry.
     pub fn load_skill_group(&mut self, group: SkillGroup) -> Result<(), SkillError> {
         match self.skills.as_mut() {
             Some(skills) => {
@@ -253,84 +404,251 @@ impl BaseAgent {
         }
     }
 
-    /// True while a task is loaded and still has iterations to run.
+    // -- Status -------------------------------------------------------------
+
+    /// True while a task is actively iterating (not idle, paused, or awaiting
+    /// approval).
     pub fn is_running(&self) -> bool {
         self.lifecycle == Lifecycle::Running
     }
 
-    /// A handle to interrupt this agent from another task.
-    ///
-    /// Grab it before the tick loop starts (see [`AgentInterruptHandle`]); the
-    /// returned handle shares the agent's underlying interrupt flag, so raising
-    /// it cancels an in-flight `tick` cooperatively.
-    pub fn interrupt_handle(&self) -> AgentInterruptHandle {
-        AgentInterruptHandle {
+    /// A handle to abort this agent's in-flight iteration from another task. Grab
+    /// it before the tick loop starts (see [`AgentAbortHandle`]).
+    pub fn abort_handle(&self) -> AgentAbortHandle {
+        AgentAbortHandle {
             flag: Arc::clone(&self.interruption.flag),
         }
     }
 
-    /// Load per-task context and reset the working state. No iteration runs here.
-    ///
-    /// Returns [`AgentError::Busy`] if a previous task is still running.
-    pub fn run(&mut self, params: RunParams<'_>) -> Result<(), AgentError> {
+    // -- The tick -----------------------------------------------------------
+
+    /// Process queued commands, advance at most one iteration, and report what
+    /// happened as a [`TickOutcome`].
+    pub fn tick(&mut self) -> TickOutcome {
+        self.outcome = None;
+
+        // 1. External commands.
+        self.drain_inbox();
+
+        // 2. One iteration, if running.
         if self.lifecycle == Lifecycle::Running {
-            return Err(AgentError::Busy);
+            let iteration_id = self.next_iteration;
+            self.next_iteration = IterationId(iteration_id.0.saturating_add(1));
+
+            if let Err(error) = self.refresh_effective_prompt() {
+                self.fail_with(AgentRunError::Skill(error));
+            } else {
+                let outcome = self.run_iteration(iteration_id);
+                self.reduce_outcome(outcome);
+                // 3. Internal-tool signals raised during the iteration, folded
+                //    back through the same reducer.
+                self.drain_control_signals();
+                self.drain_inbox();
+            }
         }
-        self.next_iteration = IterationId(0);
-        let turn = self.memory.group();
-        turn.append_user(params.goal);
-        self.open_turn = Some(turn);
-        self.lifecycle = Lifecycle::Running;
-        Ok(())
+
+        self.outcome.take().unwrap_or_else(|| match self.lifecycle {
+            Lifecycle::Running => TickOutcome::Working,
+            _ => TickOutcome::Idle,
+        })
     }
 
-    /// Advance exactly one iteration and return its outbound result.
-    ///
-    /// A no-op returning [`BaseAgentState::Idle`] unless the agent is running.
-    pub fn tick(&mut self) -> BaseAgentState {
-        if self.lifecycle != Lifecycle::Running {
-            return BaseAgentState::Idle;
-        }
-
-        let iteration_id = self.next_iteration;
-        self.next_iteration = IterationId(iteration_id.0.saturating_add(1));
-
-        // Rebuild the combined prompt only when the base prompt or skills changed;
-        // otherwise this is a no-op and we reuse the cached string below.
-        if let Err(error) = self.refresh_effective_prompt() {
-            return self.on_skill_error(error);
-        }
+    /// Run exactly one [`IterationLoop`] round over current context.
+    fn run_iteration(&self, iteration_id: IterationId) -> IterationResult {
         let system_prompt = self.effective_prompt();
-
         let messages = self.memory.messages();
-
-        let outcome = {
-            let iteration_loop = IterationLoop {
-                llm: &self.llm,
-                interruption: &self.interruption,
-            };
-            let step = IterationStep {
-                iteration_id,
-                system_prompt: SystemPrompt(system_prompt),
-                messages: ChatMessages(&messages),
-                tools: self.tools.as_ref(),
-            };
-            iteration_loop.run(step)
+        let iteration_loop = IterationLoop {
+            llm: &self.llm,
+            interruption: &self.interruption,
         };
+        let step = IterationStep {
+            iteration_id,
+            system_prompt: SystemPrompt(system_prompt),
+            messages: ChatMessages(&messages),
+            tools: self.tools.as_ref(),
+        };
+        iteration_loop.run(step)
+    }
 
-        match outcome {
-            Ok(IterationOutcome::Completed(outcome)) => self.on_completed(outcome.kind),
-            Ok(IterationOutcome::Preempted(outcome)) => self.on_preempted(outcome),
-            Err(err) => self.on_error(err),
+    // -- Reducer: the single state-mutation funnel for inbound --------------
+
+    fn drain_inbox(&mut self) {
+        while let Some(inbound) = self.inbox.pop_front() {
+            self.apply_inbound(inbound);
         }
     }
 
-    /// Rebuild the cached combined prompt if it is stale; otherwise a no-op.
+    /// Move internal-tool signals onto the inbox so they reduce like commands.
+    fn drain_control_signals(&mut self) {
+        let signals: Vec<ControlSignal> = {
+            let mut sink = self.control.lock().unwrap_or_else(|poison| poison.into_inner());
+            sink.drain(..).collect()
+        };
+        for signal in signals {
+            self.inbox.push_back(Inbound::Control(signal));
+        }
+    }
+
+    /// THE reducer: the only place inbound input mutates agent state.
+    fn apply_inbound(&mut self, inbound: Inbound) {
+        match inbound {
+            Inbound::Command(AgentCommand::AppendMessage(text)) => {
+                if self.lifecycle == Lifecycle::Idle {
+                    // A fresh task: reset the iteration counter and open a new turn.
+                    self.next_iteration = IterationId(0);
+                    self.open_turn = None;
+                    self.lifecycle = Lifecycle::Running;
+                }
+                self.append_user_message(text);
+            }
+            Inbound::Command(AgentCommand::Cancel { reason }) => {
+                self.open_turn = None;
+                self.pending_approval = None;
+                self.lifecycle = Lifecycle::Idle;
+                self.outcome = Some(TickOutcome::Cancelled { reason });
+            }
+            Inbound::Command(AgentCommand::Pause) => {
+                if self.lifecycle == Lifecycle::Running {
+                    self.lifecycle = Lifecycle::Paused;
+                }
+            }
+            Inbound::Command(AgentCommand::Resume) => {
+                if self.lifecycle == Lifecycle::Paused {
+                    self.lifecycle = Lifecycle::Running;
+                }
+            }
+            Inbound::Command(AgentCommand::ApprovalResult { id, decision }) => {
+                if self.lifecycle == Lifecycle::AwaitingApproval
+                    && self.pending_approval == Some(id)
+                {
+                    self.commit_approval_decision(id, &decision);
+                    self.pending_approval = None;
+                    self.lifecycle = Lifecycle::Running;
+                }
+            }
+            Inbound::Control(ControlSignal::EndConversation { final_message }) => {
+                let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+                turn.append_patch(&json!([{ "role": "assistant", "content": final_message.clone() }]));
+                drop(turn);
+                self.lifecycle = Lifecycle::Idle;
+                self.outcome = Some(TickOutcome::Ended { final_message });
+            }
+            Inbound::Control(ControlSignal::ApprovalRequested { summary }) => {
+                let id = self.allocate_approval_id();
+                self.pending_approval = Some(id);
+                self.lifecycle = Lifecycle::AwaitingApproval;
+                self.outcome = Some(TickOutcome::AwaitingApproval { id, summary });
+            }
+        }
+    }
+
+    /// Reduce one iteration outcome into the tick's outcome and lifecycle. The
+    /// second funnel (the first being [`apply_inbound`](Self::apply_inbound)) — its
+    /// input is the LLM/tool round result, not a command.
+    fn reduce_outcome(&mut self, outcome: IterationResult) {
+        match outcome {
+            Ok(IterationOutcome::Completed(CompletedOutcome { kind, .. })) => match kind {
+                CompletedKind::PlainText(answer) => {
+                    self.commit_assistant(&answer);
+                    // Non-terminal: hand back to the caller, go idle for next input.
+                    self.lifecycle = Lifecycle::Idle;
+                    self.outcome = Some(TickOutcome::Yielded { text: answer.text });
+                }
+                CompletedKind::Tools(tools) => {
+                    // A tool round: merge the messages and keep working. The
+                    // per-tool summary (`tools.runs`) stays internal — base_agent
+                    // does not surface it as an outcome.
+                    self.commit_patch(&tools.appended.0);
+                }
+            },
+            Ok(IterationOutcome::Preempted(outcome)) => {
+                // A preempted iteration is terminal; the task is not. Merge only a
+                // well-formed partial patch, then re-iterate next tick.
+                self.merge_preempt_patch(outcome);
+            }
+            Err(error) => self.fail_with(AgentRunError::Iteration(error)),
+        }
+    }
+
+    /// End the task with a failure outcome, leaving the agent idle and reusable.
+    fn fail_with(&mut self, error: AgentRunError) {
+        log::warn!("base_agent task failed: {error}");
+        self.lifecycle = Lifecycle::Idle;
+        self.outcome = Some(TickOutcome::Failed(error));
+    }
+
+    // -- Memory helpers -----------------------------------------------------
+
+    /// Append a user message, reusing the open turn group or opening a new one.
+    fn append_user_message(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        match &self.open_turn {
+            Some(turn) => turn.append_user(text),
+            None => {
+                let turn = self.memory.group();
+                turn.append_user(text);
+                self.open_turn = Some(turn);
+            }
+        }
+    }
+
+    /// Commit the model's plain-text answer, closing the open turn group.
+    fn commit_assistant(&mut self, answer: &PlainTextOutcome) {
+        let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+        match answer.raw_message_json.as_deref() {
+            Some(raw) => turn.append_assistant(raw),
+            None => turn.append_patch(&json!([{ "role": "assistant", "content": answer.text }])),
+        }
+    }
+
+    /// Commit a materialized assistant+tool patch, closing the open turn group.
+    fn commit_patch(&mut self, patch: &Value) {
+        let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+        turn.append_patch(patch);
+    }
+
+    /// Merge a preemption's partial patch only when it is well-formed.
+    ///
+    /// A mid-tool-round preempt can leave an assistant message whose `tool_calls`
+    /// have no matching tool results — committing that would make the next LLM
+    /// call ill-formed. So such a patch is dropped (the half-done work simply did
+    /// not happen); a clean patch is merged.
+    fn merge_preempt_patch(&mut self, outcome: PreemptedOutcome) {
+        let Some(produced) = outcome.produced else {
+            return;
+        };
+        if has_dangling_tool_calls(&produced.0) {
+            log::info!("base_agent dropping preempted partial patch: unmatched tool_calls");
+            return;
+        }
+        let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
+        turn.append_patch(&produced.0);
+    }
+
+    /// Record a human approval decision as a message for the next iteration.
+    fn commit_approval_decision(&mut self, id: ApprovalId, decision: &ApprovalDecision) {
+        let text = match decision {
+            ApprovalDecision::Approved => format!("[approval {id}] approved by the human."),
+            ApprovalDecision::Rejected(reason) => {
+                format!("[approval {id}] rejected by the human: {reason}")
+            }
+        };
+        self.append_user_message(text);
+    }
+
+    fn allocate_approval_id(&mut self) -> ApprovalId {
+        let id = ApprovalId(self.next_approval);
+        self.next_approval = self.next_approval.saturating_add(1);
+        id
+    }
+
+    // -- Effective prompt cache ---------------------------------------------
+
+    /// Rebuild the cached combined prompt if stale; otherwise a no-op.
     ///
     /// When the loaded skills produce content, the cache holds `system_prompt`
     /// concatenated with it (allocated once per change). When there is none, the
-    /// cache is left empty as the signal to borrow `system_prompt` directly — see
-    /// [`effective_prompt`](Self::effective_prompt).
+    /// cache is left empty as the signal to borrow `system_prompt` directly.
     fn refresh_effective_prompt(&mut self) -> Result<(), SkillError> {
         if !self.effective_prompt_dirty {
             return Ok(());
@@ -350,10 +668,8 @@ impl BaseAgent {
     }
 
     /// The prompt to send this iteration — the cached combined prompt when skills
-    /// contributed content, else the base prompt borrowed with no copy.
-    ///
-    /// Assumes [`refresh_effective_prompt`](Self::refresh_effective_prompt) ran
-    /// this tick so the cache is current.
+    /// contributed content, else the base prompt borrowed with no copy. Assumes
+    /// [`refresh_effective_prompt`](Self::refresh_effective_prompt) ran this tick.
     fn effective_prompt(&self) -> &str {
         if self.effective_prompt.is_empty() {
             &self.system_prompt
@@ -361,71 +677,40 @@ impl BaseAgent {
             &self.effective_prompt
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Internal state transitions — each returns this tick's outbound result.
-    // -----------------------------------------------------------------------
-
-    /// A completed iteration: either a final answer or one executed tool round.
-    fn on_completed(&mut self, kind: CompletedKind) -> BaseAgentState {
-        match kind {
-            CompletedKind::PlainText(answer) => {
-                let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
-                match answer.raw_message_json.as_deref() {
-                    Some(raw) => turn.append_assistant(raw),
-                    None => turn.append_patch(&serde_json::json!([{
-                        "role": "assistant",
-                        "content": answer.text
-                    }])),
-                }
-                drop(turn);
-                self.lifecycle = Lifecycle::Terminal;
-                BaseAgentState::Completed(answer.text)
-            }
-            CompletedKind::Tools(tools) => {
-                let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
-                turn.append_patch(&tools.appended.0);
-                BaseAgentState::Working
-            }
-        }
-    }
-
-    /// A preempted iteration is terminal, but the *task* is not.
-    ///
-    /// Per the iteration semantics, the next action happens in a new iteration:
-    /// merge whatever was produced, rebuild context, and continue ticking.
-    fn on_preempted(&mut self, outcome: PreemptedOutcome) -> BaseAgentState {
-        if let Some(produced) = outcome.produced {
-            let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
-            turn.append_patch(&produced.0);
-        }
-        // todo: rebuild context from pending input/memories before the next iteration.
-        BaseAgentState::Interrupted
-    }
-
-    /// A failed iteration ends the task.
-    fn on_error(&mut self, err: IterationLoopError) -> BaseAgentState {
-        log::warn!("base_agent iteration failed: {err}");
-        self.lifecycle = Lifecycle::Terminal;
-        BaseAgentState::Failed(AgentRunError::Iteration(err))
-    }
-
-    /// A failure assembling skill context ends the task before the iteration.
-    fn on_skill_error(&mut self, err: SkillError) -> BaseAgentState {
-        log::warn!("base_agent skill context failed: {err}");
-        self.lifecycle = Lifecycle::Terminal;
-        BaseAgentState::Failed(AgentRunError::Skill(err))
-    }
 }
+
+/// True when `patch` contains an assistant `tool_calls` id with no matching
+/// `tool` message (`tool_call_id`).
+fn has_dangling_tool_calls(patch: &Value) -> bool {
+    let Some(items) = patch.as_array() else {
+        return false;
+    };
+    let mut expected: Vec<&str> = Vec::new();
+    let mut satisfied: HashSet<&str> = HashSet::new();
+    for message in items {
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    expected.push(id);
+                }
+            }
+        }
+        if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+            satisfied.insert(id);
+        }
+    }
+    expected.iter().any(|id| !satisfied.contains(id))
+}
+
+// ===========================================================================
+// Builder
+// ===========================================================================
 
 /// Builder for a [`BaseAgent`], collecting all construction-time configuration.
 ///
-/// Separates the *build* phase from the *run* phase: tools and skills are set
-/// here (optional, any order), and [`build`](Self::build) produces a finished
-/// `BaseAgent` that exposes only the runtime API (`run`/`tick`/`load_skill`/…).
-/// You cannot drive an agent before building it, and the consuming setters can't
-/// be mixed with the agent's `&mut self` methods — the misuse that the two-phase
-/// split prevents.
+/// Separates the *build* phase from the *run* phase: system prompt, tools, and
+/// skills are set here (optional, any order), and [`build`](Self::build) produces
+/// a finished agent that exposes only the runtime command/tick API.
 #[must_use = "a BaseAgentBuilder does nothing until `.build()` is called"]
 pub struct BaseAgentBuilder {
     llm: ClawApi,
@@ -438,41 +723,62 @@ pub struct BaseAgentBuilder {
 impl BaseAgentBuilder {
     /// Set the tools available to the agent across all tasks.
     ///
-    /// Takes a pre-built [`ToolSet`] so construction (which can fail on duplicate
-    /// names) stays in one place; build it with
-    /// [`ToolSet::from_groups`](crate::tools::ToolSet::from_groups) or
-    /// [`ToolSet::new`](crate::tools::ToolSet::new).
+    /// Takes a pre-built [`ToolSet`]; the agent's built-in tools
+    /// (`end_conversation`, `request_approval`) are merged on at
+    /// [`build`](Self::build).
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
         self.tools = Some(tools);
         self
     }
 
-    /// Set the agent's skills.
-    ///
-    /// The [`SkillSet`] is the agent's loaded-skill state; it stays mutable after
-    /// build so skills can be loaded or unloaded at runtime via
-    /// [`BaseAgent::load_skill`] / [`BaseAgent::unload_skill`].
+    /// Set the agent's skills. The [`SkillSet`] stays mutable after build so
+    /// skills can be loaded/unloaded at runtime via [`BaseAgent::load_skill`] /
+    /// [`BaseAgent::unload_skill`].
     pub fn with_skills(mut self, skills: SkillSet) -> Self {
         self.skills = Some(skills);
         self
     }
 
-    /// Set the agent's system prompt — its instructions/persona, fixed across
-    /// all of its tasks. Defaults to empty.
+    /// Set the agent's system prompt — its instructions/persona, fixed across all
+    /// of its tasks. Defaults to empty.
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = system_prompt.into();
         self
     }
 
     /// Finish configuration and produce a runnable [`BaseAgent`].
-    pub fn build(self) -> BaseAgent {
-        BaseAgent {
+    ///
+    /// The built-in tool group is merged onto the caller's tools when the LLM
+    /// supports tool calls.
+    ///
+    /// # Errors
+    ///
+    /// - [`BaseAgentBuildError::Tools`] if a built-in tool name clashes with a
+    ///   caller tool.
+    /// - [`BaseAgentBuildError::ToolsUnsupported`] if tools were provided but the
+    ///   configured LLM cannot call tools.
+    pub fn build(self) -> Result<BaseAgent, BaseAgentBuildError> {
+        let control: ControlSink = Arc::new(Mutex::new(VecDeque::new()));
+        let supports_tools = self.llm.profile().supports_tools;
+
+        let tools = if supports_tools {
+            let mut tools = self.tools.unwrap_or_else(ToolSet::empty);
+            tools.extend_with_group(internal_tool_group(Arc::clone(&control)))?;
+            Some(tools)
+        } else {
+            if self.tools.is_some() {
+                return Err(BaseAgentBuildError::ToolsUnsupported);
+            }
+            None
+        };
+
+        Ok(BaseAgent {
             llm: self.llm,
             interruption: AgentInterruption {
                 flag: Arc::new(AtomicBool::new(false)),
             },
             memory: self.memory,
-            tools: self.tools,
+            tools,
             skills: self.skills,
             system_prompt: self.system_prompt,
             effective_prompt: String::new(),
@@ -480,7 +786,12 @@ impl BaseAgentBuilder {
             effective_prompt_dirty: true,
             open_turn: None,
             next_iteration: IterationId(0),
+            next_approval: 0,
+            pending_approval: None,
             lifecycle: Lifecycle::Idle,
-        }
+            outcome: None,
+            control,
+            inbox: VecDeque::new(),
+        })
     }
 }

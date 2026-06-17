@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_core::agent::{BaseAgent, BaseAgentState, RunParams};
+use claw_core::agent::{ApprovalDecision, BaseAgent, TickOutcome};
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_interfaces::{ClawFs, FsError};
 use claw_memory::{
@@ -232,7 +232,8 @@ fn main() {
     let memory_view = memory.clone();
     let mut agent = BaseAgent::builder(make_llm(), memory)
         .with_system_prompt(SYSTEM_PROMPT)
-        .build();
+        .build()
+        .expect("failed to build agent");
 
     eprintln!("Memory: {MEMORY_DIR}");
     eprintln!("Type your message and press Enter. Empty line or Ctrl-D to quit.\n");
@@ -263,26 +264,29 @@ fn main() {
             continue;
         }
 
-        if let Err(err) = agent.run(RunParams { goal: input }) {
-            eprintln!("run error: {err}");
-            continue;
-        }
+        agent.run(input);
 
         loop {
             match agent.tick() {
-                BaseAgentState::Completed(text) => {
+                TickOutcome::Working => continue,
+                TickOutcome::Yielded { text } => {
                     println!("\n{text}\n");
                     break;
                 }
-                BaseAgentState::Working => continue,
-                BaseAgentState::Failed(err) => {
-                    eprintln!("agent error: {err}");
+                TickOutcome::Ended { final_message } => {
+                    println!("\n{final_message}\n");
                     break;
                 }
-                other => {
-                    eprintln!("unexpected state: {other:?}");
+                TickOutcome::Failed(error) => {
+                    eprintln!("agent error: {error}");
                     break;
                 }
+                TickOutcome::AwaitingApproval { id, summary } => {
+                    eprintln!("approval requested [{id}]: {summary} — auto-approving");
+                    agent.resolve_approval(id, ApprovalDecision::Approved);
+                    // Keep pumping so the queued decision resolves next tick.
+                }
+                TickOutcome::Cancelled { .. } | TickOutcome::Idle => break,
             }
         }
     }

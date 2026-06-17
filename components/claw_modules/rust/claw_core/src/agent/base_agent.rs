@@ -61,13 +61,17 @@ use crate::agent::internal_tools::{internal_tool_group, ControlSignal, ControlSi
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
-    PreemptedOutcome, SystemPrompt,
+    PreemptedOutcome, SystemPrompt, ToolRun,
 };
 use crate::skills::{SkillError, SkillGroup, SkillId, SkillSet};
-use crate::tools::{ToolSet, ToolSetError};
+use crate::tools::{AllowedTools, ToolSet, ToolSetError};
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
 crate::define_prefixed_id!(ApprovalId, "approval-", "approval");
+
+/// Default for [`BaseAgentBuilder::with_tool_block_retries`]: tolerate one
+/// gating-blocked tool round (one self-correction nudge) before failing.
+const DEFAULT_TOOL_BLOCK_RETRIES: u32 = 1;
 
 // ===========================================================================
 // Public command / outcome vocabulary
@@ -174,6 +178,22 @@ pub enum AgentCommandError {
     },
 }
 
+/// Rejection of a soft-hide tool-gating change made outside
+/// [`Idle`](AgentState::Idle).
+///
+/// Tool gating is a *pre-run* policy: a caller configures which tools the next
+/// task may use, then starts it. Mutating the allow-set while a task is
+/// `Running`/`Paused`/`AwaitingApproval` would let the policy desync from the
+/// task in flight (and, once a semantic layer owns gating, fight that layer for
+/// the same state), so it is refused. Validation is against the *projected*
+/// state, so queueing a task and then trying to change gating is rejected too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("cannot change tool gating: the agent is {state:?}, not idle")]
+pub struct ToolGatingError {
+    /// The state the agent was in when the gating change was rejected.
+    pub state: AgentState,
+}
+
 /// Why a task was [`Cancel`](AgentCommand::Cancel)led, carried on the resulting
 /// [`TickOutcome::Cancelled`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,6 +292,14 @@ pub enum AgentRunError {
     /// not be read).
     #[error(transparent)]
     Skill(#[from] SkillError),
+    /// The model kept calling a tool that soft-hide gating does not permit this
+    /// phase, past the allowed retry budget (see
+    /// [`BaseAgentBuilder::with_tool_block_retries`]).
+    #[error("tool not permitted in the current phase: {name}")]
+    ToolNotPermitted {
+        /// The name of the refused tool.
+        name: String,
+    },
 }
 
 /// Failure assembling a [`BaseAgent`] in [`BaseAgentBuilder::build`].
@@ -365,6 +393,23 @@ pub struct BaseAgent {
     interruption: AgentInterruption,
     memory: ConversationMemory,
     tools: Option<ToolSet>,
+    /// Tools allowed to execute this phase ("soft-hide" gating). `None` = ungated
+    /// (every tool in `tools` may run). Set per semantic state by an upper layer
+    /// via [`set_active_tools`](Self::set_active_tools); the full `tools` schema
+    /// is always sent regardless, so the cached prompt prefix stays stable.
+    allowed_tools: Option<AllowedTools>,
+    /// A transient, per-tick instruction appended to the tail of the messages
+    /// sent to the LLM (never persisted to memory). Carries soft-hide phase
+    /// guidance (current phase + permitted tools). Set via
+    /// [`set_tail_note`](Self::set_tail_note).
+    tail_note: Option<String>,
+    /// Count of consecutive tool rounds that had at least one gating-blocked
+    /// call. Reset to 0 by any clean tool round. When it exceeds
+    /// `tool_block_retries`, the task fails with [`AgentRunError::ToolNotPermitted`].
+    consecutive_tool_blocks: u32,
+    /// How many consecutive blocked rounds to tolerate (with a self-correction
+    /// nudge) before failing the task. Default 1.
+    tool_block_retries: u32,
     skills: Option<SkillSet>,
     /// Agent-level system prompt (its persona/identity), fixed across tasks.
     system_prompt: String,
@@ -417,6 +462,7 @@ impl BaseAgent {
             skills: None,
             system_prompt: String::new(),
             retry_policy: RetryPolicy::default(),
+            tool_block_retries: DEFAULT_TOOL_BLOCK_RETRIES,
         }
     }
 
@@ -605,6 +651,75 @@ impl BaseAgent {
         }
     }
 
+    // -- Soft-hide gating (set by an upper / semantic layer) ----------------
+
+    /// Restrict which tools may *execute* for the next task ("soft-hide" gating).
+    ///
+    /// The full tool schema is still sent to the model every iteration (so the
+    /// cached prompt prefix never moves), but any tool call whose name is not in
+    /// `allowed` is refused at execution time and the model is handed a tool
+    /// error instead. Pair the budget with
+    /// [`BaseAgentBuilder::with_tool_block_retries`].
+    ///
+    /// Only valid while [`Idle`](AgentState::Idle): gating is a pre-run policy,
+    /// configured before a task starts and held for that task's lifetime, not
+    /// mutated mid-flight. Calling it once a task is queued or running returns
+    /// [`ToolGatingError`] and changes nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::AllowedTools;
+    ///
+    /// // Configure gating, then start the task.
+    /// agent.set_active_tools(AllowedTools::new(["read_file", "end_conversation"]))?;
+    /// agent.run("look something up");
+    /// ```
+    pub fn set_active_tools(&mut self, allowed: AllowedTools) -> Result<(), ToolGatingError> {
+        self.ensure_idle_for_gating()?;
+        self.allowed_tools = Some(allowed);
+        Ok(())
+    }
+
+    /// Remove tool gating so every tool in the set may run again (the default).
+    ///
+    /// Only valid while [`Idle`](AgentState::Idle); see
+    /// [`set_active_tools`](Self::set_active_tools).
+    pub fn clear_active_tools(&mut self) -> Result<(), ToolGatingError> {
+        self.ensure_idle_for_gating()?;
+        self.allowed_tools = None;
+        Ok(())
+    }
+
+    /// Reject a gating change unless the agent is idle (no task queued or
+    /// running). Checks the *projected* state so a queued-but-not-yet-ticked
+    /// task also blocks the change.
+    fn ensure_idle_for_gating(&self) -> Result<(), ToolGatingError> {
+        if self.projected_lifecycle == AgentState::Idle {
+            Ok(())
+        } else {
+            Err(ToolGatingError {
+                state: self.projected_lifecycle,
+            })
+        }
+    }
+
+    /// Set the transient phase note appended to the tail of the next LLM
+    /// request's messages (never written to memory).
+    ///
+    /// Mirrors the production "system-reminder" pattern: stable `system`/`tools`
+    /// stay frozen for cache reuse while changing, per-phase guidance rides at
+    /// the end of the conversation. The note persists across ticks until changed
+    /// or cleared. Crate-internal: consumed by the in-crate semantic agents.
+    pub(crate) fn set_tail_note(&mut self, note: impl Into<String>) {
+        self.tail_note = Some(note.into());
+    }
+
+    /// Clear the transient phase note.
+    pub(crate) fn clear_tail_note(&mut self) {
+        self.tail_note = None;
+    }
+
     // -- The tick -----------------------------------------------------------
 
     /// Process queued commands, advance at most one iteration, and report what
@@ -663,7 +778,18 @@ impl BaseAgent {
     /// Run exactly one [`IterationLoop`] round over current context.
     fn run_iteration(&self, iteration_id: IterationId) -> IterationResult {
         let system_prompt = self.effective_prompt();
-        let messages = self.memory.messages();
+        let mut messages = self.memory.messages();
+        // Append the transient phase note at the tail of this request only; it is
+        // never committed to memory, so the cached system/tools prefix is untouched.
+        // TODO: provisional soft-hide injection — a single user message at the
+        // messages tail. Revisit placement/format once the semantic layer lands
+        // (e.g. richer system-reminder-style notes, or attaching guidance next to
+        // the latest tool result for stronger recency).
+        if let Some(note) = &self.tail_note {
+            if let Some(items) = messages.as_array_mut() {
+                items.push(json!({ "role": "user", "content": note }));
+            }
+        }
         let iteration_loop = IterationLoop {
             llm: &self.llm,
             interruption: &self.interruption,
@@ -674,6 +800,7 @@ impl BaseAgent {
             system_prompt: SystemPrompt(system_prompt),
             messages: ChatMessages(&messages),
             tools: self.tools.as_ref(),
+            allowed_tools: self.allowed_tools.as_ref(),
         };
         iteration_loop.run(step)
     }
@@ -826,8 +953,11 @@ impl BaseAgent {
                 CompletedKind::Tools(tools) => {
                     // A tool round: merge the messages and keep working. The
                     // per-tool summary (`tools.runs`) stays internal — base_agent
-                    // does not surface it as an outcome.
+                    // does not surface it as an outcome. The patch is well-formed
+                    // even for gating-blocked calls (each got a matched tool
+                    // error), so committing here never leaves a dangling call.
                     self.commit_patch(&tools.appended.0);
+                    self.apply_tool_block_policy(&tools.runs);
                 }
             },
             Ok(IterationOutcome::Preempted(outcome)) => {
@@ -836,6 +966,37 @@ impl BaseAgent {
                 self.merge_preempt_patch(outcome);
             }
             Err(error) => self.fail_with(AgentRunError::Iteration(error)),
+        }
+    }
+
+    /// Apply the soft-hide "retry then fail" policy after a tool round.
+    ///
+    /// A round with any gating-blocked call bumps the consecutive counter (the
+    /// model already received a tool error to self-correct from); once it exceeds
+    /// `tool_block_retries` the task fails. A clean round resets the counter.
+    fn apply_tool_block_policy(&mut self, runs: &[ToolRun]) {
+        let blocked: Vec<&str> = runs
+            .iter()
+            .filter(|run| run.blocked)
+            .map(|run| run.name.as_str())
+            .collect();
+
+        if blocked.is_empty() {
+            self.consecutive_tool_blocks = 0;
+            return;
+        }
+
+        self.consecutive_tool_blocks = self.consecutive_tool_blocks.saturating_add(1);
+        log::warn!(
+            "tool_gate_blocked consecutive={} budget={} tools={:?}",
+            self.consecutive_tool_blocks,
+            self.tool_block_retries,
+            blocked
+        );
+
+        if self.consecutive_tool_blocks > self.tool_block_retries {
+            let name = blocked.first().map(|name| (*name).to_string()).unwrap_or_default();
+            self.fail_with(AgentRunError::ToolNotPermitted { name });
         }
     }
 
@@ -1006,6 +1167,7 @@ pub struct BaseAgentBuilder {
     skills: Option<SkillSet>,
     system_prompt: String,
     retry_policy: RetryPolicy,
+    tool_block_retries: u32,
 }
 
 impl BaseAgentBuilder {
@@ -1056,6 +1218,31 @@ impl BaseAgentBuilder {
         self
     }
 
+    /// How many consecutive soft-hide-blocked tool rounds to tolerate before the
+    /// task fails with [`AgentRunError::ToolNotPermitted`].
+    ///
+    /// Only relevant once an upper layer gates tools via
+    /// [`BaseAgent::set_active_tools`]. Each blocked round hands the model a tool
+    /// error so it can self-correct; this bounds how many such nudges are given.
+    /// `0` fails on the first blocked call; the default is `1` (one nudge, then
+    /// fail on a second consecutive blocked round). A clean tool round resets the
+    /// counter.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::agent::BaseAgent;
+    ///
+    /// let agent = BaseAgent::builder(llm, memory)
+    ///     .with_tool_block_retries(0) // fail immediately on a disallowed tool call
+    ///     .build()?;
+    /// # Ok::<(), claw_core::agent::BaseAgentBuildError>(())
+    /// ```
+    pub fn with_tool_block_retries(mut self, retries: u32) -> Self {
+        self.tool_block_retries = retries;
+        self
+    }
+
     /// Finish configuration and produce a runnable [`BaseAgent`].
     ///
     /// The built-in tool group is merged onto the caller's tools when the LLM
@@ -1090,6 +1277,10 @@ impl BaseAgentBuilder {
             },
             memory: self.memory,
             tools,
+            allowed_tools: None,
+            tail_note: None,
+            consecutive_tool_blocks: 0,
+            tool_block_retries: self.tool_block_retries,
             skills: self.skills,
             system_prompt: self.system_prompt,
             effective_prompt: String::new(),

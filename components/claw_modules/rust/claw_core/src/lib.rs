@@ -32,7 +32,7 @@ pub use skills::{
     SkillSet,
 };
 pub use tools::{
-    Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet, ToolSetError,
-    DEFAULT_TOOL_GROUP,
+    AllowedTools, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
+    ToolSetError, DEFAULT_TOOL_GROUP,
 };
 pub use protocol::{IdParseError, IterationId, StepId, TaskId, WorkerId};

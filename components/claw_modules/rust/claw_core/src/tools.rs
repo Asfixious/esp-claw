@@ -1,7 +1,7 @@
 //! Tools: model-callable units ([`Tool`]), named bundles ([`ToolGroup`]), and the
 //! per-agent aggregate ([`ToolSet`]) the iteration loop consumes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -282,6 +282,60 @@ impl ToolSet {
         match self.by_name.get(call.name) {
             Some(entry) => entry.tool.invoke(call),
             None => Err(ToolError::NotFound(call.name.to_string())),
+        }
+    }
+}
+
+/// The set of tool names allowed to *execute* in the current phase ("soft-hide"
+/// gating).
+///
+/// Soft-hide keeps the full [`ToolSet`] schema (the superset) in the prompt so
+/// the cached `tools` prefix never changes, while restricting which of those
+/// tools may actually run right now. The iteration loop consults this before
+/// invoking each tool and refuses any call whose name is absent (the model is
+/// handed a tool error instead). A `None` allow-set elsewhere means "ungated":
+/// every tool in the set may run.
+///
+/// Names are `&'static str` to match [`ToolHandler::name`]; the allow-set is
+/// built from the same compile-time identities.
+///
+/// # Examples
+///
+/// ```
+/// use claw_core::AllowedTools;
+///
+/// let allowed = AllowedTools::new(["read_file", "list_dir"]);
+/// assert!(allowed.contains("read_file"));
+/// assert!(!allowed.contains("write_file"));
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AllowedTools {
+    names: HashSet<&'static str>,
+}
+
+impl AllowedTools {
+    /// Build an allow-set from a collection of permitted tool names.
+    pub fn new(names: impl IntoIterator<Item = &'static str>) -> Self {
+        Self {
+            names: names.into_iter().collect(),
+        }
+    }
+
+    /// True when `name` is permitted to execute this phase.
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// True when no tool is permitted (an empty allow-set blocks everything).
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+impl FromIterator<&'static str> for AllowedTools {
+    fn from_iter<T: IntoIterator<Item = &'static str>>(iter: T) -> Self {
+        Self {
+            names: iter.into_iter().collect(),
         }
     }
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
-use crate::tools::{ToolError, ToolInvocation, ToolOutput, ToolSet};
+use crate::tools::{AllowedTools, ToolError, ToolInvocation, ToolOutput, ToolSet};
 
 use claw_utils::TruncatedText;
 
@@ -88,6 +88,11 @@ pub struct IterationStep<'a> {
     pub system_prompt: SystemPrompt<'a>,
     pub messages: ChatMessages<'a>,
     pub tools: Option<&'a ToolSet>,
+    /// Tools allowed to *execute* this step ("soft-hide" gating). `None` is
+    /// ungated: every tool in `tools` may run. When `Some`, the full `tools`
+    /// schema is still sent (cache-stable), but a call to a tool not in the set
+    /// is refused with a tool error rather than invoked — see [`ToolRun::blocked`].
+    pub allowed_tools: Option<&'a AllowedTools>,
 }
 
 /// Terminal outcome of exactly one [`IterationLoop::run`] (completed or preempted).
@@ -118,6 +123,11 @@ pub enum CompletedKind {
 pub struct ToolRun {
     pub name: String,
     pub ok: bool,
+    /// True when the call was refused by soft-hide gating (not in the step's
+    /// `allowed_tools`) instead of being invoked. A blocked run is always
+    /// `ok == false`; upper layers use this to drive the "retry then fail"
+    /// policy without treating it as a normal tool failure.
+    pub blocked: bool,
 }
 
 /// The model issued tool calls and they were executed.
@@ -256,6 +266,7 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
     match run_tool_calls(
         loop_.interruption,
         tools,
+        step.allowed_tools,
         &mut appended,
         &llm_response,
         iteration_id,
@@ -337,6 +348,7 @@ fn append_assistant_tool_calls(
 fn run_tool_calls(
     interruption: &dyn InterruptionControl,
     tools: &ToolSet,
+    allowed_tools: Option<&AllowedTools>,
     appended: &mut AppendedMessages,
     response: &LlmResponse,
     iteration_id: IterationId,
@@ -364,27 +376,41 @@ fn run_tool_calls(
             tc.arguments_json
         );
 
-        let ToolOutput { output, ok } = match tools.invoke(&ToolInvocation {
-            id: Some(&tc.id),
-            name: &tc.name,
-            arguments_json: &tc.arguments_json,
-        }) {
-            Ok(output) => output,
-            Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
+        // Soft-hide gating: the schema superset reached the model, but a tool
+        // not in `allowed_tools` must not run this phase. Refuse it with a tool
+        // error (keeping the tool_call_id matched, so the patch stays
+        // well-formed) instead of invoking it.
+        let blocked = allowed_tools.is_some_and(|allowed| !allowed.contains(&tc.name));
+        let (content, ok) = if blocked {
+            log::warn!(
+                "tool_blocked iteration={} name={} reason=not_in_allowed_set",
+                iteration_id,
+                if tc.name.is_empty() { "(null)" } else { &tc.name },
+            );
+            (blocked_tool_message(&tc.name), false)
+        } else {
+            let ToolOutput { output, ok } = match tools.invoke(&ToolInvocation {
+                id: Some(&tc.id),
+                name: &tc.name,
+                arguments_json: &tc.arguments_json,
+            }) {
+                Ok(output) => output,
+                Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
+            };
+            log::info!(
+                "tool_result iteration={} name={} ok={} output={}",
+                iteration_id,
+                if tc.name.is_empty() { "(null)" } else { &tc.name },
+                ok,
+                output
+            );
+            (output, ok)
         };
-
-        log::info!(
-            "tool_result iteration={} name={} ok={} output={}",
-            iteration_id,
-            if tc.name.is_empty() { "(null)" } else { &tc.name },
-            ok,
-            output
-        );
 
         let tool_message = serde_json::json!({
             "role": "tool",
             "tool_call_id": tc.id,
-            "content": output,
+            "content": content,
             "is_error": !ok,
         });
 
@@ -399,10 +425,23 @@ fn run_tool_calls(
                 tc.name.clone()
             },
             ok,
+            blocked,
         });
     }
 
     ToolRoundResult::Completed { runs }
+}
+
+/// The tool-error content handed back to the model when a call is refused by
+/// soft-hide gating. Worded so the model treats it as a policy restriction (not
+/// a transient failure to retry) and switches to a permitted tool.
+fn blocked_tool_message(name: &str) -> String {
+    let name = if name.is_empty() { "(null)" } else { name };
+    format!(
+        "Tool \"{name}\" is not available in the current phase and was not executed. \
+         This is a policy restriction, not a transient error: do not retry it. \
+         Use one of the tools listed as available in the latest instructions instead."
+    )
 }
 
 fn log_tool_call_names(iteration_id: IterationId, response: &LlmResponse) {
@@ -588,7 +627,14 @@ mod tests {
 
         let mut not_array = AppendedMessages(Value::Object(Default::default()));
         assert!(matches!(
-            run_tool_calls(&interruption, &tools, &mut not_array, &response, iteration_id),
+            run_tool_calls(
+                &interruption,
+                &tools,
+                None,
+                &mut not_array,
+                &response,
+                iteration_id
+            ),
             ToolRoundResult::Failed(IterationLoopError::MessagesNotArray)
         ));
 
@@ -604,14 +650,86 @@ mod tests {
         )
         .expect("assistant");
 
-        let ToolRoundResult::Completed { runs } =
-            run_tool_calls(&interruption, &tools, &mut appended, &response, iteration_id)
-        else {
+        let ToolRoundResult::Completed { runs } = run_tool_calls(
+            &interruption,
+            &tools,
+            None,
+            &mut appended,
+            &response,
+            iteration_id,
+        ) else {
             panic!("expected completed tool round");
         };
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].name, "(null)");
         assert!(!runs[0].ok);
+        assert!(!runs[0].blocked);
+        assert_eq!(appended.0[1]["is_error"], true);
+    }
+
+    #[test]
+    fn run_tool_calls_blocks_tool_not_in_allowed_set() {
+        // A tool that would succeed if invoked; gating must refuse it instead.
+        struct OkTool;
+        impl ToolHandler for OkTool {
+            fn name(&self) -> &'static str {
+                "writer"
+            }
+            fn schema(&self) -> &'static str {
+                r#"{"type":"function","function":{"name":"writer"}}"#
+            }
+            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput {
+                    output: "wrote".into(),
+                    ok: true,
+                })
+            }
+        }
+
+        let interruption = FlagControl::new();
+        let tools =
+            ToolSet::from_groups([ToolGroup::new("g", [Tool::new(OkTool)])]).expect("tool set");
+        let allowed = AllowedTools::new(["reader"]); // "writer" is not permitted
+        let response = LlmResponse {
+            text: None,
+            reasoning_content: None,
+            raw_message_json: None,
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "writer".into(),
+                arguments_json: "{}".into(),
+            }],
+        };
+
+        let mut appended = AppendedMessages::empty();
+        append_assistant_tool_calls(
+            &mut appended.0,
+            &LlmResponse {
+                text: None,
+                reasoning_content: None,
+                raw_message_json: Some(r#"{"role":"assistant"}"#.into()),
+                tool_calls: vec![],
+            },
+        )
+        .expect("assistant");
+
+        let ToolRoundResult::Completed { runs } = run_tool_calls(
+            &interruption,
+            &tools,
+            Some(&allowed),
+            &mut appended,
+            &response,
+            IterationId(1),
+        ) else {
+            panic!("expected completed tool round");
+        };
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].name, "writer");
+        assert!(!runs[0].ok);
+        assert!(runs[0].blocked);
+        // The tool message is present (id matched, no dangling) and is an error.
+        assert_eq!(appended.0[1]["tool_call_id"], "t1");
         assert_eq!(appended.0[1]["is_error"], true);
     }
 

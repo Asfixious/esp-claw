@@ -341,6 +341,7 @@ fn run_step(
         system_prompt: SystemPrompt(system_prompt),
         messages: ChatMessages(messages),
         tools,
+        allowed_tools: None,
     };
     IterationLoop {
         llm,

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use claw_api::{ClawApi, ClawApiConfig};
+use claw_api::{ClawApi, ClawApiConfig, RetryPolicy};
 use claw_core::{
     IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
 };
@@ -345,6 +345,7 @@ fn run_step(
     IterationLoop {
         llm,
         interruption: control,
+        retry: RetryPolicy::default(),
     }
     .run(step)
 }

@@ -8,3 +8,6 @@ pub use base_agent::{
     ApprovalDecision, ApprovalId, BaseAgent, BaseAgentBuildError, BaseAgentBuilder, CancelReason,
     TickOutcome,
 };
+
+#[doc(no_inline)]
+pub use claw_api::RetryPolicy;

@@ -53,7 +53,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use claw_api::ClawApi;
+use claw_api::{ClawApi, RetryPolicy};
 use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
@@ -317,6 +317,8 @@ impl InterruptionControl for AgentInterruption {
 /// ```
 pub struct BaseAgent {
     llm: ClawApi,
+    /// Retry policy applied to every per-iteration LLM call.
+    retry_policy: RetryPolicy,
     interruption: AgentInterruption,
     memory: ConversationMemory,
     tools: Option<ToolSet>,
@@ -371,6 +373,7 @@ impl BaseAgent {
             tools: None,
             skills: None,
             system_prompt: String::new(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -559,6 +562,7 @@ impl BaseAgent {
         let iteration_loop = IterationLoop {
             llm: &self.llm,
             interruption: &self.interruption,
+            retry: self.retry_policy,
         };
         let step = IterationStep {
             iteration_id,
@@ -896,6 +900,7 @@ pub struct BaseAgentBuilder {
     tools: Option<ToolSet>,
     skills: Option<SkillSet>,
     system_prompt: String,
+    retry_policy: RetryPolicy,
 }
 
 impl BaseAgentBuilder {
@@ -921,6 +926,17 @@ impl BaseAgentBuilder {
     /// of its tasks. Defaults to empty.
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = system_prompt.into();
+        self
+    }
+
+    /// Override the [`RetryPolicy`] applied to every per-iteration LLM call.
+    ///
+    /// Defaults to [`RetryPolicy::default`] (2 retries on transient transport
+    /// failures). Pass [`RetryPolicy::none`] to fail fast on the first error
+    /// (e.g. to make a single transport error surface as
+    /// [`TickOutcome::Failed`] without burning the retry budget).
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
         self
     }
 
@@ -952,6 +968,7 @@ impl BaseAgentBuilder {
 
         Ok(BaseAgent {
             llm: self.llm,
+            retry_policy: self.retry_policy,
             interruption: AgentInterruption {
                 flag: Arc::new(AtomicBool::new(false)),
             },

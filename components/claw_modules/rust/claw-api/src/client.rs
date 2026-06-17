@@ -205,7 +205,7 @@ impl ClawApi {
         request: &ChatRequest,
         abort: &AtomicBool,
     ) -> Result<LlmResponse, ChatError> {
-        let policy = request.retry.unwrap_or_default();
+        let policy = request.retry;
         run_with_retry(
             &policy,
             abort,
@@ -285,7 +285,7 @@ impl ClawApi {
             return Err(ChatJsonError::ToolsUnsupported);
         }
 
-        let policy = request.retry.unwrap_or_default();
+        let policy = request.retry;
         run_with_retry(
             &policy,
             abort,
@@ -369,7 +369,7 @@ impl ClawApi {
         request: &MediaRequest,
         abort: &AtomicBool,
     ) -> Result<String, InferMediaError> {
-        let policy = request.retry.unwrap_or_default();
+        let policy = request.retry;
         run_with_retry(
             &policy,
             abort,

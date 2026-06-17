@@ -243,7 +243,8 @@ pub struct StaticOutputSchema<'a> {
 /// `messages` is a JSON array of chat messages (e.g.
 /// `[{ "role": "user", "content": "..." }]`). An output schema is **required**
 /// — set it with [`with_output_schema`](ChatJsonRequest::with_output_schema).
-/// Tools and a per-call [`RetryPolicy`] are optional.
+/// Tools are optional; the per-call [`RetryPolicy`] defaults and is overridable
+/// via [`with_retry`](ChatJsonRequest::with_retry).
 ///
 /// ```
 /// use claw_api::ChatJsonRequest;
@@ -262,8 +263,9 @@ pub struct ChatJsonRequest<'a> {
     pub tools_json: Option<&'a str>,
     /// The required output schema (set via [`Self::with_output_schema`]).
     pub output_schema: Option<StaticOutputSchema<'a>>,
-    /// Per-call retry policy. `None` applies [`RetryPolicy::default`].
-    pub retry: Option<RetryPolicy>,
+    /// Per-call retry policy. Defaults to [`RetryPolicy::default`]; use
+    /// [`RetryPolicy::none`] to disable retry.
+    pub retry: RetryPolicy,
 }
 
 impl<'a> ChatJsonRequest<'a> {
@@ -274,7 +276,7 @@ impl<'a> ChatJsonRequest<'a> {
             messages,
             tools_json: None,
             output_schema: None,
-            retry: None,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -295,7 +297,7 @@ impl<'a> ChatJsonRequest<'a> {
 
     /// Override the retry policy for this call.
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = Some(retry);
+        self.retry = retry;
         self
     }
 }
@@ -320,8 +322,9 @@ pub struct ChatJsonResponse<T> {
 /// A request for [`crate::ClawApi::chat`].
 ///
 /// `messages` is a JSON array of chat messages (e.g.
-/// `[{ "role": "user", "content": "..." }]`). Tools and a per-call
-/// [`RetryPolicy`] are optional.
+/// `[{ "role": "user", "content": "..." }]`). Tools are optional; the per-call
+/// [`RetryPolicy`] defaults and is overridable via
+/// [`with_retry`](ChatRequest::with_retry).
 ///
 /// ```
 /// use claw_api::{ChatRequest, RetryPolicy};
@@ -337,8 +340,9 @@ pub struct ChatRequest<'a> {
     pub messages: &'a serde_json::Value,
     /// Optional OpenAI-style tools JSON array.
     pub tools_json: Option<&'a str>,
-    /// Per-call retry policy. `None` applies [`RetryPolicy::default`].
-    pub retry: Option<RetryPolicy>,
+    /// Per-call retry policy. Defaults to [`RetryPolicy::default`]; use
+    /// [`RetryPolicy::none`] to disable retry.
+    pub retry: RetryPolicy,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -348,7 +352,7 @@ impl<'a> ChatRequest<'a> {
             system_prompt,
             messages,
             tools_json: None,
-            retry: None,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -360,7 +364,7 @@ impl<'a> ChatRequest<'a> {
 
     /// Override the retry policy for this call.
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = Some(retry);
+        self.retry = retry;
         self
     }
 }
@@ -457,8 +461,9 @@ pub struct MediaRequest<'a> {
     pub user_prompt: Option<&'a str>,
     /// The image asset(s) to send.
     pub media: &'a [MediaAsset],
-    /// Per-call retry policy. `None` applies [`RetryPolicy::default`].
-    pub retry: Option<RetryPolicy>,
+    /// Per-call retry policy. Defaults to [`RetryPolicy::default`]; use
+    /// [`RetryPolicy::none`] to disable retry.
+    pub retry: RetryPolicy,
 }
 
 impl<'a> MediaRequest<'a> {
@@ -468,7 +473,7 @@ impl<'a> MediaRequest<'a> {
             system_prompt: None,
             user_prompt: None,
             media,
-            retry: None,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -486,7 +491,7 @@ impl<'a> MediaRequest<'a> {
 
     /// Override the retry policy for this call.
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = Some(retry);
+        self.retry = retry;
         self
     }
 }

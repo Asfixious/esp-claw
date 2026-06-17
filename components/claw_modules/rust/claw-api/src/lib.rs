@@ -31,8 +31,9 @@
 //! # Retries
 //!
 //! Retry is configured **per call** via [`RetryPolicy`] on the request (not on
-//! the client). When a request leaves `retry` unset, [`RetryPolicy::default`]
-//! applies (2 retries, 500ms initial interval, exponential, capped at 8s). Only
+//! the client). A freshly constructed request carries [`RetryPolicy::default`]
+//! (2 retries, 500ms initial interval, exponential, capped at 8s); override it
+//! with `.with_retry(...)`, or disable retry with [`RetryPolicy::none`]. Only
 //! transient transport failures are retried (network errors and HTTP
 //! 408/429/5xx); aborts, bad URLs/bodies, and other 4xx are never retried. See
 //! [`RetryPolicy`] for the knobs and [`ClawApiError::is_retryable`] for the
@@ -637,10 +638,10 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_applies_when_request_sets_none() {
-        // No `.with_retry`: chat() falls back to RetryPolicy::default(), which
-        // retries transient failures (max_retries=2). Use zero backoff so the
-        // test doesn't sleep, by exhausting within the default retry budget.
+    fn default_policy_applies_when_retry_unset() {
+        // No `.with_retry`: `ChatRequest::new` defaults `retry` to
+        // RetryPolicy::default(), which retries transient failures
+        // (max_retries=2). Pre-abort so the test does not actually sleep.
         let http = FlakyHttp::new(2, HttpError::RequestFailed("blip".into()), "{}");
         let rt = flaky_rt(http.clone());
         let messages = json!([{"role": "user", "content": "hi"}]);

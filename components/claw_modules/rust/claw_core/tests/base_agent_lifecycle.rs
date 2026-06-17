@@ -60,7 +60,10 @@ fn idle_after_yield_makes_no_llm_call() {
 fn retask_after_ended() {
     let dir = common::test_output_dir("life_retask_after_ended");
     let mut agent = agent_builder(
-        scripted_llm(vec![body_end_conversation("bye"), body_plain_text("hello again")]),
+        scripted_llm(vec![
+            body_end_conversation("bye"),
+            body_plain_text("hello again"),
+        ]),
         AgentId(1),
         dir.display().to_string(),
     )

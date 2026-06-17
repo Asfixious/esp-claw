@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
 use crate::tools::{AllowedTools, ToolError, ToolInvocation, ToolOutput, ToolSet};
+use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
 
 use claw_utils::TruncatedText;
 
@@ -287,9 +287,7 @@ enum ToolRoundResult {
 }
 
 fn take_interrupt(interruption: &dyn InterruptionControl) -> bool {
-    interruption
-        .interrupt_flag()
-        .swap(false, Ordering::AcqRel)
+    interruption.interrupt_flag().swap(false, Ordering::AcqRel)
 }
 
 /// True when an in-flight LLM HTTP ended because of user interrupt.
@@ -330,7 +328,11 @@ fn append_assistant_tool_calls(
     messages: &mut Value,
     response: &LlmResponse,
 ) -> Result<(), IterationLoopError> {
-    let Some(raw) = response.raw_message_json.as_deref().filter(|s| !s.is_empty()) else {
+    let Some(raw) = response
+        .raw_message_json
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
         return Err(IterationLoopError::MissingAssistantMessage);
     };
     let Ok(assistant) = serde_json::from_str::<Value>(raw) else {
@@ -372,7 +374,11 @@ fn run_tool_calls(
         log::info!(
             "tool_call iteration={} name={} args={}",
             iteration_id,
-            if tc.name.is_empty() { "(null)" } else { &tc.name },
+            if tc.name.is_empty() {
+                "(null)"
+            } else {
+                &tc.name
+            },
             tc.arguments_json
         );
 
@@ -385,7 +391,11 @@ fn run_tool_calls(
             log::warn!(
                 "tool_blocked iteration={} name={} reason=not_in_allowed_set",
                 iteration_id,
-                if tc.name.is_empty() { "(null)" } else { &tc.name },
+                if tc.name.is_empty() {
+                    "(null)"
+                } else {
+                    &tc.name
+                },
             );
             (blocked_tool_message(&tc.name), false)
         } else {
@@ -400,7 +410,11 @@ fn run_tool_calls(
             log::info!(
                 "tool_result iteration={} name={} ok={} output={}",
                 iteration_id,
-                if tc.name.is_empty() { "(null)" } else { &tc.name },
+                if tc.name.is_empty() {
+                    "(null)"
+                } else {
+                    &tc.name
+                },
                 ok,
                 output
             );
@@ -451,7 +465,13 @@ fn log_tool_call_names(iteration_id: IterationId, response: &LlmResponse) {
     let names: Vec<&str> = response
         .tool_calls
         .iter()
-        .map(|tc| if tc.name.is_empty() { "(null)" } else { tc.name.as_str() })
+        .map(|tc| {
+            if tc.name.is_empty() {
+                "(null)"
+            } else {
+                tc.name.as_str()
+            }
+        })
         .collect();
     log::debug!(
         "llm_tool_calls iteration={} count={} names={}",
@@ -735,12 +755,15 @@ mod tests {
 
     #[test]
     fn log_tool_call_names_handles_empty_and_null_names() {
-        log_tool_call_names(IterationId(1), &LlmResponse {
-            text: None,
-            reasoning_content: None,
-            raw_message_json: None,
-            tool_calls: vec![],
-        });
+        log_tool_call_names(
+            IterationId(1),
+            &LlmResponse {
+                text: None,
+                reasoning_content: None,
+                raw_message_json: None,
+                tool_calls: vec![],
+            },
+        );
 
         log_tool_call_names(
             IterationId(2),

@@ -123,8 +123,8 @@ impl ToolHandler for ClashTool {
 #[test]
 fn caller_tool_name_clashing_with_builtin_is_error() {
     let dir = test_output_dir("caller_tool_name_clashing_with_builtin_is_error");
-    let clashing = ToolSet::from_groups([ToolGroup::new("clash", [Tool::new(ClashTool)])])
-        .expect("tools");
+    let clashing =
+        ToolSet::from_groups([ToolGroup::new("clash", [Tool::new(ClashTool)])]).expect("tools");
     let result = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string())
         .with_tools(clashing)
         .build();

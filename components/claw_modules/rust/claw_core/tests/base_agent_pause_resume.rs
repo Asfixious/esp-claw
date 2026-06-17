@@ -36,7 +36,9 @@ fn pause_before_first_tick_prevents_iteration() {
     let mut agent = build_agent("pause_before_first_tick", scripted_llm(vec![]));
 
     agent.run("work");
-    agent.pause().expect("pause accepted while Running (projected)");
+    agent
+        .pause()
+        .expect("pause accepted while Running (projected)");
 
     assert!(!agent.is_running());
     assert!(matches!(agent.tick(), TickOutcome::Idle));

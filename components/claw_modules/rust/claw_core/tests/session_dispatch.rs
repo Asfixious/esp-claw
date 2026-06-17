@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use claw_core::{
-    ChannelEgressHub, ChannelIngressSink, Command, InboundCommand, InboundMessage,
-    RecordingTransport, Orchestrator, SessionId, TaskId,
+    ChannelEgressHub, ChannelIngressSink, Command, InboundCommand, InboundMessage, Orchestrator,
+    RecordingTransport, SessionId, TaskId,
 };
 
 fn test_orchestrator() -> (Arc<Orchestrator>, Arc<RecordingTransport>) {

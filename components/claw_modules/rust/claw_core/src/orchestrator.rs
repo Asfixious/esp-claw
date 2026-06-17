@@ -247,5 +247,4 @@ mod tests {
             .with_llm(test_llm())
             .build();
     }
-
 }

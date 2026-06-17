@@ -64,8 +64,9 @@ fn string_argument(arguments_json: &str, key: &str) -> Result<String, ToolError>
     if arguments_json.trim().is_empty() {
         return Ok(String::new());
     }
-    let value: Value = serde_json::from_str(arguments_json)
-        .map_err(|error| ToolError::InvokeFailed(format!("invalid tool arguments JSON: {error}")))?;
+    let value: Value = serde_json::from_str(arguments_json).map_err(|error| {
+        ToolError::InvokeFailed(format!("invalid tool arguments JSON: {error}"))
+    })?;
     Ok(value
         .get(key)
         .and_then(Value::as_str)

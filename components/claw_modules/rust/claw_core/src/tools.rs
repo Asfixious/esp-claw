@@ -255,7 +255,11 @@ impl ToolSet {
 
     /// Re-serialize the combined `[schema, …]` array from the current entries.
     fn rebuild_schemas(&mut self) {
-        let schemas: Vec<&str> = self.by_name.values().map(|entry| entry.tool.schema()).collect();
+        let schemas: Vec<&str> = self
+            .by_name
+            .values()
+            .map(|entry| entry.tool.schema())
+            .collect();
         self.schemas_json = (!schemas.is_empty()).then(|| format!("[{}]", schemas.join(",")));
     }
 
@@ -330,6 +334,16 @@ impl AllowedTools {
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
+
+    /// The permitted names in a stable (alphabetical) order.
+    ///
+    /// The backing set is unordered; sorting gives deterministic output for the
+    /// phase note built from this allow-set (and for tests).
+    pub(crate) fn sorted_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.names.iter().copied().collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 impl FromIterator<&'static str> for AllowedTools {
@@ -339,4 +353,3 @@ impl FromIterator<&'static str> for AllowedTools {
         }
     }
 }
-

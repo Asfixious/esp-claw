@@ -163,7 +163,10 @@ pub struct SessionOut<'a> {
 
 impl<'a> SessionOut<'a> {
     pub fn new(egress: &'a dyn ChannelEgress, reply_route: &'a ReplyRoute) -> Self {
-        Self { egress, reply_route }
+        Self {
+            egress,
+            reply_route,
+        }
     }
 
     pub fn send_message(&self, text: impl Into<String>) -> Result<(), ChannelError> {

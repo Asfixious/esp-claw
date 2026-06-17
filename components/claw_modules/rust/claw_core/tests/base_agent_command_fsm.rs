@@ -10,7 +10,7 @@
 mod common;
 
 use claw_core::agent::{
-    AgentCommand, AgentCommandError, AgentState, ApprovalDecision, ApprovalId, BaseAgent, AgentId,
+    AgentCommand, AgentCommandError, AgentId, AgentState, ApprovalDecision, ApprovalId, BaseAgent,
     CancelReason, TickOutcome,
 };
 use common::{agent_builder, body_plain_text, scripted_llm};

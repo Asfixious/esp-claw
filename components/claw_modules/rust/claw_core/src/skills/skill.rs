@@ -172,10 +172,7 @@ fn front_matter_json<'a>(id: &SkillId, text: &'a str) -> Result<&'a str, SkillEr
 ///
 /// [`SkillError::MissingOpeningFence`] / [`SkillError::MissingClosingFence`] if
 /// the `---` fences are absent.
-pub(crate) fn strip_front_matter<'a>(
-    id: &SkillId,
-    text: &'a str,
-) -> Result<&'a str, SkillError> {
+pub(crate) fn strip_front_matter<'a>(id: &SkillId, text: &'a str) -> Result<&'a str, SkillError> {
     let after_open = text
         .trim_start()
         .strip_prefix("---")
@@ -187,7 +184,10 @@ pub(crate) fn strip_front_matter<'a>(
     let from_fence = after_open.get(close..).unwrap_or("");
     let body = from_fence
         .get(1..) // drop the leading '\n' so the fence line starts the slice
-        .and_then(|line| line.find('\n').and_then(|newline_index| line.get(newline_index.saturating_add(1)..)))
+        .and_then(|line| {
+            line.find('\n')
+                .and_then(|newline_index| line.get(newline_index.saturating_add(1)..))
+        })
         .unwrap_or("");
     Ok(body)
 }
@@ -221,7 +221,8 @@ mod tests {
     #[test]
     fn defaults_when_metadata_absent() {
         let metadata =
-            parse_front_matter(SkillId::new("x"), "---\n{\"description\":\"d\"}\n---\nbody").unwrap();
+            parse_front_matter(SkillId::new("x"), "---\n{\"description\":\"d\"}\n---\nbody")
+                .unwrap();
         assert!(metadata.capability_groups().is_empty());
         assert_eq!(metadata.manage_mode(), ManageMode::ReadOnly);
     }

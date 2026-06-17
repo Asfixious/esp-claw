@@ -178,22 +178,6 @@ pub enum AgentCommandError {
     },
 }
 
-/// Rejection of a soft-hide tool-gating change made outside
-/// [`Idle`](AgentState::Idle).
-///
-/// Tool gating is a *pre-run* policy: a caller configures which tools the next
-/// task may use, then starts it. Mutating the allow-set while a task is
-/// `Running`/`Paused`/`AwaitingApproval` would let the policy desync from the
-/// task in flight (and, once a semantic layer owns gating, fight that layer for
-/// the same state), so it is refused. Validation is against the *projected*
-/// state, so queueing a task and then trying to change gating is rejected too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("cannot change tool gating: the agent is {state:?}, not idle")]
-pub struct ToolGatingError {
-    /// The state the agent was in when the gating change was rejected.
-    pub state: AgentState,
-}
-
 /// Why a task was [`Cancel`](AgentCommand::Cancel)led, carried on the resulting
 /// [`TickOutcome::Cancelled`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,10 +382,11 @@ pub struct BaseAgent {
     /// via [`set_active_tools`](Self::set_active_tools); the full `tools` schema
     /// is always sent regardless, so the cached prompt prefix stays stable.
     allowed_tools: Option<AllowedTools>,
-    /// A transient, per-tick instruction appended to the tail of the messages
-    /// sent to the LLM (never persisted to memory). Carries soft-hide phase
-    /// guidance (current phase + permitted tools). Set via
-    /// [`set_tail_note`](Self::set_tail_note).
+    /// A transient instruction appended to the tail of the messages sent to the
+    /// LLM (never persisted to memory). Carries the soft-hide phase note (the
+    /// permitted tools), generated from the allow-set by
+    /// [`set_active_tools`](Self::set_active_tools) and dropped by
+    /// [`clear_active_tools`](Self::clear_active_tools).
     tail_note: Option<String>,
     /// Count of consecutive tool rounds that had at least one gating-blocked
     /// call. Reset to 0 by any clean tool round. When it exceeds
@@ -652,72 +637,59 @@ impl BaseAgent {
     }
 
     // -- Soft-hide gating (set by an upper / semantic layer) ----------------
+    //
+    // `allow(dead_code)`: these are the seam the in-crate semantic agents
+    // (Phase 2/3) call to re-gate on each state change. Until that layer lands
+    // the only callers are `#[cfg(test)]` (`gating_tests`), so the non-test lib
+    // build sees them as unused. Drop the allow once a semantic agent consumes
+    // them.
 
-    /// Restrict which tools may *execute* for the next task ("soft-hide" gating).
+    /// Restrict which tools may *execute* until changed ("soft-hide" gating).
     ///
-    /// The full tool schema is still sent to the model every iteration (so the
-    /// cached prompt prefix never moves), but any tool call whose name is not in
-    /// `allowed` is refused at execution time and the model is handed a tool
-    /// error instead. Pair the budget with
-    /// [`BaseAgentBuilder::with_tool_block_retries`].
+    /// Two coupled effects, from the one allow-set so they cannot desync:
+    /// - **Enforcement:** the full tool schema is still sent every iteration (so
+    ///   the cached prompt prefix never moves), but a call to a tool not in
+    ///   `allowed` is refused at execution time — see
+    ///   [`BaseAgentBuilder::with_tool_block_retries`].
+    /// - **Prevention:** a transient phase note listing the permitted tools is
+    ///   appended to the tail of the next request's messages (the production
+    ///   "system-reminder" pattern), so the model avoids blocked calls up front.
+    ///   The note is never written to memory, keeping the cached prefix intact.
     ///
-    /// Only valid while [`Idle`](AgentState::Idle): gating is a pre-run policy,
-    /// configured before a task starts and held for that task's lifetime, not
-    /// mutated mid-flight. Calling it once a task is queued or running returns
-    /// [`ToolGatingError`] and changes nothing.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use claw_core::AllowedTools;
-    ///
-    /// // Configure gating, then start the task.
-    /// agent.set_active_tools(AllowedTools::new(["read_file", "end_conversation"]))?;
-    /// agent.run("look something up");
-    /// ```
-    pub fn set_active_tools(&mut self, allowed: AllowedTools) -> Result<(), ToolGatingError> {
-        self.ensure_idle_for_gating()?;
+    /// Crate-internal: the in-crate semantic agents set this automatically on
+    /// each semantic state change (including mid-task), so gating tracks the
+    /// FSM. It is not part of the public boundary — external callers drive the
+    /// agent through semantic commands, not by toggling gating directly.
+    #[allow(dead_code)]
+    pub(crate) fn set_active_tools(&mut self, allowed: AllowedTools) {
+        self.tail_note = Some(Self::phase_note(&allowed));
         self.allowed_tools = Some(allowed);
-        Ok(())
     }
 
-    /// Remove tool gating so every tool in the set may run again (the default).
-    ///
-    /// Only valid while [`Idle`](AgentState::Idle); see
-    /// [`set_active_tools`](Self::set_active_tools).
-    pub fn clear_active_tools(&mut self) -> Result<(), ToolGatingError> {
-        self.ensure_idle_for_gating()?;
+    /// Remove tool gating: every tool in the set may run again (the default),
+    /// and drop the accompanying phase note.
+    #[allow(dead_code)]
+    pub(crate) fn clear_active_tools(&mut self) {
         self.allowed_tools = None;
-        Ok(())
-    }
-
-    /// Reject a gating change unless the agent is idle (no task queued or
-    /// running). Checks the *projected* state so a queued-but-not-yet-ticked
-    /// task also blocks the change.
-    fn ensure_idle_for_gating(&self) -> Result<(), ToolGatingError> {
-        if self.projected_lifecycle == AgentState::Idle {
-            Ok(())
-        } else {
-            Err(ToolGatingError {
-                state: self.projected_lifecycle,
-            })
-        }
-    }
-
-    /// Set the transient phase note appended to the tail of the next LLM
-    /// request's messages (never written to memory).
-    ///
-    /// Mirrors the production "system-reminder" pattern: stable `system`/`tools`
-    /// stay frozen for cache reuse while changing, per-phase guidance rides at
-    /// the end of the conversation. The note persists across ticks until changed
-    /// or cleared. Crate-internal: consumed by the in-crate semantic agents.
-    pub(crate) fn set_tail_note(&mut self, note: impl Into<String>) {
-        self.tail_note = Some(note.into());
-    }
-
-    /// Clear the transient phase note.
-    pub(crate) fn clear_tail_note(&mut self) {
         self.tail_note = None;
+    }
+
+    /// Build the transient phase note from the allow-set: a single
+    /// "system-reminder" line naming the tools the model may use this phase, so
+    /// its wording stays in lock-step with what enforcement will actually allow.
+    fn phase_note(allowed: &AllowedTools) -> String {
+        let names = allowed.sorted_names();
+        if names.is_empty() {
+            "[system] No tools are available in the current phase; do not call any \
+             tool."
+                .to_string()
+        } else {
+            format!(
+                "[system] Tools available in the current phase: {}. Other tools \
+                 are temporarily unavailable — do not call them.",
+                names.join(", ")
+            )
+        }
     }
 
     // -- The tick -----------------------------------------------------------
@@ -816,7 +788,10 @@ impl BaseAgent {
     /// Move internal-tool signals onto the inbox so they reduce like commands.
     fn drain_control_signals(&mut self) {
         let signals: Vec<ControlSignal> = {
-            let mut sink = self.control.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut sink = self
+                .control
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             sink.drain(..).collect()
         };
         for signal in signals {
@@ -864,7 +839,9 @@ impl BaseAgent {
             }
             Inbound::Control(ControlSignal::EndConversation { final_message }) => {
                 let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
-                turn.append_patch(&json!([{ "role": "assistant", "content": final_message.clone() }]));
+                turn.append_patch(
+                    &json!([{ "role": "assistant", "content": final_message.clone() }]),
+                );
                 drop(turn);
                 self.lifecycle = AgentState::Idle;
                 self.outcome = Some(TickOutcome::Ended { final_message });
@@ -921,7 +898,8 @@ impl BaseAgent {
             }
 
             // An approval result needs a matching pending request.
-            (State::AwaitingApproval, Command::ApprovalResult { id, .. }) => match pending_approval {
+            (State::AwaitingApproval, Command::ApprovalResult { id, .. }) => match pending_approval
+            {
                 Some(pending) if pending == *id => Ok(State::Running),
                 Some(pending) => Err(AgentCommandError::ApprovalMismatch {
                     expected: pending,
@@ -995,7 +973,10 @@ impl BaseAgent {
         );
 
         if self.consecutive_tool_blocks > self.tool_block_retries {
-            let name = blocked.first().map(|name| (*name).to_string()).unwrap_or_default();
+            let name = blocked
+                .first()
+                .map(|name| (*name).to_string())
+                .unwrap_or_default();
             self.fail_with(AgentRunError::ToolNotPermitted { name });
         }
     }
@@ -1324,13 +1305,19 @@ mod transition_tests {
         }
     }
 
-    fn classify(state: AgentState, command: &AgentCommand) -> Result<AgentState, AgentCommandError> {
+    fn classify(
+        state: AgentState,
+        command: &AgentCommand,
+    ) -> Result<AgentState, AgentCommandError> {
         BaseAgent::classify(state, command, None)
     }
 
     #[test]
     fn append_is_accepted_in_every_state() {
-        assert_eq!(classify(AgentState::Idle, &append()), Ok(AgentState::Running));
+        assert_eq!(
+            classify(AgentState::Idle, &append()),
+            Ok(AgentState::Running)
+        );
         assert_eq!(
             classify(AgentState::Running, &append()),
             Ok(AgentState::Running)
@@ -1351,7 +1338,10 @@ mod transition_tests {
             classify(AgentState::Running, &cancel()),
             Ok(AgentState::Idle)
         );
-        assert_eq!(classify(AgentState::Paused, &cancel()), Ok(AgentState::Idle));
+        assert_eq!(
+            classify(AgentState::Paused, &cancel()),
+            Ok(AgentState::Idle)
+        );
         assert_eq!(
             classify(AgentState::AwaitingApproval, &cancel()),
             Ok(AgentState::Idle)
@@ -1423,15 +1413,577 @@ mod transition_tests {
         }
         // Matching id resumes; a mismatch is reported with both ids.
         assert_eq!(
-            BaseAgent::classify(AgentState::AwaitingApproval, &approval(7), Some(ApprovalId(7))),
+            BaseAgent::classify(
+                AgentState::AwaitingApproval,
+                &approval(7),
+                Some(ApprovalId(7))
+            ),
             Ok(AgentState::Running)
         );
         assert_eq!(
-            BaseAgent::classify(AgentState::AwaitingApproval, &approval(7), Some(ApprovalId(9))),
+            BaseAgent::classify(
+                AgentState::AwaitingApproval,
+                &approval(7),
+                Some(ApprovalId(9))
+            ),
             Err(AgentCommandError::ApprovalMismatch {
                 expected: ApprovalId(9),
                 got: ApprovalId(7),
             })
+        );
+    }
+}
+
+// ===========================================================================
+// Tests: soft-hide tool gating (drives the pub(crate) gating hooks, so it must
+// live in-crate; a small self-contained harness keeps it hermetic)
+// ===========================================================================
+
+#[cfg(test)]
+mod gating_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use claw_api::{ClawApi, ClawApiConfig};
+    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    use claw_interfaces::{ClawFs, FsError};
+    use claw_memory::{
+        CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
+        MemoryTaskPool, PoolConfig,
+    };
+    use serde_json::{json, Value};
+
+    use crate::agent::{AgentId, AgentRunError, BaseAgent, BaseAgentBuilder, TickOutcome};
+    use crate::tools::{
+        AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
+    };
+
+    // HTTP doubles (strict: panic if called more than scripted) -----------------
+
+    /// Serves scripted LLM bodies in order.
+    struct ScriptedHttp {
+        steps: Mutex<VecDeque<String>>,
+    }
+
+    impl ScriptedHttp {
+        fn new(bodies: Vec<String>) -> Self {
+            Self {
+                steps: Mutex::new(bodies.into_iter().collect()),
+            }
+        }
+    }
+
+    impl ClawHttp for ScriptedHttp {
+        fn post_json(
+            &self,
+            _request: &HttpJsonRequest,
+            _abort: &AtomicBool,
+        ) -> Result<HttpResponse, HttpError> {
+            let body = self
+                .steps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front()
+                .expect("ScriptedHttp: LLM called more times than scripted");
+            Ok(HttpResponse {
+                status_code: 200,
+                body,
+            })
+        }
+    }
+
+    /// Like [`ScriptedHttp`] but records each request body so a test can inspect
+    /// what the agent actually sent to the model.
+    struct CapturingHttp {
+        steps: Mutex<VecDeque<String>>,
+        captured: Mutex<Vec<String>>,
+    }
+
+    impl CapturingHttp {
+        fn new(bodies: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                steps: Mutex::new(bodies.into_iter().collect()),
+                captured: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn captured_bodies(&self) -> Vec<Value> {
+            self.captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .map(|s| serde_json::from_str(s).unwrap_or(Value::Null))
+                .collect()
+        }
+    }
+
+    impl ClawHttp for CapturingHttp {
+        fn post_json(
+            &self,
+            request: &HttpJsonRequest,
+            _abort: &AtomicBool,
+        ) -> Result<HttpResponse, HttpError> {
+            self.captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(request.body.to_string());
+            let body = self
+                .steps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front()
+                .expect("CapturingHttp: LLM called more times than scripted");
+            Ok(HttpResponse {
+                status_code: 200,
+                body,
+            })
+        }
+    }
+
+    // In-memory FS + stub compactor (hermetic conversation memory) --------------
+
+    #[derive(Default)]
+    struct MemFs {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl MemFs {
+        fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
+            self.files.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+
+    impl ClawFs for MemFs {
+        fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+            self.lock().get(path).cloned().ok_or(FsError::NotFound)
+        }
+        fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+            let files = self.lock();
+            let bytes = files.get(path).ok_or(FsError::NotFound)?;
+            let start =
+                usize::try_from(offset).map_err(|_| FsError::Io("offset overflow".into()))?;
+            let end = start
+                .checked_add(len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| FsError::Io("read_at past end of file".into()))?;
+            Ok(bytes[start..end].to_vec())
+        }
+        fn len(&self, path: &str) -> Result<u64, FsError> {
+            self.lock()
+                .get(path)
+                .map(|b| u64::try_from(b.len()).unwrap_or(u64::MAX))
+                .ok_or(FsError::NotFound)
+        }
+        fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+            self.lock().insert(path.to_string(), data.to_vec());
+            Ok(())
+        }
+        fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+            self.lock()
+                .entry(path.to_string())
+                .or_default()
+                .extend_from_slice(data);
+            Ok(())
+        }
+        fn exists(&self, path: &str) -> bool {
+            self.lock().contains_key(path)
+        }
+        fn remove(&self, path: &str) -> Result<(), FsError> {
+            self.lock().remove(path);
+            Ok(())
+        }
+        fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let mut names = std::collections::BTreeSet::new();
+            for key in self.lock().keys() {
+                if let Some(rest) = key.strip_prefix(&prefix) {
+                    if let Some(name) = rest.split('/').next().filter(|n| !n.is_empty()) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            Ok(names.into_iter().collect())
+        }
+    }
+
+    /// Never compacts.
+    struct StubCompactor;
+
+    impl Compactor for StubCompactor {
+        fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
+            Ok(Vec::new())
+        }
+    }
+
+    // Test tools ----------------------------------------------------------------
+
+    /// Echoes its arguments back; used as the "allowed" tool.
+    struct EchoTool;
+
+    impl ToolHandler for EchoTool {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn schema(&self) -> &'static str {
+            r#"{"type":"function","function":{"name":"echo","description":"Echo"}}"#
+        }
+        fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: format!("echo:{}", call.arguments_json),
+                ok: true,
+            })
+        }
+    }
+
+    /// Writes something; used as the "disallowed" tool.
+    struct WriterTool;
+
+    impl ToolHandler for WriterTool {
+        fn name(&self) -> &'static str {
+            "writer"
+        }
+        fn schema(&self) -> &'static str {
+            r#"{"type":"function","function":{"name":"writer","description":"Write"}}"#
+        }
+        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: "wrote".into(),
+                ok: true,
+            })
+        }
+    }
+
+    fn caller_tools() -> ToolSet {
+        ToolSet::new([Tool::new(EchoTool), Tool::new(WriterTool)]).expect("tool set")
+    }
+
+    // Builders / drivers --------------------------------------------------------
+
+    fn build_llm(http: Arc<dyn ClawHttp>) -> ClawApi {
+        ClawApi::init(
+            ClawApiConfig {
+                api_key: Some("sk-test".into()),
+                backend_type: "openai_compatible".into(),
+                model: Some("gpt-test".into()),
+                base_url: Some("https://example.invalid".into()),
+                supports_tools: true,
+                ..Default::default()
+            },
+            http,
+        )
+        .expect("init llm")
+    }
+
+    fn scripted_llm(bodies: Vec<String>) -> ClawApi {
+        build_llm(Arc::new(ScriptedHttp::new(bodies)))
+    }
+
+    fn test_memory(agent_id: AgentId) -> ConversationMemory {
+        let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
+        ConversationMemory::new(
+            agent_id.0,
+            ConversationConfig::new(format!("/mem/agent-{}", agent_id.0)),
+            ConversationDeps {
+                fs: Arc::new(MemFs::default()),
+                pool,
+                compactor: Arc::new(StubCompactor),
+            },
+        )
+    }
+
+    /// A builder plus a cloned read-only view of the same memory.
+    fn builder_with_view(
+        llm: ClawApi,
+        agent_id: AgentId,
+    ) -> (BaseAgentBuilder, ConversationMemory) {
+        let memory = test_memory(agent_id);
+        let view = memory.clone();
+        (BaseAgent::builder(llm, memory), view)
+    }
+
+    fn body_plain_text(text: &str) -> String {
+        json!({ "choices": [{ "message": { "role": "assistant", "content": text } }] }).to_string()
+    }
+
+    fn body_tool_call(id: &str, name: &str, arguments_json: &str) -> String {
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": id,
+                        "function": { "name": name, "arguments": arguments_json }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    fn body_end_conversation(final_message: &str) -> String {
+        body_tool_call(
+            "e1",
+            "end_conversation",
+            &json!({ "final_message": final_message }).to_string(),
+        )
+    }
+
+    fn run_to_completion(agent: &mut BaseAgent) -> String {
+        loop {
+            match agent.tick() {
+                TickOutcome::Working => continue,
+                TickOutcome::Yielded { text } => return text,
+                TickOutcome::Ended { final_message } => return final_message,
+                TickOutcome::Failed(error) => panic!("unexpected agent failure: {error}"),
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+    }
+
+    fn transcript_contents(view: &ConversationMemory) -> Vec<String> {
+        view.messages()
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|m| m.get("content").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn first_tool_message(messages: &Value) -> Option<Value> {
+        messages
+            .as_array()?
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .cloned()
+    }
+
+    /// True when every assistant `tool_calls[].id` has a matching `tool` message.
+    fn no_dangling_tool_calls(messages: &Value) -> bool {
+        let Some(items) = messages.as_array() else {
+            return false;
+        };
+        let mut expected: Vec<String> = Vec::new();
+        let mut satisfied: Vec<String> = Vec::new();
+        for message in items {
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        expected.push(id.to_string());
+                    }
+                }
+            }
+            if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+                satisfied.push(id.to_string());
+            }
+        }
+        expected.iter().all(|id| satisfied.contains(id))
+    }
+
+    // Tests ---------------------------------------------------------------------
+
+    /// A disallowed tool call is refused with a *matched* tool error (no dangling
+    /// call) and, within the retry budget, the agent keeps working and self-corrects.
+    #[test]
+    fn disallowed_tool_is_refused_with_matched_error() {
+        let (builder, view) = builder_with_view(
+            scripted_llm(vec![
+                body_tool_call("t1", "writer", "{}"),
+                body_end_conversation("done"),
+            ]),
+            AgentId(1),
+        );
+        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
+        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+
+        agent.run("go");
+        assert_eq!(run_to_completion(&mut agent), "done");
+
+        let messages = view.messages();
+        assert!(
+            no_dangling_tool_calls(&messages),
+            "blocked call left dangling"
+        );
+        let tool_message = first_tool_message(&messages).expect("a tool message was committed");
+        assert_eq!(tool_message["tool_call_id"], "t1");
+        assert_eq!(tool_message["is_error"], true);
+        let content = tool_message["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("not available in the current phase"),
+            "unexpected blocked-tool content: {content}"
+        );
+    }
+
+    /// With the default budget (1), a second *consecutive* blocked round fails the
+    /// task with `ToolNotPermitted` naming the refused tool.
+    #[test]
+    fn two_consecutive_blocks_fail_the_task() {
+        let (builder, _view) = builder_with_view(
+            scripted_llm(vec![
+                body_tool_call("t1", "writer", "{}"),
+                body_tool_call("t2", "writer", "{}"),
+            ]),
+            AgentId(1),
+        );
+        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
+        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+
+        agent.run("go");
+        // First block: nudged, still working.
+        assert!(matches!(agent.tick(), TickOutcome::Working));
+        // Second consecutive block: budget exhausted -> failed.
+        match agent.tick() {
+            TickOutcome::Failed(AgentRunError::ToolNotPermitted { name }) => {
+                assert_eq!(name, "writer")
+            }
+            other => panic!("expected ToolNotPermitted, got {other:?}"),
+        }
+        // Failed leaves the agent idle and reusable.
+        assert!(!agent.is_running());
+    }
+
+    /// A clean tool round between two blocks resets the counter, so the budget of 1
+    /// is never exceeded and the task completes.
+    #[test]
+    fn clean_round_resets_block_counter() {
+        let (builder, _view) = builder_with_view(
+            scripted_llm(vec![
+                body_tool_call("t1", "writer", "{}"), // block (count 1)
+                body_tool_call("t2", "echo", "{}"),   // clean (reset to 0)
+                body_tool_call("t3", "writer", "{}"), // block (count 1 again)
+                body_end_conversation("done"),
+            ]),
+            AgentId(1),
+        );
+        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
+        // echo is permitted (the clean round); writer is not.
+        agent.set_active_tools(AllowedTools::new(["echo", "end_conversation"]));
+
+        agent.run("go");
+        assert_eq!(run_to_completion(&mut agent), "done");
+    }
+
+    /// `0` retries fails on the very first disallowed call.
+    #[test]
+    fn zero_retries_fails_on_first_block() {
+        let (builder, _view) = builder_with_view(
+            scripted_llm(vec![body_tool_call("t1", "writer", "{}")]),
+            AgentId(1),
+        );
+        let mut agent = builder
+            .with_tools(caller_tools())
+            .with_tool_block_retries(0)
+            .build()
+            .expect("build");
+        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+
+        agent.run("go");
+        match agent.tick() {
+            TickOutcome::Failed(AgentRunError::ToolNotPermitted { name }) => {
+                assert_eq!(name, "writer")
+            }
+            other => panic!("expected ToolNotPermitted, got {other:?}"),
+        }
+    }
+
+    /// With no allow-set, gating is off: a tool that gating *would* block runs
+    /// normally (the pre-gating behaviour is preserved).
+    #[test]
+    fn ungated_when_no_allow_set() {
+        let (builder, view) = builder_with_view(
+            scripted_llm(vec![
+                body_tool_call("t1", "writer", "{}"),
+                body_end_conversation("done"),
+            ]),
+            AgentId(1),
+        );
+        // Note: set_active_tools is intentionally NOT called.
+        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
+
+        agent.run("go");
+        assert_eq!(run_to_completion(&mut agent), "done");
+        // The writer tool actually executed.
+        assert!(transcript_contents(&view).iter().any(|c| c == "wrote"));
+    }
+
+    /// Clearing the gating restores the defaults: the previously blocked tool runs
+    /// again and no phase note is appended to the request.
+    #[test]
+    fn clearing_gating_restores_ungated_and_no_note() {
+        let http = CapturingHttp::new(vec![
+            body_tool_call("t1", "writer", "{}"),
+            body_end_conversation("done"),
+        ]);
+        let llm = build_llm(Arc::clone(&http) as Arc<dyn ClawHttp>);
+        let (builder, view) = builder_with_view(llm, AgentId(1));
+        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
+
+        // Gate (which also sets the phase note), then immediately ungate before
+        // running — clearing must drop both the allow-set and the note.
+        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+        agent.clear_active_tools();
+
+        agent.run("go");
+        assert_eq!(run_to_completion(&mut agent), "done");
+
+        // The writer tool executed (gating was cleared).
+        assert!(transcript_contents(&view).iter().any(|c| c == "wrote"));
+
+        // No request carried a phase note (the "[system] Tools available" reminder).
+        for body in http.captured_bodies() {
+            if let Some(messages) = body["messages"].as_array() {
+                assert!(
+                    messages.iter().all(|m| {
+                        m.get("content")
+                            .and_then(Value::as_str)
+                            .is_none_or(|c| !c.contains("Tools available in the current phase"))
+                    }),
+                    "a phase note reached the model after gating was cleared"
+                );
+            }
+        }
+    }
+
+    /// Gating auto-generates a phase note that is appended to the request the model
+    /// sees (last message, naming the allowed tools) but is never written to memory.
+    #[test]
+    fn gating_phase_note_reaches_model_but_not_memory() {
+        let http = CapturingHttp::new(vec![body_plain_text("hi there")]);
+        let llm = build_llm(Arc::clone(&http) as Arc<dyn ClawHttp>);
+        let (builder, view) = builder_with_view(llm, AgentId(1));
+        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
+        // Gating sets the note as a side effect; no separate note API.
+        agent.set_active_tools(AllowedTools::new(["echo", "end_conversation"]));
+
+        agent.run("hello");
+        assert_eq!(run_to_completion(&mut agent), "hi there");
+
+        // The request carried the auto note as the final (user) message, naming the
+        // permitted tools in stable order.
+        let body = http.captured_bodies().pop().expect("one captured request");
+        let messages = body["messages"].as_array().expect("messages array");
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last["role"], "user");
+        let note = last["content"].as_str().expect("note content");
+        assert!(note.contains("Tools available in the current phase"));
+        assert!(note.contains("echo"));
+        assert!(note.contains("end_conversation"));
+
+        // Memory holds the real turn but not the transient note.
+        let committed = transcript_contents(&view);
+        assert!(committed.iter().any(|c| c == "hello"));
+        assert!(committed.iter().any(|c| c == "hi there"));
+        assert!(
+            !committed
+                .iter()
+                .any(|c| c.contains("Tools available in the current phase")),
+            "phase note leaked into memory"
         );
     }
 }

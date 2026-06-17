@@ -46,7 +46,10 @@ fn request_approval_pauses_for_decision() {
 fn approve_resumes_and_records_decision() {
     let dir = common::test_output_dir("appr_approve_records");
     let (builder, view) = builder_with_view(
-        scripted_llm(vec![body_request_approval("do it"), body_plain_text("done")]),
+        scripted_llm(vec![
+            body_request_approval("do it"),
+            body_plain_text("done"),
+        ]),
         AgentId(1),
         dir.display().to_string(),
     );
@@ -67,7 +70,9 @@ fn approve_resumes_and_records_decision() {
 
     assert!(matches!(agent.tick(), TickOutcome::Yielded { text } if text == "done"));
     let transcript = transcript_contents(&view);
-    assert!(transcript.iter().any(|c| c.contains("approved by the human")));
+    assert!(transcript
+        .iter()
+        .any(|c| c.contains("approved by the human")));
 }
 
 #[test]
@@ -219,10 +224,7 @@ fn cancel_while_awaiting_clears_pending_and_records_marker() {
 #[test]
 fn append_while_awaiting_is_included_after_approval() {
     let dir = common::test_output_dir("appr_append_awaiting");
-    let (llm, http) = capturing_llm(vec![
-        body_request_approval("x"),
-        body_plain_text("final"),
-    ]);
+    let (llm, http) = capturing_llm(vec![body_request_approval("x"), body_plain_text("final")]);
     let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
         .build()
         .expect("build");

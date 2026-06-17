@@ -166,7 +166,12 @@ fn assert_golden(path: &Path, actual: &str, label: &str) {
             path.display()
         )
     });
-    assert_eq!(actual, &expected, "{label} does not match golden {}", path.display());
+    assert_eq!(
+        actual,
+        &expected,
+        "{label} does not match golden {}",
+        path.display()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +230,10 @@ fn skill_set_loads_unloads_and_caches() {
 
     set.load("test", first.clone()).expect("load skill");
     let loaded = set.context().expect("loaded context").to_string();
-    assert!(loaded.contains(first.as_str()), "loaded context omits the skill id");
+    assert!(
+        loaded.contains(first.as_str()),
+        "loaded context omits the skill id"
+    );
     // A second read with nothing changed returns the same cached content.
     assert_eq!(set.context().expect("cached context"), loaded);
 

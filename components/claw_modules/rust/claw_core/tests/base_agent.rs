@@ -13,14 +13,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
+use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, CancelReason, TickOutcome};
+use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_interfaces::{ClawFs, FsError};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
 };
-use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, CancelReason, TickOutcome};
-use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -61,14 +61,12 @@ fn require_local_api_key() -> String {
 
 fn local_base_url() -> String {
     load_local_env();
-    std::env::var("CLAW_LLM_BASE_URL")
-        .expect("CLAW_LLM_BASE_URL must be set in .env.local")
+    std::env::var("CLAW_LLM_BASE_URL").expect("CLAW_LLM_BASE_URL must be set in .env.local")
 }
 
 fn local_model() -> String {
     load_local_env();
-    std::env::var("CLAW_LLM_MODEL")
-        .expect("CLAW_LLM_MODEL must be set in .env.local")
+    std::env::var("CLAW_LLM_MODEL").expect("CLAW_LLM_MODEL must be set in .env.local")
 }
 
 // ---------------------------------------------------------------------------
@@ -119,15 +117,13 @@ impl ClawFs for DiskFs {
     }
 
     fn len(&self, path: &str) -> Result<u64, FsError> {
-        std::fs::metadata(path)
-            .map(|m| m.len())
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    FsError::NotFound
-                } else {
-                    FsError::Io(e.to_string())
-                }
-            })
+        std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FsError::NotFound
+            } else {
+                FsError::Io(e.to_string())
+            }
+        })
     }
 
     fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
@@ -181,8 +177,7 @@ impl ClawFs for DiskFs {
 // Helpers: HTTP stubs
 // ---------------------------------------------------------------------------
 
-const PLAIN_TEXT_BODY: &str =
-    r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
+const PLAIN_TEXT_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
 
 const TOOL_CALL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"t1","function":{"name":"echo","arguments":"{\"input\":\"hello\"}"}}]}}]}"#;
 
@@ -204,7 +199,10 @@ impl ClawHttp for ScriptedHttp {
             .unwrap_or_else(|p| p.into_inner())
             .pop_front()
             .expect("ScriptedHttp: no more canned responses — test called the LLM more times than expected");
-        Ok(HttpResponse { status_code: 200, body })
+        Ok(HttpResponse {
+            status_code: 200,
+            body,
+        })
     }
 }
 
@@ -249,7 +247,10 @@ impl ClawHttp for CapturingHttp {
             .unwrap_or_else(|p| p.into_inner())
             .pop_front()
             .unwrap_or_else(|| PLAIN_TEXT_BODY.into());
-        Ok(HttpResponse { status_code: 200, body })
+        Ok(HttpResponse {
+            status_code: 200,
+            body,
+        })
     }
 }
 
@@ -452,8 +453,9 @@ fn agent_id_serializes_to_prefixed_string() {
 #[test]
 fn tick_returns_idle_before_run() {
     let dir = test_output_dir("tick_returns_idle_before_run");
-    let mut agent =
-        agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build().expect("build");
+    let mut agent = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string())
+        .build()
+        .expect("build");
 
     assert!(!agent.is_running());
     assert!(matches!(agent.tick(), TickOutcome::Idle));
@@ -462,11 +464,13 @@ fn tick_returns_idle_before_run() {
 #[test]
 fn cancel_reports_cancelled_and_goes_idle() {
     let dir = test_output_dir("cancel_reports_cancelled_and_goes_idle");
-    let mut agent =
-        agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build().expect("build");
+    let mut agent = agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string())
+        .build()
+        .expect("build");
 
     agent.run("do something");
-    agent.cancel(CancelReason::UserRequested)
+    agent
+        .cancel(CancelReason::UserRequested)
         .expect("cancel accepted while a task is queued");
 
     // The first tick drains AppendMessage then Cancel, never calling the LLM (so
@@ -519,11 +523,14 @@ fn cancel_records_interruption_marker_in_memory() {
 #[test]
 fn single_turn_yields_answer() {
     let dir = test_output_dir("single_turn_yields_answer");
-    let mut agent =
-        agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-            .with_system_prompt("You are a test assistant.")
-            .build()
-            .expect("build");
+    let mut agent = agent_builder(
+        scripted_llm(vec![PLAIN_TEXT_BODY]),
+        AgentId(1),
+        dir.display().to_string(),
+    )
+    .with_system_prompt("You are a test assistant.")
+    .build()
+    .expect("build");
 
     agent.run("say pong");
     let text = run_to_completion(&mut agent);
@@ -558,10 +565,13 @@ fn tool_round_works_then_yields() {
 #[test]
 fn end_conversation_tool_ends_task() {
     let dir = test_output_dir("end_conversation_tool_ends_task");
-    let mut agent =
-        agent_builder(scripted_llm(vec![END_CONVERSATION_BODY]), AgentId(1), dir.display().to_string())
-            .build()
-            .expect("build");
+    let mut agent = agent_builder(
+        scripted_llm(vec![END_CONVERSATION_BODY]),
+        AgentId(1),
+        dir.display().to_string(),
+    )
+    .build()
+    .expect("build");
 
     agent.run("finish up");
 
@@ -578,7 +588,9 @@ fn end_conversation_tool_ends_task() {
 fn append_after_end_starts_fresh_task() {
     let dir = test_output_dir("append_after_end_starts_fresh_task");
     let llm = scripted_llm(vec![END_CONVERSATION_BODY, PLAIN_TEXT_BODY]);
-    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string()).build().expect("build");
+    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
+        .build()
+        .expect("build");
 
     agent.run("first");
     assert!(agent.tick().is_terminal());
@@ -593,7 +605,9 @@ fn append_after_end_starts_fresh_task() {
 fn failed_http_reports_failed_and_goes_idle() {
     let dir = test_output_dir("failed_http_reports_failed_and_goes_idle");
     let llm = make_llm(Arc::new(FailingHttp));
-    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string()).build().expect("build");
+    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
+        .build()
+        .expect("build");
 
     agent.run("hello");
 
@@ -604,10 +618,13 @@ fn failed_http_reports_failed_and_goes_idle() {
 #[test]
 fn abort_before_iteration_reruns_next_tick() {
     let dir = test_output_dir("abort_before_iteration_reruns_next_tick");
-    let mut agent =
-        agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-            .build()
-            .expect("build");
+    let mut agent = agent_builder(
+        scripted_llm(vec![PLAIN_TEXT_BODY]),
+        AgentId(1),
+        dir.display().to_string(),
+    )
+    .build()
+    .expect("build");
 
     agent.run("hello");
     agent.abort_handle().abort();
@@ -624,10 +641,13 @@ fn abort_before_iteration_reruns_next_tick() {
 #[test]
 fn tick_stays_idle_after_yield() {
     let dir = test_output_dir("tick_stays_idle_after_yield");
-    let mut agent =
-        agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-            .build()
-            .expect("build");
+    let mut agent = agent_builder(
+        scripted_llm(vec![PLAIN_TEXT_BODY]),
+        AgentId(1),
+        dir.display().to_string(),
+    )
+    .build()
+    .expect("build");
 
     agent.run("hi");
     assert!(matches!(agent.tick(), TickOutcome::Yielded { .. }));
@@ -646,9 +666,13 @@ fn memory_written_to_disk_after_turn() {
     let dir = test_output_dir("memory_written_to_disk_after_turn");
     let data_file = dir.join("conversation-1.jsonl");
 
-    let mut agent = agent_builder(scripted_llm(vec![PLAIN_TEXT_BODY]), AgentId(1), dir.display().to_string())
-        .build()
-        .expect("build");
+    let mut agent = agent_builder(
+        scripted_llm(vec![PLAIN_TEXT_BODY]),
+        AgentId(1),
+        dir.display().to_string(),
+    )
+    .build()
+    .expect("build");
 
     agent.run("write something to disk");
     run_to_completion(&mut agent);

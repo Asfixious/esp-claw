@@ -61,10 +61,12 @@ impl InMemoryTraceSink {
 impl TraceSink for InMemoryTraceSink {
     fn record_iteration(&self, trace: IterationTrace) {
         let mut runs = self.runs.lock().unwrap();
-        let entry = runs.entry(trace.run_id.clone()).or_insert_with(|| RunTrace {
-            run_id: trace.run_id.clone(),
-            iterations: Vec::new(),
-        });
+        let entry = runs
+            .entry(trace.run_id.clone())
+            .or_insert_with(|| RunTrace {
+                run_id: trace.run_id.clone(),
+                iterations: Vec::new(),
+            });
         entry.iterations.push(trace);
     }
 

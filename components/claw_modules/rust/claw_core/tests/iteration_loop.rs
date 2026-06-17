@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig, RetryPolicy};
+use claw_core::iteration_loop::{
+    AppendedMessages, ChatMessages, CompletedKind, InterruptionControl, IterationCheckpoint,
+    IterationLoop, IterationLoopError, IterationOutcome, IterationResult, IterationStep,
+    SystemPrompt,
+};
 use claw_core::{
     IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
-};
-use claw_core::iteration_loop::{
-    AppendedMessages, ChatMessages, CompletedKind, IterationCheckpoint, IterationLoop,
-    IterationLoopError, IterationOutcome, IterationResult, IterationStep, InterruptionControl,
-    SystemPrompt,
 };
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use serde_json::{json, Value};
@@ -153,7 +153,9 @@ impl ClawHttp for FailingHttp {
         _request: &HttpJsonRequest,
         _abort: &AtomicBool,
     ) -> Result<HttpResponse, HttpError> {
-        Err(HttpError::RequestFailed("simulated transport failure".into()))
+        Err(HttpError::RequestFailed(
+            "simulated transport failure".into(),
+        ))
     }
 }
 
@@ -459,10 +461,7 @@ fn run_errors_when_tool_calls_without_tools_port() {
 
     let result = run_step(&llm, &control, None, TEST_ITERATION_ID, &messages, "system");
 
-    assert!(matches!(
-        result,
-        Err(IterationLoopError::MissingTools)
-    ));
+    assert!(matches!(result, Err(IterationLoopError::MissingTools)));
 }
 
 #[test]

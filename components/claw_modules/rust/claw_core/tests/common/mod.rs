@@ -149,7 +149,10 @@ impl CapturingHttp {
 
     /// Number of LLM calls the agent has made so far.
     pub fn call_count(&self) -> usize {
-        self.captured.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.captured
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
@@ -226,7 +229,10 @@ fn build_llm(http: Arc<dyn ClawHttp>, supports_tools: bool) -> ClawApi {
 
 /// Tool-capable LLM serving the given plain bodies in order (strict).
 pub fn scripted_llm(bodies: Vec<String>) -> ClawApi {
-    build_llm(Arc::new(ScriptedHttp::new(bodies.into_iter().map(Ok).collect())), true)
+    build_llm(
+        Arc::new(ScriptedHttp::new(bodies.into_iter().map(Ok).collect())),
+        true,
+    )
 }
 
 /// Tool-capable LLM whose rounds may be successes or transport errors (strict).
@@ -248,7 +254,10 @@ pub fn failing_llm() -> ClawApi {
 
 /// LLM that does NOT support tools, serving the given plain bodies (strict).
 pub fn scripted_llm_no_tools(bodies: Vec<String>) -> ClawApi {
-    build_llm(Arc::new(ScriptedHttp::new(bodies.into_iter().map(Ok).collect())), false)
+    build_llm(
+        Arc::new(ScriptedHttp::new(bodies.into_iter().map(Ok).collect())),
+        false,
+    )
 }
 
 /// Tool-capable LLM that must never be called (panics if it is).

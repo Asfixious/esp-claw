@@ -1,5 +1,6 @@
 [package]
 name = "claw-memory"
+authors = ["Finn(Ziheng) Sheng"]
 version = "0.1.0"
 edition = "2021"
 description = "Agent memory subsystem: conversation tape, compaction, and the shared memory task pool"

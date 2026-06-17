@@ -66,18 +66,34 @@ pub fn parse_prefixed_id(
 #[macro_export]
 macro_rules! define_prefixed_id {
     ($name:ident, $prefix:literal, $kind:literal) => {
+        #[doc = concat!(
+            "A `usize` newtype id whose wire form is prefixed with `",
+            $prefix,
+            "` (e.g. `", $prefix, "1`). Compares, hashes, displays, and (de)serializes by that wire form."
+        )]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-        pub struct $name(pub usize);
+        pub struct $name(
+            /// The raw numeric id; the wire form prepends the type prefix.
+            pub usize,
+        );
 
         impl $name {
+            /// Construct from a raw numeric id.
             pub const fn new(id: usize) -> Self {
                 Self(id)
             }
 
+            /// Render to the prefixed wire string (e.g. the prefix followed by the number).
             pub fn to_wire(&self) -> String {
                 format!(concat!($prefix, "{}"), self.0)
             }
 
+            /// Parse from a prefixed wire string, validating the prefix.
+            ///
+            /// # Errors
+            ///
+            /// [`IdParseError`](crate::IdParseError) when the string is empty or
+            /// does not carry the expected prefix and a numeric suffix.
             pub fn from_wire(value: &str) -> Result<Self, $crate::IdParseError> {
                 $crate::parse_prefixed_id(value, $prefix, $kind).map(Self)
             }

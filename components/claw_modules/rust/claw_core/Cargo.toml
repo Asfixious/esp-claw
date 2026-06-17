@@ -1,5 +1,6 @@
 [package]
 name = "claw_core"
+authors = ["Finn(Ziheng) Sheng"]
 version = "0.1.0"
 edition = "2021"
 description = "Runtime primitives: orchestrator shell, channels, and iteration loop"

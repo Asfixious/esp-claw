@@ -89,7 +89,10 @@ pub enum AgentCommand {
     /// commits the abandoned turn and records an interruption marker (keyed on the
     /// [`CancelReason`]) in memory, so the next task does not inherit an
     /// unexplained, half-finished exchange.
-    Cancel { reason: CancelReason },
+    Cancel {
+        /// Why the task is being abandoned; selects the recorded interruption marker.
+        reason: CancelReason,
+    },
     /// Stop scheduling iterations until [`Resume`](Self::Resume). No-op unless the
     /// agent is actively running.
     Pause,
@@ -98,7 +101,9 @@ pub enum AgentCommand {
     /// Deliver a human decision for a pending [`TickOutcome::AwaitingApproval`].
     /// Ignored unless the agent is awaiting this exact approval.
     ApprovalResult {
+        /// The pending approval this decision answers.
         id: ApprovalId,
+        /// The human's verdict.
         decision: ApprovalDecision,
     },
 }
@@ -137,11 +142,17 @@ pub enum AgentCommandError {
     /// [`Pause`](AgentCommand::Pause) is only valid while
     /// [`Running`](AgentState::Running).
     #[error("cannot pause: the agent is {state:?}, not running")]
-    CannotPause { state: AgentState },
+    CannotPause {
+        /// The state the agent was in when the pause was rejected.
+        state: AgentState,
+    },
     /// [`Resume`](AgentCommand::Resume) is only valid while
     /// [`Paused`](AgentState::Paused).
     #[error("cannot resume: the agent is {state:?}, not paused")]
-    CannotResume { state: AgentState },
+    CannotResume {
+        /// The state the agent was in when the resume was rejected.
+        state: AgentState,
+    },
     /// [`Cancel`](AgentCommand::Cancel) has nothing to act on while
     /// [`Idle`](AgentState::Idle).
     #[error("cannot cancel: the agent is idle with no active task")]
@@ -149,11 +160,16 @@ pub enum AgentCommandError {
     /// [`ApprovalResult`](AgentCommand::ApprovalResult) is only valid while
     /// [`AwaitingApproval`](AgentState::AwaitingApproval).
     #[error("cannot resolve approval: the agent is {state:?}, not awaiting approval")]
-    NotAwaitingApproval { state: AgentState },
+    NotAwaitingApproval {
+        /// The state the agent was in when the approval result was rejected.
+        state: AgentState,
+    },
     /// The agent is awaiting approval, but for a different request id.
     #[error("approval {got} does not match the pending approval {expected}")]
     ApprovalMismatch {
+        /// The approval the agent is actually waiting on.
         expected: ApprovalId,
+        /// The approval id the caller supplied.
         got: ApprovalId,
     },
 }
@@ -173,7 +189,9 @@ pub enum CancelReason {
 /// A human's answer to an approval request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApprovalDecision {
+    /// The human approved; the agent resumes and proceeds.
     Approved,
+    /// The human rejected, with a reason recorded for the agent to reconsider.
     Rejected(String),
 }
 
@@ -191,15 +209,29 @@ pub enum TickOutcome {
     Idle,
     /// The model returned a user-facing answer and handed control back.
     /// **Non-terminal** — the agent goes idle awaiting the next message.
-    Yielded { text: String },
+    Yielded {
+        /// The model's user-facing answer.
+        text: String,
+    },
     /// The agent called `request_approval` and is paused for a human decision.
-    /// Resolve it with [`approve`](BaseAgent::approve) / [`reject`](BaseAgent::reject).
-    AwaitingApproval { id: ApprovalId, summary: String },
+    /// Resolve it with [`resolve_approval`](BaseAgent::resolve_approval).
+    AwaitingApproval {
+        /// The id to pass back via [`resolve_approval`](BaseAgent::resolve_approval).
+        id: ApprovalId,
+        /// A human-readable description of what needs approving.
+        summary: String,
+    },
     /// Terminal: the agent ended the task itself (via `end_conversation`). The
     /// agent returns to idle and may be re-tasked.
-    Ended { final_message: String },
+    Ended {
+        /// The agent's closing message.
+        final_message: String,
+    },
     /// Terminal: the task was cancelled by the orchestrator.
-    Cancelled { reason: CancelReason },
+    Cancelled {
+        /// Why the task was cancelled.
+        reason: CancelReason,
+    },
     /// Terminal: the task failed.
     Failed(AgentRunError),
 }
@@ -208,6 +240,17 @@ impl TickOutcome {
     /// True for the terminal outcomes ([`Ended`](Self::Ended) /
     /// [`Cancelled`](Self::Cancelled) / [`Failed`](Self::Failed)) — the task is
     /// over, though the agent stays reusable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use claw_core::agent::{CancelReason, TickOutcome};
+    ///
+    /// assert!(TickOutcome::Ended { final_message: "done".into() }.is_terminal());
+    /// assert!(TickOutcome::Cancelled { reason: CancelReason::Shutdown }.is_terminal());
+    /// assert!(!TickOutcome::Working.is_terminal());
+    /// assert!(!TickOutcome::Yielded { text: "partial answer".into() }.is_terminal());
+    /// ```
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -391,6 +434,21 @@ impl BaseAgent {
     /// [`AgentCommandError`] when the command is not legal for the projected
     /// state — e.g. [`Resume`](AgentCommand::Resume) when not paused, or
     /// [`Cancel`](AgentCommand::Cancel) when already idle.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::agent::{AgentCommandError, CancelReason};
+    ///
+    /// agent.run("summarize the news");            // projected state -> Running
+    /// agent.cancel(CancelReason::UserRequested)?; // projected state -> Idle
+    ///
+    /// // Validated against the *projected* state (the batch so far), before any
+    /// // tick runs: resuming the now-idle agent is rejected and the agent is
+    /// // left unchanged.
+    /// assert!(matches!(agent.resume(), Err(AgentCommandError::CannotResume { .. })));
+    /// # Ok::<(), AgentCommandError>(())
+    /// ```
     pub fn send_command(&mut self, command: AgentCommand) -> Result<(), AgentCommandError> {
         let next = Self::classify(self.projected_lifecycle, &command, self.pending_approval)?;
         self.projected_lifecycle = next;
@@ -403,6 +461,15 @@ impl BaseAgent {
     ///
     /// Infallible: an append is valid in every state (it starts a fresh task when
     /// idle and joins the current one otherwise), so it can never be rejected.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::agent::TickOutcome;
+    ///
+    /// agent.run("summarize today's news"); // queue the task, then drive with `tick`
+    /// assert!(matches!(agent.tick(), TickOutcome::Working | TickOutcome::Yielded { .. }));
+    /// ```
     pub fn run(&mut self, goal: impl Into<String>) {
         // `AppendMessage` is accepted in every state; `send_command` cannot reject it.
         let _ = self.send_command(AgentCommand::AppendMessage(goal.into()));
@@ -450,6 +517,18 @@ impl BaseAgent {
     ///
     /// [`AgentCommandError::NotAwaitingApproval`] when no approval is pending, or
     /// [`AgentCommandError::ApprovalMismatch`] when `id` is not the pending one.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::agent::{ApprovalDecision, AgentCommandError, TickOutcome};
+    ///
+    /// // A tick that stopped on a built-in `request_approval` hands back the id.
+    /// if let TickOutcome::AwaitingApproval { id, .. } = agent.tick() {
+    ///     agent.resolve_approval(id, ApprovalDecision::Approved)?;
+    /// }
+    /// # Ok::<(), AgentCommandError>(())
+    /// ```
     pub fn resolve_approval(
         &mut self,
         id: ApprovalId,
@@ -512,6 +591,14 @@ impl BaseAgent {
 
     /// A handle to abort this agent's in-flight iteration from another task. Grab
     /// it before the tick loop starts (see [`AgentAbortHandle`]).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let handle = agent.abort_handle();      // clone-and-move to another thread
+    /// std::thread::spawn(move || handle.abort());
+    /// // The next `tick` is preempted at its first checkpoint and returns Working.
+    /// ```
     pub fn abort_handle(&self) -> AgentAbortHandle {
         AgentAbortHandle {
             flag: Arc::clone(&self.interruption.flag),
@@ -522,6 +609,24 @@ impl BaseAgent {
 
     /// Process queued commands, advance at most one iteration, and report what
     /// happened as a [`TickOutcome`].
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::agent::TickOutcome;
+    ///
+    /// agent.run("summarize today's news");
+    /// loop {
+    ///     match agent.tick() {
+    ///         TickOutcome::Working => continue,            // pump again now
+    ///         TickOutcome::Idle => break,                  // nothing to do; await input
+    ///         TickOutcome::Yielded { text } => { println!("{text}"); break; }
+    ///         TickOutcome::Ended { final_message } => { println!("{final_message}"); break; }
+    ///         TickOutcome::Failed(error) => { eprintln!("{error}"); break; }
+    ///         _ => break,
+    ///     }
+    /// }
+    /// ```
     pub fn tick(&mut self) -> TickOutcome {
         self.outcome = None;
 
@@ -935,6 +1040,17 @@ impl BaseAgentBuilder {
     /// failures). Pass [`RetryPolicy::none`] to fail fast on the first error
     /// (e.g. to make a single transport error surface as
     /// [`TickOutcome::Failed`] without burning the retry budget).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use claw_core::agent::{BaseAgent, RetryPolicy};
+    ///
+    /// let agent = BaseAgent::builder(llm, memory)
+    ///     .with_retry_policy(RetryPolicy::none()) // no retry: first transport error -> Failed
+    ///     .build()?;
+    /// # Ok::<(), claw_core::agent::BaseAgentBuildError>(())
+    /// ```
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self

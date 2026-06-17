@@ -283,7 +283,10 @@ fn main() {
                 }
                 TickOutcome::AwaitingApproval { id, summary } => {
                     eprintln!("approval requested [{id}]: {summary} — auto-approving");
-                    agent.resolve_approval(id, ApprovalDecision::Approved);
+                    if let Err(error) = agent.resolve_approval(id, ApprovalDecision::Approved) {
+                        eprintln!("failed to resolve approval [{id}]: {error}");
+                        break;
+                    }
                     // Keep pumping so the queued decision resolves next tick.
                 }
                 TickOutcome::Cancelled { .. } | TickOutcome::Idle => break,

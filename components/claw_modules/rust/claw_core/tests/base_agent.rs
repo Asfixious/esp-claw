@@ -466,7 +466,8 @@ fn cancel_reports_cancelled_and_goes_idle() {
         agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string()).build().expect("build");
 
     agent.run("do something");
-    agent.cancel(CancelReason::UserRequested);
+    agent.cancel(CancelReason::UserRequested)
+        .expect("cancel accepted while a task is queued");
 
     // The first tick drains AppendMessage then Cancel, never calling the LLM (so
     // the empty script is fine).
@@ -477,6 +478,42 @@ fn cancel_reports_cancelled_and_goes_idle() {
         }
     ));
     assert!(!agent.is_running());
+}
+
+#[test]
+fn cancel_records_interruption_marker_in_memory() {
+    let dir = test_output_dir("cancel_records_interruption_marker_in_memory");
+    let memory = test_memory(AgentId(1), dir.display().to_string(), test_pool());
+    let view = memory.clone();
+    let mut agent = BaseAgent::builder(scripted_llm(vec![]), memory)
+        .build()
+        .expect("build");
+
+    agent.run("do something risky");
+    agent
+        .cancel(CancelReason::UserRequested)
+        .expect("cancel accepted while a task is queued");
+    assert!(matches!(agent.tick(), TickOutcome::Cancelled { .. }));
+
+    let messages = view.messages();
+    let items = messages.as_array().expect("messages is an array");
+    let contents: Vec<&str> = items
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_str))
+        .collect();
+
+    // The abandoned user turn is retained (no memory loss)...
+    assert!(
+        contents.contains(&"do something risky"),
+        "abandoned user turn missing: {contents:?}"
+    );
+    // ...and the disruption is explained by an interruption marker.
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("interrupted") && c.contains("user")),
+        "interruption marker missing: {contents:?}"
+    );
 }
 
 #[test]

@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::tools::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput};
+use crate::tools::{
+    tool_metadata, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput,
+};
 
 /// Group label for the agent's built-in tools (provenance only).
 pub(crate) const INTERNAL_TOOL_GROUP: &str = "agent";
@@ -99,13 +101,7 @@ struct EndConversationTool {
 }
 
 impl ToolHandler for EndConversationTool {
-    fn name(&self) -> &'static str {
-        END_CONVERSATION
-    }
-
-    fn schema(&self) -> &'static str {
-        r#"{"type":"function","function":{"name":"end_conversation","description":"Terminate the conversation as a safety or ethics circuit-breaker (e.g. an abusive, unsafe, or out-of-bounds request) — NOT for ordinary task completion, which is a normal reply. Provide the final message to show the user.","parameters":{"type":"object","properties":{"final_message":{"type":"string","description":"The closing message for the user."}},"required":["final_message"]}}}"#
-    }
+    tool_metadata!("end_conversation");
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let final_message = string_argument(call.arguments_json, "final_message")?;
@@ -123,13 +119,7 @@ struct RequestApprovalTool {
 }
 
 impl ToolHandler for RequestApprovalTool {
-    fn name(&self) -> &'static str {
-        REQUEST_APPROVAL
-    }
-
-    fn schema(&self) -> &'static str {
-        r#"{"type":"function","function":{"name":"request_approval","description":"Request human approval before taking a consequential action. Execution pauses until a decision is returned.","parameters":{"type":"object","properties":{"summary":{"type":"string","description":"What you want approved, and why."}},"required":["summary"]}}}"#
-    }
+    tool_metadata!("request_approval");
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let summary = string_argument(call.arguments_json, "summary")?;
@@ -171,13 +161,7 @@ struct SpawnSubagentTool {
 }
 
 impl ToolHandler for SpawnSubagentTool {
-    fn name(&self) -> &'static str {
-        SPAWN_SUBAGENT
-    }
-
-    fn schema(&self) -> &'static str {
-        r#"{"type":"function","function":{"name":"spawn_subagent","description":"Delegate a goal to a new subagent that works in parallel. Its result is reported back to you when it finishes.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"The goal to delegate to the subagent."}},"required":["goal"]}}}"#
-    }
+    tool_metadata!("spawn_subagent");
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let goal = string_argument(call.arguments_json, "goal")?;

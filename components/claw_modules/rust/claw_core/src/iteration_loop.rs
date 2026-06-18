@@ -619,7 +619,8 @@ mod tests {
             }
 
             fn schema(&self) -> &'static str {
-                "{}"
+                // Self-consistent minimal schema: function.name matches name().
+                r#"{"type":"function","function":{"name":""}}"#
             }
 
             fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {

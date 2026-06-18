@@ -58,6 +58,31 @@ pub trait ToolHandler: Send + Sync {
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError>;
 }
 
+/// Generate the `name()` and `schema()` methods of a [`ToolHandler`] impl.
+///
+/// `name()` returns the given literal; `schema()` embeds, at compile time, the
+/// JSON file `resources/tool_schemas/<name>.json` (resolved against the crate
+/// root). Only [`invoke`](ToolHandler::invoke) is then written by hand. Keeping a
+/// tool's schema in its own file decouples the prompt text from the Rust source
+/// while staying a `&'static str` constant — no runtime cost.
+macro_rules! tool_metadata {
+    ($name:literal) => {
+        fn name(&self) -> &'static str {
+            $name
+        }
+
+        fn schema(&self) -> &'static str {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/resources/tool_schemas/",
+                $name,
+                ".json"
+            ))
+        }
+    };
+}
+pub(crate) use tool_metadata;
+
 /// A single tool as a cheap-to-clone value.
 ///
 /// The handler lives behind an `Arc`, so cloning a `Tool` is a reference-count
@@ -160,6 +185,32 @@ pub struct ToolSet {
     schemas_json: Option<String>,
 }
 
+/// Dev-time consistency check for a tool's schema, run when a [`ToolSet`] is
+/// assembled. Verifies the schema text is a JSON object **and** that its
+/// `function.name` matches the handler's [`name()`](ToolHandler::name) — the one
+/// invariant the `tool_metadata!` macro cannot enforce at compile time (the macro
+/// guarantees `name()` equals the schema filename, but not the `name` field
+/// *inside* the JSON).
+///
+/// Every check is wrapped in `debug_assert*!`, so this is compiled out and costs
+/// nothing in release builds; the JSON is parsed only under `cfg(debug_assertions)`.
+fn debug_validate_schema(name: &str, schema: &str) {
+    debug_assert!(
+        serde_json::from_str::<Value>(schema).is_ok_and(|value| value.is_object()),
+        "tool '{name}' returned an invalid JSON object schema: {schema}"
+    );
+    debug_assert_eq!(
+        serde_json::from_str::<Value>(schema)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("function"))
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str),
+        Some(name),
+        "tool '{name}' schema function.name must match handler name(): {schema}"
+    );
+}
+
 impl ToolSet {
     /// Assemble ungrouped tools under [`DEFAULT_TOOL_GROUP`].
     ///
@@ -186,10 +237,7 @@ impl ToolSet {
                     return Err(ToolSetError::DuplicateToolName(name));
                 }
                 let schema = tool.schema();
-                debug_assert!(
-                    serde_json::from_str::<Value>(schema).is_ok_and(|value| value.is_object()),
-                    "tool '{name}' returned an invalid JSON object schema: {schema}"
-                );
+                debug_validate_schema(name, schema);
                 schemas.push(schema);
                 by_name.insert(
                     name,
@@ -237,10 +285,7 @@ impl ToolSet {
                 return Err(ToolSetError::DuplicateToolName(name));
             }
             let schema = tool.schema();
-            debug_assert!(
-                serde_json::from_str::<Value>(schema).is_ok_and(|value| value.is_object()),
-                "tool '{name}' returned an invalid JSON object schema: {schema}"
-            );
+            debug_validate_schema(name, schema);
             self.by_name.insert(
                 name,
                 Entry {
@@ -351,5 +396,42 @@ impl FromIterator<&'static str> for AllowedTools {
         Self {
             names: iter.into_iter().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A handler whose `name()` deliberately disagrees with the `function.name`
+    /// inside its schema — the inconsistency `tool_metadata!` cannot catch.
+    struct MismatchedNameTool;
+
+    impl ToolHandler for MismatchedNameTool {
+        fn name(&self) -> &'static str {
+            "alpha"
+        }
+
+        fn schema(&self) -> &'static str {
+            r#"{"type":"function","function":{"name":"beta","parameters":{"type":"object"}}}"#
+        }
+
+        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: String::new(),
+                ok: true,
+            })
+        }
+    }
+
+    /// In dev builds, assembling a set surfaces a `name()` vs schema `function.name`
+    /// mismatch via the `debug_assert_eq!` in `debug_validate_schema`. Gated to
+    /// `debug_assertions` because that check is compiled out of release builds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "function.name must match handler name")]
+    fn schema_name_mismatch_is_caught_in_dev() {
+        let _ = ToolSet::new([Tool::new(MismatchedNameTool)]);
     }
 }

@@ -300,7 +300,8 @@ impl ToolHandler for SoftFailTool {
         ""
     }
     fn schema(&self) -> &'static str {
-        "{}"
+        // Self-consistent minimal schema: function.name matches name().
+        r#"{"type":"function","function":{"name":""}}"#
     }
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {

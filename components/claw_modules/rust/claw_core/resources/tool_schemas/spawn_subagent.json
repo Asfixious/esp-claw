@@ -1,0 +1,1 @@
+{"type":"function","function":{"name":"spawn_subagent","description":"Delegate a goal to a new subagent that works in parallel. Its result is reported back to you when it finishes.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"The goal to delegate to the subagent."}},"required":["goal"]}}}

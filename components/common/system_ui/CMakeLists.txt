@@ -1,0 +1,33 @@
+set(system_ui_srcs
+    "src/system_ui.c"
+    "src/activity_overlay.c"
+    "src/haptics.c"
+    "src/home_screen.c"
+    "src/launcher_config.c"
+    "src/system_ui_assets.c"
+    "src/task_panel.c"
+)
+
+set(system_ui_requires
+    claw_cap
+    claw_core
+    claw_skill
+    display_service
+    esp_board_manager
+    esp_lcd
+    esp_timer
+    lvgl
+)
+
+idf_component_register(
+    SRCS
+        ${system_ui_srcs}
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+    REQUIRES
+        ${system_ui_requires}
+    PRIV_REQUIRES
+        esp_driver_gpio
+)

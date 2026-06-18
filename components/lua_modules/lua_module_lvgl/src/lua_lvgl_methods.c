@@ -167,6 +167,7 @@ static const luaL_Reg lua_lvgl_canvas_methods[] = {
     {"fill_bg", lua_lvgl_canvas_fill_bg},
     {"set_px", lua_lvgl_canvas_set_px},
     {"get_px", lua_lvgl_canvas_get_px},
+    {"set_rgb565_data", lua_lvgl_canvas_set_rgb565_data},
     {NULL, NULL},
 };
 

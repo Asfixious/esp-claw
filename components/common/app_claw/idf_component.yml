@@ -118,11 +118,10 @@ dependencies:
   lua_module_builder:
     path: ../../common/lua_module_builder
 
-  emote:
+  system_ui:
     rules:
       - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT} == True
-      - if: $CONFIG{APP_CLAW_ENABLE_EMOTE} == True
-    path: ../emote
+    path: ../system_ui
 
   # --- lua_driver (hardware peripheral drivers) ---
 

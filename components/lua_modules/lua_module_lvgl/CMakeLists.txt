@@ -19,7 +19,7 @@ idf_component_register(
         "src"
     REQUIRES
         cap_lua
-        display_arbiter
+        display_service
         esp_lcd
         esp_lcd_touch
         esp_timer

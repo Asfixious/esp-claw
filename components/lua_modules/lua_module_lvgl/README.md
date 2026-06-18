@@ -314,6 +314,7 @@ Basic methods:
 - `calendar:get_pressed_date()` -> `{year, month, day}` or nil
 - `canvas:fill_bg(color[, opa])`
 - `canvas:set_px(x, y, color[, opa])`
+- `canvas:set_rgb565_data(data[, byte_order])`
 - `canvas:get_px(x, y)` -> `{r, g, b, a}`
 - `chart:add_series(color[, axis])` -> series handle
 - `chart:set_type(type)`

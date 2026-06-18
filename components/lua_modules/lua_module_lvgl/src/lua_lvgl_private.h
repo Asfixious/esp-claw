@@ -14,7 +14,7 @@
 #include <string.h>
 
 #include "cap_lua.h"
-#include "display_arbiter.h"
+#include "display_service.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -160,10 +160,13 @@ typedef struct lua_lvgl_obj_record {
     void *data2;
     size_t data_size;
     size_t data2_size;
+    int data_width;
+    int data_height;
     int value_cache;
     uint32_t generation;
     lua_lvgl_obj_type_t type;
     bool valid;
+    bool owned;
     lua_lvgl_event_sub_t *events;
     struct lua_lvgl_obj_record *next;
 } lua_lvgl_obj_record_t;
@@ -190,13 +193,14 @@ typedef struct {
     SemaphoreHandle_t mutex;
     bool lvgl_initialized;
     bool runtime_initialized;
-    bool display_owner_acquired;
     volatile bool task_stop;
     TaskHandle_t task_handle;
     TaskHandle_t task_waiter;
     esp_timer_handle_t tick_timer;
     SemaphoreHandle_t flush_done;
+    display_service_session_handle_t display_session;
     lv_display_t *display;
+    lv_obj_t *root_screen;
     esp_lcd_panel_handle_t panel;
     esp_lcd_panel_io_handle_t io;
     int width;
@@ -248,6 +252,7 @@ int lua_lvgl_error_esp(lua_State *L, const char *what, esp_err_t err);
 lua_lvgl_obj_ud_t *lua_lvgl_check_ud(lua_State *L, int index);
 void lua_lvgl_record_release_resources(lua_lvgl_obj_record_t *record);
 lua_lvgl_obj_ud_t *lua_lvgl_push_obj(lua_State *L, lv_obj_t *obj, lua_lvgl_obj_type_t type);
+lua_lvgl_obj_ud_t *lua_lvgl_push_obj_ex(lua_State *L, lv_obj_t *obj, lua_lvgl_obj_type_t type, bool owned);
 lv_obj_t *lua_lvgl_validate_ud_locked(const lua_lvgl_obj_ud_t *ud,
                                       lua_lvgl_obj_type_t *out_type,
                                       const char **out_error);
@@ -321,6 +326,7 @@ int lua_lvgl_calendar_get_pressed_date(lua_State *L);
 int lua_lvgl_canvas_fill_bg(lua_State *L);
 int lua_lvgl_canvas_set_px(lua_State *L);
 int lua_lvgl_canvas_get_px(lua_State *L);
+int lua_lvgl_canvas_set_rgb565_data(lua_State *L);
 int lua_lvgl_chart_add_series(lua_State *L);
 int lua_lvgl_chart_set_type(lua_State *L);
 int lua_lvgl_chart_set_point_count(lua_State *L);

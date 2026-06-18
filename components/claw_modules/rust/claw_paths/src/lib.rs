@@ -108,7 +108,10 @@ mod tests {
         reset();
         assert_eq!(set(99, "/x"), Err(PathError::InvalidRoot));
         assert_eq!(set(CLAW_PATH_DATA, ""), Err(PathError::EmptyPath));
-        assert_eq!(set(CLAW_PATH_DATA, &"/".repeat(40)), Err(PathError::PathTooLong));
+        assert_eq!(
+            set(CLAW_PATH_DATA, &"/".repeat(40)),
+            Err(PathError::PathTooLong)
+        );
     }
 
     #[test]
@@ -125,6 +128,9 @@ mod tests {
         // 31 chars fit (leaves room for NUL); 32 do not.
         assert_eq!(set(CLAW_PATH_DATA, &"a".repeat(31)), Ok(()));
         assert_eq!(get(CLAW_PATH_DATA), Some("a".repeat(31).as_str()));
-        assert_eq!(set(CLAW_PATH_DATA, &"a".repeat(32)), Err(PathError::PathTooLong));
+        assert_eq!(
+            set(CLAW_PATH_DATA, &"a".repeat(32)),
+            Err(PathError::PathTooLong)
+        );
     }
 }

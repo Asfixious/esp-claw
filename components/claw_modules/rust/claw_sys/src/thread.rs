@@ -124,7 +124,11 @@ mod espidf {
             cfg.stack_alloc_caps = caps;
             esp_pthread_set_cfg(&cfg);
 
-            CfgGuard { previous, had_previous, _name: cname }
+            CfgGuard {
+                previous,
+                had_previous,
+                _name: cname,
+            }
         }
     }
 }

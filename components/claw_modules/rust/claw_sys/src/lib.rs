@@ -52,7 +52,10 @@ mod tests {
     #[test]
     fn error_body_top_level_message() {
         let body = r#"{"message":"rate limited"}"#;
-        assert_eq!(parse_error_message_body(body, 429), "HTTP 429: rate limited");
+        assert_eq!(
+            parse_error_message_body(body, 429),
+            "HTTP 429: rate limited"
+        );
     }
 
     #[test]

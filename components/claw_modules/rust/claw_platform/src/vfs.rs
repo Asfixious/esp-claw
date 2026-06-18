@@ -14,7 +14,8 @@ pub type WriteOp = unsafe extern "C" fn(*mut c_void, c_int, *const c_void, usize
 pub type LseekOp = unsafe extern "C" fn(*mut c_void, c_int, off_t, c_int) -> off_t;
 pub type ReadOp = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void, usize) -> ssize_t;
 pub type PreadOp = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void, usize, off_t) -> ssize_t;
-pub type PwriteOp = unsafe extern "C" fn(*mut c_void, c_int, *const c_void, usize, off_t) -> ssize_t;
+pub type PwriteOp =
+    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, usize, off_t) -> ssize_t;
 pub type OpenOp = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_int) -> c_int;
 pub type CloseOp = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 pub type FstatOp = unsafe extern "C" fn(*mut c_void, c_int, *mut stat) -> c_int;

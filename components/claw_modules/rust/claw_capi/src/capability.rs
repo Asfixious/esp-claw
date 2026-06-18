@@ -142,7 +142,11 @@ impl RegistryBackend for CLegacyRegistryBackend {
             self.fill_call_user_context(&mut call_context);
 
             let name = cstring(capability_name);
-            let input = cstring(if input_json.is_empty() { "{}" } else { input_json });
+            let input = cstring(if input_json.is_empty() {
+                "{}"
+            } else {
+                input_json
+            });
             let mut buffer = vec![0u8; CLAW_CAP_CORE_OUTPUT_SIZE];
             let error = unsafe {
                 claw_cap_call(

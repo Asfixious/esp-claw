@@ -195,13 +195,7 @@ impl ClawPlatform for EspPlatform {
     unsafe fn fread(&self, ptr: *mut u8, size: usize, nmemb: usize, stream: *mut FILE) -> usize {
         libc::fread(ptr as *mut c_void, size, nmemb, stream)
     }
-    unsafe fn fwrite(
-        &self,
-        ptr: *const u8,
-        size: usize,
-        nmemb: usize,
-        stream: *mut FILE,
-    ) -> usize {
+    unsafe fn fwrite(&self, ptr: *const u8, size: usize, nmemb: usize, stream: *mut FILE) -> usize {
         libc::fwrite(ptr as *const c_void, size, nmemb, stream)
     }
     unsafe fn fflush(&self, stream: *mut FILE) -> c_int {

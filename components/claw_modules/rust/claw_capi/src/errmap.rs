@@ -11,13 +11,13 @@
 //! and is *not* re-mapped here.
 
 use claw_api::{ChatError, InferMediaError, InitError};
+use claw_interface::http::HttpError;
+use claw_memory::cap::CapStatus;
+use claw_memory::error::MemoryError;
 use claw_platform::{
     esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE,
     ESP_ERR_NOT_FOUND, ESP_ERR_NOT_SUPPORTED, ESP_ERR_NO_MEM, ESP_ERR_TIMEOUT, ESP_FAIL, ESP_OK,
 };
-use claw_interface::http::HttpError;
-use claw_memory::cap::CapStatus;
-use claw_memory::error::MemoryError;
 
 /// Map a [`MemoryError`] to the `esp_err_t` the C `claw_memory` ABI returns.
 pub fn memory_esp_err(err: MemoryError) -> EspErr {

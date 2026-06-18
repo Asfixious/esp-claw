@@ -9,7 +9,10 @@
 /// Mirrors `build_auth_header_value` + `auth_header_name`: returns `None` when
 /// the key is empty or the auth type is `"none"`.
 #[cfg_attr(not(any(test, target_os = "espidf")), allow(dead_code))]
-pub(crate) fn build_auth_header(auth_type: Option<&str>, api_key: Option<&str>) -> Option<(&'static str, String)> {
+pub(crate) fn build_auth_header(
+    auth_type: Option<&str>,
+    api_key: Option<&str>,
+) -> Option<(&'static str, String)> {
     let kind = auth_type.unwrap_or("bearer");
     let key = api_key.unwrap_or("");
     if key.is_empty() || kind == "none" {
@@ -29,7 +32,10 @@ pub(crate) fn parse_error_message_body(body: &str, status: i32) -> String {
     if body.is_empty() {
         return format!("HTTP {status}");
     }
-    match serde_json::from_str::<serde_json::Value>(body).ok().and_then(|root| extract_message(&root)) {
+    match serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|root| extract_message(&root))
+    {
         Some(msg) => format!("HTTP {status}: {msg}"),
         None => format!("HTTP {status}: {}", truncate(body, 160)),
     }
@@ -65,8 +71,8 @@ pub use espidf_driver::EspIdfHttp;
 #[cfg(target_os = "espidf")]
 mod espidf_driver {
     use super::{build_auth_header, parse_error_message_body};
-    use claw_platform::{ESP_FAIL, ESP_OK};
     use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    use claw_platform::{ESP_FAIL, ESP_OK};
     use core::ffi::{c_char, c_int, c_void};
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::ffi::CString;
@@ -144,8 +150,16 @@ mod espidf_driver {
     extern "C" {
         fn esp_http_client_init(config: *const esp_http_client_config_t) -> *mut c_void;
         fn esp_http_client_set_method(client: *mut c_void, method: c_int) -> c_int;
-        fn esp_http_client_set_header(client: *mut c_void, key: *const c_char, value: *const c_char) -> c_int;
-        fn esp_http_client_set_post_field(client: *mut c_void, data: *const c_char, len: c_int) -> c_int;
+        fn esp_http_client_set_header(
+            client: *mut c_void,
+            key: *const c_char,
+            value: *const c_char,
+        ) -> c_int;
+        fn esp_http_client_set_post_field(
+            client: *mut c_void,
+            data: *const c_char,
+            len: c_int,
+        ) -> c_int;
         fn esp_http_client_perform(client: *mut c_void) -> c_int;
         fn esp_http_client_get_status_code(client: *mut c_void) -> c_int;
         fn esp_http_client_cleanup(client: *mut c_void) -> c_int;
@@ -170,7 +184,8 @@ mod espidf_driver {
                 return ESP_FAIL;
             }
             if evt.event_id == HTTP_EVENT_ON_DATA && evt.data_len > 0 {
-                let slice = core::slice::from_raw_parts(evt.data as *const u8, evt.data_len as usize);
+                let slice =
+                    core::slice::from_raw_parts(evt.data as *const u8, evt.data_len as usize);
                 ctx.body.extend_from_slice(slice);
             }
         }
@@ -191,9 +206,16 @@ mod espidf_driver {
     pub struct EspIdfHttp;
 
     impl ClawHttp for EspIdfHttp {
-        fn post_json(&self, request: &HttpJsonRequest, abort: &AtomicBool) -> Result<HttpResponse, HttpError> {
+        fn post_json(
+            &self,
+            request: &HttpJsonRequest,
+            abort: &AtomicBool,
+        ) -> Result<HttpResponse, HttpError> {
             let url = CString::new(request.url).map_err(|_| HttpError::InvalidUrl)?;
-            let mut ctx = Box::new(RequestCtx { body: Vec::with_capacity(4096), abort: abort as *const _ });
+            let mut ctx = Box::new(RequestCtx {
+                body: Vec::with_capacity(4096),
+                abort: abort as *const _,
+            });
 
             let mut config: esp_http_client_config_t = unsafe { core::mem::zeroed() };
             config.url = url.as_ptr();
@@ -247,11 +269,13 @@ mod espidf_driver {
                 let body_str = String::from_utf8_lossy(&ctx.body).into_owned();
                 if status != 200 {
                     return Err(HttpError::UnexpectedStatus(parse_error_message_body(
-                        &body_str,
-                        status,
+                        &body_str, status,
                     )));
                 }
-                Ok(HttpResponse { status_code: status, body: body_str })
+                Ok(HttpResponse {
+                    status_code: status,
+                    body: body_str,
+                })
             })();
 
             unsafe { esp_http_client_cleanup(client) };

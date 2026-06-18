@@ -91,7 +91,11 @@ impl Default for claw_memory_item_t {
 }
 
 fn read_carr(arr: &[c_char]) -> String {
-    let bytes: Vec<u8> = arr.iter().map(|&c| c as u8).take_while(|&b| b != 0).collect();
+    let bytes: Vec<u8> = arr
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -557,8 +561,7 @@ pub unsafe extern "C" fn claw_memory_persist_context_callback(
     } else {
         let req = crate::core_abi::request_from_c(b.request);
         let publish = move |text: &str| {
-            crate::core_abi::publish_stage_text_impl(&req, text)
-                == claw_platform::ESP_OK
+            crate::core_abi::publish_stage_text_impl(&req, text) == claw_platform::ESP_OK
         };
         let publish_dyn: &dyn Fn(&str) -> bool = &publish;
         match session::persist_context(
@@ -699,7 +702,11 @@ unsafe extern "C" fn profile_collect(
     out_context: *mut claw_core_context_t,
     _user_ctx: *mut c_void,
 ) -> EspErr {
-    finish_context(out_context, CONTEXT_KIND_SYSTEM_PROMPT, profile::profile_collect_content())
+    finish_context(
+        out_context,
+        CONTEXT_KIND_SYSTEM_PROMPT,
+        profile::profile_collect_content(),
+    )
 }
 
 unsafe extern "C" fn long_term_collect(
@@ -707,7 +714,11 @@ unsafe extern "C" fn long_term_collect(
     out_context: *mut claw_core_context_t,
     _user_ctx: *mut c_void,
 ) -> EspErr {
-    finish_context(out_context, CONTEXT_KIND_SYSTEM_PROMPT, api::long_term_collect_content())
+    finish_context(
+        out_context,
+        CONTEXT_KIND_SYSTEM_PROMPT,
+        api::long_term_collect_content(),
+    )
 }
 
 unsafe extern "C" fn long_term_lightweight_collect(
@@ -747,20 +758,22 @@ const LONG_TERM_NAME: &[u8] = b"Long-term Memory\0";
 const SESSION_NAME: &[u8] = b"Session History\0";
 
 #[no_mangle]
-pub static claw_memory_profile_provider: ProviderSync = ProviderSync(claw_core_context_provider_t {
-    name: PROFILE_NAME.as_ptr() as *const c_char,
-    collect: Some(profile_collect),
-    user_ctx: ptr::null_mut(),
-    flags: 0,
-});
+pub static claw_memory_profile_provider: ProviderSync =
+    ProviderSync(claw_core_context_provider_t {
+        name: PROFILE_NAME.as_ptr() as *const c_char,
+        collect: Some(profile_collect),
+        user_ctx: ptr::null_mut(),
+        flags: 0,
+    });
 
 #[no_mangle]
-pub static claw_memory_long_term_provider: ProviderSync = ProviderSync(claw_core_context_provider_t {
-    name: LONG_TERM_NAME.as_ptr() as *const c_char,
-    collect: Some(long_term_collect),
-    user_ctx: ptr::null_mut(),
-    flags: 0,
-});
+pub static claw_memory_long_term_provider: ProviderSync =
+    ProviderSync(claw_core_context_provider_t {
+        name: LONG_TERM_NAME.as_ptr() as *const c_char,
+        collect: Some(long_term_collect),
+        user_ctx: ptr::null_mut(),
+        flags: 0,
+    });
 
 #[no_mangle]
 pub static claw_memory_long_term_lightweight_provider: ProviderSync =

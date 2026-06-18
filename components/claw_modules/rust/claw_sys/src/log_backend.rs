@@ -4,9 +4,9 @@
 //! `csrc/claw_rs_log.c`) bridges to `esp_log_write`. On the host the backend
 //! prints to stderr so `cargo test -- --nocapture` shows module logs.
 
-use core::ffi::c_int;
 #[cfg(target_os = "espidf")]
 use core::ffi::c_char;
+use core::ffi::c_int;
 use std::ffi::CString;
 
 use log::{Level, LevelFilter, Metadata, Record};
@@ -56,7 +56,11 @@ impl log::Log for ClawLogger {
     }
 
     fn log(&self, record: &Record) {
-        emit(map_level(record.level()), record.target(), &record.args().to_string());
+        emit(
+            map_level(record.level()),
+            record.target(),
+            &record.args().to_string(),
+        );
     }
 
     fn flush(&self) {}

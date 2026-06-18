@@ -92,7 +92,9 @@ pub unsafe extern "C" fn claw_task_create(
     }
 
     let caps = claw_task::memory_caps(cfg.stack_policy, external_memory_available());
-    if cfg.stack_policy == claw_task::CLAW_TASK_STACK_PSRAM_ONLY && caps != claw_task::MALLOC_CAP_SPIRAM {
+    if cfg.stack_policy == claw_task::CLAW_TASK_STACK_PSRAM_ONLY
+        && caps != claw_task::MALLOC_CAP_SPIRAM
+    {
         log::error!("task requires PSRAM stack but PSRAM is unavailable");
         return ERR_COULD_NOT_ALLOCATE_REQUIRED_MEMORY;
     }

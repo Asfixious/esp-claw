@@ -78,9 +78,8 @@ pub struct claw_core_completion_summary_t {
     pub tool_calls_csv: *const c_char,
 }
 
-pub type claw_core_persist_context_fn = Option<
-    unsafe extern "C" fn(*const claw_core_context_persist_batch_t, *mut c_void) -> EspErr,
->;
+pub type claw_core_persist_context_fn =
+    Option<unsafe extern "C" fn(*const claw_core_context_persist_batch_t, *mut c_void) -> EspErr>;
 pub type claw_core_request_start_fn =
     Option<unsafe extern "C" fn(*const claw_core_request_t, *mut c_void) -> EspErr>;
 pub type claw_core_request_gate_fn = Option<
@@ -90,7 +89,11 @@ pub type claw_core_stage_note_fn = Option<
     unsafe extern "C" fn(*const claw_core_request_t, *mut *mut c_char, *mut c_void) -> EspErr,
 >;
 pub type claw_core_context_provider_collect_fn = Option<
-    unsafe extern "C" fn(*const claw_core_request_t, *mut claw_core_context_t, *mut c_void) -> EspErr,
+    unsafe extern "C" fn(
+        *const claw_core_request_t,
+        *mut claw_core_context_t,
+        *mut c_void,
+    ) -> EspErr,
 >;
 pub type claw_core_call_cap_fn = Option<
     unsafe extern "C" fn(
@@ -211,7 +214,9 @@ fn opt_cstr(o: &Option<String>, storage: &mut Vec<CString>) -> *const c_char {
 
 fn opt_into_raw(o: Option<String>) -> *mut c_char {
     match o {
-        Some(s) => CString::new(s).map(|c| c.into_raw()).unwrap_or(ptr::null_mut()),
+        Some(s) => CString::new(s)
+            .map(|c| c.into_raw())
+            .unwrap_or(ptr::null_mut()),
         None => ptr::null_mut(),
     }
 }
@@ -278,8 +283,11 @@ fn context_kind_from_c(kind: c_int) -> ContextKind {
 
 // --- callback adapters ---------------------------------------------------
 
-type CollectFn =
-    unsafe extern "C" fn(*const claw_core_request_t, *mut claw_core_context_t, *mut c_void) -> EspErr;
+type CollectFn = unsafe extern "C" fn(
+    *const claw_core_request_t,
+    *mut claw_core_context_t,
+    *mut c_void,
+) -> EspErr;
 
 struct CContextProvider {
     name: String,
@@ -541,17 +549,27 @@ unsafe fn build_and_store_core(
         system_prompt: cstr_str(c.system_prompt),
         runtime_config,
         http: Arc::new(claw_sys::EspIdfHttp),
-        capability_invoker: Some(Box::new(crate::capability::default_registry(c.cap_user_ctx))
-            as Box<dyn claw_cap::CapabilityInvoker>),
+        capability_invoker: Some(
+            Box::new(crate::capability::default_registry(c.cap_user_ctx))
+                as Box<dyn claw_cap::CapabilityInvoker>,
+        ),
         request_gate: c.request_gate.map(|f| {
-            Box::new(CRequestGate { f, user_ctx: c.request_gate_user_ctx }) as Box<dyn RequestGate>
+            Box::new(CRequestGate {
+                f,
+                user_ctx: c.request_gate_user_ctx,
+            }) as Box<dyn RequestGate>
         }),
         on_request_start: c.on_request_start.map(|f| {
-            Box::new(CRequestStart { f, user_ctx: c.on_request_start_user_ctx })
-                as Box<dyn RequestStart>
+            Box::new(CRequestStart {
+                f,
+                user_ctx: c.on_request_start_user_ctx,
+            }) as Box<dyn RequestStart>
         }),
         collect_stage_note: c.collect_stage_note.map(|f| {
-            Box::new(CStageNote { f, user_ctx: c.collect_stage_note_user_ctx }) as Box<dyn StageNote>
+            Box::new(CStageNote {
+                f,
+                user_ctx: c.collect_stage_note_user_ctx,
+            }) as Box<dyn StageNote>
         }),
         events: Some(Box::new(espidf_events::CEventPublisher)),
         max_tool_iterations: c.max_tool_iterations,
@@ -937,7 +955,9 @@ mod espidf_events {
 
             let text = e.text.as_deref().map(cstring);
             let payload = e.payload_json.as_deref().map(cstring);
-            ev.text = text.as_ref().map_or(ptr::null_mut(), |c| c.as_ptr() as *mut c_char);
+            ev.text = text
+                .as_ref()
+                .map_or(ptr::null_mut(), |c| c.as_ptr() as *mut c_char);
             ev.payload_json = payload
                 .as_ref()
                 .map_or(ptr::null_mut(), |c| c.as_ptr() as *mut c_char);

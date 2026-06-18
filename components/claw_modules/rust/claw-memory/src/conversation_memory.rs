@@ -559,7 +559,9 @@ impl ConversationMemory {
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn group(&self) -> GroupGuard {
-        GroupGuard { inner: Arc::clone(&self.inner) }
+        GroupGuard {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// The current messages, ready to send to the model in chronological order:
@@ -933,7 +935,9 @@ fn schedule_compaction(inner: &Arc<MemoryInner>) {
     let task_inner = Arc::clone(inner);
     inner.deps.pool.submit(Box::new(move || {
         compute_compact_chunk(&task_inner);
-        task_inner.compaction_in_flight.store(false, Ordering::Release);
+        task_inner
+            .compaction_in_flight
+            .store(false, Ordering::Release);
     }));
 }
 

@@ -62,6 +62,10 @@ impl CapabilityInvoker for Registry {
         let Some(backend) = &self.backend else {
             return Err(CapabilityError::NotFound);
         };
-        backend.invoke(capability_name, input_json, &context.to_capability_context())
+        backend.invoke(
+            capability_name,
+            input_json,
+            &context.to_capability_context(),
+        )
     }
 }

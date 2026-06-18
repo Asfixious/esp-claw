@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 
 mod common;
 use common::{
-    agent_builder, capturing_llm, failing_llm, run_to_completion, scripted_llm as common_scripted_llm,
-    test_memory, test_output_dir, test_pool, EchoTool,
+    agent_builder, capturing_llm, failing_llm, run_to_completion,
+    scripted_llm as common_scripted_llm, test_memory, test_output_dir, test_pool, EchoTool,
 };
 
 // ---------------------------------------------------------------------------

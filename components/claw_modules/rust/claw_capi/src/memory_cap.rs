@@ -126,11 +126,41 @@ const fn descriptor(
 }
 
 static DESCRIPTORS: DescriptorsSync = DescriptorsSync([
-    descriptor(STORE_ID, STORE_FAMILY, STORE_DESC, STORE_SCHEMA, cap_memory_store_execute),
-    descriptor(RECALL_ID, STORE_FAMILY, RECALL_DESC, RECALL_SCHEMA, cap_memory_recall_execute),
-    descriptor(LIST_ID, STORE_FAMILY, LIST_DESC, LIST_SCHEMA, cap_memory_list_execute),
-    descriptor(UPDATE_ID, STORE_FAMILY, UPDATE_DESC, UPDATE_SCHEMA, cap_memory_update_execute),
-    descriptor(FORGET_ID, STORE_FAMILY, FORGET_DESC, FORGET_SCHEMA, cap_memory_forget_execute),
+    descriptor(
+        STORE_ID,
+        STORE_FAMILY,
+        STORE_DESC,
+        STORE_SCHEMA,
+        cap_memory_store_execute,
+    ),
+    descriptor(
+        RECALL_ID,
+        STORE_FAMILY,
+        RECALL_DESC,
+        RECALL_SCHEMA,
+        cap_memory_recall_execute,
+    ),
+    descriptor(
+        LIST_ID,
+        STORE_FAMILY,
+        LIST_DESC,
+        LIST_SCHEMA,
+        cap_memory_list_execute,
+    ),
+    descriptor(
+        UPDATE_ID,
+        STORE_FAMILY,
+        UPDATE_DESC,
+        UPDATE_SCHEMA,
+        cap_memory_update_execute,
+    ),
+    descriptor(
+        FORGET_ID,
+        STORE_FAMILY,
+        FORGET_DESC,
+        FORGET_SCHEMA,
+        cap_memory_forget_execute,
+    ),
 ]);
 
 static GROUP: GroupSync = GroupSync(claw_cap_group_t {

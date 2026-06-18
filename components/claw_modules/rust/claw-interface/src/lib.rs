@@ -9,13 +9,13 @@
 pub mod fs;
 pub mod http;
 
-pub use fs::{ClawFs, FsError};
 #[cfg(feature = "diskfs")]
 pub use fs::DiskFs;
 #[cfg(feature = "memfs")]
 pub use fs::MemFs;
-pub use http::{ClawHttp, HttpError, HttpHeader, HttpJsonRequest, HttpResponse};
-#[cfg(feature = "httpmock")]
-pub use http::{CapturingHttp, FailingHttp, NeverHttp, NoopHttp, ScriptStep, ScriptedHttp};
+pub use fs::{ClawFs, FsError};
 #[cfg(feature = "realhttp")]
 pub use http::RealHttp;
+#[cfg(feature = "httpmock")]
+pub use http::{CapturingHttp, FailingHttp, NeverHttp, NoopHttp, ScriptStep, ScriptedHttp};
+pub use http::{ClawHttp, HttpError, HttpHeader, HttpJsonRequest, HttpResponse};

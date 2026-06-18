@@ -126,29 +126,54 @@ mod tests {
     fn join_composes_and_validates() {
         let _g = GUARD.lock().unwrap();
         unsafe {
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, CString::new("/fatfs").unwrap().as_ptr()), ESP_OK);
+            assert_eq!(
+                claw_paths_set(CLAW_PATH_DATA, CString::new("/fatfs").unwrap().as_ptr()),
+                ESP_OK
+            );
 
             let mut out = [0u8; 64];
             let sub = CString::new("skills/foo").unwrap();
             assert_eq!(
-                claw_paths_join(CLAW_PATH_DATA, sub.as_ptr(), out.as_mut_ptr() as *mut c_char, out.len()),
+                claw_paths_join(
+                    CLAW_PATH_DATA,
+                    sub.as_ptr(),
+                    out.as_mut_ptr() as *mut c_char,
+                    out.len()
+                ),
                 ESP_OK
             );
-            let s = core::ffi::CStr::from_ptr(out.as_ptr() as *const c_char).to_str().unwrap();
+            let s = core::ffi::CStr::from_ptr(out.as_ptr() as *const c_char)
+                .to_str()
+                .unwrap();
             assert_eq!(s, "/fatfs/skills/foo");
 
             // NULL subpath -> just the base
             let mut out2 = [0u8; 64];
             assert_eq!(
-                claw_paths_join(CLAW_PATH_DATA, ptr::null(), out2.as_mut_ptr() as *mut c_char, out2.len()),
+                claw_paths_join(
+                    CLAW_PATH_DATA,
+                    ptr::null(),
+                    out2.as_mut_ptr() as *mut c_char,
+                    out2.len()
+                ),
                 ESP_OK
             );
-            assert_eq!(core::ffi::CStr::from_ptr(out2.as_ptr() as *const c_char).to_str().unwrap(), "/fatfs");
+            assert_eq!(
+                core::ffi::CStr::from_ptr(out2.as_ptr() as *const c_char)
+                    .to_str()
+                    .unwrap(),
+                "/fatfs"
+            );
 
             // too small buffer -> INVALID_SIZE
             let mut tiny = [0u8; 4];
             assert_eq!(
-                claw_paths_join(CLAW_PATH_DATA, sub.as_ptr(), tiny.as_mut_ptr() as *mut c_char, tiny.len()),
+                claw_paths_join(
+                    CLAW_PATH_DATA,
+                    sub.as_ptr(),
+                    tiny.as_mut_ptr() as *mut c_char,
+                    tiny.len()
+                ),
                 ESP_ERR_INVALID_SIZE
             );
         }
@@ -174,11 +199,23 @@ mod tests {
     fn set_rejects_bad_args() {
         let _g = GUARD.lock().unwrap();
         unsafe {
-            assert_eq!(claw_paths_set(99, CString::new("/x").unwrap().as_ptr()), ESP_ERR_INVALID_ARG);
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, ptr::null()), ESP_ERR_INVALID_ARG);
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, CString::new("").unwrap().as_ptr()), ESP_ERR_INVALID_ARG);
+            assert_eq!(
+                claw_paths_set(99, CString::new("/x").unwrap().as_ptr()),
+                ESP_ERR_INVALID_ARG
+            );
+            assert_eq!(
+                claw_paths_set(CLAW_PATH_DATA, ptr::null()),
+                ESP_ERR_INVALID_ARG
+            );
+            assert_eq!(
+                claw_paths_set(CLAW_PATH_DATA, CString::new("").unwrap().as_ptr()),
+                ESP_ERR_INVALID_ARG
+            );
             let too_long = CString::new("/".repeat(40)).unwrap();
-            assert_eq!(claw_paths_set(CLAW_PATH_DATA, too_long.as_ptr()), ESP_ERR_INVALID_SIZE);
+            assert_eq!(
+                claw_paths_set(CLAW_PATH_DATA, too_long.as_ptr()),
+                ESP_ERR_INVALID_SIZE
+            );
         }
     }
 }

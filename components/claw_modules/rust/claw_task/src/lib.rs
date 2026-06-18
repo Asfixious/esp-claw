@@ -29,15 +29,33 @@ mod tests {
 
     #[test]
     fn caps_internal_when_no_psram() {
-        assert_eq!(memory_caps(CLAW_TASK_STACK_INTERNAL_ONLY, false), MALLOC_CAP_INTERNAL);
-        assert_eq!(memory_caps(CLAW_TASK_STACK_PREFER_PSRAM, false), MALLOC_CAP_INTERNAL);
-        assert_eq!(memory_caps(CLAW_TASK_STACK_PSRAM_ONLY, false), MALLOC_CAP_INTERNAL);
+        assert_eq!(
+            memory_caps(CLAW_TASK_STACK_INTERNAL_ONLY, false),
+            MALLOC_CAP_INTERNAL
+        );
+        assert_eq!(
+            memory_caps(CLAW_TASK_STACK_PREFER_PSRAM, false),
+            MALLOC_CAP_INTERNAL
+        );
+        assert_eq!(
+            memory_caps(CLAW_TASK_STACK_PSRAM_ONLY, false),
+            MALLOC_CAP_INTERNAL
+        );
     }
 
     #[test]
     fn caps_psram_when_available_and_permitted() {
-        assert_eq!(memory_caps(CLAW_TASK_STACK_INTERNAL_ONLY, true), MALLOC_CAP_INTERNAL);
-        assert_eq!(memory_caps(CLAW_TASK_STACK_PREFER_PSRAM, true), MALLOC_CAP_SPIRAM);
-        assert_eq!(memory_caps(CLAW_TASK_STACK_PSRAM_ONLY, true), MALLOC_CAP_SPIRAM);
+        assert_eq!(
+            memory_caps(CLAW_TASK_STACK_INTERNAL_ONLY, true),
+            MALLOC_CAP_INTERNAL
+        );
+        assert_eq!(
+            memory_caps(CLAW_TASK_STACK_PREFER_PSRAM, true),
+            MALLOC_CAP_SPIRAM
+        );
+        assert_eq!(
+            memory_caps(CLAW_TASK_STACK_PSRAM_ONLY, true),
+            MALLOC_CAP_SPIRAM
+        );
     }
 }

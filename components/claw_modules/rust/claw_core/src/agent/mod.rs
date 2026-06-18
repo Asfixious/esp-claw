@@ -24,7 +24,7 @@ pub use base_agent::{
     TickOutcome,
 };
 pub use conversation_agent::{
-    ConversationAgent, ConversationAgentBuildError, ConversationAgentBuilder, ConvPhase,
+    ConvPhase, ConversationAgent, ConversationAgentBuildError, ConversationAgentBuilder,
 };
 pub use worker_agent::{WorkerAgent, WorkerAgentBuildError, WorkerAgentBuilder};
 

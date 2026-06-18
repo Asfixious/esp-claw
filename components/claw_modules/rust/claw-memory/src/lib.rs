@@ -96,9 +96,9 @@ pub mod conversation_memory;
 pub mod llm_compactor;
 pub mod pool;
 
-pub use compaction::{CompactError, Compactor};
 #[cfg(feature = "compactor-stub")]
 pub use compaction::NoopCompactor;
+pub use compaction::{CompactError, Compactor};
 pub use conversation_memory::{
     ConversationConfig, ConversationDeps, ConversationMemory, GroupGuard,
 };

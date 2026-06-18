@@ -128,7 +128,9 @@ mod memfs {
         }
 
         fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<u8>>> {
-            self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            self.files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
     }
 

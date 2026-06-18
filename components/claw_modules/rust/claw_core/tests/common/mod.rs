@@ -261,11 +261,8 @@ fn skills_data_dir() -> PathBuf {
 /// A skill registry scanned over the `tests/data/skills` fixtures.
 pub fn skill_registry() -> Arc<dyn SkillRegistry> {
     Arc::new(
-        FsSkillRegistry::scan(
-            Arc::new(DiskFs::rooted(skills_data_dir())),
-            "skills",
-        )
-        .expect("scan skills fixtures"),
+        FsSkillRegistry::scan(Arc::new(DiskFs::rooted(skills_data_dir())), "skills")
+            .expect("scan skills fixtures"),
     )
 }
 

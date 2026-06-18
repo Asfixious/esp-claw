@@ -6,13 +6,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::SessionError;
-use claw_core::{
-    ChannelEgressHub, DeliverError, InboundMessage, Orchestrator, SessionId,
-};
+use claw_core::{ChannelEgressHub, DeliverError, InboundMessage, Orchestrator, SessionId};
+use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_platform::{
     esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_OK,
 };
-use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 
 struct OrchestratorState {
     orchestrator: Mutex<Orchestrator>,
@@ -164,9 +162,7 @@ pub extern "C" fn claw_orchestrator_push_user_message(
 
     with_orchestrator_mut(|orch| {
         let inbound = InboundMessage {
-            message_id: cstr_input(msg.message_id)
-                .unwrap_or("msg")
-                .to_string(),
+            message_id: cstr_input(msg.message_id).unwrap_or("msg").to_string(),
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             sender_id: cstr_input(msg.sender_id).map(str::to_string),

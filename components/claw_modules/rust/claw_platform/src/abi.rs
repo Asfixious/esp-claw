@@ -11,7 +11,7 @@
 
 use core::ffi::c_void;
 
-pub use libc::{dirent, mode_t, off_t, ssize_t, stat, time_t, timespec, utimbuf, DIR, FILE, ino_t};
+pub use libc::{dirent, ino_t, mode_t, off_t, ssize_t, stat, time_t, timespec, utimbuf, DIR, FILE};
 
 /// `_lock_t` is `struct __lock *` on ESP-IDF (retargetable locking enabled).
 /// Not exposed by `libc`, so define it here as an opaque pointer.

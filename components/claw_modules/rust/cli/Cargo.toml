@@ -3,6 +3,7 @@ name = "claw-agent-cli"
 authors = ["Finn(Ziheng) Sheng"]
 version = "0.1.0"
 edition = "2021"
+description = "Host CLIs that drive the claw agents (BaseAgent, ConversationAgent) against a live LLM with on-disk memory for off-device manual testing"
 
 [lib]
 name = "claw_agent_cli"
@@ -10,11 +11,11 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "base-agent"
-path = "src/main.rs"
+path = "src/base_agent_cli.rs"
 
 [[bin]]
 name = "conversation-agent-chat"
-path = "src/conversation_agent_chat.rs"
+path = "src/conversation_agent_cli.rs"
 
 [dependencies]
 claw_core = { path = "../claw_core" }

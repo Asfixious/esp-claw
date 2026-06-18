@@ -17,8 +17,10 @@ use claw_core::agent::{Agent, AgentCommand, AgentId, ConvPhase, ConversationAgen
 use owo_colors::{AnsiColors, OwoColorize};
 use serde_json::Value;
 
-const MEMORY_DIR: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../claw_core/output/conversation-chat");
+const MEMORY_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../claw_core/output/conversation-chat"
+);
 const SYSTEM_PROMPT: &str = "You are a helpful, concise assistant.";
 const AGENT_ID: usize = 1;
 

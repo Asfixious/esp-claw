@@ -5,22 +5,20 @@
 //! the crate root so that transcript files can be inspected after a run.
 //! The live test talks to a real LLM and verifies multi-turn memory continuity.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, CancelReason, TickOutcome};
-use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
-use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-use claw_interfaces::DiskFs;
-use claw_memory::{
-    CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
-    MemoryTaskPool, PoolConfig,
-};
+use claw_core::agent::{AgentId, BaseAgent, CancelReason, TickOutcome};
+use claw_core::{Tool, ToolGroup, ToolSet};
+use claw_interfaces::RealHttp;
 use serde_json::{json, Value};
+
+mod common;
+use common::{
+    agent_builder, capturing_llm, failing_llm, run_to_completion, scripted_llm as common_scripted_llm,
+    test_memory, test_output_dir, test_pool, EchoTool,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers: env / live API
@@ -69,26 +67,13 @@ fn local_model() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: output directory
-// ---------------------------------------------------------------------------
-
-/// Returns `<crate>/output/<name>/`, wiped clean and recreated on every call.
-fn test_output_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("output")
-        .join(name);
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).expect("create output dir");
-    dir
-}
-
-// Memory uses the shared `DiskFs::absolute()` from claw_interfaces (the `diskfs`
-// dev-dependency feature), writing to `output/<test_name>/` so transcript files
-// can be inspected after a run.
-
-// ---------------------------------------------------------------------------
 // Helpers: HTTP stubs
 // ---------------------------------------------------------------------------
+//
+// Body constants and the strict HTTP doubles / LLM builders / agent + memory
+// helpers (`scripted_llm`, `capturing_llm`, `failing_llm`, `agent_builder`,
+// `test_memory`, `run_to_completion`, `EchoTool`, …) are shared from `common`.
+// The live transport is `RealHttp` (the `realhttp` feature).
 
 const PLAIN_TEXT_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
 
@@ -96,196 +81,10 @@ const TOOL_CALL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","tool
 
 const END_CONVERSATION_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"e1","function":{"name":"end_conversation","arguments":"{\"final_message\":\"all done\"}"}}]}}]}"#;
 
-struct ScriptedHttp {
-    bodies: Mutex<VecDeque<String>>,
-}
-
-impl ClawHttp for ScriptedHttp {
-    fn post_json(
-        &self,
-        _request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        let body = self
-            .bodies
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pop_front()
-            .expect("ScriptedHttp: no more canned responses — test called the LLM more times than expected");
-        Ok(HttpResponse {
-            status_code: 200,
-            body,
-        })
-    }
-}
-
-/// Scripted HTTP that also records every request body so tests can inspect
-/// what context the agent actually sent to the LLM.
-struct CapturingHttp {
-    bodies: Mutex<VecDeque<String>>,
-    captured: Mutex<Vec<String>>,
-}
-
-impl CapturingHttp {
-    fn new(bodies: Vec<&str>) -> Arc<Self> {
-        Arc::new(Self {
-            bodies: Mutex::new(bodies.into_iter().map(str::to_string).collect()),
-            captured: Mutex::new(Vec::new()),
-        })
-    }
-
-    fn captured_bodies(&self) -> Vec<Value> {
-        self.captured
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|s| serde_json::from_str(s).unwrap_or(Value::Null))
-            .collect()
-    }
-}
-
-impl ClawHttp for CapturingHttp {
-    fn post_json(
-        &self,
-        request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        self.captured
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(request.body.to_string());
-        let body = self
-            .bodies
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pop_front()
-            .unwrap_or_else(|| PLAIN_TEXT_BODY.into());
-        Ok(HttpResponse {
-            status_code: 200,
-            body,
-        })
-    }
-}
-
-struct FailingHttp;
-
-impl ClawHttp for FailingHttp {
-    fn post_json(
-        &self,
-        _request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        Err(HttpError::RequestFailed("simulated failure".into()))
-    }
-}
-
-struct LiveHttp;
-
-impl ClawHttp for LiveHttp {
-    fn post_json(
-        &self,
-        request: &HttpJsonRequest,
-        abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        if abort.load(Ordering::Acquire) {
-            return Err(HttpError::Aborted);
-        }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(request.timeout_ms as u64))
-            .build()
-            .map_err(|_| HttpError::ClientInitFailed)?;
-
-        let mut builder = client
-            .post(request.url)
-            .header("Content-Type", "application/json")
-            .body(request.body.to_string());
-
-        if let Some(api_key) = request.api_key.filter(|v| !v.is_empty()) {
-            builder = builder.header("Authorization", format!("Bearer {api_key}"));
-        }
-        for header in request.headers {
-            builder = builder.header(header.name, header.value);
-        }
-
-        let response = builder
-            .send()
-            .map_err(|err| HttpError::RequestFailed(err.to_string()))?;
-        let status_code = response.status().as_u16() as i32;
-        let body = response
-            .text()
-            .map_err(|err| HttpError::RequestFailed(err.to_string()))?;
-
-        if status_code != 200 {
-            return Err(HttpError::UnexpectedStatus(format!(
-                "HTTP {status_code}: {body}"
-            )));
-        }
-        Ok(HttpResponse { status_code, body })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers: memory stubs
-// ---------------------------------------------------------------------------
-
-/// Skips compaction entirely.
-struct StubCompactor;
-
-impl Compactor for StubCompactor {
-    fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
-        Ok(Vec::new())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers: tools
-// ---------------------------------------------------------------------------
-
-struct EchoTool;
-
-impl ToolHandler for EchoTool {
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn schema(&self) -> &'static str {
-        r#"{"type":"function","function":{"name":"echo","description":"Echo the arguments back"}}"#
-    }
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput {
-            output: format!("echo:{}", call.arguments_json),
-            ok: true,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers: agent / LLM builders
-// ---------------------------------------------------------------------------
-
-fn test_pool() -> Arc<MemoryTaskPool> {
-    Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("pool"))
-}
-
+/// Tool-capable strict scripted LLM over `&str` bodies (thin wrapper over the
+/// shared [`common::scripted_llm`], which takes owned `String`s).
 fn scripted_llm(bodies: Vec<&str>) -> ClawApi {
-    let http = Arc::new(ScriptedHttp {
-        bodies: Mutex::new(bodies.into_iter().map(str::to_string).collect()),
-    });
-    make_llm(http)
-}
-
-fn make_llm(http: Arc<dyn ClawHttp>) -> ClawApi {
-    ClawApi::init(
-        ClawApiConfig {
-            api_key: Some("sk-test".into()),
-            backend_type: "openai_compatible".into(),
-            model: Some("gpt-test".into()),
-            base_url: Some("https://example.invalid".into()),
-            supports_tools: true,
-            ..Default::default()
-        },
-        http,
-    )
-    .expect("llm")
+    common_scripted_llm(bodies.into_iter().map(String::from).collect())
 }
 
 fn live_llm() -> ClawApi {
@@ -300,44 +99,9 @@ fn live_llm() -> ClawApi {
             timeout_ms: 60_000,
             ..Default::default()
         },
-        Arc::new(LiveHttp),
+        Arc::new(RealHttp::new()),
     )
     .expect("live llm")
-}
-
-fn test_memory(
-    agent_id: AgentId,
-    dir: impl Into<String>,
-    pool: Arc<MemoryTaskPool>,
-) -> ConversationMemory {
-    ConversationMemory::new(
-        agent_id.0,
-        ConversationConfig::new(dir),
-        ConversationDeps {
-            fs: Arc::new(DiskFs::absolute()),
-            pool,
-            compactor: Arc::new(StubCompactor),
-        },
-    )
-}
-
-/// Builder over a fresh memory pool — the common single-agent test path.
-fn agent_builder(llm: ClawApi, agent_id: AgentId, dir: impl Into<String>) -> BaseAgentBuilder {
-    BaseAgent::builder(llm, test_memory(agent_id, dir, test_pool()))
-}
-
-/// Pump until the task hands back an answer (Yielded) or ends (Ended), returning
-/// that text.
-fn run_to_completion(agent: &mut BaseAgent) -> String {
-    loop {
-        match agent.tick() {
-            TickOutcome::Working => continue,
-            TickOutcome::Yielded { text } => return text,
-            TickOutcome::Ended { final_message } => return final_message,
-            TickOutcome::Failed(error) => panic!("unexpected agent error: {error}"),
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +281,7 @@ fn append_after_end_starts_fresh_task() {
 #[test]
 fn failed_http_reports_failed_and_goes_idle() {
     let dir = test_output_dir("failed_http_reports_failed_and_goes_idle");
-    let llm = make_llm(Arc::new(FailingHttp));
+    let llm = failing_llm();
     let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
         .build()
         .expect("build");
@@ -607,28 +371,20 @@ fn second_turn_includes_first_turn_context() {
 
     // Turn 1: complete a turn so the user + assistant messages are committed.
     {
-        let http = CapturingHttp::new(vec![PLAIN_TEXT_BODY]);
-        let mut agent = agent_builder(
-            make_llm(Arc::clone(&http) as Arc<dyn ClawHttp>),
-            AgentId(1),
-            dir.display().to_string(),
-        )
-        .build()
-        .expect("build");
+        let (llm, _http) = capturing_llm(vec![PLAIN_TEXT_BODY.into()]);
+        let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
+            .build()
+            .expect("build");
         agent.run("my secret word is BANANA");
         run_to_completion(&mut agent);
     }
 
     // Turn 2: new agent instance, same agent_id and dir → loads persisted transcript.
-    let http2 = CapturingHttp::new(vec![PLAIN_TEXT_BODY]);
+    let (llm, http2) = capturing_llm(vec![PLAIN_TEXT_BODY.into()]);
     {
-        let mut agent = agent_builder(
-            make_llm(Arc::clone(&http2) as Arc<dyn ClawHttp>),
-            AgentId(1),
-            dir.display().to_string(),
-        )
-        .build()
-        .expect("build");
+        let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
+            .build()
+            .expect("build");
         agent.run("what was my secret word?");
         run_to_completion(&mut agent);
     }

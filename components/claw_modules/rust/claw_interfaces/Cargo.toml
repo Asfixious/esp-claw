@@ -16,10 +16,15 @@ crate-type = ["rlib"]
 # - `memfs`:        in-memory test double (no extra deps).
 # - `diskfs`:       `std::fs` backend for host CLIs and disk-backed tests.
 # - `diskfs-pretty`: pretty-print `.json` writes via serde_json (implies diskfs).
+# - `httpmock`:     scripted / failing / never-called ClawHttp test doubles.
+# - `realhttp`:     blocking reqwest ClawHttp backend for host CLIs / live tests.
 memfs = []
 diskfs = []
 diskfs-pretty = ["diskfs", "dep:serde_json"]
+httpmock = ["dep:serde_json"]
+realhttp = ["dep:reqwest"]
 
 [dependencies]
 thiserror = "2"
 serde_json = { version = "1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }

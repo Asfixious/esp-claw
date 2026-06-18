@@ -9,68 +9,18 @@
 //! tests use): `CLAW_LLM_API_KEY`, `CLAW_LLM_BASE_URL`, `CLAW_LLM_MODEL`.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-use claw_interfaces::DiskFs;
+use claw_interfaces::{DiskFs, RealHttp};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
 };
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// ClawHttp: real network via reqwest blocking
-// ---------------------------------------------------------------------------
-
-/// A [`ClawHttp`] backed by a blocking `reqwest` client.
-pub struct LiveHttp;
-
-impl ClawHttp for LiveHttp {
-    fn post_json(
-        &self,
-        request: &HttpJsonRequest,
-        abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        if abort.load(Ordering::Acquire) {
-            return Err(HttpError::Aborted);
-        }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(u64::from(request.timeout_ms)))
-            .build()
-            .map_err(|_| HttpError::ClientInitFailed)?;
-
-        let mut builder = client
-            .post(request.url)
-            .header("Content-Type", "application/json")
-            .body(request.body.to_string());
-
-        if let Some(key) = request.api_key.filter(|v| !v.is_empty()) {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
-        }
-        for header in request.headers {
-            builder = builder.header(header.name, header.value);
-        }
-
-        let response = builder
-            .send()
-            .map_err(|err| HttpError::RequestFailed(err.to_string()))?;
-        let status_code = i32::from(response.status().as_u16());
-        let body = response
-            .text()
-            .map_err(|err| HttpError::RequestFailed(err.to_string()))?;
-
-        if status_code != 200 {
-            return Err(HttpError::UnexpectedStatus(format!(
-                "HTTP {status_code}: {body}"
-            )));
-        }
-        Ok(HttpResponse { status_code, body })
-    }
-}
+// The real network transport is `claw_interfaces::RealHttp` (the `realhttp`
+// feature).
 
 // ---------------------------------------------------------------------------
 // Compactor: stub (no background summarisation)
@@ -130,7 +80,7 @@ pub fn make_llm(supports_tools: bool) -> ClawApi {
             timeout_ms: 60_000,
             ..Default::default()
         },
-        Arc::new(LiveHttp),
+        Arc::new(RealHttp::new()),
     )
     .expect("failed to init LLM client")
 }

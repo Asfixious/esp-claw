@@ -1438,13 +1438,10 @@ mod transition_tests {
 mod gating_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-    use std::collections::VecDeque;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-    use claw_interfaces::MemFs;
+    use claw_interfaces::{CapturingHttp, ClawHttp, MemFs, ScriptedHttp};
     use claw_memory::{
         CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
         MemoryTaskPool, PoolConfig,
@@ -1456,87 +1453,8 @@ mod gating_tests {
         AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
     };
 
-    // HTTP doubles (strict: panic if called more than scripted) -----------------
-
-    /// Serves scripted LLM bodies in order.
-    struct ScriptedHttp {
-        steps: Mutex<VecDeque<String>>,
-    }
-
-    impl ScriptedHttp {
-        fn new(bodies: Vec<String>) -> Self {
-            Self {
-                steps: Mutex::new(bodies.into_iter().collect()),
-            }
-        }
-    }
-
-    impl ClawHttp for ScriptedHttp {
-        fn post_json(
-            &self,
-            _request: &HttpJsonRequest,
-            _abort: &AtomicBool,
-        ) -> Result<HttpResponse, HttpError> {
-            let body = self
-                .steps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop_front()
-                .expect("ScriptedHttp: LLM called more times than scripted");
-            Ok(HttpResponse {
-                status_code: 200,
-                body,
-            })
-        }
-    }
-
-    /// Like [`ScriptedHttp`] but records each request body so a test can inspect
-    /// what the agent actually sent to the model.
-    struct CapturingHttp {
-        steps: Mutex<VecDeque<String>>,
-        captured: Mutex<Vec<String>>,
-    }
-
-    impl CapturingHttp {
-        fn new(bodies: Vec<String>) -> Arc<Self> {
-            Arc::new(Self {
-                steps: Mutex::new(bodies.into_iter().collect()),
-                captured: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn captured_bodies(&self) -> Vec<Value> {
-            self.captured
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .map(|s| serde_json::from_str(s).unwrap_or(Value::Null))
-                .collect()
-        }
-    }
-
-    impl ClawHttp for CapturingHttp {
-        fn post_json(
-            &self,
-            request: &HttpJsonRequest,
-            _abort: &AtomicBool,
-        ) -> Result<HttpResponse, HttpError> {
-            self.captured
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(request.body.to_string());
-            let body = self
-                .steps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop_front()
-                .expect("CapturingHttp: LLM called more times than scripted");
-            Ok(HttpResponse {
-                status_code: 200,
-                body,
-            })
-        }
-    }
+    // HTTP doubles (ScriptedHttp / CapturingHttp) come from claw_interfaces via
+    // the `httpmock` dev-dependency feature.
 
     // Stub compactor (hermetic conversation memory) -----------------------------
 

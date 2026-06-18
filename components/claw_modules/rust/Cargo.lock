@@ -64,7 +64,6 @@ dependencies = [
  "claw_interfaces",
  "dotenvy",
  "owo-colors",
- "reqwest",
  "serde_json",
 ]
 
@@ -74,7 +73,6 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "claw_interfaces",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -136,7 +134,6 @@ dependencies = [
  "claw_interfaces",
  "dotenvy",
  "log",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -146,6 +143,7 @@ dependencies = [
 name = "claw_interfaces"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "serde_json",
  "thiserror",
 ]

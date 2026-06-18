@@ -13,8 +13,8 @@
 use std::io::{self, BufRead, Write};
 
 use claw_agent_cli::{load_env, make_llm, make_memory};
-use claw_core::agent::{Agent, AgentCommand, AgentId, ConversationAgent, TickOutcome};
-use owo_colors::OwoColorize;
+use claw_core::agent::{Agent, AgentCommand, AgentId, ConvPhase, ConversationAgent, TickOutcome};
+use owo_colors::{AnsiColors, OwoColorize};
 use serde_json::Value;
 
 const MEMORY_DIR: &str =
@@ -99,10 +99,24 @@ fn main() {
         }
 
         print_tool_calls_since(&memory_view.messages(), turn_start);
+        println!("{}", stage_label(agent.phase()));
         println!();
     }
 
     eprintln!("Goodbye.");
+}
+
+/// A colored `[stage: X]` label for the agent's current FSM stage. Each stage
+/// gets its own color so progression is easy to track at a glance.
+fn stage_label(phase: ConvPhase) -> String {
+    let color = match phase {
+        ConvPhase::Intake => AnsiColors::Blue,
+        ConvPhase::Verify => AnsiColors::Yellow,
+        ConvPhase::Delegate => AnsiColors::Magenta,
+        ConvPhase::Watch => AnsiColors::Cyan,
+        ConvPhase::Report => AnsiColors::Green,
+    };
+    format!("[stage: {phase}]").color(color).to_string()
 }
 
 /// Number of messages currently in the transcript.

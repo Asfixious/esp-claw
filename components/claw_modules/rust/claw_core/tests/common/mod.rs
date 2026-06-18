@@ -8,10 +8,8 @@
 #![allow(dead_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, TickOutcome};
@@ -19,8 +17,9 @@ use claw_core::{
     FsSkillRegistry, SkillId, SkillRegistry, SkillSet, ToolError, ToolHandler, ToolInvocation,
     ToolOutput,
 };
-use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-use claw_interfaces::DiskFs;
+use claw_interfaces::{
+    CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp,
+};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -80,132 +79,8 @@ pub fn body_echo_call(input: &str) -> String {
 // HTTP doubles — all strict (panic on an unscripted call)
 // ===========================================================================
 
-/// One scripted LLM round: a 200 body, or a transport error.
-type ScriptStep = Result<String, String>;
-
-/// Serves scripted responses in order; panics if the agent calls more often than
-/// scripted, so an unexpected LLM round is caught.
-pub struct ScriptedHttp {
-    steps: Mutex<VecDeque<ScriptStep>>,
-}
-
-impl ScriptedHttp {
-    pub fn new(steps: Vec<ScriptStep>) -> Self {
-        Self {
-            steps: Mutex::new(steps.into_iter().collect()),
-        }
-    }
-
-    fn next_step(&self) -> ScriptStep {
-        self.steps
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pop_front()
-            .expect("ScriptedHttp: agent called the LLM more times than scripted")
-    }
-}
-
-impl ClawHttp for ScriptedHttp {
-    fn post_json(
-        &self,
-        _request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        match self.next_step() {
-            Ok(body) => Ok(HttpResponse {
-                status_code: 200,
-                body,
-            }),
-            Err(message) => Err(HttpError::RequestFailed(message)),
-        }
-    }
-}
-
-/// Like [`ScriptedHttp`] but also records every request body so tests can assert
-/// on the context the agent sent to the model.
-pub struct CapturingHttp {
-    steps: Mutex<VecDeque<ScriptStep>>,
-    captured: Mutex<Vec<String>>,
-}
-
-impl CapturingHttp {
-    pub fn new(bodies: Vec<String>) -> Arc<Self> {
-        Arc::new(Self {
-            steps: Mutex::new(bodies.into_iter().map(Ok).collect()),
-            captured: Mutex::new(Vec::new()),
-        })
-    }
-
-    /// Every request body the agent sent, parsed as JSON, in call order.
-    pub fn captured_bodies(&self) -> Vec<Value> {
-        self.captured
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|s| serde_json::from_str(s).unwrap_or(Value::Null))
-            .collect()
-    }
-
-    /// Number of LLM calls the agent has made so far.
-    pub fn call_count(&self) -> usize {
-        self.captured
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .len()
-    }
-}
-
-impl ClawHttp for CapturingHttp {
-    fn post_json(
-        &self,
-        request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        self.captured
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(request.body.to_string());
-        let step = self
-            .steps
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pop_front()
-            .expect("CapturingHttp: agent called the LLM more times than scripted");
-        match step {
-            Ok(body) => Ok(HttpResponse {
-                status_code: 200,
-                body,
-            }),
-            Err(message) => Err(HttpError::RequestFailed(message)),
-        }
-    }
-}
-
-/// Always fails the LLM round.
-pub struct FailingHttp;
-
-impl ClawHttp for FailingHttp {
-    fn post_json(
-        &self,
-        _request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        Err(HttpError::RequestFailed("simulated failure".into()))
-    }
-}
-
-/// Panics if called — for tests that must never reach the LLM (e.g. build errors).
-pub struct NeverHttp;
-
-impl ClawHttp for NeverHttp {
-    fn post_json(
-        &self,
-        _request: &HttpJsonRequest,
-        _abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        panic!("NeverHttp: the LLM must not be called in this test");
-    }
-}
+// `ScriptedHttp` / `CapturingHttp` / `FailingHttp` / `NeverHttp` and the
+// `ScriptStep` alias come from claw_interfaces via the `httpmock` feature.
 
 // ===========================================================================
 // LLM builders
@@ -228,15 +103,12 @@ fn build_llm(http: Arc<dyn ClawHttp>, supports_tools: bool) -> ClawApi {
 
 /// Tool-capable LLM serving the given plain bodies in order (strict).
 pub fn scripted_llm(bodies: Vec<String>) -> ClawApi {
-    build_llm(
-        Arc::new(ScriptedHttp::new(bodies.into_iter().map(Ok).collect())),
-        true,
-    )
+    build_llm(Arc::new(ScriptedHttp::new(bodies)), true)
 }
 
 /// Tool-capable LLM whose rounds may be successes or transport errors (strict).
 pub fn scripted_llm_steps(steps: Vec<ScriptStep>) -> ClawApi {
-    build_llm(Arc::new(ScriptedHttp::new(steps)), true)
+    build_llm(Arc::new(ScriptedHttp::with_steps(steps)), true)
 }
 
 /// Tool-capable LLM that records requests; returns the API plus the capture handle.
@@ -253,10 +125,7 @@ pub fn failing_llm() -> ClawApi {
 
 /// LLM that does NOT support tools, serving the given plain bodies (strict).
 pub fn scripted_llm_no_tools(bodies: Vec<String>) -> ClawApi {
-    build_llm(
-        Arc::new(ScriptedHttp::new(bodies.into_iter().map(Ok).collect())),
-        false,
-    )
+    build_llm(Arc::new(ScriptedHttp::new(bodies)), false)
 }
 
 /// Tool-capable LLM that must never be called (panics if it is).

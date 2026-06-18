@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use claw_api::{ClawApi, ClawApiConfig, RetryPolicy};
 use claw_core::iteration_loop::{
@@ -16,6 +15,7 @@ use claw_core::{
     IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
 };
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+use claw_interfaces::RealHttp;
 use serde_json::{json, Value};
 
 const PLAIN_TEXT_BODY: &str =
@@ -65,62 +65,8 @@ fn local_model() -> String {
     std::env::var("CLAW_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into())
 }
 
-/// Host-only HTTP client for optional live LLM tests (reads API key from `.env.local`).
-struct LiveHttp;
-
-impl ClawHttp for LiveHttp {
-    fn post_json(
-        &self,
-        request: &HttpJsonRequest,
-        abort: &AtomicBool,
-    ) -> Result<HttpResponse, HttpError> {
-        if abort.load(Ordering::Acquire) {
-            return Err(HttpError::Aborted);
-        }
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(request.timeout_ms as u64))
-            .build()
-            .map_err(|_| HttpError::ClientInitFailed)?;
-
-        let mut builder = client
-            .post(request.url)
-            .header("Content-Type", "application/json")
-            .body(request.body.to_string());
-
-        if let Some(api_key) = request.api_key.filter(|value| !value.is_empty()) {
-            match request.auth_type.unwrap_or("bearer") {
-                "api-key" => {
-                    builder = builder.header("api-key", api_key);
-                }
-                "none" => {}
-                _ => {
-                    builder = builder.header("Authorization", format!("Bearer {api_key}"));
-                }
-            }
-        }
-
-        for header in request.headers {
-            builder = builder.header(header.name, header.value);
-        }
-
-        let response = builder
-            .send()
-            .map_err(|error| HttpError::RequestFailed(error.to_string()))?;
-        let status_code = response.status().as_u16() as i32;
-        let body = response
-            .text()
-            .map_err(|error| HttpError::RequestFailed(error.to_string()))?;
-
-        if status_code != 200 {
-            return Err(HttpError::UnexpectedStatus(format!(
-                "HTTP {status_code}: {body}"
-            )));
-        }
-
-        Ok(HttpResponse { status_code, body })
-    }
-}
+// The live transport for optional LLM tests is `claw_interfaces::RealHttp` (the
+// `realhttp` feature).
 
 struct ScriptedHttp {
     bodies: Mutex<VecDeque<String>>,
@@ -572,7 +518,7 @@ fn run_propagates_capability_errors() {
 fn live_plain_text_when_api_key_configured() {
     let api_key = require_local_api_key();
 
-    let http = Arc::new(LiveHttp);
+    let http = Arc::new(RealHttp::new());
     let llm = ClawApi::init(
         ClawApiConfig {
             api_key: Some(api_key),

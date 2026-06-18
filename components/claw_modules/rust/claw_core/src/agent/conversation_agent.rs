@@ -169,9 +169,10 @@ Report: write the final answer for the user. \
 Use end_conversation only as a safety or ethics circuit-breaker, never for \
 ordinary completion.";
 
-/// The five stages of a [`ConversationAgent`].
+/// The five stages of a [`ConversationAgent`]'s FSM, observable via
+/// [`ConversationAgent::phase`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConvPhase {
+pub enum ConvPhase {
     /// Understand the request; spawning gated off.
     Intake,
     /// Confirm intent and feasibility; spawning gated off.
@@ -182,6 +183,19 @@ enum ConvPhase {
     Watch,
     /// Synthesize the final answer; spawning gated off.
     Report,
+}
+
+impl std::fmt::Display for ConvPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ConvPhase::Intake => "Intake",
+            ConvPhase::Verify => "Verify",
+            ConvPhase::Delegate => "Delegate",
+            ConvPhase::Watch => "Watch",
+            ConvPhase::Report => "Report",
+        };
+        f.write_str(name)
+    }
 }
 
 /// Per-stage soft-hide allow-sets, precomputed at build time.
@@ -224,6 +238,11 @@ impl ConversationAgent {
             tool_block_retries: None,
             spawn_enabled: false,
         }
+    }
+
+    /// The agent's current FSM stage (read-only; the agent owns transitions).
+    pub fn phase(&self) -> ConvPhase {
+        self.phase
     }
 
     /// The allow-set for a stage.
@@ -469,13 +488,10 @@ fn compose_prompt(caller: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-    use claw_interfaces::MemFs;
+    use claw_interfaces::{MemFs, ScriptedHttp};
     use claw_memory::{
         CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
         MemoryTaskPool, PoolConfig,
@@ -485,30 +501,7 @@ mod tests {
     use super::*;
 
     // -- Host-test scaffolding (a scripted LLM + hermetic memory) -----------
-
-    /// Serves scripted LLM bodies in order; panics if called past the script.
-    struct ScriptedHttp {
-        steps: Mutex<VecDeque<String>>,
-    }
-
-    impl ClawHttp for ScriptedHttp {
-        fn post_json(
-            &self,
-            _request: &HttpJsonRequest,
-            _abort: &AtomicBool,
-        ) -> Result<HttpResponse, HttpError> {
-            let body = self
-                .steps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop_front()
-                .expect("ScriptedHttp: LLM called more times than scripted");
-            Ok(HttpResponse {
-                status_code: 200,
-                body,
-            })
-        }
-    }
+    // `ScriptedHttp` comes from claw_interfaces via the `httpmock` feature.
 
     /// Never compacts.
     struct StubCompactor;
@@ -530,9 +523,7 @@ mod tests {
                 supports_tools: true,
                 ..Default::default()
             },
-            Arc::new(ScriptedHttp {
-                steps: Mutex::new(bodies.into_iter().collect()),
-            }),
+            Arc::new(ScriptedHttp::new(bodies)),
         )
         .expect("init llm")
     }

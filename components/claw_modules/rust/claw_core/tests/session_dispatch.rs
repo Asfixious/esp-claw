@@ -20,18 +20,7 @@ fn test_orchestrator() -> (Arc<Orchestrator>, Arc<RecordingTransport>) {
 
 fn dummy_orchestrator(egress: Arc<dyn claw_core::ChannelEgress>) -> Arc<Orchestrator> {
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-
-    struct NoopHttp;
-    impl ClawHttp for NoopHttp {
-        fn post_json(
-            &self,
-            _request: &HttpJsonRequest,
-            _abort: &std::sync::atomic::AtomicBool,
-        ) -> Result<HttpResponse, HttpError> {
-            Err(HttpError::RequestFailed("noop".into()))
-        }
-    }
+    use claw_interfaces::NoopHttp;
 
     let llm = Arc::new(
         ClawApi::init(

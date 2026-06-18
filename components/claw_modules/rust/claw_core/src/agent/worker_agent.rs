@@ -335,13 +335,10 @@ fn compose_prompt(caller: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-    use claw_interfaces::MemFs;
+    use claw_interfaces::{MemFs, ScriptedHttp};
     use claw_memory::{
         CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
         MemoryTaskPool, PoolConfig,
@@ -352,30 +349,7 @@ mod tests {
     use crate::agent::CancelReason;
 
     // -- Host-test scaffolding (a scripted LLM + hermetic memory) -----------
-
-    /// Serves scripted LLM bodies in order; panics if called past the script.
-    struct ScriptedHttp {
-        steps: Mutex<VecDeque<String>>,
-    }
-
-    impl ClawHttp for ScriptedHttp {
-        fn post_json(
-            &self,
-            _request: &HttpJsonRequest,
-            _abort: &AtomicBool,
-        ) -> Result<HttpResponse, HttpError> {
-            let body = self
-                .steps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop_front()
-                .expect("ScriptedHttp: LLM called more times than scripted");
-            Ok(HttpResponse {
-                status_code: 200,
-                body,
-            })
-        }
-    }
+    // `ScriptedHttp` comes from claw_interfaces via the `httpmock` feature.
 
     /// Never compacts.
     struct StubCompactor;
@@ -397,9 +371,7 @@ mod tests {
                 supports_tools: true,
                 ..Default::default()
             },
-            Arc::new(ScriptedHttp {
-                steps: Mutex::new(bodies.into_iter().collect()),
-            }),
+            Arc::new(ScriptedHttp::new(bodies)),
         )
         .expect("init llm")
     }

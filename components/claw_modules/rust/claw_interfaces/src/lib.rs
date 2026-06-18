@@ -19,3 +19,7 @@ pub use fs::DiskFs;
 #[cfg(feature = "memfs")]
 pub use fs::MemFs;
 pub use http::{ClawHttp, HttpError, HttpHeader, HttpJsonRequest, HttpResponse};
+#[cfg(feature = "httpmock")]
+pub use http::{CapturingHttp, FailingHttp, NeverHttp, NoopHttp, ScriptStep, ScriptedHttp};
+#[cfg(feature = "realhttp")]
+pub use http::RealHttp;

@@ -208,21 +208,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::ChannelEgressHub;
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-
-    struct NoopHttp;
-
-    impl ClawHttp for NoopHttp {
-        fn post_json(
-            &self,
-            _request: &HttpJsonRequest,
-            _abort: &std::sync::atomic::AtomicBool,
-        ) -> Result<HttpResponse, HttpError> {
-            Err(HttpError::RequestFailed("noop".into()))
-        }
-    }
+    use claw_interfaces::NoopHttp;
 
     fn test_llm() -> Arc<ClawApi> {
         Arc::new(

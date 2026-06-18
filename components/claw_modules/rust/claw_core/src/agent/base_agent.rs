@@ -638,11 +638,8 @@ impl BaseAgent {
 
     // -- Soft-hide gating (set by an upper / semantic layer) ----------------
     //
-    // `allow(dead_code)`: these are the seam the in-crate semantic agents
-    // (Phase 2/3) call to re-gate on each state change. Until that layer lands
-    // the only callers are `#[cfg(test)]` (`gating_tests`), so the non-test lib
-    // build sees them as unused. Drop the allow once a semantic agent consumes
-    // them.
+    // Consumed by the in-crate semantic agents: `ConversationAgent` re-gates on
+    // each phase change via these.
 
     /// Restrict which tools may *execute* until changed ("soft-hide" gating).
     ///
@@ -660,7 +657,6 @@ impl BaseAgent {
     /// each semantic state change (including mid-task), so gating tracks the
     /// FSM. It is not part of the public boundary — external callers drive the
     /// agent through semantic commands, not by toggling gating directly.
-    #[allow(dead_code)]
     pub(crate) fn set_active_tools(&mut self, allowed: AllowedTools) {
         self.tail_note = Some(Self::phase_note(&allowed));
         self.allowed_tools = Some(allowed);
@@ -668,7 +664,6 @@ impl BaseAgent {
 
     /// Remove tool gating: every tool in the set may run again (the default),
     /// and drop the accompanying phase note.
-    #[allow(dead_code)]
     pub(crate) fn clear_active_tools(&mut self) {
         self.allowed_tools = None;
         self.tail_note = None;

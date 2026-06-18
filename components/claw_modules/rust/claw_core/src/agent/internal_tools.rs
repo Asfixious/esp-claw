@@ -1,11 +1,15 @@
-//! The agent's built-in tools and the control channel they speak through.
+//! The agent's built-in tools and the control channels they speak through.
 //!
 //! Internal tools are model-callable like any other [`Tool`], but instead of
 //! returning a result to the conversation they steer the *agent itself*: ending
-//! the conversation, or requesting human approval. A tool handler only has
-//! `&self`, so it cannot touch the agent's state directly — it pushes a
-//! [`ControlSignal`] onto a shared [`ControlSink`] that the agent drains each
-//! tick and folds back through its single command reducer.
+//! the conversation, requesting human approval, or spawning a subagent. A tool
+//! handler only has `&self`, so it cannot touch the agent's state directly — it
+//! pushes onto a shared sink (a [`ControlSink`] for end/approval, a [`SpawnSink`]
+//! for spawn) that the owning agent drains each tick.
+//!
+//! `spawn_subagent` is shared by both semantic agents (whether it is present at
+//! all is a build-time knob); the actual creation of a child agent is implemented
+//! in the multi-agent phase.
 //!
 //! Keeping this in one place means [`IterationLoop`](crate::iteration_loop) stays
 //! fully agnostic: it runs these like ordinary tools and never learns their
@@ -20,6 +24,15 @@ use crate::tools::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, Tool
 
 /// Group label for the agent's built-in tools (provenance only).
 pub(crate) const INTERNAL_TOOL_GROUP: &str = "agent";
+
+/// Name of the built-in `end_conversation` tool.
+pub(crate) const END_CONVERSATION: &str = "end_conversation";
+/// Name of the built-in `request_approval` tool.
+pub(crate) const REQUEST_APPROVAL: &str = "request_approval";
+/// Name of the shared `spawn_subagent` tool.
+pub(crate) const SPAWN_SUBAGENT: &str = "spawn_subagent";
+/// Group label for the spawn tool (provenance only).
+pub(crate) const SPAWN_TOOL_GROUP: &str = "spawn";
 
 /// A signal an internal tool raises for the agent to act on next tick.
 ///
@@ -60,7 +73,7 @@ pub(crate) fn internal_tool_group(sink: ControlSink) -> ToolGroup {
 ///
 /// [`ToolError::InvokeFailed`] if the arguments are present but not valid JSON —
 /// a malformed call is surfaced, not swallowed.
-fn string_argument(arguments_json: &str, key: &str) -> Result<String, ToolError> {
+pub(crate) fn string_argument(arguments_json: &str, key: &str) -> Result<String, ToolError> {
     if arguments_json.trim().is_empty() {
         return Ok(String::new());
     }
@@ -87,11 +100,11 @@ struct EndConversationTool {
 
 impl ToolHandler for EndConversationTool {
     fn name(&self) -> &'static str {
-        "end_conversation"
+        END_CONVERSATION
     }
 
     fn schema(&self) -> &'static str {
-        r#"{"type":"function","function":{"name":"end_conversation","description":"End the conversation when the task is complete. Provide the final message to show the user.","parameters":{"type":"object","properties":{"final_message":{"type":"string","description":"The closing message for the user."}},"required":["final_message"]}}}"#
+        r#"{"type":"function","function":{"name":"end_conversation","description":"Terminate the conversation as a safety or ethics circuit-breaker (e.g. an abusive, unsafe, or out-of-bounds request) — NOT for ordinary task completion, which is a normal reply. Provide the final message to show the user.","parameters":{"type":"object","properties":{"final_message":{"type":"string","description":"The closing message for the user."}},"required":["final_message"]}}}"#
     }
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -111,7 +124,7 @@ struct RequestApprovalTool {
 
 impl ToolHandler for RequestApprovalTool {
     fn name(&self) -> &'static str {
-        "request_approval"
+        REQUEST_APPROVAL
     }
 
     fn schema(&self) -> &'static str {
@@ -123,6 +136,58 @@ impl ToolHandler for RequestApprovalTool {
         push(&self.sink, ControlSignal::ApprovalRequested { summary });
         Ok(ToolOutput {
             output: "Approval requested; awaiting a human decision.".to_string(),
+            ok: true,
+        })
+    }
+}
+
+// -- Shared subagent spawning ----------------------------------------------
+//
+// The `spawn_subagent` tool only *records intent*: it pushes the requested goal
+// onto a `SpawnSink` and returns immediately, mirroring the control tools above.
+// The owning agent drains the sink each tick and turns each goal into a child.
+
+/// Queue the `spawn_subagent` tool pushes requested goals onto; the agent drains
+/// it each tick. A `Mutex` because [`ToolHandler`] is `Send + Sync`; contention
+/// is nil in the single-driver-thread model.
+pub(crate) type SpawnSink = Arc<Mutex<VecDeque<String>>>;
+
+/// Build the spawn tool group over a sink.
+pub(crate) fn spawn_tool_group(sink: SpawnSink) -> ToolGroup {
+    ToolGroup::new(SPAWN_TOOL_GROUP, [Tool::new(SpawnSubagentTool { sink })])
+}
+
+/// Drain all pending spawn goals, leaving the sink empty.
+pub(crate) fn drain_goals(sink: &SpawnSink) -> Vec<String> {
+    sink.lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .drain(..)
+        .collect()
+}
+
+/// `spawn_subagent(goal)` — request a child agent to work on `goal`.
+struct SpawnSubagentTool {
+    sink: SpawnSink,
+}
+
+impl ToolHandler for SpawnSubagentTool {
+    fn name(&self) -> &'static str {
+        SPAWN_SUBAGENT
+    }
+
+    fn schema(&self) -> &'static str {
+        r#"{"type":"function","function":{"name":"spawn_subagent","description":"Delegate a goal to a new subagent that works in parallel. Its result is reported back to you when it finishes.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"The goal to delegate to the subagent."}},"required":["goal"]}}}"#
+    }
+
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        let goal = string_argument(call.arguments_json, "goal")?;
+        self.sink
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push_back(goal);
+        Ok(ToolOutput {
+            output: "Subagent requested; its result will be reported back when it finishes."
+                .to_string(),
             ok: true,
         })
     }

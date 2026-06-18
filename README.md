@@ -176,12 +176,14 @@ ESP-Claw is still under active development. Feel free to open an issue to report
 
 ## Roadmap
 
-- [ ] Preempt Base Agent State
+- [x] Preempt Base Agent State
 - [ ] Resumable Agents
 - [ ] Permission
+- [ ] Context Management
 - [ ] Evals
 - [ ] GuardRails
 - [ ] Obsevability
+- [ ] Async Runtime (To avoid current multi-agent multithreading tradeoffs)
 - [ ] Virtual Drivers for Hardware Capability
  
 ## 📷 Follow Us

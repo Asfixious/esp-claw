@@ -101,7 +101,7 @@ The firmware uses two logical filesystem roots, configured at boot through `claw
 ## General Engineering Rules
 
 - Use modular design. Each module should have clear responsibilities, ownership, and boundaries.
-- Keep source files under 1500 lines where practical; split files by responsibility when they grow beyond that.
+- Keep source files under 1500 lines where practical; split files by responsibility when they grow beyond that. Exception: Rust files may exceed 1500 lines, especially when in-crate `#[cfg(test)]` test modules (stripped from non-test builds) live alongside the code they test, per Rust convention.
 - Keep functions focused and reviewable; split large functions instead of adding deeply nested branches.
 - Avoid magic numbers and magic strings. Use named constants, enums, macros, Kconfig options, or shared config keys.
 - Prefer explicit ownership and explicit data flow over hidden global state.

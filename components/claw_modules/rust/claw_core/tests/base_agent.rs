@@ -11,7 +11,7 @@ use std::sync::Arc;
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::agent::{AgentId, BaseAgent, CancelReason, TickOutcome};
 use claw_core::{Tool, ToolGroup, ToolSet};
-use claw_interfaces::RealHttp;
+use claw_interface::RealHttp;
 use serde_json::{json, Value};
 
 mod common;

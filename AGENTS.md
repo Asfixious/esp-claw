@@ -274,7 +274,7 @@ The payoff: callers pass whatever they already hold with no `.as_ref()` / `.to_s
 Rust is integrated as an ESP-IDF *component*, so the Rust workspace (`components/claw_modules/rust/`) is organized around two FFI boundaries with a pure-Rust core in between.
 
 - **Inbound crates (C / OS → Rust).** Convert C and operating-system facilities into ergonomic Rust APIs and dependency-injection traits, including OS-level abstraction, with per-target implementations (ESP-IDF and Linux/host). The core depends on the *traits*, never on a platform directly.
-  - `claw_interfaces` — shared types + DI traits (`esp_err`, `ClawEvent`, `EventPublisher`, `ClawHttp`).
+  - `claw-interface` — shared types + DI traits (`esp_err`, `ClawEvent`, `EventPublisher`, `ClawHttp`).
   - `claw_platform` — platform abstraction traits + target ABI types; `claw_platform_espidf` — the ESP-IDF impl via raw FFI.
   - `claw_sys` — thin IDF shims std can't express (the `ESP_LOGx` backend, the `esp_http_client` `ClawHttp` driver). Linux/host impls plug into the same traits for tests.
 - **Outbound crate (Rust → C).** Converts the Rust APIs back into a C ABI for the firmware's C callers, with **explicit init/deinit lifetimes and reference ownership**. Prefer **opaque handle types** (an opaque pointer) over structs that expose internal fields/layout.

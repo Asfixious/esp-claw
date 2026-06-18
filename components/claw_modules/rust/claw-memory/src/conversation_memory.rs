@@ -84,7 +84,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use claw_interfaces::ClawFs;
+use claw_interface::ClawFs;
 
 use crate::compaction::Compactor;
 use crate::pool::MemoryTaskPool;
@@ -386,7 +386,7 @@ struct MemoryInner {
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use claw_interfaces::{ClawFs, FsError};
+/// # use claw_interface::{ClawFs, FsError};
 /// # use claw_memory::{
 /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
 /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -447,7 +447,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -521,7 +521,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -574,7 +574,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -662,7 +662,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interfaces::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -720,7 +720,7 @@ impl ConversationMemory {
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use claw_interfaces::{ClawFs, FsError};
+/// # use claw_interface::{ClawFs, FsError};
 /// # use claw_memory::{
 /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
 /// #     ConversationMemory, MemoryTaskPool, PoolConfig,

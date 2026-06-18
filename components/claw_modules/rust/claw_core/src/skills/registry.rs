@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use claw_interfaces::ClawFs;
+use claw_interface::ClawFs;
 
 use super::skill::{parse_front_matter, strip_front_matter, SkillError, SkillId, SkillMetadata};
 

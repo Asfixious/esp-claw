@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use claw_interfaces::{ClawFs, DiskFs, MemFs};
+use claw_interface::{ClawFs, DiskFs, MemFs};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 // --- test doubles --------------------------------------------------------
 //
 // `MemFs` (hermetic in-memory) and `DiskFs` (disk-inspection) come from
-// claw_interfaces via the `memfs` / `diskfs-pretty` dev-dependency features.
+// claw_interface via the `memfs` / `diskfs-pretty` dev-dependency features.
 
 /// A [`Compactor`] that records how many times it ran and returns a fixed
 /// one-message summary, so tests can observe the background compaction.

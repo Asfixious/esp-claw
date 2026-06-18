@@ -14,7 +14,7 @@
 //! The catalog (id + description + cap groups + manage mode) lives entirely in
 //! that head, so it is read without touching the potentially large body.
 
-use claw_interfaces::FsError;
+use claw_interface::FsError;
 use serde::Deserialize;
 use thiserror::Error;
 

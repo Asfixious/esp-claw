@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use claw_interfaces::http::ClawHttp;
+use claw_interface::http::ClawHttp;
 
 use super::backend::{find_builtin_registration, LlmBackend};
 use super::backends::{anthropic, openai_compatible};
@@ -42,7 +42,7 @@ const DEFAULT_IMAGE_MAX_BYTES: usize = 512 * 1024;
 /// use std::sync::Arc;
 /// use std::sync::atomic::AtomicBool;
 /// use claw_api::{ChatRequest, ClawApi, ClawApiConfig};
-/// # use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+/// # use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 /// # struct H; impl ClawHttp for H {
 /// #   fn post_json(&self, _r: &HttpJsonRequest, _a: &AtomicBool) -> Result<HttpResponse, HttpError> {
 /// #     Ok(HttpResponse { status_code: 200, body: r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.into() }) } }
@@ -95,7 +95,7 @@ impl ClawApi {
     /// use std::sync::Arc;
     /// use std::sync::atomic::AtomicBool;
     /// use claw_api::{ClawApi, ClawApiConfig, InitError};
-    /// # use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    /// # use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     /// # struct H; impl ClawHttp for H {
     /// #   fn post_json(&self, _r: &HttpJsonRequest, _a: &AtomicBool) -> Result<HttpResponse, HttpError> {
     /// #     Ok(HttpResponse { status_code: 200, body: "{}".into() }) } }

@@ -11,11 +11,11 @@
 //! and is *not* re-mapped here.
 
 use claw_api::{ChatError, InferMediaError, InitError};
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
-    ESP_ERR_NOT_SUPPORTED, ESP_ERR_NO_MEM, ESP_ERR_TIMEOUT, ESP_FAIL, ESP_OK,
+use claw_platform::{
+    esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE,
+    ESP_ERR_NOT_FOUND, ESP_ERR_NOT_SUPPORTED, ESP_ERR_NO_MEM, ESP_ERR_TIMEOUT, ESP_FAIL, ESP_OK,
 };
-use claw_interfaces::http::HttpError;
+use claw_interface::http::HttpError;
 use claw_memory::cap::CapStatus;
 use claw_memory::error::MemoryError;
 
@@ -100,7 +100,7 @@ fn chat_error_code(err: &ChatError) -> EspErr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claw_interfaces::http::HttpError;
+    use claw_interface::http::HttpError;
 
     #[test]
     fn http_esp_err_matches_c_transport() {

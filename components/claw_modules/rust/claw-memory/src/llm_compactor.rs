@@ -48,7 +48,7 @@ impl LlmCompactor {
     /// use claw_api::{ClawApi, ClawApiConfig};
     /// use claw_memory::{Compactor, LlmCompactor};
     /// # use std::sync::atomic::AtomicBool;
-    /// # use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    /// # use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     /// # struct StubHttp;
     /// # impl ClawHttp for StubHttp {
     /// #     fn post_json(&self, _: &HttpJsonRequest, _: &AtomicBool) -> Result<HttpResponse, HttpError> {

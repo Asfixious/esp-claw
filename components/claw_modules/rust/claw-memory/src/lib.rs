@@ -6,8 +6,8 @@
 //! submits its background work to the same pool so FreeRTOS task allocation stays
 //! amortized.
 //!
-//! At its core the crate depends only on the cycle-breaking [`claw_interfaces`]
-//! (for the [`ClawFs`](claw_interfaces::ClawFs) persistence seam) and
+//! At its core the crate depends only on the cycle-breaking [`claw_interface`]
+//! (for the [`ClawFs`](claw_interface::ClawFs) persistence seam) and
 //! [`claw_sys`] (for worker spawning); summarization is injected via the
 //! [`Compactor`] trait. The default `llm` feature adds a ready-made
 //! `LlmCompactor` backed by `claw-api`; turn the feature off to keep the crate
@@ -18,7 +18,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //!
-//! use claw_interfaces::{ClawFs, FsError};
+//! use claw_interface::{ClawFs, FsError};
 //! use claw_memory::{
 //!     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
 //!     MemoryTaskPool, PoolConfig,

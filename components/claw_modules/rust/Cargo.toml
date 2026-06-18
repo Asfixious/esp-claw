@@ -4,7 +4,7 @@ members = [
     "cli",
     "claw_platform",
     "claw_platform_espidf",
-    "claw_interfaces",
+    "claw-interface",
     "claw-utils",
     "claw-api",
     "claw_sys",

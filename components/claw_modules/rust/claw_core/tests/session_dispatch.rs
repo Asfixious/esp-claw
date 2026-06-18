@@ -20,7 +20,7 @@ fn test_orchestrator() -> (Arc<Orchestrator>, Arc<RecordingTransport>) {
 
 fn dummy_orchestrator(egress: Arc<dyn claw_core::ChannelEgress>) -> Arc<Orchestrator> {
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::NoopHttp;
+    use claw_interface::NoopHttp;
 
     let llm = Arc::new(
         ClawApi::init(

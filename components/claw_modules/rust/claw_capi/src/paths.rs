@@ -7,8 +7,8 @@
 use core::ffi::{c_char, c_int};
 use core::ptr;
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_OK,
+use claw_platform::{
+    esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE, ESP_OK,
 };
 
 use claw_paths::PathError;

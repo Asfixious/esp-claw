@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_memory::{Compactor, LlmCompactor};
 use serde_json::json;
 

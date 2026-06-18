@@ -11,7 +11,7 @@ use core::sync::atomic::AtomicBool;
 
 use serde_json::{json, Map, Value};
 
-use claw_interfaces::http::{ClawHttp, HttpHeader, HttpJsonRequest};
+use claw_interface::http::{ClawHttp, HttpHeader, HttpJsonRequest};
 
 use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
 use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};

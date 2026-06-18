@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use claw_core::{FsSkillRegistry, ManageMode, SkillId, SkillRegistry, SkillSet};
-use claw_interfaces::DiskFs;
+use claw_interface::DiskFs;
 use serde_json::json;
 
 /// Virtual skills root handed to the registry; maps onto `tests/data/skills`.

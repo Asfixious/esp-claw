@@ -17,8 +17,8 @@ use core::ptr;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_OK,
+use claw_platform::{
+    esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_OK,
 };
 
 use claw_core::callbacks::{
@@ -578,7 +578,7 @@ unsafe fn build_and_store_core(
     _out_core: *mut claw_core_handle_t,
 ) -> EspErr {
     // No esp_http_client / event router off-target.
-    claw_interfaces::error::ESP_ERR_NOT_SUPPORTED
+    claw_platform::ESP_ERR_NOT_SUPPORTED
 }
 
 /// `claw_core_start`.
@@ -839,7 +839,7 @@ pub(crate) fn publish_stage_text_impl(request: &RequestItem, text: &str) -> EspE
 
 #[cfg(not(target_os = "espidf"))]
 pub(crate) fn publish_stage_text_impl(_request: &RequestItem, _text: &str) -> EspErr {
-    claw_interfaces::error::ESP_ERR_NOT_SUPPORTED
+    claw_platform::ESP_ERR_NOT_SUPPORTED
 }
 
 // --- espidf event publisher ----------------------------------------------
@@ -847,7 +847,43 @@ pub(crate) fn publish_stage_text_impl(_request: &RequestItem, _text: &str) -> Es
 #[cfg(target_os = "espidf")]
 mod espidf_events {
     use super::*;
-    use claw_interfaces::event::{ClawEvent, EventPublisher};
+
+    /// Mirror of `claw_session_policy_t` from `claw_session_mgr.h`.
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub enum SessionPolicy {
+        #[default]
+        Chat = 0,
+        Trigger = 1,
+        Global = 2,
+        Ephemeral = 3,
+        NoSave = 4,
+    }
+
+    /// Rust-owned representation of the fields `claw_core` populates on a
+    /// `claw_event_t`. String fields are truncated to the C buffer sizes at the
+    /// publish boundary below.
+    #[derive(Clone, Debug, Default)]
+    pub struct ClawEvent {
+        pub event_id: String,
+        pub source_cap: String,
+        pub event_type: String,
+        pub source_channel: String,
+        pub chat_id: String,
+        pub message_id: String,
+        pub correlation_id: String,
+        pub content_type: String,
+        pub timestamp_ms: i64,
+        pub session_policy: SessionPolicy,
+        pub text: Option<String>,
+        pub payload_json: Option<String>,
+    }
+
+    /// Injection point for publishing events to the (still-C) event router.
+    pub trait EventPublisher: Send + Sync {
+        /// Equivalent to `claw_event_router_publish(&event)`.
+        fn publish(&self, event: &ClawEvent) -> EspErr;
+    }
 
     #[repr(C)]
     struct claw_event_t {

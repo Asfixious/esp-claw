@@ -12,13 +12,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
-use claw_interfaces::{DiskFs, RealHttp};
+use claw_interface::{DiskFs, RealHttp};
 use claw_memory::{
     ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
     PoolConfig,
 };
 
-// The real network transport is `claw_interfaces::RealHttp` (the `realhttp`
+// The real network transport is `claw_interface::RealHttp` (the `realhttp`
 // feature); background summarisation is disabled via claw-memory's
 // `NoopCompactor` (the `compactor-stub` feature).
 

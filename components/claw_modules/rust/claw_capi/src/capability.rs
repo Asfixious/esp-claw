@@ -10,7 +10,7 @@ use claw_cap::error::CapabilityError;
 use claw_cap::invoker::CapabilityInvokeResult;
 use claw_cap::registry::RegistryBackend;
 use claw_cap::Registry;
-use claw_interfaces::error::{EspErr, ESP_ERR_NO_MEM, ESP_OK};
+use claw_platform::{esp_err_t as EspErr, ESP_ERR_NO_MEM, ESP_OK};
 
 use crate::abi_types::claw_core_handle_t;
 

@@ -10,7 +10,8 @@ description = "The single C ABI layer between the pure-Rust claw modules and the
 crate-type = ["rlib"]
 
 [dependencies]
-claw_interfaces = { path = "../claw_interfaces" }
+claw-interface = { path = "../claw-interface" }
+claw_platform = { path = "../claw_platform" }
 claw-api = { path = "../claw-api" }
 claw_sys = { path = "../claw_sys" }
 claw_cap = { path = "../claw_cap" }

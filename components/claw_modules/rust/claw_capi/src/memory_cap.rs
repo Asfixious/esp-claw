@@ -7,7 +7,7 @@
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 
-use claw_interfaces::error::EspErr;
+use claw_platform::esp_err_t as EspErr;
 
 use claw_memory::cap::{self, CapCtx};
 
@@ -246,7 +246,7 @@ unsafe extern "C" fn cap_memory_forget_execute(
 #[no_mangle]
 pub unsafe extern "C" fn claw_memory_register_group() -> EspErr {
     if claw_cap_group_exists(GROUP.0.group_id) {
-        return claw_interfaces::error::ESP_OK;
+        return claw_platform::ESP_OK;
     }
     claw_cap_register_group(&GROUP.0)
 }

@@ -491,7 +491,7 @@ mod tests {
     use std::sync::Arc;
 
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::{MemFs, ScriptedHttp};
+    use claw_interface::{MemFs, ScriptedHttp};
     use claw_memory::{
         ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
         PoolConfig,
@@ -502,7 +502,7 @@ mod tests {
 
     // -- Host-test scaffolding (a scripted LLM + hermetic memory) -----------
     // `ScriptedHttp` (httpmock feature) and `NoopCompactor` (compactor-stub
-    // feature) are shared from claw_interfaces / claw-memory.
+    // feature) are shared from claw_interface / claw-memory.
 
     /// Build a tool-capable LLM that replays `bodies` in order.
     fn scripted_llm(bodies: Vec<String>) -> ClawApi {

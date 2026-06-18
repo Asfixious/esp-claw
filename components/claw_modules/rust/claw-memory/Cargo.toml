@@ -17,7 +17,7 @@ llm = ["dep:claw-api"]
 compactor-stub = []
 
 [dependencies]
-claw_interfaces = { path = "../claw_interfaces" }
+claw-interface = { path = "../claw-interface" }
 claw_sys = { path = "../claw_sys" }
 claw-api = { path = "../claw-api", optional = true }
 log = "0.4"
@@ -26,6 +26,6 @@ serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
-# Host-only filesystem doubles shared from claw_interfaces (tests only).
+# Host-only filesystem doubles shared from claw-interface (tests only).
 # diskfs-pretty implies diskfs and pretty-prints on-disk JSON for inspection.
-claw_interfaces = { path = "../claw_interfaces", features = ["memfs", "diskfs-pretty"] }
+claw-interface = { path = "../claw-interface", features = ["memfs", "diskfs-pretty"] }

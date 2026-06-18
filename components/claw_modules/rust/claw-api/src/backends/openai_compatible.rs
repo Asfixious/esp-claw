@@ -4,7 +4,7 @@ use core::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
-use claw_interfaces::http::{ClawHttp, HttpJsonRequest};
+use claw_interface::http::{ClawHttp, HttpJsonRequest};
 
 use super::super::backend::{BackendDefaults, BackendRegistration, LlmBackend};
 use super::super::errors::{ChatError, ClawApiError, InferMediaError, InitError};

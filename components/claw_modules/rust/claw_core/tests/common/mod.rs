@@ -17,7 +17,7 @@ use claw_core::{
     FsSkillRegistry, SkillId, SkillRegistry, SkillSet, ToolError, ToolHandler, ToolInvocation,
     ToolOutput,
 };
-use claw_interfaces::{
+use claw_interface::{
     CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp,
 };
 use claw_memory::{
@@ -80,7 +80,7 @@ pub fn body_echo_call(input: &str) -> String {
 // ===========================================================================
 
 // `ScriptedHttp` / `CapturingHttp` / `FailingHttp` / `NeverHttp` and the
-// `ScriptStep` alias come from claw_interfaces via the `httpmock` feature.
+// `ScriptStep` alias come from claw_interface via the `httpmock` feature.
 
 // ===========================================================================
 // LLM builders
@@ -133,7 +133,7 @@ pub fn never_called_llm() -> ClawApi {
     build_llm(Arc::new(NeverHttp), true)
 }
 
-// Filesystem doubles: the shared `DiskFs` from `claw_interfaces` (the `diskfs`
+// Filesystem doubles: the shared `DiskFs` from `claw_interface` (the `diskfs`
 // dev-dependency feature). `DiskFs::absolute()` backs conversation memory with
 // absolute paths; `DiskFs::rooted(base)` keeps skill fixtures portable.
 

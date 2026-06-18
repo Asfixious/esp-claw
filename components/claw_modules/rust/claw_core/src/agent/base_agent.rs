@@ -1441,7 +1441,7 @@ mod gating_tests {
     use std::sync::Arc;
 
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::{CapturingHttp, ClawHttp, MemFs, ScriptedHttp};
+    use claw_interface::{CapturingHttp, ClawHttp, MemFs, ScriptedHttp};
     use claw_memory::{
         ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
         PoolConfig,
@@ -1455,7 +1455,7 @@ mod gating_tests {
 
     // HTTP doubles (ScriptedHttp / CapturingHttp, httpmock feature) and the
     // never-compacts `NoopCompactor` (compactor-stub feature) are shared from
-    // claw_interfaces / claw-memory.
+    // claw_interface / claw-memory.
 
     // Test tools ----------------------------------------------------------------
 

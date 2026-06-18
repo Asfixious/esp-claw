@@ -7,7 +7,7 @@ use super::super::errors::{ChatError, ClawApiError, InferMediaError};
 use super::super::json_output::augment_system_with_schema;
 use super::super::types::ModelProfile;
 use super::super::types::{ChatJsonRequest, ChatRequest, LlmResponse, MediaAsset, ToolCall};
-use claw_interfaces::http::{ClawHttp, HttpError};
+use claw_interface::http::{ClawHttp, HttpError};
 use core::sync::atomic::AtomicBool;
 use serde_json::Map;
 

@@ -65,8 +65,8 @@ pub use espidf_driver::EspIdfHttp;
 #[cfg(target_os = "espidf")]
 mod espidf_driver {
     use super::{build_auth_header, parse_error_message_body};
-    use claw_interfaces::error::{ESP_OK};
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    use claw_platform::{ESP_FAIL, ESP_OK};
+    use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use core::ffi::{c_char, c_int, c_void};
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::ffi::CString;

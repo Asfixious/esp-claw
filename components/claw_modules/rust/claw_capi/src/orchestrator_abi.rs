@@ -9,10 +9,10 @@ use claw_core::SessionError;
 use claw_core::{
     ChannelEgressHub, DeliverError, InboundMessage, Orchestrator, SessionId,
 };
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_OK,
+use claw_platform::{
+    esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_OK,
 };
-use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 
 struct OrchestratorState {
     orchestrator: Mutex<Orchestrator>,

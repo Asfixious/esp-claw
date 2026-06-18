@@ -11,7 +11,7 @@ use core::ptr;
 use std::ffi::CStr;
 
 use claw_api::{MediaAsset, MediaRequest};
-use claw_interfaces::error::{EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_OK};
+use claw_platform::{esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_OK};
 
 use crate::core_abi::{claw_core_handle_t, core_from_handle};
 

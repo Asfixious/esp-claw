@@ -209,7 +209,7 @@ where
 mod tests {
     use super::*;
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interfaces::NoopHttp;
+    use claw_interface::NoopHttp;
 
     fn test_llm() -> Arc<ClawApi> {
         Arc::new(

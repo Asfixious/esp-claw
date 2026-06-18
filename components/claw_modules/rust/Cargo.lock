@@ -59,9 +59,9 @@ name = "claw-agent-cli"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw-interface",
  "claw-memory",
  "claw_core",
- "claw_interfaces",
  "dotenvy",
  "owo-colors",
  "serde_json",
@@ -72,8 +72,17 @@ name = "claw-api"
 version = "0.1.0"
 dependencies = [
  "base64",
- "claw_interfaces",
+ "claw-interface",
  "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "claw-interface"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
  "serde_json",
  "thiserror",
 ]
@@ -83,7 +92,7 @@ name = "claw-memory"
 version = "0.1.0"
 dependencies = [
  "claw-api",
- "claw_interfaces",
+ "claw-interface",
  "claw_sys",
  "log",
  "serde",
@@ -111,11 +120,12 @@ name = "claw_capi"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw-interface",
  "claw-memory",
  "claw_cap",
  "claw_core",
- "claw_interfaces",
  "claw_paths",
+ "claw_platform",
  "claw_sys",
  "claw_task",
  "libc",
@@ -128,22 +138,13 @@ name = "claw_core"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw-interface",
  "claw-memory",
  "claw-utils",
  "claw_cap",
- "claw_interfaces",
  "dotenvy",
  "log",
  "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "claw_interfaces"
-version = "0.1.0"
-dependencies = [
- "reqwest",
  "serde_json",
  "thiserror",
 ]
@@ -171,7 +172,8 @@ dependencies = [
 name = "claw_sys"
 version = "0.1.0"
 dependencies = [
- "claw_interfaces",
+ "claw-interface",
+ "claw_platform",
  "log",
  "serde_json",
 ]

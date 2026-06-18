@@ -12,8 +12,9 @@ use crate::core_abi::{
     claw_core_context_persist_batch_t, claw_core_context_provider_t, claw_core_context_t,
     claw_core_request_t,
 };
-use claw_interfaces::error::{
-    EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND, ESP_ERR_NO_MEM, ESP_OK,
+use claw_platform::{
+    esp_err_t as EspErr, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND,
+    ESP_ERR_NO_MEM, ESP_OK,
 };
 
 use claw_memory::api::{self, LlmConfig, MemoryConfig};
@@ -557,7 +558,7 @@ pub unsafe extern "C" fn claw_memory_persist_context_callback(
         let req = crate::core_abi::request_from_c(b.request);
         let publish = move |text: &str| {
             crate::core_abi::publish_stage_text_impl(&req, text)
-                == claw_interfaces::error::ESP_OK
+                == claw_platform::ESP_OK
         };
         let publish_dyn: &dyn Fn(&str) -> bool = &publish;
         match session::persist_context(

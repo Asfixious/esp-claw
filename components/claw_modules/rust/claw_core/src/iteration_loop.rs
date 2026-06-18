@@ -158,9 +158,9 @@ pub struct PreemptedOutcome {
 
 /// User interrupt surface for one in-flight iteration. No message payloads here.
 ///
-/// Contract with [`claw_interfaces::http::ClawHttp`]:
+/// Contract with [`claw_interface::http::ClawHttp`]:
 /// - Upper layer sets `interrupt_flag` to request cooperative abort.
-/// - HTTP polls the flag and returns [`claw_interfaces::http::HttpError::Aborted`]
+/// - HTTP polls the flag and returns [`claw_interface::http::HttpError::Aborted`]
 ///   without clearing it (`claw_sys` / ESP HTTP keeps the flag intact).
 /// - [`IterationLoop`] consumes the flag via `swap(false)` when ending preempted.
 pub trait InterruptionControl: Send + Sync {

@@ -14,8 +14,8 @@ use claw_core::iteration_loop::{
 use claw_core::{
     IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
 };
-use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-use claw_interfaces::RealHttp;
+use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+use claw_interface::RealHttp;
 use serde_json::{json, Value};
 
 const PLAIN_TEXT_BODY: &str =
@@ -65,7 +65,7 @@ fn local_model() -> String {
     std::env::var("CLAW_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into())
 }
 
-// The live transport for optional LLM tests is `claw_interfaces::RealHttp` (the
+// The live transport for optional LLM tests is `claw_interface::RealHttp` (the
 // `realhttp` feature).
 
 struct ScriptedHttp {

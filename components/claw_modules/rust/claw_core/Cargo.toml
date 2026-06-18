@@ -15,7 +15,7 @@ crate-type = ["rlib"]
 stage_verbose = []
 
 [dependencies]
-claw_interfaces = { path = "../claw_interfaces" }
+claw-interface = { path = "../claw-interface" }
 claw-utils = { path = "../claw-utils" }
 claw-api = { path = "../claw-api" }
 claw-memory = { path = "../claw-memory" }
@@ -25,8 +25,8 @@ serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
-# Host-only fs/http doubles + live transport shared from claw_interfaces (tests only).
-claw_interfaces = { path = "../claw_interfaces", features = [
+# Host-only fs/http doubles + live transport shared from claw-interface (tests only).
+claw-interface = { path = "../claw-interface", features = [
     "memfs",
     "diskfs",
     "httpmock",

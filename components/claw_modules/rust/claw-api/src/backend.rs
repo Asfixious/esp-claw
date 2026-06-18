@@ -4,7 +4,7 @@
 
 use core::sync::atomic::AtomicBool;
 
-use claw_interfaces::http::ClawHttp;
+use claw_interface::http::ClawHttp;
 use serde_json::Value;
 
 use super::backends::{anthropic, openai_compatible};

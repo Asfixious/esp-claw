@@ -40,7 +40,10 @@ pub const ESP_FAIL: esp_err_t = -1;
 pub const ESP_ERR_NO_MEM: esp_err_t = 0x101;
 pub const ESP_ERR_INVALID_ARG: esp_err_t = 0x102;
 pub const ESP_ERR_INVALID_STATE: esp_err_t = 0x103;
+pub const ESP_ERR_INVALID_SIZE: esp_err_t = 0x104;
 pub const ESP_ERR_NOT_FOUND: esp_err_t = 0x105;
+pub const ESP_ERR_NOT_SUPPORTED: esp_err_t = 0x106;
+pub const ESP_ERR_TIMEOUT: esp_err_t = 0x107;
 
 // --- esp_vfs register flags (components/vfs/include/esp_vfs.h) --------------
 pub const ESP_VFS_FLAG_DEFAULT: i32 = 1 << 0;

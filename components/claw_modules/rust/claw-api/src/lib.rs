@@ -8,7 +8,7 @@
 //! # Overview
 //!
 //! The entry point is [`ClawApi`]. You build it once from a [`ClawApiConfig`]
-//! plus an HTTP transport (any [`claw_interfaces::http::ClawHttp`]), then issue
+//! plus an HTTP transport (any [`claw_interface::http::ClawHttp`]), then issue
 //! requests:
 //!
 //! | Method | Request | Returns |
@@ -18,7 +18,7 @@
 //! | [`ClawApi::infer_media`] | [`MediaRequest`] | `String` (model text about the image) |
 //!
 //! Networking is **injected**: `claw-api` never opens sockets itself. On device
-//! the espidf layer implements [`ClawHttp`](claw_interfaces::http::ClawHttp) over
+//! the espidf layer implements [`ClawHttp`](claw_interface::http::ClawHttp) over
 //! `esp_http_client`; tests and host tools provide their own implementation.
 //!
 //! # Cancellation
@@ -45,7 +45,7 @@
 //! use std::sync::Arc;
 //! use std::sync::atomic::AtomicBool;
 //! use claw_api::{ChatRequest, ClawApi, ClawApiConfig, RetryPolicy};
-//! use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+//! use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 //!
 //! // 1. Provide an HTTP transport. On device this wraps `esp_http_client`;
 //! //    here we stub a fixed OpenAI-shaped reply.
@@ -110,7 +110,7 @@ mod tests {
     use super::{
         ChatError, ChatRequest, ClawApi, ClawApiConfig, ClawApiError, InitError, RetryPolicy,
     };
-    use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
     use core::sync::atomic::AtomicBool;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};

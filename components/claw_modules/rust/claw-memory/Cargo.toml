@@ -13,6 +13,8 @@ crate-type = ["rlib"]
 # LLM-free (inject your own `Compactor`).
 default = ["llm"]
 llm = ["dep:claw-api"]
+# `NoopCompactor`: a never-compacts stub for host CLIs and tests (host-only).
+compactor-stub = []
 
 [dependencies]
 claw_interfaces = { path = "../claw_interfaces" }

@@ -493,24 +493,16 @@ mod tests {
     use claw_api::{ClawApi, ClawApiConfig};
     use claw_interfaces::{MemFs, ScriptedHttp};
     use claw_memory::{
-        CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
-        MemoryTaskPool, PoolConfig,
+        ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
+        PoolConfig,
     };
     use serde_json::{json, Value};
 
     use super::*;
 
     // -- Host-test scaffolding (a scripted LLM + hermetic memory) -----------
-    // `ScriptedHttp` comes from claw_interfaces via the `httpmock` feature.
-
-    /// Never compacts.
-    struct StubCompactor;
-
-    impl Compactor for StubCompactor {
-        fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
-            Ok(Vec::new())
-        }
-    }
+    // `ScriptedHttp` (httpmock feature) and `NoopCompactor` (compactor-stub
+    // feature) are shared from claw_interfaces / claw-memory.
 
     /// Build a tool-capable LLM that replays `bodies` in order.
     fn scripted_llm(bodies: Vec<String>) -> ClawApi {
@@ -537,7 +529,7 @@ mod tests {
             ConversationDeps {
                 fs: Arc::new(MemFs::default()),
                 pool,
-                compactor: Arc::new(StubCompactor),
+                compactor: Arc::new(NoopCompactor),
             },
         )
     }

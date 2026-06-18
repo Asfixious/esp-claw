@@ -14,26 +14,13 @@ use std::sync::Arc;
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_interfaces::{DiskFs, RealHttp};
 use claw_memory::{
-    CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
-    MemoryTaskPool, PoolConfig,
+    ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
+    PoolConfig,
 };
-use serde_json::Value;
 
 // The real network transport is `claw_interfaces::RealHttp` (the `realhttp`
-// feature).
-
-// ---------------------------------------------------------------------------
-// Compactor: stub (no background summarisation)
-// ---------------------------------------------------------------------------
-
-/// A [`Compactor`] that never compacts.
-pub struct StubCompactor;
-
-impl Compactor for StubCompactor {
-    fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
-        Ok(Vec::new())
-    }
-}
+// feature); background summarisation is disabled via claw-memory's
+// `NoopCompactor` (the `compactor-stub` feature).
 
 // ---------------------------------------------------------------------------
 // Config / wiring
@@ -99,7 +86,7 @@ pub fn make_memory(agent_id: usize, memory_dir: &str) -> (ConversationMemory, Co
         ConversationDeps {
             fs: Arc::new(DiskFs::absolute()),
             pool,
-            compactor: Arc::new(StubCompactor),
+            compactor: Arc::new(NoopCompactor),
         },
     );
     let view = memory.clone();

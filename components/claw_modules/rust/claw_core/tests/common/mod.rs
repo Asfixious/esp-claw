@@ -21,8 +21,8 @@ use claw_interfaces::{
     CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp,
 };
 use claw_memory::{
-    CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
-    MemoryTaskPool, PoolConfig,
+    ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
+    PoolConfig,
 };
 use serde_json::{json, Value};
 
@@ -138,17 +138,10 @@ pub fn never_called_llm() -> ClawApi {
 // absolute paths; `DiskFs::rooted(base)` keeps skill fixtures portable.
 
 // ===========================================================================
-// Compactor / tools
+// Tools
 // ===========================================================================
-
-/// Never compacts.
-pub struct StubCompactor;
-
-impl Compactor for StubCompactor {
-    fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
-        Ok(Vec::new())
-    }
-}
+// The never-compacts `NoopCompactor` is shared from claw-memory (the
+// `compactor-stub` dev-dependency feature).
 
 /// A trivial caller tool named `echo` that echoes its arguments back.
 pub struct EchoTool;
@@ -202,7 +195,7 @@ pub fn test_memory(
         ConversationDeps {
             fs: Arc::new(DiskFs::absolute()),
             pool,
-            compactor: Arc::new(StubCompactor),
+            compactor: Arc::new(NoopCompactor),
         },
     )
 }

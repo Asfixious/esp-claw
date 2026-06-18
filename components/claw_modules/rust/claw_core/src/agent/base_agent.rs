@@ -1443,8 +1443,8 @@ mod gating_tests {
     use claw_api::{ClawApi, ClawApiConfig};
     use claw_interfaces::{CapturingHttp, ClawHttp, MemFs, ScriptedHttp};
     use claw_memory::{
-        CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
-        MemoryTaskPool, PoolConfig,
+        ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
+        PoolConfig,
     };
     use serde_json::{json, Value};
 
@@ -1453,19 +1453,9 @@ mod gating_tests {
         AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
     };
 
-    // HTTP doubles (ScriptedHttp / CapturingHttp) come from claw_interfaces via
-    // the `httpmock` dev-dependency feature.
-
-    // Stub compactor (hermetic conversation memory) -----------------------------
-
-    /// Never compacts.
-    struct StubCompactor;
-
-    impl Compactor for StubCompactor {
-        fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
-            Ok(Vec::new())
-        }
-    }
+    // HTTP doubles (ScriptedHttp / CapturingHttp, httpmock feature) and the
+    // never-compacts `NoopCompactor` (compactor-stub feature) are shared from
+    // claw_interfaces / claw-memory.
 
     // Test tools ----------------------------------------------------------------
 
@@ -1538,7 +1528,7 @@ mod gating_tests {
             ConversationDeps {
                 fs: Arc::new(MemFs::default()),
                 pool,
-                compactor: Arc::new(StubCompactor),
+                compactor: Arc::new(NoopCompactor),
             },
         )
     }

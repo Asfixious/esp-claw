@@ -71,3 +71,20 @@ pub trait Compactor: Send + Sync {
     /// compact segment.
     fn compact(&self, window: &[Value]) -> Result<Vec<Value>, CompactError>;
 }
+
+/// A [`Compactor`] that never compacts: every call yields an empty segment.
+///
+/// For wiring where background summarization is undesired or irrelevant — host
+/// CLIs that keep the full transcript, and tests that need a memory without an
+/// LLM. Behind the `compactor-stub` feature so it is never built into firmware
+/// unless explicitly opted in.
+#[cfg(feature = "compactor-stub")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopCompactor;
+
+#[cfg(feature = "compactor-stub")]
+impl Compactor for NoopCompactor {
+    fn compact(&self, _window: &[Value]) -> Result<Vec<Value>, CompactError> {
+        Ok(Vec::new())
+    }
+}

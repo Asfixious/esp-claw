@@ -2,12 +2,11 @@
 //! way an agent would: append turns, read the messages, persist/reload, and let
 //! background auto-compaction run on the shared pool.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use claw_interfaces::{ClawFs, FsError};
+use claw_interfaces::{ClawFs, DiskFs, MemFs};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -15,70 +14,9 @@ use claw_memory::{
 use serde_json::{json, Value};
 
 // --- test doubles --------------------------------------------------------
-
-/// In-memory [`ClawFs`] so tests stay hermetic.
-#[derive(Default)]
-struct MemFs {
-    files: Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl ClawFs for MemFs {
-    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        self.lock().get(path).cloned().ok_or(FsError::NotFound)
-    }
-    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let files = self.lock();
-        let bytes = files.get(path).ok_or(FsError::NotFound)?;
-        let start = offset as usize;
-        let end = start
-            .checked_add(len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| FsError::Io("read_at past end of file".into()))?;
-        Ok(bytes[start..end].to_vec())
-    }
-    fn len(&self, path: &str) -> Result<u64, FsError> {
-        self.lock()
-            .get(path)
-            .map(|b| b.len() as u64)
-            .ok_or(FsError::NotFound)
-    }
-    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        self.lock().insert(path.to_string(), data.to_vec());
-        Ok(())
-    }
-    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        self.lock()
-            .entry(path.to_string())
-            .or_default()
-            .extend_from_slice(data);
-        Ok(())
-    }
-    fn exists(&self, path: &str) -> bool {
-        self.lock().contains_key(path)
-    }
-    fn remove(&self, path: &str) -> Result<(), FsError> {
-        self.lock().remove(path);
-        Ok(())
-    }
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-        let prefix = format!("{}/", path.trim_end_matches('/'));
-        let mut names = std::collections::BTreeSet::new();
-        for key in self.lock().keys() {
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                if let Some(name) = rest.split('/').next().filter(|n| !n.is_empty()) {
-                    names.insert(name.to_string());
-                }
-            }
-        }
-        Ok(names.into_iter().collect())
-    }
-}
-
-impl MemFs {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
-        self.files.lock().unwrap_or_else(|p| p.into_inner())
-    }
-}
+//
+// `MemFs` (hermetic in-memory) and `DiskFs` (disk-inspection) come from
+// claw_interfaces via the `memfs` / `diskfs-pretty` dev-dependency features.
 
 /// A [`Compactor`] that records how many times it ran and returns a fixed
 /// one-message summary, so tests can observe the background compaction.
@@ -731,115 +669,6 @@ fn compact_record_supersedes_groups_in_range() {
     }
 }
 
-// --- real-filesystem helpers (disk-inspection tests only) ----------------
-
-/// A [`ClawFs`] that writes to real files on disk, so output can be inspected
-/// after a test run. Virtual paths (starting with `/`) are mapped into `base`.
-struct RealFs {
-    base: std::path::PathBuf,
-}
-
-impl RealFs {
-    fn new(base: impl AsRef<std::path::Path>) -> Self {
-        let base = base.as_ref().to_path_buf();
-        std::fs::create_dir_all(&base).expect("create RealFs base dir");
-        Self { base }
-    }
-
-    fn full_path(&self, path: &str) -> std::path::PathBuf {
-        // Virtual paths start with '/'; strip it so they join into base cleanly.
-        self.base.join(path.trim_start_matches('/'))
-    }
-}
-
-impl ClawFs for RealFs {
-    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        std::fs::read(self.full_path(path)).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FsError::NotFound
-            } else {
-                FsError::Io(e.to_string())
-            }
-        })
-    }
-
-    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f =
-            std::fs::File::open(self.full_path(path)).map_err(|e| FsError::Io(e.to_string()))?;
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        Ok(buf)
-    }
-
-    fn len(&self, path: &str) -> Result<u64, FsError> {
-        std::fs::metadata(self.full_path(path))
-            .map(|m| m.len())
-            .map_err(|_| FsError::NotFound)
-    }
-
-    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let full = self.full_path(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| FsError::Io(e.to_string()))?;
-        }
-        // Pretty-print .json files so they are readable when inspecting on disk.
-        let bytes: std::borrow::Cow<[u8]> = if path.ends_with(".json") {
-            serde_json::from_slice::<Value>(data)
-                .ok()
-                .and_then(|v| serde_json::to_vec_pretty(&v).ok())
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or(std::borrow::Cow::Borrowed(data))
-        } else {
-            std::borrow::Cow::Borrowed(data)
-        };
-        std::fs::write(&full, bytes.as_ref()).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        use std::io::Write;
-        let full = self.full_path(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| FsError::Io(e.to_string()))?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&full)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        f.write_all(data).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        self.full_path(path).exists()
-    }
-
-    fn remove(&self, path: &str) -> Result<(), FsError> {
-        std::fs::remove_file(self.full_path(path)).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-        let entries = std::fs::read_dir(self.full_path(path)).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FsError::NotFound
-            } else {
-                FsError::Io(e.to_string())
-            }
-        })?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-}
-
 // --- manifest coverage helpers -------------------------------------------
 
 /// Number of live compact segments listed in a manifest `.json`.
@@ -907,7 +736,7 @@ fn compaction_index_coverage_has_no_holes() {
     std::fs::remove_dir_all(&disk_dir).ok();
     std::fs::create_dir_all(&disk_dir).expect("create disk_dir");
 
-    let fs: Arc<dyn ClawFs> = Arc::new(RealFs::new(output_root));
+    let fs: Arc<dyn ClawFs> = Arc::new(DiskFs::rooted(output_root).with_pretty_json(true));
     let shared = pool();
 
     let mut cfg = ConversationConfig::new(virtual_dir);
@@ -961,7 +790,7 @@ fn writes_inspectable_output_files() {
     std::fs::remove_dir_all(&disk_dir).ok();
     std::fs::create_dir_all(&disk_dir).expect("create disk_dir");
 
-    let fs: Arc<dyn ClawFs> = Arc::new(RealFs::new(output_root));
+    let fs: Arc<dyn ClawFs> = Arc::new(DiskFs::rooted(output_root).with_pretty_json(true));
     let shared = pool();
 
     let mut cfg = ConversationConfig::new(virtual_dir);

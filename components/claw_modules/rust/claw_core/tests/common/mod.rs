@@ -9,7 +9,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::VecDeque;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -21,7 +20,7 @@ use claw_core::{
     ToolOutput,
 };
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-use claw_interfaces::{ClawFs, FsError};
+use claw_interfaces::DiskFs;
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -265,145 +264,9 @@ pub fn never_called_llm() -> ClawApi {
     build_llm(Arc::new(NeverHttp), true)
 }
 
-// ===========================================================================
-// Filesystem doubles
-// ===========================================================================
-
-/// `ClawFs` over the real disk using absolute paths (for conversation memory).
-pub struct AbsFs;
-
-impl ClawFs for AbsFs {
-    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        std::fs::read(path).map_err(map_io)
-    }
-
-    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let mut file = std::fs::File::open(path).map_err(map_io)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        let mut buf = vec![0u8; len];
-        file.read_exact(&mut buf)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        Ok(buf)
-    }
-
-    fn len(&self, path: &str) -> Result<u64, FsError> {
-        std::fs::metadata(path).map(|m| m.len()).map_err(map_io)
-    }
-
-    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let tmp = format!("{path}.tmp");
-        std::fs::write(&tmp, data).map_err(|e| FsError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        file.write_all(data).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        Path::new(path).exists()
-    }
-
-    fn remove(&self, path: &str) -> Result<(), FsError> {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(FsError::Io(e.to_string())),
-        }
-    }
-
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-        let entries = std::fs::read_dir(path).map_err(map_io)?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-}
-
-/// `ClawFs` rooted at a base directory, so virtual paths stay portable (skills).
-pub struct RootedFs {
-    base: PathBuf,
-}
-
-impl RootedFs {
-    fn full(&self, path: &str) -> PathBuf {
-        self.base.join(path)
-    }
-}
-
-impl ClawFs for RootedFs {
-    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        std::fs::read(self.full(path)).map_err(map_io)
-    }
-
-    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let mut file = std::fs::File::open(self.full(path)).map_err(map_io)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        let mut buf = vec![0u8; len];
-        file.read_exact(&mut buf)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        Ok(buf)
-    }
-
-    fn len(&self, path: &str) -> Result<u64, FsError> {
-        std::fs::metadata(self.full(path))
-            .map(|m| m.len())
-            .map_err(map_io)
-    }
-
-    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        std::fs::write(self.full(path), data).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn append(&self, _path: &str, _data: &[u8]) -> Result<(), FsError> {
-        Err(FsError::Io("append unsupported in skills fs".into()))
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        self.full(path).exists()
-    }
-
-    fn remove(&self, path: &str) -> Result<(), FsError> {
-        match std::fs::remove_file(self.full(path)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(FsError::Io(e.to_string())),
-        }
-    }
-
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-        let entries = std::fs::read_dir(self.full(path)).map_err(map_io)?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-}
-
-fn map_io(error: std::io::Error) -> FsError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        FsError::NotFound
-    } else {
-        FsError::Io(error.to_string())
-    }
-}
+// Filesystem doubles: the shared `DiskFs` from `claw_interfaces` (the `diskfs`
+// dev-dependency feature). `DiskFs::absolute()` backs conversation memory with
+// absolute paths; `DiskFs::rooted(base)` keeps skill fixtures portable.
 
 // ===========================================================================
 // Compactor / tools
@@ -468,7 +331,7 @@ pub fn test_memory(
         agent_id.0,
         ConversationConfig::new(dir),
         ConversationDeps {
-            fs: Arc::new(AbsFs),
+            fs: Arc::new(DiskFs::absolute()),
             pool,
             compactor: Arc::new(StubCompactor),
         },
@@ -537,9 +400,7 @@ fn skills_data_dir() -> PathBuf {
 pub fn skill_registry() -> Arc<dyn SkillRegistry> {
     Arc::new(
         FsSkillRegistry::scan(
-            Arc::new(RootedFs {
-                base: skills_data_dir(),
-            }),
+            Arc::new(DiskFs::rooted(skills_data_dir())),
             "skills",
         )
         .expect("scan skills fixtures"),

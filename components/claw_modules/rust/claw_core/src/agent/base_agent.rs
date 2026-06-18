@@ -1438,13 +1438,13 @@ mod transition_tests {
 mod gating_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use claw_api::{ClawApi, ClawApiConfig};
     use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-    use claw_interfaces::{ClawFs, FsError};
+    use claw_interfaces::MemFs;
     use claw_memory::{
         CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
         MemoryTaskPool, PoolConfig,
@@ -1538,71 +1538,7 @@ mod gating_tests {
         }
     }
 
-    // In-memory FS + stub compactor (hermetic conversation memory) --------------
-
-    #[derive(Default)]
-    struct MemFs {
-        files: Mutex<HashMap<String, Vec<u8>>>,
-    }
-
-    impl MemFs {
-        fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
-            self.files.lock().unwrap_or_else(|p| p.into_inner())
-        }
-    }
-
-    impl ClawFs for MemFs {
-        fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-            self.lock().get(path).cloned().ok_or(FsError::NotFound)
-        }
-        fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-            let files = self.lock();
-            let bytes = files.get(path).ok_or(FsError::NotFound)?;
-            let start =
-                usize::try_from(offset).map_err(|_| FsError::Io("offset overflow".into()))?;
-            let end = start
-                .checked_add(len)
-                .filter(|end| *end <= bytes.len())
-                .ok_or_else(|| FsError::Io("read_at past end of file".into()))?;
-            Ok(bytes[start..end].to_vec())
-        }
-        fn len(&self, path: &str) -> Result<u64, FsError> {
-            self.lock()
-                .get(path)
-                .map(|b| u64::try_from(b.len()).unwrap_or(u64::MAX))
-                .ok_or(FsError::NotFound)
-        }
-        fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-            self.lock().insert(path.to_string(), data.to_vec());
-            Ok(())
-        }
-        fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-            self.lock()
-                .entry(path.to_string())
-                .or_default()
-                .extend_from_slice(data);
-            Ok(())
-        }
-        fn exists(&self, path: &str) -> bool {
-            self.lock().contains_key(path)
-        }
-        fn remove(&self, path: &str) -> Result<(), FsError> {
-            self.lock().remove(path);
-            Ok(())
-        }
-        fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-            let prefix = format!("{}/", path.trim_end_matches('/'));
-            let mut names = std::collections::BTreeSet::new();
-            for key in self.lock().keys() {
-                if let Some(rest) = key.strip_prefix(&prefix) {
-                    if let Some(name) = rest.split('/').next().filter(|n| !n.is_empty()) {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-            Ok(names.into_iter().collect())
-        }
-    }
+    // Stub compactor (hermetic conversation memory) -----------------------------
 
     /// Never compacts.
     struct StubCompactor;

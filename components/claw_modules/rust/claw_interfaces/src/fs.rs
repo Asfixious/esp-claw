@@ -90,3 +90,274 @@ pub trait ClawFs: Send + Sync {
     /// skills root (one directory per skill) without reading any file.
     fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError>;
 }
+
+// ===========================================================================
+// Reference implementations (feature-gated)
+// ===========================================================================
+//
+// These are host-only `ClawFs` backends, kept beside the trait so the handful
+// of distinct implementations live in exactly one place. They are NOT part of
+// the platform-free seam the rest of this crate provides, so each is gated
+// behind its own opt-in feature and must never be enabled in a device build:
+//
+// - `memfs`: an in-memory map used as a hermetic test double.
+// - `diskfs`: a `std::fs` backend used by the host CLIs and disk-backed tests.
+
+#[cfg(feature = "memfs")]
+mod memfs {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::{ClawFs, FsError};
+
+    /// In-memory [`ClawFs`] backed by a path → bytes map.
+    ///
+    /// Hermetic and thread-safe (a single instance is shared across the memory
+    /// task pool via `Arc`), so host tests can exercise persistence without
+    /// touching the real filesystem. `list_dir` derives entries from the key
+    /// prefixes, mirroring a real directory tree.
+    #[derive(Debug, Default)]
+    pub struct MemFs {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl MemFs {
+        /// An empty filesystem.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<u8>>> {
+            self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl ClawFs for MemFs {
+        fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+            self.lock().get(path).cloned().ok_or(FsError::NotFound)
+        }
+
+        fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+            let files = self.lock();
+            let bytes = files.get(path).ok_or(FsError::NotFound)?;
+            let start =
+                usize::try_from(offset).map_err(|_| FsError::Io("offset overflow".into()))?;
+            let end = start
+                .checked_add(len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| FsError::Io("read_at past end of file".into()))?;
+            bytes
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| FsError::Io("read_at past end of file".into()))
+        }
+
+        fn len(&self, path: &str) -> Result<u64, FsError> {
+            self.lock()
+                .get(path)
+                .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .ok_or(FsError::NotFound)
+        }
+
+        fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+            self.lock().insert(path.to_string(), data.to_vec());
+            Ok(())
+        }
+
+        fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+            self.lock()
+                .entry(path.to_string())
+                .or_default()
+                .extend_from_slice(data);
+            Ok(())
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.lock().contains_key(path)
+        }
+
+        fn remove(&self, path: &str) -> Result<(), FsError> {
+            self.lock().remove(path);
+            Ok(())
+        }
+
+        fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let mut names = BTreeSet::new();
+            for key in self.lock().keys() {
+                if let Some(rest) = key.strip_prefix(&prefix) {
+                    if let Some(name) = rest.split('/').next().filter(|name| !name.is_empty()) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            Ok(names.into_iter().collect())
+        }
+    }
+}
+
+#[cfg(feature = "diskfs")]
+mod diskfs {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+
+    use super::{ClawFs, FsError};
+
+    fn map_io(error: std::io::Error) -> FsError {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FsError::NotFound
+        } else {
+            FsError::Io(error.to_string())
+        }
+    }
+
+    /// Host [`ClawFs`] over `std::fs`.
+    ///
+    /// Two addressing modes share one durable write discipline (write to a `.tmp`
+    /// sibling then `rename`, creating parent directories as needed):
+    /// - [`absolute`](DiskFs::absolute): paths are used verbatim. Used by the
+    ///   host CLIs and conversation-memory tests that already hold absolute paths.
+    /// - [`rooted`](DiskFs::rooted): paths are joined onto a base directory (a
+    ///   leading `/` is stripped so absolute-looking virtual paths stay inside the
+    ///   root), keeping on-disk fixtures portable. Used by the skill-registry
+    ///   tests.
+    #[derive(Debug, Clone, Default)]
+    pub struct DiskFs {
+        base: Option<PathBuf>,
+        #[cfg(feature = "diskfs-pretty")]
+        pretty_json: bool,
+    }
+
+    impl DiskFs {
+        /// Verbatim-path mode: the trait `path` is the on-disk path.
+        pub fn absolute() -> Self {
+            Self::default()
+        }
+
+        /// Rooted mode: the trait `path` is joined onto `base` (leading `/`
+        /// stripped) so virtual paths resolve inside the root.
+        pub fn rooted(base: impl Into<PathBuf>) -> Self {
+            Self {
+                base: Some(base.into()),
+                #[cfg(feature = "diskfs-pretty")]
+                pretty_json: false,
+            }
+        }
+
+        /// Pretty-print `.json` writes so the on-disk files are readable when
+        /// inspecting a test's output directory. Off by default.
+        #[cfg(feature = "diskfs-pretty")]
+        pub fn with_pretty_json(mut self, enabled: bool) -> Self {
+            self.pretty_json = enabled;
+            self
+        }
+
+        fn resolve(&self, path: &str) -> PathBuf {
+            match &self.base {
+                Some(base) => base.join(path.trim_start_matches('/')),
+                None => PathBuf::from(path),
+            }
+        }
+    }
+
+    impl ClawFs for DiskFs {
+        fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+            std::fs::read(self.resolve(path)).map_err(map_io)
+        }
+
+        fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+            let mut file = std::fs::File::open(self.resolve(path)).map_err(map_io)?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| FsError::Io(error.to_string()))?;
+            let mut buffer = vec![0u8; len];
+            file.read_exact(&mut buffer)
+                .map_err(|error| FsError::Io(error.to_string()))?;
+            Ok(buffer)
+        }
+
+        fn len(&self, path: &str) -> Result<u64, FsError> {
+            std::fs::metadata(self.resolve(path))
+                .map(|metadata| metadata.len())
+                .map_err(map_io)
+        }
+
+        fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+            let full = self.resolve(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| FsError::Io(error.to_string()))?;
+            }
+            #[cfg(feature = "diskfs-pretty")]
+            let payload = self.render(path, data);
+            #[cfg(not(feature = "diskfs-pretty"))]
+            let payload = std::borrow::Cow::Borrowed(data);
+            // Write to a sibling and rename over the target so a crash mid-write
+            // never leaves a torn file.
+            let mut tmp = full.clone().into_os_string();
+            tmp.push(".tmp");
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, payload.as_ref())
+                .map_err(|error| FsError::Io(error.to_string()))?;
+            std::fs::rename(&tmp, &full).map_err(|error| FsError::Io(error.to_string()))
+        }
+
+        fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+            let full = self.resolve(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| FsError::Io(error.to_string()))?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&full)
+                .map_err(|error| FsError::Io(error.to_string()))?;
+            file.write_all(data)
+                .map_err(|error| FsError::Io(error.to_string()))
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.resolve(path).exists()
+        }
+
+        fn remove(&self, path: &str) -> Result<(), FsError> {
+            match std::fs::remove_file(self.resolve(path)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(FsError::Io(error.to_string())),
+            }
+        }
+
+        fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+            let entries = std::fs::read_dir(self.resolve(path)).map_err(map_io)?;
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| FsError::Io(error.to_string()))?;
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+            Ok(names)
+        }
+    }
+
+    #[cfg(feature = "diskfs-pretty")]
+    impl DiskFs {
+        /// Pretty-print `.json` payloads when enabled; otherwise pass through.
+        fn render<'data>(&self, path: &str, data: &'data [u8]) -> std::borrow::Cow<'data, [u8]> {
+            if self.pretty_json && path.ends_with(".json") {
+                serde_json::from_slice::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|value| serde_json::to_vec_pretty(&value).ok())
+                    .map(std::borrow::Cow::Owned)
+                    .unwrap_or(std::borrow::Cow::Borrowed(data))
+            } else {
+                std::borrow::Cow::Borrowed(data)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "memfs")]
+pub use memfs::MemFs;
+
+#[cfg(feature = "diskfs")]
+pub use diskfs::DiskFs;

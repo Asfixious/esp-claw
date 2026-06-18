@@ -6,7 +6,6 @@
 //! The live test talks to a real LLM and verifies multi-turn memory continuity.
 
 use std::collections::VecDeque;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +15,7 @@ use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, CancelReason, TickOutcome};
 use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
 use claw_interfaces::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
-use claw_interfaces::{ClawFs, FsError};
+use claw_interfaces::DiskFs;
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -83,95 +82,9 @@ fn test_output_dir(name: &str) -> PathBuf {
     dir
 }
 
-// ---------------------------------------------------------------------------
-// Helpers: real DiskFs
-// ---------------------------------------------------------------------------
-
-struct DiskFs;
-
-impl ClawFs for DiskFs {
-    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        std::fs::read(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FsError::NotFound
-            } else {
-                FsError::Io(e.to_string())
-            }
-        })
-    }
-
-    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let mut file = std::fs::File::open(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FsError::NotFound
-            } else {
-                FsError::Io(e.to_string())
-            }
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        let mut buf = vec![0u8; len];
-        file.read_exact(&mut buf)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        Ok(buf)
-    }
-
-    fn len(&self, path: &str) -> Result<u64, FsError> {
-        std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FsError::NotFound
-            } else {
-                FsError::Io(e.to_string())
-            }
-        })
-    }
-
-    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        let tmp = format!("{path}.tmp");
-        std::fs::write(&tmp, data).map_err(|e| FsError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| FsError::Io(e.to_string()))?;
-        file.write_all(data).map_err(|e| FsError::Io(e.to_string()))
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        Path::new(path).exists()
-    }
-
-    fn remove(&self, path: &str) -> Result<(), FsError> {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(FsError::Io(e.to_string())),
-        }
-    }
-
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-        let entries = std::fs::read_dir(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FsError::NotFound
-            } else {
-                FsError::Io(e.to_string())
-            }
-        })?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-}
+// Memory uses the shared `DiskFs::absolute()` from claw_interfaces (the `diskfs`
+// dev-dependency feature), writing to `output/<test_name>/` so transcript files
+// can be inspected after a run.
 
 // ---------------------------------------------------------------------------
 // Helpers: HTTP stubs
@@ -401,7 +314,7 @@ fn test_memory(
         agent_id.0,
         ConversationConfig::new(dir),
         ConversationDeps {
-            fs: Arc::new(DiskFs),
+            fs: Arc::new(DiskFs::absolute()),
             pool,
             compactor: Arc::new(StubCompactor),
         },

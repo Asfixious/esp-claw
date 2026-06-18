@@ -16,92 +16,19 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use claw_core::{FsSkillRegistry, ManageMode, SkillId, SkillRegistry, SkillSet};
-use claw_interfaces::{ClawFs, FsError};
+use claw_interfaces::DiskFs;
 use serde_json::json;
 
 /// Virtual skills root handed to the registry; maps onto `tests/data/skills`.
 const SKILLS_ROOT: &str = "skills";
 
-// ---------------------------------------------------------------------------
-// DiskFs rooted at a base directory (so virtual paths stay portable).
-// ---------------------------------------------------------------------------
-
-struct DiskFs {
-    base: PathBuf,
-}
-
-impl DiskFs {
-    fn full_path(&self, path: &str) -> PathBuf {
-        self.base.join(path)
-    }
-}
-
-impl ClawFs for DiskFs {
-    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
-        std::fs::read(self.full_path(path)).map_err(map_io)
-    }
-
-    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let mut file = std::fs::File::open(self.full_path(path)).map_err(map_io)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| FsError::Io(error.to_string()))?;
-        let mut buffer = vec![0u8; len];
-        file.read_exact(&mut buffer)
-            .map_err(|error| FsError::Io(error.to_string()))?;
-        Ok(buffer)
-    }
-
-    fn len(&self, path: &str) -> Result<u64, FsError> {
-        std::fs::metadata(self.full_path(path))
-            .map(|metadata| metadata.len())
-            .map_err(map_io)
-    }
-
-    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
-        std::fs::write(self.full_path(path), data).map_err(|error| FsError::Io(error.to_string()))
-    }
-
-    fn append(&self, _path: &str, _data: &[u8]) -> Result<(), FsError> {
-        Err(FsError::Io("append unsupported in skills test fs".into()))
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        self.full_path(path).exists()
-    }
-
-    fn remove(&self, path: &str) -> Result<(), FsError> {
-        match std::fs::remove_file(self.full_path(path)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(FsError::Io(error.to_string())),
-        }
-    }
-
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
-        let entries = std::fs::read_dir(self.full_path(path)).map_err(map_io)?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| FsError::Io(error.to_string()))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-}
-
-fn map_io(error: std::io::Error) -> FsError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        FsError::NotFound
-    } else {
-        FsError::Io(error.to_string())
-    }
-}
+// The registry is scanned over the shared `DiskFs::rooted(base)` (the `diskfs`
+// dev-dependency feature) so virtual paths like `skills/<id>` resolve under
+// `tests/data` and stay portable.
 
 // ---------------------------------------------------------------------------
 // Fixture paths + helpers
@@ -120,7 +47,7 @@ fn update_golden() -> bool {
 }
 
 fn registry() -> FsSkillRegistry {
-    FsSkillRegistry::scan(Arc::new(DiskFs { base: data_dir() }), SKILLS_ROOT)
+    FsSkillRegistry::scan(Arc::new(DiskFs::rooted(data_dir())), SKILLS_ROOT)
         .expect("scan skills fixtures")
 }
 

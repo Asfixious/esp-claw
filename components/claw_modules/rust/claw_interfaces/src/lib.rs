@@ -14,4 +14,8 @@ pub mod http;
 pub use error::*;
 pub use event::{ClawEvent, EventPublisher, SessionPolicy};
 pub use fs::{ClawFs, FsError};
+#[cfg(feature = "diskfs")]
+pub use fs::DiskFs;
+#[cfg(feature = "memfs")]
+pub use fs::MemFs;
 pub use http::{ClawHttp, HttpError, HttpHeader, HttpJsonRequest, HttpResponse};

@@ -3,6 +3,8 @@
 //! Replaces `claw_llm_http_transport.c`. The espidf wiring implements this over
 //! `esp_http_client`; host tests provide canned responses.
 
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::AtomicBool;
 
 /// A single extra request header (`name: value`).
@@ -59,6 +61,60 @@ pub trait ClawHttp: Send + Sync {
         request: &HttpJsonRequest,
         abort: &AtomicBool,
     ) -> Result<HttpResponse, HttpError>;
+}
+
+/// Boxed future returned by [`ClawHttpAsync::post_json`].
+///
+/// Boxed (instead of an `async fn` in the trait) so `ClawHttpAsync` stays
+/// object-safe: the LLM stack shares its transport as `Arc<dyn ClawHttpAsync>`,
+/// exactly like the blocking [`ClawHttp`] seam. The future borrows `self`, the
+/// request, and the abort flag, so it cannot outlive any of them.
+///
+/// The future is intentionally **not** `Send`: the espidf driver advances an
+/// `esp_http_client` handle (a raw pointer) across polls, so it must be polled
+/// on the task that created it — the common single-task embedded executor model.
+pub type HttpResponseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<HttpResponse, HttpError>> + 'a>>;
+
+/// Async counterpart of [`ClawHttp`], driven by a cooperative executor instead
+/// of blocking the calling task for the whole request.
+///
+/// On ESP-IDF this maps onto `esp_http_client`'s non-blocking mode
+/// (`config.is_async = true`): each poll runs one `esp_http_client_perform`
+/// step and yields (`Poll::Pending`) while the call reports
+/// `ESP_ERR_HTTP_EAGAIN`, letting other tasks run between steps. Cancel a
+/// request by dropping the future, which tears down the underlying client;
+/// `abort` is still honored for parity with [`ClawHttp`] and to stop a transfer
+/// that has already begun.
+pub trait ClawHttpAsync: Send + Sync {
+    /// Async equivalent of [`ClawHttp::post_json`]: resolves to the body on
+    /// HTTP 200, otherwise an [`HttpError`].
+    fn post_json<'a>(
+        &'a self,
+        request: &'a HttpJsonRequest<'a>,
+        abort: &'a AtomicBool,
+    ) -> HttpResponseFuture<'a>;
+}
+
+/// Adapts any blocking [`ClawHttp`] into a [`ClawHttpAsync`] by running the
+/// request to completion in a single poll.
+///
+/// Intended for the host (CLIs, tests) where the blocking transports — the
+/// `httpmock` doubles, [`RealHttp`] — already exist and a real cooperative
+/// executor is unnecessary. It is **not** appropriate on-device: the wrapped
+/// call blocks the polling task for the whole request, defeating the purpose of
+/// the async seam (use the native `esp_http_client` driver there instead).
+pub struct BlockingClawHttpAsync<T>(pub T);
+
+impl<T: ClawHttp> ClawHttpAsync for BlockingClawHttpAsync<T> {
+    fn post_json<'a>(
+        &'a self,
+        request: &'a HttpJsonRequest<'a>,
+        abort: &'a AtomicBool,
+    ) -> HttpResponseFuture<'a> {
+        let result = self.0.post_json(request, abort);
+        Box::pin(core::future::ready(result))
+    }
 }
 
 // ===========================================================================
@@ -325,3 +381,78 @@ mod realhttp {
 
 #[cfg(feature = "realhttp")]
 pub use realhttp::RealHttp;
+
+#[cfg(test)]
+mod async_seam_tests {
+    use super::{
+        BlockingClawHttpAsync, ClawHttp, ClawHttpAsync, HttpError, HttpJsonRequest, HttpResponse,
+    };
+    use core::future::Future;
+    use core::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake};
+
+    /// Noop waker: our reference futures resolve in a bounded number of polls,
+    /// so a spin-driven `block_on` needs no real wakeups.
+    struct NoopWake;
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let waker = Arc::new(NoopWake).into();
+        let mut context = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+        }
+    }
+
+    struct EchoStatus(i32);
+    impl ClawHttp for EchoStatus {
+        fn post_json(
+            &self,
+            request: &HttpJsonRequest,
+            _abort: &AtomicBool,
+        ) -> Result<HttpResponse, HttpError> {
+            Ok(HttpResponse {
+                status_code: self.0,
+                body: request.body.to_string(),
+            })
+        }
+    }
+
+    fn request<'a>(url: &'a str, body: &'a str) -> HttpJsonRequest<'a> {
+        HttpJsonRequest {
+            url,
+            body,
+            api_key: None,
+            auth_type: None,
+            timeout_ms: 1_000,
+            headers: &[],
+        }
+    }
+
+    #[test]
+    fn blocking_adapter_drives_clawhttp_through_async_seam() {
+        let transport = BlockingClawHttpAsync(EchoStatus(200));
+        let abort = AtomicBool::new(false);
+        let request = request("https://example.test", "ping");
+        let response = block_on(transport.post_json(&request, &abort)).expect("ok");
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.body, "ping");
+    }
+
+    #[test]
+    fn blocking_adapter_is_object_safe() {
+        // The async seam must be shareable as a trait object, mirroring the
+        // blocking `Arc<dyn ClawHttp>` usage in `claw-api`.
+        let transport: Arc<dyn ClawHttpAsync> = Arc::new(BlockingClawHttpAsync(EchoStatus(204)));
+        let abort = AtomicBool::new(false);
+        let request = request("https://example.test", "{}");
+        let response = block_on(transport.post_json(&request, &abort)).expect("ok");
+        assert_eq!(response.status_code, 204);
+    }
+}

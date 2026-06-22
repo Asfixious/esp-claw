@@ -71,11 +71,20 @@ pub use espidf_driver::EspIdfHttp;
 #[cfg(target_os = "espidf")]
 mod espidf_driver {
     use super::{build_auth_header, parse_error_message_body};
-    use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
+    use claw_interface::http::{
+        ClawHttp, ClawHttpAsync, HttpError, HttpJsonRequest, HttpResponse, HttpResponseFuture,
+    };
     use claw_platform::{ESP_FAIL, ESP_OK};
     use core::ffi::{c_char, c_int, c_void};
+    use core::future::Future;
+    use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll};
     use std::ffi::CString;
+
+    /// `esp_http_client_perform` return when the non-blocking request is still
+    /// in progress (`ESP_ERR_HTTP_BASE + 7`, see `esp_http_client.h`).
+    const ESP_ERR_HTTP_EAGAIN: c_int = 0x7007;
 
     // --- esp_http_client FFI ------------------------------------------------
     #[repr(C)]
@@ -280,6 +289,169 @@ mod espidf_driver {
 
             unsafe { esp_http_client_cleanup(client) };
             result
+        }
+    }
+
+    /// RAII owner of an in-flight async `esp_http_client` request.
+    ///
+    /// Holds everything that must outlive the repeated `esp_http_client_perform`
+    /// calls and cleans the client up on drop, so cancelling the future (by
+    /// dropping it) tears the request down without leaking the connection.
+    struct AsyncRequest {
+        client: *mut c_void,
+        // Referenced by the client via `config.user_data`; the event handler
+        // writes the response body here through that raw pointer, so the box
+        // must stay alive and pinned in place for the whole request.
+        ctx: Box<RequestCtx>,
+        // `esp_http_client_set_post_field` stores the pointer (it does not copy
+        // the body), so the buffer must outlive every perform call.
+        _body: CString,
+    }
+
+    impl Drop for AsyncRequest {
+        fn drop(&mut self) {
+            unsafe { esp_http_client_cleanup(self.client) };
+        }
+    }
+
+    impl AsyncRequest {
+        /// Initialize a non-blocking client and apply method/headers/body once.
+        /// After this returns the request is ready to be driven by repeated
+        /// [`AsyncRequest::perform`] calls.
+        fn new(request: &HttpJsonRequest, abort: &AtomicBool) -> Result<AsyncRequest, HttpError> {
+            // `url` only needs to stay alive until `esp_http_client_init`
+            // returns (it parses and copies the URL internally).
+            let url = CString::new(request.url).map_err(|_| HttpError::InvalidUrl)?;
+            let body = CString::new(request.body).map_err(|_| HttpError::InvalidBody)?;
+            let mut ctx = Box::new(RequestCtx {
+                body: Vec::with_capacity(4096),
+                abort: abort as *const _,
+            });
+
+            let mut config: esp_http_client_config_t = unsafe { core::mem::zeroed() };
+            config.url = url.as_ptr();
+            config.event_handler = Some(http_event_handler);
+            config.user_data = (&mut *ctx as *mut RequestCtx) as *mut c_void;
+            config.timeout_ms = request.timeout_ms as c_int;
+            config.buffer_size = 4096;
+            config.buffer_size_tx = 4096;
+            config.crt_bundle_attach = Some(esp_crt_bundle_attach);
+            // Non-blocking mode: perform returns ESP_ERR_HTTP_EAGAIN while the
+            // transfer is in progress. Only supported over HTTPS.
+            config.is_async = true;
+
+            let client = unsafe { esp_http_client_init(&config) };
+            if client.is_null() {
+                return Err(HttpError::ClientInitFailed);
+            }
+            // Own the client immediately so any early return below still cleans
+            // it up via `Drop`.
+            let request_state = AsyncRequest {
+                client,
+                ctx,
+                _body: body,
+            };
+
+            unsafe {
+                esp_http_client_set_method(client, HTTP_METHOD_POST);
+                let ct_key = CString::new("Content-Type").unwrap();
+                let ct_val = CString::new("application/json").unwrap();
+                esp_http_client_set_header(client, ct_key.as_ptr(), ct_val.as_ptr());
+
+                if let Some((name, value)) = build_auth_header(request.auth_type, request.api_key) {
+                    let k = CString::new(name).unwrap();
+                    if let Ok(v) = CString::new(value) {
+                        esp_http_client_set_header(client, k.as_ptr(), v.as_ptr());
+                    }
+                }
+                for h in request.headers {
+                    if h.name.is_empty() {
+                        continue;
+                    }
+                    if let (Ok(k), Ok(v)) = (CString::new(h.name), CString::new(h.value)) {
+                        esp_http_client_set_header(client, k.as_ptr(), v.as_ptr());
+                    }
+                }
+                esp_http_client_set_post_field(
+                    client,
+                    request_state._body.as_ptr(),
+                    request.body.len() as c_int,
+                );
+            }
+            Ok(request_state)
+        }
+
+        /// Run one non-blocking transfer step. `Ok(None)` means the transfer is
+        /// still in progress (caller should yield and poll again); `Ok(Some(_))`
+        /// is the finished response.
+        fn perform(&self, abort: &AtomicBool) -> Result<Option<HttpResponse>, HttpError> {
+            if abort.load(Ordering::Relaxed) {
+                return Err(HttpError::Aborted);
+            }
+            let err = unsafe { esp_http_client_perform(self.client) };
+            if err == ESP_ERR_HTTP_EAGAIN {
+                return Ok(None);
+            }
+            let aborted = abort.load(Ordering::Relaxed);
+            if err != ESP_OK {
+                return Err(if aborted {
+                    HttpError::Aborted
+                } else {
+                    HttpError::RequestFailed(err_name(err))
+                });
+            }
+            if aborted {
+                return Err(HttpError::Aborted);
+            }
+            let status = unsafe { esp_http_client_get_status_code(self.client) };
+            let body = String::from_utf8_lossy(&self.ctx.body).into_owned();
+            if status != 200 {
+                return Err(HttpError::UnexpectedStatus(parse_error_message_body(
+                    &body, status,
+                )));
+            }
+            Ok(Some(HttpResponse {
+                status_code: status,
+                body,
+            }))
+        }
+    }
+
+    /// Yields once to the executor, then resumes. Lets cooperatively-scheduled
+    /// tasks run between `ESP_ERR_HTTP_EAGAIN` retries instead of spinning the
+    /// CPU inside a single poll.
+    async fn yield_once() {
+        struct YieldOnce(bool);
+        impl Future for YieldOnce {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.0 {
+                    Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+        YieldOnce(false).await
+    }
+
+    impl ClawHttpAsync for EspIdfHttp {
+        fn post_json<'a>(
+            &'a self,
+            request: &'a HttpJsonRequest<'a>,
+            abort: &'a AtomicBool,
+        ) -> HttpResponseFuture<'a> {
+            Box::pin(async move {
+                let state = AsyncRequest::new(request, abort)?;
+                loop {
+                    if let Some(response) = state.perform(abort)? {
+                        return Ok(response);
+                    }
+                    yield_once().await;
+                }
+            })
         }
     }
 }

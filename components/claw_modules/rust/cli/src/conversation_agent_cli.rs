@@ -13,7 +13,9 @@
 use std::io::{self, BufRead, Write};
 
 use claw_agent_cli::{load_env, make_llm, make_memory};
-use claw_core::agent::{Agent, AgentCommand, AgentId, ConvPhase, ConversationAgent, TickOutcome};
+use claw_core::agent::{
+    Agent, AgentCommand, AgentId, ConversationAgent, ConversationPhase, TickOutcome,
+};
 use owo_colors::{AnsiColors, OwoColorize};
 use serde_json::Value;
 
@@ -110,13 +112,13 @@ fn main() {
 
 /// A colored `[stage: X]` label for the agent's current FSM stage. Each stage
 /// gets its own color so progression is easy to track at a glance.
-fn stage_label(phase: ConvPhase) -> String {
+fn stage_label(phase: ConversationPhase) -> String {
     let color = match phase {
-        ConvPhase::Intake => AnsiColors::Blue,
-        ConvPhase::Verify => AnsiColors::Yellow,
-        ConvPhase::Delegate => AnsiColors::Magenta,
-        ConvPhase::Watch => AnsiColors::Cyan,
-        ConvPhase::Report => AnsiColors::Green,
+        ConversationPhase::Intake => AnsiColors::Blue,
+        ConversationPhase::Verify => AnsiColors::Yellow,
+        ConversationPhase::Delegate => AnsiColors::Magenta,
+        ConversationPhase::Watch => AnsiColors::Cyan,
+        ConversationPhase::Report => AnsiColors::Green,
     };
     format!("[stage: {phase}]").color(color).to_string()
 }

@@ -1,0 +1,17 @@
+{
+  "type": "function",
+  "function": {
+    "name": "understood",
+    "description": "Signal that you fully understand the user's request and are ready to verify it. Provide a one-line restatement of the request.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "description": "A one-line restatement of the request."
+        }
+      },
+      "required": ["summary"]
+    }
+  }
+}

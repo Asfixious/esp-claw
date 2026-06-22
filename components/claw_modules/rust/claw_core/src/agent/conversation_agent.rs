@@ -38,8 +38,8 @@ use crate::agent::base_agent::{
     AgentCommand, AgentCommandError, AgentId, BaseAgent, BaseAgentBuildError, TickOutcome,
 };
 use crate::agent::internal_tools::{
-    drain_goals, spawn_tool_group, string_argument, SpawnSink, END_CONVERSATION, REQUEST_APPROVAL,
-    SPAWN_SUBAGENT,
+    drain_goals, ensure_valid_arguments_json, spawn_tool_group, SpawnSink, END_CONVERSATION,
+    REQUEST_APPROVAL, SPAWN_SUBAGENT,
 };
 use crate::agent::{append_child_result, Agent};
 use crate::skills::SkillSet;
@@ -67,9 +67,37 @@ const COMPILE_RESULTS: &str = "compile_results";
 /// Group label for conversation-only control tools (provenance only).
 const CONVERSATION_TOOL_GROUP: &str = "conversation";
 
+/// Build one conversation control [`Tool`] from a single name literal, deriving
+/// **both** its `name` and its schema file `resources/tool_schemas/<name>.json`
+/// from that one literal — the same single-source rule as
+/// [`tool_metadata!`](crate::tools::tool_metadata).
+///
+/// `SignalTool` is one struct with three instances (their behavior is identical,
+/// differing only in `signal`/`name`/`ack`), so it carries `name`/`schema` as
+/// fields instead of via the trait macro; this wires them from the one literal
+/// here. The matching `&str` constant (e.g. [`UNDERSTOOD`]) stays for the
+/// per-stage allow-sets in [`phase_allows`], mirroring how `internal_tools`
+/// pairs a `tool_metadata!` literal with a name constant.
+macro_rules! signal_tool {
+    ($sink:expr, $signal:expr, $name:literal, $ack:expr $(,)?) => {
+        Tool::new(SignalTool {
+            sink: $sink,
+            signal: $signal,
+            tool_name: $name,
+            tool_schema: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/resources/tool_schemas/",
+                $name,
+                ".json"
+            )),
+            ack: $ack,
+        })
+    };
+}
+
 /// A conversation FSM transition raised by a control tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConvSignal {
+enum ConversationSignal {
     /// The request is understood (Intake -> Verify).
     Understood,
     /// The request is confirmed and feasible; begin executing (Verify -> Delegate).
@@ -78,54 +106,51 @@ enum ConvSignal {
     CompileResults,
 }
 
-/// Queue the conversation control tools push [`ConvSignal`]s onto; the agent
+/// Queue the conversation control tools push [`ConversationSignal`]s onto; the agent
 /// drains it each tick.
-type ConvSink = Arc<Mutex<VecDeque<ConvSignal>>>;
+type ConversationSink = Arc<Mutex<VecDeque<ConversationSignal>>>;
 
 /// Build the conversation control tool group over a signal sink.
-fn conversation_tool_group(sink: ConvSink) -> ToolGroup {
+fn conversation_tool_group(sink: ConversationSink) -> ToolGroup {
     ToolGroup::new(
         CONVERSATION_TOOL_GROUP,
         [
-            Tool::new(SignalTool {
-                sink: Arc::clone(&sink),
-                signal: ConvSignal::Understood,
-                tool_name: UNDERSTOOD,
-                tool_schema: r#"{"type":"function","function":{"name":"understood","description":"Signal that you fully understand the user's request and are ready to verify it. Provide a one-line restatement of the request.","parameters":{"type":"object","properties":{"summary":{"type":"string","description":"A one-line restatement of the request."}},"required":["summary"]}}}"#,
-                ack: "Understanding confirmed; proceed to verify the request.",
-            }),
-            Tool::new(SignalTool {
-                sink: Arc::clone(&sink),
-                signal: ConvSignal::BeginExecution,
-                tool_name: BEGIN_EXECUTION,
-                tool_schema: r#"{"type":"function","function":{"name":"begin_execution","description":"Confirm the request is feasible and begin executing it (this unlocks delegating work to subagents). Provide a short plan.","parameters":{"type":"object","properties":{"plan":{"type":"string","description":"A short plan of how the task will be executed."}},"required":["plan"]}}}"#,
-                ack: "Execution unlocked; delegate subtasks with spawn_subagent.",
-            }),
-            Tool::new(SignalTool {
+            signal_tool!(
+                Arc::clone(&sink),
+                ConversationSignal::Understood,
+                "understood",
+                "Understanding confirmed; proceed to verify the request.",
+            ),
+            signal_tool!(
+                Arc::clone(&sink),
+                ConversationSignal::BeginExecution,
+                "begin_execution",
+                "Execution unlocked; delegate subtasks with spawn_subagent.",
+            ),
+            signal_tool!(
                 sink,
-                signal: ConvSignal::CompileResults,
-                tool_name: COMPILE_RESULTS,
-                tool_schema: r#"{"type":"function","function":{"name":"compile_results","description":"Signal that the subagents' results are sufficient and you will now synthesize the final answer for the user.","parameters":{"type":"object","properties":{},"required":[]}}}"#,
-                ack: "Synthesizing the final answer; spawning is now closed.",
-            }),
+                ConversationSignal::CompileResults,
+                "compile_results",
+                "Synthesizing the final answer; spawning is now closed.",
+            ),
         ],
     )
 }
 
 /// Drain all pending FSM signals, leaving the sink empty.
-fn drain_signals(sink: &ConvSink) -> Vec<ConvSignal> {
+fn drain_signals(sink: &ConversationSink) -> Vec<ConversationSignal> {
     sink.lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .drain(..)
         .collect()
 }
 
-/// A control tool that pushes a fixed [`ConvSignal`] when invoked. Its argument
+/// A control tool that pushes a fixed [`ConversationSignal`] when invoked. Its argument
 /// (if any) is for the model's own reasoning — already captured in the recorded
 /// tool call — so the handler only needs to raise the signal.
 struct SignalTool {
-    sink: ConvSink,
-    signal: ConvSignal,
+    sink: ConversationSink,
+    signal: ConversationSignal,
     tool_name: &'static str,
     tool_schema: &'static str,
     ack: &'static str,
@@ -141,9 +166,11 @@ impl ToolHandler for SignalTool {
     }
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
-        // Validate any provided arguments are well-formed JSON (surface malformed
-        // calls rather than swallowing them); the value itself is unused.
-        let _ = string_argument(call.arguments_json, "summary")?;
+        // The argument (if any) exists only for the model's own reasoning and is
+        // already captured in the recorded tool call, so its value is unused;
+        // validate it is well-formed JSON to surface a malformed call rather
+        // than swallow it.
+        ensure_valid_arguments_json(call.arguments_json)?;
         self.sink
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -172,7 +199,7 @@ ordinary completion.";
 /// The five stages of a [`ConversationAgent`]'s FSM, observable via
 /// [`ConversationAgent::phase`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConvPhase {
+pub enum ConversationPhase {
     /// Understand the request; spawning gated off.
     Intake,
     /// Confirm intent and feasibility; spawning gated off.
@@ -185,14 +212,14 @@ pub enum ConvPhase {
     Report,
 }
 
-impl std::fmt::Display for ConvPhase {
+impl std::fmt::Display for ConversationPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            ConvPhase::Intake => "Intake",
-            ConvPhase::Verify => "Verify",
-            ConvPhase::Delegate => "Delegate",
-            ConvPhase::Watch => "Watch",
-            ConvPhase::Report => "Report",
+            ConversationPhase::Intake => "Intake",
+            ConversationPhase::Verify => "Verify",
+            ConversationPhase::Delegate => "Delegate",
+            ConversationPhase::Watch => "Watch",
+            ConversationPhase::Report => "Report",
         };
         f.write_str(name)
     }
@@ -215,8 +242,8 @@ pub struct ConversationAgent {
     /// Present iff this agent may spawn subagents.
     spawn: Option<SpawnSink>,
     /// FSM transition signals raised by the conversation control tools.
-    signals: ConvSink,
-    phase: ConvPhase,
+    signals: ConversationSink,
+    phase: ConversationPhase,
     allows: PhaseAllows,
 }
 
@@ -241,35 +268,41 @@ impl ConversationAgent {
     }
 
     /// The agent's current FSM stage (read-only; the agent owns transitions).
-    pub fn phase(&self) -> ConvPhase {
+    pub fn phase(&self) -> ConversationPhase {
         self.phase
     }
 
     /// The allow-set for a stage.
-    fn allow_for(&self, phase: ConvPhase) -> &AllowedTools {
+    fn allow_for(&self, phase: ConversationPhase) -> &AllowedTools {
         match phase {
-            ConvPhase::Intake => &self.allows.intake,
-            ConvPhase::Verify => &self.allows.verify,
-            ConvPhase::Delegate => &self.allows.delegate,
-            ConvPhase::Watch => &self.allows.watch,
-            ConvPhase::Report => &self.allows.report,
+            ConversationPhase::Intake => &self.allows.intake,
+            ConversationPhase::Verify => &self.allows.verify,
+            ConversationPhase::Delegate => &self.allows.delegate,
+            ConversationPhase::Watch => &self.allows.watch,
+            ConversationPhase::Report => &self.allows.report,
         }
     }
 
     /// Move to `phase` and apply its tool gating. Gating persists in the base
     /// between ticks, so it is only re-applied on a transition.
-    fn set_phase(&mut self, phase: ConvPhase) {
+    fn set_phase(&mut self, phase: ConversationPhase) {
         self.phase = phase;
         let allowed = self.allow_for(phase).clone();
         self.base.set_active_tools(allowed);
     }
 
     /// Apply one drained FSM signal if it is valid for the current stage.
-    fn apply_signal(&mut self, signal: ConvSignal) {
+    fn apply_signal(&mut self, signal: ConversationSignal) {
         match (self.phase, signal) {
-            (ConvPhase::Intake, ConvSignal::Understood) => self.set_phase(ConvPhase::Verify),
-            (ConvPhase::Verify, ConvSignal::BeginExecution) => self.set_phase(ConvPhase::Delegate),
-            (ConvPhase::Watch, ConvSignal::CompileResults) => self.set_phase(ConvPhase::Report),
+            (ConversationPhase::Intake, ConversationSignal::Understood) => {
+                self.set_phase(ConversationPhase::Verify)
+            }
+            (ConversationPhase::Verify, ConversationSignal::BeginExecution) => {
+                self.set_phase(ConversationPhase::Delegate)
+            }
+            (ConversationPhase::Watch, ConversationSignal::CompileResults) => {
+                self.set_phase(ConversationPhase::Report)
+            }
             // A signal that does not match the current stage is ignored (the tool
             // that raises it is gated off outside its stage, so this is defensive).
             _ => {}
@@ -308,8 +341,8 @@ impl Agent for ConversationAgent {
 
         // A spawn during Delegate moves to Watch; further spawns stay in Watch.
         let goals = self.spawn.as_ref().map(drain_goals).unwrap_or_default();
-        if !goals.is_empty() && self.phase == ConvPhase::Delegate {
-            self.set_phase(ConvPhase::Watch);
+        if !goals.is_empty() && self.phase == ConversationPhase::Delegate {
+            self.set_phase(ConversationPhase::Watch);
         }
         for goal in goals {
             self.spawn_subagent(goal);
@@ -325,12 +358,12 @@ impl Agent for ConversationAgent {
             ) => true,
             (
                 TickOutcome::Yielded { .. },
-                ConvPhase::Intake | ConvPhase::Verify | ConvPhase::Report,
+                ConversationPhase::Intake | ConversationPhase::Verify | ConversationPhase::Report,
             ) => true,
             _ => false,
         };
-        if reset && self.phase != ConvPhase::Intake {
-            self.set_phase(ConvPhase::Intake);
+        if reset && self.phase != ConversationPhase::Intake {
+            self.set_phase(ConversationPhase::Intake);
         }
 
         outcome
@@ -410,7 +443,7 @@ impl ConversationAgentBuilder {
     /// [`ConversationAgentBuildError`] when tool assembly or base construction
     /// fails.
     pub fn build(self) -> Result<ConversationAgent, ConversationAgentBuildError> {
-        let signals: ConvSink = ConvSink::default();
+        let signals: ConversationSink = ConversationSink::default();
         let spawn = self.spawn_enabled.then(SpawnSink::default);
 
         let allows = phase_allows(&self.tools, spawn.is_some());
@@ -438,11 +471,11 @@ impl ConversationAgentBuilder {
             base,
             spawn,
             signals,
-            phase: ConvPhase::Intake,
+            phase: ConversationPhase::Intake,
             allows,
         };
         // Apply the initial Intake gating before the first tick.
-        agent.set_phase(ConvPhase::Intake);
+        agent.set_phase(ConversationPhase::Intake);
         Ok(agent)
     }
 }
@@ -646,7 +679,7 @@ mod tests {
         let agent = ConversationAgent::builder(AgentId(1), llm, memory)
             .build()
             .unwrap();
-        assert_eq!(agent.phase, ConvPhase::Intake);
+        assert_eq!(agent.phase, ConversationPhase::Intake);
     }
 
     #[test]
@@ -663,7 +696,7 @@ mod tests {
             TickOutcome::Yielded { text } => assert_eq!(text, "here you go"),
             other => panic!("unexpected: {other:?}"),
         }
-        assert_eq!(agent.phase, ConvPhase::Intake);
+        assert_eq!(agent.phase, ConversationPhase::Intake);
     }
 
     #[test]
@@ -685,9 +718,9 @@ mod tests {
             .unwrap();
 
         assert!(matches!(agent.tick(), TickOutcome::Working));
-        assert_eq!(agent.phase, ConvPhase::Verify);
+        assert_eq!(agent.phase, ConversationPhase::Verify);
         assert!(matches!(agent.tick(), TickOutcome::Working));
-        assert_eq!(agent.phase, ConvPhase::Delegate);
+        assert_eq!(agent.phase, ConversationPhase::Delegate);
     }
 
     /// In Intake, `spawn_subagent` is gated off: the call is refused with a
@@ -715,7 +748,7 @@ mod tests {
             TickOutcome::Ended { final_message } => assert_eq!(final_message, "stopping"),
             other => panic!("unexpected: {other:?}"),
         }
-        assert_eq!(agent.phase, ConvPhase::Intake);
+        assert_eq!(agent.phase, ConversationPhase::Intake);
         assert!(
             transcript_contents(&view)
                 .iter()

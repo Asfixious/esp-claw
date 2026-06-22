@@ -89,6 +89,23 @@ pub(crate) fn string_argument(arguments_json: &str, key: &str) -> Result<String,
         .to_string())
 }
 
+/// Validate that a tool call's arguments are well-formed JSON, without
+/// extracting any field. For control tools whose argument exists only for the
+/// model's own reasoning (already captured in the recorded tool call), this
+/// surfaces a malformed call instead of swallowing it.
+///
+/// # Errors
+///
+/// [`ToolError::InvokeFailed`] if the arguments are present but not valid JSON.
+pub(crate) fn ensure_valid_arguments_json(arguments_json: &str) -> Result<(), ToolError> {
+    if arguments_json.trim().is_empty() {
+        return Ok(());
+    }
+    serde_json::from_str::<Value>(arguments_json)
+        .map(|_| ())
+        .map_err(|error| ToolError::InvokeFailed(format!("invalid tool arguments JSON: {error}")))
+}
+
 fn push(sink: &ControlSink, signal: ControlSignal) {
     sink.lock()
         .unwrap_or_else(|poison| poison.into_inner())

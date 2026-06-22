@@ -1,0 +1,12 @@
+{
+  "type": "function",
+  "function": {
+    "name": "compile_results",
+    "description": "Signal that the subagents' results are sufficient and you will now synthesize the final answer for the user.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  }
+}

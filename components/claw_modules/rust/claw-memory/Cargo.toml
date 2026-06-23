@@ -18,7 +18,7 @@ compactor-stub = []
 
 [dependencies]
 claw-interface = { path = "../claw-interface" }
-claw_sys = { path = "../claw_sys" }
+claw-sys = { path = "../claw-sys" }
 claw-api = { path = "../claw-api", optional = true }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

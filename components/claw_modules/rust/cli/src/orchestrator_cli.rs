@@ -42,6 +42,12 @@ const CHAT_ID: &str = "cli-chat";
 
 fn main() {
     load_env();
+    // Install the flat-tree `tracing` subscriber so the layered spans/events
+    // (turn > agent > iteration_loop > toolcall) print as `TR …` lines on
+    // stderr — the same stream a device build sends to `ESP_LOGx`. `init_logger`
+    // routes plain `log::` records to stderr too.
+    claw_log::init_logger(claw_log::LevelFilter::Trace).expect("install log backend");
+    claw_log::init_tracing().expect("install tracing subscriber");
 
     // Empty resolver: the built-in conversation/worker manifests declare no extra
     // capabilities, so no name->handler mapping is needed yet.

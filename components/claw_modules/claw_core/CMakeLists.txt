@@ -11,14 +11,14 @@
 # claw_core_llm.h ABI (claw_core_llm_infer_media) exported here.
 #
 # The only C source still compiled here is the tiny log shim that lets the Rust
-# `log` backend reach `esp_log_write` (csrc lives next to the claw_sys crate).
+# `log` backend reach `esp_log_write` (csrc lives next to the claw-sys crate).
 #
 # NOTE: building this component requires the Espressif Rust toolchain
 # (`espup install`, channel "esp" pinned in ../rust/rust-toolchain.toml) on PATH.
 
 idf_component_register(
     SRCS
-        "../rust/claw_sys/csrc/claw_rs_log.c"
+        "../rust/claw-sys/csrc/claw_rs_log.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -29,9 +29,10 @@ idf_component_register(
         mbedtls
     PRIV_REQUIRES
         claw_event_router
-    # The Rust log backend in libclaw_rt.a references `claw_rs_log` (the C shim
-    # compiled into this component's archive). WHOLE_ARCHIVE guarantees the shim
-    # object is always linked, independent of static-archive scan order.
+    # The Rust log backend in libclaw_rt.a references the `claw_rs_log_*` shims
+    # (the per-level C functions compiled into this component's archive).
+    # WHOLE_ARCHIVE guarantees the shim object is always linked, independent of
+    # static-archive scan order.
     WHOLE_ARCHIVE
 )
 

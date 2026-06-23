@@ -175,7 +175,6 @@ name = "claw-sys"
 version = "0.1.0"
 dependencies = [
  "claw-interface",
- "claw_platform",
  "log",
  "serde_json",
 ]
@@ -210,29 +209,6 @@ dependencies = [
  "thiserror",
  "tracing",
 ]
-
-[[package]]
-name = "claw_paths"
-version = "0.1.0"
-
-[[package]]
-name = "claw_platform"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "claw_platform_espidf"
-version = "0.1.0"
-dependencies = [
- "claw_platform",
- "libc",
-]
-
-[[package]]
-name = "claw_task"
-version = "0.1.0"
 
 [[package]]
 name = "colorchoice"

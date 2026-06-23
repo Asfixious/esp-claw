@@ -74,13 +74,16 @@ mod espidf_driver {
     use claw_interface::http::{
         ClawHttp, ClawHttpAsync, HttpError, HttpJsonRequest, HttpResponse, HttpResponseFuture,
     };
-    use claw_platform::{ESP_FAIL, ESP_OK};
     use core::ffi::{c_char, c_int, c_void};
     use core::future::Future;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, Ordering};
     use core::task::{Context, Poll};
     use std::ffi::CString;
+
+    // `esp_err_t` sentinels from components/esp_common/include/esp_err.h.
+    const ESP_OK: c_int = 0;
+    const ESP_FAIL: c_int = -1;
 
     /// `esp_http_client_perform` return when the non-blocking request is still
     /// in progress (`ESP_ERR_HTTP_BASE + 7`, see `esp_http_client.h`).

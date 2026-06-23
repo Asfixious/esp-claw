@@ -168,17 +168,48 @@ pub struct FlatTreeSubscriber<S: TraceSink> {
     next_id: AtomicU64,
     spans: Mutex<HashMap<u64, SpanSlot>>,
     sink: S,
+    /// Target-prefix allowlist. Empty means "accept every target"; otherwise a
+    /// span/event is kept only if its `target` starts with one of these prefixes.
+    /// Used to keep third-party library noise (reqwest/hyper/h2/rustls/…) out of
+    /// the trace — see [`with_allowed_target_prefix`](Self::with_allowed_target_prefix).
+    allowed_prefixes: Vec<String>,
 }
 
 impl<S: TraceSink> FlatTreeSubscriber<S> {
-    /// Build a subscriber writing to `sink`.
+    /// Build a subscriber writing to `sink`. With no target allowlist configured
+    /// it accepts every target; add [`with_allowed_target_prefix`] to filter.
+    ///
+    /// [`with_allowed_target_prefix`]: Self::with_allowed_target_prefix
     pub fn with_sink(sink: S) -> Self {
         Self {
             // `span::Id` must be non-zero; start at 1 and reserve 0 for "no span".
             next_id: AtomicU64::new(1),
             spans: Mutex::new(HashMap::new()),
             sink,
+            allowed_prefixes: Vec::new(),
         }
+    }
+
+    /// Only emit spans/events whose `target` (module path) starts with `prefix`.
+    ///
+    /// Call once per allowed prefix. The intended use is `"claw"` so only this
+    /// firmware's own crates are traced and noisy dependency `tracing` output
+    /// (reqwest/hyper/h2/…) is dropped. Because filtering is by static target, a
+    /// rejected callsite is cached as [`Interest::never`](tracing::subscriber::Interest)
+    /// by `tracing`'s default `register_callsite`, so it costs nothing after the
+    /// first check.
+    pub fn with_allowed_target_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.allowed_prefixes.push(prefix.into());
+        self
+    }
+
+    /// True when `target` passes the allowlist (or no allowlist is set).
+    fn target_allowed(&self, target: &str) -> bool {
+        self.allowed_prefixes.is_empty()
+            || self
+                .allowed_prefixes
+                .iter()
+                .any(|prefix| target.starts_with(prefix.as_str()))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, SpanSlot>> {
@@ -193,10 +224,13 @@ impl<S: TraceSink> FlatTreeSubscriber<S> {
 }
 
 impl<S: TraceSink + 'static> Subscriber for FlatTreeSubscriber<S> {
-    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-        // Compile-time filtering (the `tracing` `max_level_*` features) and the
-        // runtime sink ceiling already gate output; accept everything here.
-        true
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        // Target allowlist keeps dependency `tracing` noise (reqwest/hyper/h2/…)
+        // out of the trace. Level filtering is left to the compile-time
+        // `tracing` `max_level_*` features and the sink's runtime ceiling.
+        // `tracing`'s default `register_callsite` caches this per callsite, so a
+        // rejected target becomes `Interest::never` and is never re-checked.
+        self.target_allowed(metadata.target())
     }
 
     fn new_span(&self, attributes: &Attributes<'_>) -> Id {
@@ -432,6 +466,30 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.starts_with("TR <<") && token(l, "sp") == Some(turn_id)));
+    }
+
+    #[test]
+    fn target_allowlist_drops_foreign_targets() {
+        let sink = VecSink::default();
+        let subscriber =
+            FlatTreeSubscriber::with_sink(sink.clone()).with_allowed_target_prefix("claw");
+
+        tracing::subscriber::with_default(subscriber, || {
+            // A dependency-style target (reqwest/hyper/h2/…) must be dropped …
+            tracing::info!(target: "reqwest::connect", "pool checkout");
+            // … while a `claw`-prefixed target is kept.
+            tracing::info!(target: "claw_core::demo", "kept");
+        });
+
+        let lines = sink.lines();
+        assert!(
+            lines.iter().any(|l| l.ends_with("kept")),
+            "claw-targeted event should be traced"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("pool checkout")),
+            "foreign-targeted event should be filtered out"
+        );
     }
 
     #[test]

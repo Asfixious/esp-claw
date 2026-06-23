@@ -275,11 +275,10 @@ Rust is integrated as an ESP-IDF *component*, so the Rust workspace (`components
 
 - **Inbound crates (C / OS → Rust).** Convert C and operating-system facilities into ergonomic Rust APIs and dependency-injection traits, including OS-level abstraction, with per-target implementations (ESP-IDF and Linux/host). The core depends on the *traits*, never on a platform directly.
   - `claw-interface` — shared types + DI traits (`esp_err`, `ClawEvent`, `EventPublisher`, `ClawHttp`).
-  - `claw_platform` — platform abstraction traits + target ABI types; `claw_platform_espidf` — the ESP-IDF impl via raw FFI.
-  - `claw_sys` — thin IDF shims std can't express (the `ESP_LOGx` backend, the `esp_http_client` `ClawHttp` driver). Linux/host impls plug into the same traits for tests.
+  - `claw-sys` — thin IDF shims std can't express (the `ESP_LOGx` log sink, i.e. the C↔Rust logging bridge, and the `esp_http_client` `ClawHttp` driver). Linux/host impls plug into the same traits for tests.
 - **Outbound crate (Rust → C).** Converts the Rust APIs back into a C ABI for the firmware's C callers, with **explicit init/deinit lifetimes and reference ownership**. Prefer **opaque handle types** (an opaque pointer) over structs that expose internal fields/layout.
   - `claw_capi` — the single C ABI layer between the pure-Rust claw modules and the C callers.
-- **Pure-Rust core in between.** Depends only on inbound traits, contains no platform/FFI details, and stays unit-testable on the host: e.g. `claw-api`, `claw_core`, `claw_cap`, `claw-memory`, `claw_task`, `claw_paths`.
+- **Pure-Rust core in between.** Depends only on inbound traits, contains no platform/FFI details, and stays unit-testable on the host: e.g. `claw-api`, `claw_core`, `claw_cap`, `claw-memory`, `claw-log` (the `log` facade backend + flat-tree `tracing` subscriber that drive `claw-sys`'s `ESP_LOGx` sink, plus the compile-time `log_max_*` / `trace_max_*` level ceilings).
 
 Rules:
 - Keep platform/FFI specifics **at the boundaries**. Core crates must not call C or platform APIs directly — depend on an inbound trait and inject the implementation.

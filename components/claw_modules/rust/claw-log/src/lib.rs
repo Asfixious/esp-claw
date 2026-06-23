@@ -51,13 +51,18 @@ static LOGGER: ClawLogger = ClawLogger;
 /// Install the global `log` facade backend, capped at `max_level` — the device
 /// `ESP_LOGx` bridge on `espidf`, [`env_logger`] on host.
 ///
-/// `max_level` is the **runtime** gate. On device the `log` macros default to
-/// [`LevelFilter::Off`] until it is set, so without it nothing — not even
-/// `error!` — is emitted; on host it is `env_logger`'s authoritative filter
-/// (`RUST_LOG` is intentionally NOT consulted). It layers under the compile-time
-/// `log_max_*` ceiling (which strips higher-level macros from release builds, so
-/// `max_level` can only narrow further) and, on device, ESP-IDF's runtime
-/// `esp_log_level_set` / `CONFIG_LOG_DEFAULT_LEVEL`.
+/// `max_level` is the **runtime** gate for this firmware's own `claw*` targets.
+/// On device the `log` macros default to [`LevelFilter::Off`] until it is set, so
+/// without it nothing — not even `error!` — is emitted; on host it is
+/// `env_logger`'s authoritative filter (`RUST_LOG` is intentionally NOT
+/// consulted). It layers under the compile-time `log_max_*` ceiling (which strips
+/// higher-level macros from release builds, so `max_level` can only narrow
+/// further) and, on device, ESP-IDF's runtime `esp_log_level_set` /
+/// `CONFIG_LOG_DEFAULT_LEVEL`.
+///
+/// On host, dependencies that log through the `log` facade (reqwest, rustls, …)
+/// are capped at [`LevelFilter::Warn`] regardless of `max_level`, mirroring the
+/// tracing target allowlist, so their verbose/debug output never floods the CLI.
 ///
 /// Pass [`LevelFilter::Trace`] to defer all filtering to those other gates.
 ///
@@ -100,8 +105,12 @@ fn install_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
     static START: OnceLock<Instant> = OnceLock::new();
 
     env_logger::Builder::new()
-        // No `parse_env`/`RUST_LOG`: `max_level` is the single authoritative filter.
-        .filter_level(max_level)
+        // No `parse_env`/`RUST_LOG`. Mirror the tracing target allowlist: noisy
+        // dependencies (reqwest/rustls/… emit through the `log` facade) only
+        // surface at `Warn`+, while first-party `claw*` targets honor `max_level`.
+        // So `init_logger(Trace)` keeps our verbose logs without the reqwest flood.
+        .filter_level(LevelFilter::Warn)
+        .filter_module(CLAW_TARGET_PREFIX, max_level)
         // Mirror ESP-IDF's `<L> (<ms>) <tag>: <msg>`; anstream strips the ANSI
         // when stderr is not a TTY.
         .format(|formatter, record| {
@@ -145,8 +154,16 @@ impl TraceSink for ClawTraceSink {
     }
 }
 
+/// Target prefix for this firmware's own crates (`claw_core`, `claw_cap`,
+/// `claw_sys`, …). The subscriber traces only these, so dependency `tracing`
+/// noise (reqwest/hyper/h2/rustls on the host CLIs) is dropped.
+const CLAW_TARGET_PREFIX: &str = "claw";
+
 /// Install the flat-tree `tracing` subscriber. Its sink forwards to the same
 /// backend as the `log` facade (`ESP_LOGx` on device, `env_logger` on host).
+///
+/// Only spans/events whose `target` starts with `claw` are traced; dependency
+/// output (reqwest/hyper/h2/…) is filtered out so it does not flood the trace.
 ///
 /// Pair it with [`init_logger`] so plain `log::` records are emitted too; the
 /// two streams are independent (no `tracing/log-always`, no `LogTracer`), so
@@ -157,5 +174,7 @@ impl TraceSink for ClawTraceSink {
 /// Returns [`tracing::subscriber::SetGlobalDefaultError`] if a global subscriber
 /// is already installed (`tracing` allows exactly one).
 pub fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
-    tracing::subscriber::set_global_default(FlatTreeSubscriber::with_sink(ClawTraceSink))
+    tracing::subscriber::set_global_default(
+        FlatTreeSubscriber::with_sink(ClawTraceSink).with_allowed_target_prefix(CLAW_TARGET_PREFIX),
+    )
 }

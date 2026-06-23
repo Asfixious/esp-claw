@@ -10,7 +10,6 @@ crate-type = ["rlib"]
 
 [dependencies]
 claw-interface = { path = "../claw-interface" }
-claw_platform = { path = "../claw_platform" }
 # Only the `Level` enum, and only on the device path: the level vocabulary for
 # the `espidf`-only `log_sink::write` bridge. The `log` facade backend and the
 # host stderr fallback both live in `claw-log`.

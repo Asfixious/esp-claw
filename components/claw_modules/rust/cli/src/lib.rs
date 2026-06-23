@@ -1,6 +1,6 @@
 //! Shared scaffolding for the agent CLIs.
 //!
-//! Both binaries in this crate (`base-agent` and `conversation-agent-chat`) drive
+//! Both binaries in this crate (`base-agent` and `generic-agent-chat`) drive
 //! a real agent against a live LLM with on-disk conversation memory. The platform
 //! dependencies are identical, so the real-disk [`ClawFs`], live [`ClawHttp`], the
 //! no-op [`Compactor`], and the env/LLM/memory wiring live here once.
@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
+use claw_interface::http::ClawHttp;
 use claw_interface::{DiskFs, RealHttp};
 use claw_memory::{
     ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
@@ -40,16 +41,20 @@ pub fn load_env() {
     }
 }
 
-/// Build a live LLM client from the `CLAW_LLM_*` environment variables.
+/// Build the LLM client config from the `CLAW_LLM_*` environment variables.
 ///
 /// `supports_tools` enables tool-calling for agents that need it (the
-/// conversation agent); pass `false` for a plain chat agent.
+/// conversation/orchestrator agents); pass `false` for a plain chat agent.
+///
+/// Returned separately from the transport so callers that mint clients
+/// themselves (e.g. [`claw_core::agent::FsAgentFactory`], which inits one client
+/// per agent) can reuse this config.
 ///
 /// # Panics
 ///
-/// If any required `CLAW_LLM_*` variable is missing, or the client cannot init —
-/// there is no safe default for these, so fail loudly.
-pub fn make_llm(supports_tools: bool) -> ClawApi {
+/// If any required `CLAW_LLM_*` variable is missing — there is no safe default
+/// for these, so fail loudly.
+pub fn make_llm_config(supports_tools: bool) -> ClawApiConfig {
     let api_key = std::env::var("CLAW_LLM_API_KEY")
         .ok()
         .filter(|v| !v.is_empty())
@@ -57,38 +62,77 @@ pub fn make_llm(supports_tools: bool) -> ClawApi {
     let base_url = std::env::var("CLAW_LLM_BASE_URL").expect("CLAW_LLM_BASE_URL must be set");
     let model = std::env::var("CLAW_LLM_MODEL").expect("CLAW_LLM_MODEL must be set");
 
-    ClawApi::init(
-        ClawApiConfig {
-            api_key: Some(api_key),
-            backend_type: "openai_compatible".into(),
-            model: Some(model),
-            base_url: Some(base_url),
-            supports_tools,
-            timeout_ms: 60_000,
-            ..Default::default()
-        },
-        Arc::new(RealHttp::new()),
-    )
-    .expect("failed to init LLM client")
+    ClawApiConfig {
+        api_key: Some(api_key),
+        backend_type: "openai_compatible".into(),
+        model: Some(model),
+        base_url: Some(base_url),
+        supports_tools,
+        timeout_ms: 60_000,
+        ..Default::default()
+    }
+}
+
+/// The shared live network transport ([`RealHttp`]).
+pub fn make_http() -> Arc<dyn ClawHttp> {
+    Arc::new(RealHttp::new())
+}
+
+/// Build a live LLM client from the `CLAW_LLM_*` environment variables.
+///
+/// `supports_tools` enables tool-calling for agents that need it.
+///
+/// # Panics
+///
+/// If any required `CLAW_LLM_*` variable is missing, or the client cannot init.
+pub fn make_llm(supports_tools: bool) -> ClawApi {
+    ClawApi::init(make_llm_config(supports_tools), make_http()).expect("failed to init LLM client")
+}
+
+/// Build the shared memory collaborators: the real disk [`ClawFs`], a fresh
+/// background task pool, and the no-op compactor.
+///
+/// Public so factories that build their own memory (e.g.
+/// [`claw_core::agent::FsAgentFactory`]) can take these collaborators directly.
+///
+/// # Panics
+///
+/// If the background memory task pool cannot be created.
+pub fn make_memory_deps() -> ConversationDeps {
+    let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
+    ConversationDeps {
+        fs: Arc::new(DiskFs::absolute()),
+        pool,
+        compactor: Arc::new(NoopCompactor),
+    }
 }
 
 /// Build an on-disk conversation memory at `memory_dir` plus a cloned read-only
-/// view of the same memory (handy for a `/messages` command).
+/// view of the same memory (handy for a `/messages` command). For agents that
+/// build their own memory (e.g. [`claw_core::agent::GenericAgent`]), use
+/// [`make_memory_ingredients`] instead.
 ///
 /// # Panics
 ///
 /// If the background memory task pool cannot be created.
 pub fn make_memory(agent_id: usize, memory_dir: &str) -> (ConversationMemory, ConversationMemory) {
-    let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
     let memory = ConversationMemory::new(
         agent_id,
         ConversationConfig::new(memory_dir),
-        ConversationDeps {
-            fs: Arc::new(DiskFs::absolute()),
-            pool,
-            compactor: Arc::new(NoopCompactor),
-        },
+        make_memory_deps(),
     );
     let view = memory.clone();
     (memory, view)
+}
+
+/// Build the ingredients a [`claw_core::agent::GenericAgent`] needs to construct
+/// its own on-disk memory at `memory_dir`: the base config plus the shared
+/// collaborators. The agent keys the conversation by its own id, so no id is
+/// needed here.
+///
+/// # Panics
+///
+/// If the background memory task pool cannot be created.
+pub fn make_memory_ingredients(memory_dir: &str) -> (ConversationConfig, ConversationDeps) {
+    (ConversationConfig::new(memory_dir), make_memory_deps())
 }

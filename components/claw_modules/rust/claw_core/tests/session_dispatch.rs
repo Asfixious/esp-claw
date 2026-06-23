@@ -2,10 +2,52 @@
 
 use std::sync::Arc;
 
+use claw_core::agent::{
+    Agent, AgentCommand, AgentCommandError, AgentFactory, AgentId, AgentKind, ApprovalResponder,
+    Spawner, TickOutcome,
+};
 use claw_core::{
     ChannelEgressHub, ChannelIngressSink, Command, InboundCommand, InboundMessage, Orchestrator,
     RecordingTransport, SessionId, TaskId,
 };
+
+/// An agent that never produces output. These tests only exercise ingress
+/// validation (no message reaches a live session's graph), so the factory below
+/// is never actually invoked — but the builder requires one.
+struct IdleAgent {
+    id: AgentId,
+}
+
+impl Agent for IdleAgent {
+    fn id(&self) -> AgentId {
+        self.id
+    }
+
+    fn send_command(&mut self, _command: AgentCommand) -> Result<(), AgentCommandError> {
+        Ok(())
+    }
+
+    fn deliver_child_result(&mut self, _child: AgentId, _text: String, _ok: bool) {}
+
+    fn tick(&mut self) -> TickOutcome {
+        TickOutcome::Idle
+    }
+}
+
+struct IdleFactory;
+
+impl AgentFactory for IdleFactory {
+    fn create_agent(
+        &self,
+        id: AgentId,
+        _kind: &AgentKind,
+        _goal: String,
+        _spawner: Arc<dyn Spawner>,
+        _approval_responder: Option<Arc<dyn ApprovalResponder>>,
+    ) -> Result<Box<dyn Agent>, String> {
+        Ok(Box::new(IdleAgent { id }))
+    }
+}
 
 fn test_orchestrator() -> (Arc<Orchestrator>, Arc<RecordingTransport>) {
     let transport = RecordingTransport::new("qq");
@@ -19,26 +61,9 @@ fn test_orchestrator() -> (Arc<Orchestrator>, Arc<RecordingTransport>) {
 }
 
 fn dummy_orchestrator(egress: Arc<dyn claw_core::ChannelEgress>) -> Arc<Orchestrator> {
-    use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interface::NoopHttp;
-
-    let llm = Arc::new(
-        ClawApi::init(
-            ClawApiConfig {
-                api_key: Some("k".into()),
-                model: Some("m".into()),
-                backend_type: "openai_compatible".into(),
-                base_url: Some("https://api.example.com/v1".into()),
-                ..Default::default()
-            },
-            Arc::new(NoopHttp),
-        )
-        .unwrap(),
-    );
-
     Orchestrator::builder()
         .config_egress(egress)
-        .with_llm(llm)
+        .with_agent_factory(Arc::new(IdleFactory))
         .build()
 }
 

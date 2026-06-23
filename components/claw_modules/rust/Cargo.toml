@@ -13,7 +13,6 @@ members = [
     "claw_core",
     "claw_cap",
     "claw-memory",
-    "claw_capi",
 ]
 
 # Device images are built with the release profile (panic = abort, since the

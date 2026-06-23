@@ -8,10 +8,9 @@
 pub mod agent;
 pub mod channels;
 pub mod iteration_loop;
-pub mod observability;
 pub mod orchestrator;
+mod orchestrator_instance;
 pub mod protocol;
-pub mod request;
 pub mod session;
 pub mod skills;
 pub mod tools;
@@ -22,7 +21,7 @@ pub use channels::{
     RecordingTransport, ReplyRoute,
 };
 pub use claw_utils::define_prefixed_id;
-pub use orchestrator::Orchestrator;
+pub use orchestrator::{ApprovalError, Orchestrator};
 pub use protocol::Command;
 pub use protocol::{IdParseError, IterationId, StepId, TaskId, WorkerId};
 pub use session::{

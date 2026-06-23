@@ -6,8 +6,8 @@ edition = "2021"
 description = "Runtime primitives: orchestrator shell, channels, and iteration loop"
 
 [lib]
-# claw_core is a pure-Rust rlib. Its C ABI lives in the `claw_capi` crate, which
-# is bundled (with the other logic crates) into the single `claw_rt` staticlib.
+# claw_core is a pure-Rust rlib bundled (with the other logic crates) into the
+# single `claw_rt` staticlib that the firmware links.
 crate-type = ["rlib"]
 
 [features]
@@ -20,6 +20,11 @@ claw-utils = { path = "../claw-utils" }
 claw-api = { path = "../claw-api" }
 claw-memory = { path = "../claw-memory" }
 log = "0.4"
+# Observability facade. `log-always` routes every `tracing` event through the
+# `log` crate to the existing `ClawLogger` (-> esp_log on device), so no tracing
+# Subscriber is needed yet. `std` kept (default), `attributes` dropped to avoid
+# the `syn` build cost until `#[instrument]` is actually used.
+tracing = { version = "0.1", default-features = false, features = ["std", "log-always"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

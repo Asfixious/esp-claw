@@ -1,27 +1,25 @@
-//! Interactive chat CLI backed by [`ConversationAgent`] with persistent memory.
+//! Interactive chat CLI backed by [`GenericAgent`] with persistent memory.
 //!
-//! Exercises the conversation agent's Intake -> Verify -> Delegate -> Watch ->
-//! Report FSM against a live LLM. Subagent spawning is left disabled (the spawn
-//! implementation is still pending), so this drives the single-agent path of the
-//! FSM. LLM config is read from `claw_core/.env.local`; memory is written to
-//! `claw_core/output/conversation-chat/`.
+//! Drives the single flat agent (here the `conversation` kind) against a live
+//! LLM — no semantic FSM, the model drives its own flow. Subagent spawning is
+//! left disabled (no registry is wired here), so this exercises the
+//! single-agent path. LLM config is read from `claw_core/.env.local`; memory is
+//! written to `claw_core/output/generic-chat/`.
 //!
 //! ```
-//! cargo run -p claw-agent-cli --bin conversation-agent-chat --target x86_64-unknown-linux-gnu
+//! cargo run -p claw-agent-cli --bin generic-agent-chat --target x86_64-unknown-linux-gnu
 //! ```
 
 use std::io::{self, BufRead, Write};
 
-use claw_agent_cli::{load_env, make_llm, make_memory};
-use claw_core::agent::{
-    Agent, AgentCommand, AgentId, ConversationAgent, ConversationPhase, TickOutcome,
-};
-use owo_colors::{AnsiColors, OwoColorize};
+use claw_agent_cli::{load_env, make_llm, make_memory_ingredients};
+use claw_core::agent::{Agent, AgentCommand, AgentConfig, AgentId, GenericAgent, TickOutcome};
+use owo_colors::OwoColorize;
 use serde_json::Value;
 
 const MEMORY_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../claw_core/output/conversation-chat"
+    "/../claw_core/output/generic-chat"
 );
 const SYSTEM_PROMPT: &str = "You are a helpful, concise assistant.";
 const AGENT_ID: usize = 1;
@@ -29,12 +27,20 @@ const AGENT_ID: usize = 1;
 fn main() {
     load_env();
 
-    let (memory, memory_view) = make_memory(AGENT_ID, MEMORY_DIR);
-    // Tool-calling is required: the FSM is driven by the agent's control tools.
-    let mut agent = ConversationAgent::builder(AgentId(AGENT_ID), make_llm(true), memory)
+    let (mem_config, mem_deps) = make_memory_ingredients(MEMORY_DIR);
+    // Tool-calling is required: the agent's control tools (end_conversation, …)
+    // are merged on by the base agent.
+    let config = AgentConfig::builder("conversation")
         .with_system_prompt(SYSTEM_PROMPT)
-        .build()
-        .expect("failed to build conversation agent");
+        .build();
+    let mut agent = GenericAgent::new(
+        AgentId(AGENT_ID),
+        make_llm(true),
+        mem_config,
+        mem_deps,
+        config,
+    )
+    .expect("failed to build agent");
 
     eprintln!("Memory: {MEMORY_DIR}");
     eprintln!("Type your message and press Enter. Empty line or Ctrl-D to quit.\n");
@@ -55,7 +61,7 @@ fn main() {
         }
 
         if input == "/messages" {
-            let messages = memory_view.messages();
+            let messages = agent.memory().messages();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&messages)
@@ -67,7 +73,7 @@ fn main() {
 
         // Remember where the transcript ends so we can show the tool calls this
         // turn appends, after the reply.
-        let turn_start = message_count(&memory_view);
+        let turn_start = message_count(agent.memory());
 
         if let Err(error) = agent.send_command(AgentCommand::AppendMessage(input.to_string())) {
             eprintln!("could not accept input: {error}");
@@ -102,25 +108,11 @@ fn main() {
             }
         }
 
-        print_tool_calls_since(&memory_view.messages(), turn_start);
-        println!("{}", stage_label(agent.phase()));
+        print_tool_calls_since(&agent.memory().messages(), turn_start);
         println!();
     }
 
     eprintln!("Goodbye.");
-}
-
-/// A colored `[stage: X]` label for the agent's current FSM stage. Each stage
-/// gets its own color so progression is easy to track at a glance.
-fn stage_label(phase: ConversationPhase) -> String {
-    let color = match phase {
-        ConversationPhase::Intake => AnsiColors::Blue,
-        ConversationPhase::Verify => AnsiColors::Yellow,
-        ConversationPhase::Delegate => AnsiColors::Magenta,
-        ConversationPhase::Watch => AnsiColors::Cyan,
-        ConversationPhase::Report => AnsiColors::Green,
-    };
-    format!("[stage: {phase}]").color(color).to_string()
 }
 
 /// Number of messages currently in the transcript.

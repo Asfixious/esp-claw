@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use crate::agent::agent::AgentKind;
+use crate::agent::base_agent::AgentId;
 use crate::tools::{
     tool_metadata, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput,
 };
@@ -27,14 +29,11 @@ use crate::tools::{
 /// Group label for the agent's built-in tools (provenance only).
 pub(crate) const INTERNAL_TOOL_GROUP: &str = "agent";
 
-/// Name of the built-in `end_conversation` tool.
-pub(crate) const END_CONVERSATION: &str = "end_conversation";
-/// Name of the built-in `request_approval` tool.
-pub(crate) const REQUEST_APPROVAL: &str = "request_approval";
-/// Name of the shared `spawn_subagent` tool.
-pub(crate) const SPAWN_SUBAGENT: &str = "spawn_subagent";
 /// Group label for the spawn tool (provenance only).
 pub(crate) const SPAWN_TOOL_GROUP: &str = "spawn";
+
+/// Group label for the approval-response tool (provenance only).
+pub(crate) const APPROVAL_TOOL_GROUP: &str = "approval";
 
 /// A signal an internal tool raises for the agent to act on next tick.
 ///
@@ -89,23 +88,6 @@ pub(crate) fn string_argument(arguments_json: &str, key: &str) -> Result<String,
         .to_string())
 }
 
-/// Validate that a tool call's arguments are well-formed JSON, without
-/// extracting any field. For control tools whose argument exists only for the
-/// model's own reasoning (already captured in the recorded tool call), this
-/// surfaces a malformed call instead of swallowing it.
-///
-/// # Errors
-///
-/// [`ToolError::InvokeFailed`] if the arguments are present but not valid JSON.
-pub(crate) fn ensure_valid_arguments_json(arguments_json: &str) -> Result<(), ToolError> {
-    if arguments_json.trim().is_empty() {
-        return Ok(());
-    }
-    serde_json::from_str::<Value>(arguments_json)
-        .map(|_| ())
-        .map_err(|error| ToolError::InvokeFailed(format!("invalid tool arguments JSON: {error}")))
-}
-
 fn push(sink: &ControlSink, signal: ControlSignal) {
     sink.lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -150,45 +132,140 @@ impl ToolHandler for RequestApprovalTool {
 
 // -- Shared subagent spawning ----------------------------------------------
 //
-// The `spawn_subagent` tool only *records intent*: it pushes the requested goal
-// onto a `SpawnSink` and returns immediately, mirroring the control tools above.
-// The owning agent drains the sink each tick and turns each goal into a child.
+// The `spawn_subagent` tool delegates *creation* to an injected [`Spawner`] (the
+// agent-graph owner, e.g. the registry). The model picks which `kind` of agent to
+// spawn and the `goal` to hand it; the `Spawner` allocates the child's id
+// synchronously and returns it (the tool reports it back to the model), but
+// materializes the child later, at a borrow-safe point — it must never insert
+// into the node map that owns the currently-ticking parent. The flat agent does
+// not track its children locally: a child's result re-enters via
+// `deliver_child_result`, so no per-agent spawn bookkeeping is needed.
 
-/// Queue the `spawn_subagent` tool pushes requested goals onto; the agent drains
-/// it each tick. A `Mutex` because [`ToolHandler`] is `Send + Sync`; contention
-/// is nil in the single-driver-thread model.
-pub(crate) type SpawnSink = Arc<Mutex<VecDeque<String>>>;
-
-/// Build the spawn tool group over a sink.
-pub(crate) fn spawn_tool_group(sink: SpawnSink) -> ToolGroup {
-    ToolGroup::new(SPAWN_TOOL_GROUP, [Tool::new(SpawnSubagentTool { sink })])
+/// Dependency-injection seam for creating subagents.
+///
+/// The agent-graph owner (an `AgentRegistry`/orchestrator) implements this so a
+/// `spawn_subagent` tool can request a child without knowing how the graph is
+/// stored. [`spawn`](Self::spawn) allocates and returns the child's id
+/// synchronously; the implementor queues the actual creation for a borrow-safe
+/// point rather than mutating the live node map mid-tick.
+pub trait Spawner: Send + Sync {
+    /// Request a child of `kind` for `goal`, parented to `parent`; returns the id
+    /// assigned to the child.
+    fn spawn(&self, parent: AgentId, kind: AgentKind, goal: String) -> AgentId;
 }
 
-/// Drain all pending spawn goals, leaving the sink empty.
-pub(crate) fn drain_goals(sink: &SpawnSink) -> Vec<String> {
-    sink.lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .drain(..)
-        .collect()
+/// Build the spawn tool group: a `spawn_subagent` tool that creates children via
+/// `spawner`, parented to `parent`.
+pub(crate) fn spawn_tool_group(spawner: Arc<dyn Spawner>, parent: AgentId) -> ToolGroup {
+    ToolGroup::new(
+        SPAWN_TOOL_GROUP,
+        [Tool::new(SpawnSubagentTool { spawner, parent })],
+    )
 }
 
-/// `spawn_subagent(goal)` — request a child agent to work on `goal`.
+/// `spawn_subagent(kind, goal)` — request a child agent of `kind` to work on `goal`.
 struct SpawnSubagentTool {
-    sink: SpawnSink,
+    spawner: Arc<dyn Spawner>,
+    parent: AgentId,
 }
 
 impl ToolHandler for SpawnSubagentTool {
     tool_metadata!("spawn_subagent");
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        let kind = string_argument(call.arguments_json, "kind")?;
+        if kind.trim().is_empty() {
+            return Err(ToolError::InvokeFailed(
+                "spawn_subagent requires a non-empty 'kind'".to_string(),
+            ));
+        }
         let goal = string_argument(call.arguments_json, "goal")?;
-        self.sink
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push_back(goal);
+        let child = self.spawner.spawn(self.parent, AgentKind::new(kind), goal);
         Ok(ToolOutput {
-            output: "Subagent requested; its result will be reported back when it finishes."
-                .to_string(),
+            output: format!(
+                "Subagent {child} requested; its result will be reported back when it finishes."
+            ),
+            ok: true,
+        })
+    }
+}
+
+// -- Root-side approval resolution ------------------------------------------
+//
+// Only the session root talks to the user, so any agent's `request_approval`
+// bubbles up to the root (done by the registry). The root presents it, reads the
+// user's free-text reply, classifies it into yes/no/other, and reports the
+// verdict back with the `respond_to_approval` tool. Like `spawn_subagent`, this
+// affects *another* agent, so it delegates to an injected responder that the
+// registry drains at a borrow-safe point rather than touching the node map here.
+
+/// The root's classification of a user's reply to a pending approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalVerdict {
+    /// A clear yes — the waiting agent is approved.
+    Yes,
+    /// A clear no — the waiting agent is rejected (with the note as the reason).
+    No,
+    /// Neither a clear yes nor no — treated as a rejection carrying the user's
+    /// words, so the waiting agent can reconsider.
+    Other,
+}
+
+/// Dependency-injection seam for routing a root's approval verdict back to the
+/// agent that requested it.
+///
+/// The agent-graph owner (an `AgentRegistry`) implements this; the
+/// `respond_to_approval` tool calls [`respond`](Self::respond) during the root's
+/// tick, and the owner applies the decision to the `target` agent at a
+/// borrow-safe point.
+pub trait ApprovalResponder: Send + Sync {
+    /// Record the root's `verdict` (with an optional free-text `note`) for the
+    /// `target` agent's pending approval.
+    fn respond(&self, target: AgentId, verdict: ApprovalVerdict, note: Option<String>);
+}
+
+/// Build the approval-response tool group: a `respond_to_approval` tool that
+/// reports verdicts through `responder`.
+pub(crate) fn respond_to_approval_tool_group(responder: Arc<dyn ApprovalResponder>) -> ToolGroup {
+    ToolGroup::new(
+        APPROVAL_TOOL_GROUP,
+        [Tool::new(RespondToApprovalTool { responder })],
+    )
+}
+
+/// `respond_to_approval(agent, verdict, note)` — the root reports its
+/// classification of a user's reply to a subagent's approval request.
+struct RespondToApprovalTool {
+    responder: Arc<dyn ApprovalResponder>,
+}
+
+impl ToolHandler for RespondToApprovalTool {
+    tool_metadata!("respond_to_approval");
+
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        let agent = string_argument(call.arguments_json, "agent")?;
+        let target = AgentId::from_wire(agent.trim()).map_err(|error| {
+            ToolError::InvokeFailed(format!("invalid agent id '{agent}': {error}"))
+        })?;
+
+        let verdict_raw = string_argument(call.arguments_json, "verdict")?;
+        let verdict = match verdict_raw.trim() {
+            "yes" => ApprovalVerdict::Yes,
+            "no" => ApprovalVerdict::No,
+            "other" => ApprovalVerdict::Other,
+            other => {
+                return Err(ToolError::InvokeFailed(format!(
+                    "respond_to_approval 'verdict' must be one of yes|no|other, got '{other}'"
+                )))
+            }
+        };
+
+        let note_raw = string_argument(call.arguments_json, "note")?;
+        let note = (!note_raw.trim().is_empty()).then_some(note_raw);
+
+        self.responder.respond(target, verdict, note);
+        Ok(ToolOutput {
+            output: format!("Recorded '{verdict_raw}' for {target}."),
             ok: true,
         })
     }
@@ -257,6 +334,63 @@ mod tests {
                 summary: "delete prod".to_string()
             }
         );
+    }
+
+    #[test]
+    fn respond_to_approval_parses_target_and_verdict() {
+        let recorded: Arc<Mutex<Vec<(AgentId, ApprovalVerdict, Option<String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        struct FakeResponder(Arc<Mutex<Vec<(AgentId, ApprovalVerdict, Option<String>)>>>);
+        impl ApprovalResponder for FakeResponder {
+            fn respond(&self, target: AgentId, verdict: ApprovalVerdict, note: Option<String>) {
+                self.0.lock().unwrap().push((target, verdict, note));
+            }
+        }
+
+        let group = respond_to_approval_tool_group(Arc::new(FakeResponder(Arc::clone(&recorded))));
+        let tool = group
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "respond_to_approval")
+            .unwrap()
+            .clone();
+
+        tool.invoke(&ToolInvocation {
+            id: Some("t1"),
+            name: "respond_to_approval",
+            arguments_json: r#"{"agent":"agent-7","verdict":"no","note":"not allowed"}"#,
+        })
+        .unwrap();
+
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(
+            recorded.as_slice(),
+            &[(
+                AgentId(7),
+                ApprovalVerdict::No,
+                Some("not allowed".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn respond_to_approval_rejects_unknown_verdict() {
+        struct NoopResponder;
+        impl ApprovalResponder for NoopResponder {
+            fn respond(&self, _t: AgentId, _v: ApprovalVerdict, _n: Option<String>) {}
+        }
+        let group = respond_to_approval_tool_group(Arc::new(NoopResponder));
+        let tool = group.tools().iter().next().unwrap().clone();
+
+        let error = tool
+            .invoke(&ToolInvocation {
+                id: Some("t1"),
+                name: "respond_to_approval",
+                arguments_json: r#"{"agent":"agent-1","verdict":"maybe"}"#,
+            })
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvokeFailed(_)));
     }
 
     #[test]

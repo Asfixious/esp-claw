@@ -211,7 +211,9 @@ mod espidf_driver {
         }
     }
 
-    /// `esp_http_client`-backed [`ClawHttp`].
+    /// `esp_http_client`-backed transport implementing both [`ClawHttp`]
+    /// (blocking, cancelled via the in-band abort flag) and [`ClawHttpAsync`]
+    /// (non-blocking `config.is_async` mode, cancelled by dropping the future).
     pub struct EspIdfHttp;
 
     impl ClawHttp for EspIdfHttp {
@@ -318,14 +320,17 @@ mod espidf_driver {
         /// Initialize a non-blocking client and apply method/headers/body once.
         /// After this returns the request is ready to be driven by repeated
         /// [`AsyncRequest::perform`] calls.
-        fn new(request: &HttpJsonRequest, abort: &AtomicBool) -> Result<AsyncRequest, HttpError> {
+        fn new(request: &HttpJsonRequest) -> Result<AsyncRequest, HttpError> {
             // `url` only needs to stay alive until `esp_http_client_init`
             // returns (it parses and copies the URL internally).
             let url = CString::new(request.url).map_err(|_| HttpError::InvalidUrl)?;
             let body = CString::new(request.body).map_err(|_| HttpError::InvalidBody)?;
+            // The async seam cancels by dropping the future (see `transfer`),
+            // which runs `Drop` and tears the client down — so no abort flag is
+            // wired into the event handler here.
             let mut ctx = Box::new(RequestCtx {
                 body: Vec::with_capacity(4096),
-                abort: abort as *const _,
+                abort: core::ptr::null(),
             });
 
             let mut config: esp_http_client_config_t = unsafe { core::mem::zeroed() };
@@ -384,24 +389,13 @@ mod espidf_driver {
         /// Run one non-blocking transfer step. `Ok(None)` means the transfer is
         /// still in progress (caller should yield and poll again); `Ok(Some(_))`
         /// is the finished response.
-        fn perform(&self, abort: &AtomicBool) -> Result<Option<HttpResponse>, HttpError> {
-            if abort.load(Ordering::Relaxed) {
-                return Err(HttpError::Aborted);
-            }
+        fn perform(&self) -> Result<Option<HttpResponse>, HttpError> {
             let err = unsafe { esp_http_client_perform(self.client) };
             if err == ESP_ERR_HTTP_EAGAIN {
                 return Ok(None);
             }
-            let aborted = abort.load(Ordering::Relaxed);
             if err != ESP_OK {
-                return Err(if aborted {
-                    HttpError::Aborted
-                } else {
-                    HttpError::RequestFailed(err_name(err))
-                });
-            }
-            if aborted {
-                return Err(HttpError::Aborted);
+                return Err(HttpError::RequestFailed(err_name(err)));
             }
             let status = unsafe { esp_http_client_get_status_code(self.client) };
             let body = String::from_utf8_lossy(&self.ctx.body).into_owned();
@@ -438,15 +432,11 @@ mod espidf_driver {
     }
 
     impl ClawHttpAsync for EspIdfHttp {
-        fn post_json<'a>(
-            &'a self,
-            request: &'a HttpJsonRequest<'a>,
-            abort: &'a AtomicBool,
-        ) -> HttpResponseFuture<'a> {
+        fn transfer<'a>(&'a self, request: &'a HttpJsonRequest<'a>) -> HttpResponseFuture<'a> {
             Box::pin(async move {
-                let state = AsyncRequest::new(request, abort)?;
+                let state = AsyncRequest::new(request)?;
                 loop {
-                    if let Some(response) = state.perform(abort)? {
+                    if let Some(response) = state.perform()? {
                         return Ok(response);
                     }
                     yield_once().await;

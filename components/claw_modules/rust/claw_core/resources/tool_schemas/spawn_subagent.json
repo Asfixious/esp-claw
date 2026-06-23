@@ -2,16 +2,20 @@
   "type": "function",
   "function": {
     "name": "spawn_subagent",
-    "description": "Delegate a goal to a new subagent that works in parallel. Its result is reported back to you when it finishes.",
+    "description": "Delegate a goal to a new subagent that works in parallel. Choose the kind of agent best suited to the goal. Its result is reported back to you when it finishes.",
     "parameters": {
       "type": "object",
       "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Which kind of agent to spawn (the role best suited to the goal, e.g. \"worker\")."
+        },
         "goal": {
           "type": "string",
           "description": "The goal to delegate to the subagent."
         }
       },
-      "required": ["goal"]
+      "required": ["kind", "goal"]
     }
   }
 }

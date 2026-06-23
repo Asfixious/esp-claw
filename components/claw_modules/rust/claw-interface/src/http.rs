@@ -144,6 +144,66 @@ impl Cancel<'static> {
 /// by the provided [`post_json`](ClawHttpAsync::post_json), which races the
 /// transfer against the [`Cancel`] token and drops the transfer future on
 /// cancellation (its `Drop` tears down any in-flight client).
+///
+/// # Examples
+///
+/// A minimal in-memory transport, driven by a hand-rolled `block_on` (on device
+/// a cooperative executor polls the future instead):
+///
+/// ```
+/// use claw_interface::{
+///     Cancel, ClawHttpAsync, HttpJsonRequest, HttpResponse, HttpResponseFuture,
+/// };
+/// use core::future::Future;
+/// use core::sync::atomic::AtomicBool;
+/// use core::task::{Context, Poll};
+/// use std::sync::Arc;
+/// use std::task::{Wake, Waker};
+///
+/// // Implement only `transfer`; `post_json` (with cancellation) comes for free.
+/// struct Echo;
+/// impl ClawHttpAsync for Echo {
+///     fn transfer<'a>(&'a self, request: &'a HttpJsonRequest<'a>) -> HttpResponseFuture<'a> {
+///         let body = request.body.to_string();
+///         Box::pin(async move { Ok(HttpResponse { status_code: 200, body }) })
+///     }
+/// }
+///
+/// struct Noop;
+/// impl Wake for Noop {
+///     fn wake(self: Arc<Self>) {}
+/// }
+///
+/// fn block_on<F: Future>(future: F) -> F::Output {
+///     let mut future = Box::pin(future);
+///     let waker = Waker::from(Arc::new(Noop));
+///     let mut context = Context::from_waker(&waker);
+///     loop {
+///         if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+///             return value;
+///         }
+///     }
+/// }
+///
+/// let request = HttpJsonRequest {
+///     url: "https://example.test",
+///     body: r#"{"hi":true}"#,
+///     api_key: None,
+///     auth_type: None,
+///     timeout_ms: 1_000,
+///     headers: &[],
+/// };
+///
+/// // Not cancelled: resolves to the transfer's result.
+/// let flag = AtomicBool::new(false);
+/// let response = block_on(Echo.post_json(&request, Cancel::new(&flag))).unwrap();
+/// assert_eq!(response.status_code, 200);
+/// assert_eq!(response.body, r#"{"hi":true}"#);
+///
+/// // A pre-set flag cancels before the transfer runs.
+/// let cancelled = AtomicBool::new(true);
+/// assert!(block_on(Echo.post_json(&request, Cancel::new(&cancelled))).is_err());
+/// ```
 pub trait ClawHttpAsync: Send + Sync {
     /// Run the request to completion, resolving to the body on HTTP 200 (or any
     /// 2xx for host backends), otherwise an [`HttpError`]. Implementations must

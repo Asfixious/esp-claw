@@ -26,6 +26,9 @@ managed_components/
 # Cache / Compiled
 .cache
 *.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
 
 # MCP / Memov
 .mcp.json

@@ -75,6 +75,17 @@ pub trait ClawFs: Send + Sync {
     /// they computed match the on-disk order.
     fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError>;
 
+    /// Recursively create directory `path`, including any missing parents.
+    ///
+    /// Idempotent: succeeds if the directory already exists. Backends with no
+    /// explicit directory concept (e.g. a flat key→bytes map) treat this as a
+    /// no-op — their directories exist implicitly the moment a file is written
+    /// beneath them, and [`list_dir`](ClawFs::list_dir) on such a path already
+    /// reports an empty listing rather than [`FsError::NotFound`]. Used to
+    /// materialize empty roots (e.g. a sandbox's scratch directories) up front,
+    /// before anything is written into them.
+    fn create_dir_all(&self, path: &str) -> Result<(), FsError>;
+
     /// Whether `path` currently exists.
     fn exists(&self, path: &str) -> bool;
 
@@ -89,6 +100,49 @@ pub trait ClawFs: Send + Sync {
     /// [`FsError::NotFound`] when `path` does not exist. Used to enumerate the
     /// skills root (one directory per skill) without reading any file.
     fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError>;
+}
+
+/// A shared `Arc<F>` (including `Arc<dyn ClawFs>`) is itself a [`ClawFs`].
+///
+/// The backend is shared across threads via `Arc`, so this blanket impl lets
+/// the same handle satisfy a generic `F: ClawFs` bound (e.g. a sandbox over a
+/// shared DATA-root filesystem) without an extra wrapper.
+impl<T: ClawFs + ?Sized> ClawFs for std::sync::Arc<T> {
+    fn read(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        (**self).read(path)
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        (**self).read_at(path, offset, len)
+    }
+
+    fn len(&self, path: &str) -> Result<u64, FsError> {
+        (**self).len(path)
+    }
+
+    fn write_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        (**self).write_atomic(path, data)
+    }
+
+    fn append(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        (**self).append(path, data)
+    }
+
+    fn create_dir_all(&self, path: &str) -> Result<(), FsError> {
+        (**self).create_dir_all(path)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        (**self).exists(path)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        (**self).remove(path)
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, FsError> {
+        (**self).list_dir(path)
+    }
 }
 
 // ===========================================================================
@@ -171,6 +225,13 @@ mod memfs {
                 .entry(path.to_string())
                 .or_default()
                 .extend_from_slice(data);
+            Ok(())
+        }
+
+        fn create_dir_all(&self, _path: &str) -> Result<(), FsError> {
+            // Flat key→bytes map: directories are implicit in key prefixes, so
+            // there is nothing to materialize. `list_dir` of an empty prefix
+            // already returns an empty listing.
             Ok(())
         }
 
@@ -313,6 +374,11 @@ mod diskfs {
                 .open(&full)
                 .map_err(|error| FsError::Io(error.to_string()))?;
             file.write_all(data)
+                .map_err(|error| FsError::Io(error.to_string()))
+        }
+
+        fn create_dir_all(&self, path: &str) -> Result<(), FsError> {
+            std::fs::create_dir_all(self.resolve(path))
                 .map_err(|error| FsError::Io(error.to_string()))
         }
 

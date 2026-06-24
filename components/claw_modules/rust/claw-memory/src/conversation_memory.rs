@@ -399,6 +399,7 @@ struct MemoryInner {
 /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
 /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
 /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+/// #     fn create_dir_all(&self, _: &str) -> Result<(), FsError> { Ok(()) }
 /// #     fn exists(&self, _: &str) -> bool { false }
 /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
 /// #     fn list_dir(&self, _: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }
@@ -460,6 +461,7 @@ impl ConversationMemory {
     /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
     /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
     /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn create_dir_all(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn exists(&self, _: &str) -> bool { false }
     /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn list_dir(&self, _: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }
@@ -534,6 +536,7 @@ impl ConversationMemory {
     /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
     /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
     /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn create_dir_all(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn exists(&self, _: &str) -> bool { false }
     /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn list_dir(&self, _: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }
@@ -589,6 +592,7 @@ impl ConversationMemory {
     /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
     /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
     /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn create_dir_all(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn exists(&self, _: &str) -> bool { false }
     /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn list_dir(&self, _: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }
@@ -677,6 +681,7 @@ impl ConversationMemory {
     /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
     /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
     /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+    /// #     fn create_dir_all(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn exists(&self, _: &str) -> bool { false }
     /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
     /// #     fn list_dir(&self, _: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }
@@ -735,6 +740,7 @@ impl ConversationMemory {
 /// #     fn len(&self, _: &str) -> Result<u64, FsError> { Err(FsError::NotFound) }
 /// #     fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
 /// #     fn append(&self, _: &str, _: &[u8]) -> Result<(), FsError> { Ok(()) }
+/// #     fn create_dir_all(&self, _: &str) -> Result<(), FsError> { Ok(()) }
 /// #     fn exists(&self, _: &str) -> bool { false }
 /// #     fn remove(&self, _: &str) -> Result<(), FsError> { Ok(()) }
 /// #     fn list_dir(&self, _: &str) -> Result<Vec<String>, FsError> { Ok(Vec::new()) }

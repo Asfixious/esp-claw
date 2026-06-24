@@ -262,6 +262,14 @@ The payoff: callers pass whatever they already hold with no `.as_ref()` / `.to_s
 - **Defaults via `Default`, readability via `with_xxx()`.** Implement the `Default` trait for zero-config construction. Because `Default::default()` is opaque about *what* it sets, complement it with named builder-style methods (`with_timeout(...)`, `with_retry(...)`, …) that apply readable, intention-revealing defaults and overrides on top of `Default`.
 - **Finalize the boundary when an object/crate is "done."** Re-audit every `pub`: shrink the surface to the minimum necessary before considering the module/crate complete.
 - **Document the boundary with rustdoc — public items only.** Write doc comments and runnable `/// # Examples` for **public** APIs (the boundary callers consume). Do not spend rustdoc/examples on private internals; comment those only where intent is non-obvious (see the comment guidance in `making_code_changes`).
+- **Examine the public API shape** with `cargo public-api` (install if missing: `cargo +stable install cargo-public-api`):
+
+  ```bash
+  cargo public-api \
+    -p <path-to-crate> \
+    --target x86_64-unknown-linux-gnu \
+    --omit blanket-impls,auto-trait-impls,auto-derived-impls
+  ```
 
 #### Enforcing Call Order: Typestate vs RAII
 

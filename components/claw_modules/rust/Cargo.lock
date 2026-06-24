@@ -136,6 +136,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-context"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "claw-interface"
 version = "0.1.0"
 dependencies = [
@@ -154,6 +161,7 @@ dependencies = [
  "claw-sys",
  "env_logger",
  "log",
+ "thiserror",
  "tracing",
 ]
 
@@ -165,6 +173,24 @@ dependencies = [
  "claw-interface",
  "claw-sys",
  "log",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "claw-sandbox"
+version = "0.1.0"
+dependencies = [
+ "claw-interface",
+ "thiserror",
+]
+
+[[package]]
+name = "claw-skill"
+version = "0.1.0"
+dependencies = [
+ "claw-interface",
  "serde",
  "serde_json",
  "thiserror",
@@ -201,9 +227,12 @@ dependencies = [
  "claw-api",
  "claw-interface",
  "claw-memory",
+ "claw-skill",
  "claw-utils",
  "claw_cap",
  "dotenvy",
+ "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
  "thiserror",

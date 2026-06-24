@@ -7,9 +7,12 @@ members = [
     "claw-api",
     "claw-sys",
     "claw-log",
+    "claw-skill",
     "claw_core",
     "claw_cap",
     "claw-memory",
+    "claw-context",
+    "claw-sandbox",
 ]
 
 # Device images are built with the release profile (panic = abort, since the

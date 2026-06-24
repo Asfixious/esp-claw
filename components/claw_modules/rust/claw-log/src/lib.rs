@@ -159,11 +159,49 @@ impl TraceSink for ClawTraceSink {
 /// noise (reqwest/hyper/h2/rustls on the host CLIs) is dropped.
 const CLAW_TARGET_PREFIX: &str = "claw";
 
+/// Caller-supplied configuration for [`init_tracing`].
+///
+/// `claw-log` bakes in no domain knowledge: the caller declares the
+/// inherited-context groups (their names, keys, and order) here, keeping the
+/// generic trace layer decoupled from `claw_core`'s concepts. Build with
+/// [`Default`] and layer groups via [`with_context_group_keys`].
+///
+/// ```
+/// use claw_log::TracingConfig;
+///
+/// let config = TracingConfig::default()
+///     .with_context_group_keys("conversation", ["session", "turn", "agent", "iteration"]);
+/// ```
+///
+/// [`with_context_group_keys`]: TracingConfig::with_context_group_keys
+#[derive(Default)]
+pub struct TracingConfig {
+    context_groups: Vec<(&'static str, Vec<&'static str>)>,
+}
+
+impl TracingConfig {
+    /// Register an inherited-context group `name` with its closed, ordered `keys`.
+    ///
+    /// A span field named `name.<key>` becomes this group's incremental context;
+    /// see [`FlatTreeSubscriber::with_context_group_keys`].
+    #[must_use]
+    pub fn with_context_group_keys(
+        mut self,
+        name: &'static str,
+        keys: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
+        self.context_groups
+            .push((name, keys.into_iter().collect()));
+        self
+    }
+}
+
 /// Install the flat-tree `tracing` subscriber. Its sink forwards to the same
 /// backend as the `log` facade (`ESP_LOGx` on device, `env_logger` on host).
 ///
 /// Only spans/events whose `target` starts with `claw` are traced; dependency
 /// output (reqwest/hyper/h2/…) is filtered out so it does not flood the trace.
+/// `config` declares the inherited-context groups (see [`TracingConfig`]).
 ///
 /// Pair it with [`init_logger`] so plain `log::` records are emitted too; the
 /// two streams are independent (no `tracing/log-always`, no `LogTracer`), so
@@ -173,8 +211,11 @@ const CLAW_TARGET_PREFIX: &str = "claw";
 ///
 /// Returns [`tracing::subscriber::SetGlobalDefaultError`] if a global subscriber
 /// is already installed (`tracing` allows exactly one).
-pub fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
-    tracing::subscriber::set_global_default(
-        FlatTreeSubscriber::with_sink(ClawTraceSink).with_allowed_target_prefix(CLAW_TARGET_PREFIX),
-    )
+pub fn init_tracing(config: TracingConfig) -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
+    let mut subscriber =
+        FlatTreeSubscriber::with_sink(ClawTraceSink).with_allowed_target_prefix(CLAW_TARGET_PREFIX);
+    for (name, keys) in config.context_groups {
+        subscriber = subscriber.with_context_group_keys(name, keys);
+    }
+    tracing::subscriber::set_global_default(subscriber)
 }

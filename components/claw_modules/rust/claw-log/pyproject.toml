@@ -1,0 +1,34 @@
+[project]
+name = "claw-trace"
+version = "0.1.0"
+description = "Parser and tree reconstructor for claw-log's flat-tree TRACE format (see docs/trace-format.md)."
+readme = "scripts/README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "chrometrace>=0.2.1",
+]
+
+[project.scripts]
+# Pretty-print a TRACE log as a reconstructed tree: `uv run claw-trace <file>`.
+claw-trace = "claw_trace.__main__:main"
+# Separate tool (consumes the claw_trace lib): export Chrome Trace Event JSON.
+claw-trace-chrome = "chrome_export.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The library lives under scripts/ rather than the conventional src/. The chrome
+# exporter is a separate top-level package next to it (not part of the lib).
+packages = ["scripts/claw_trace", "scripts/chrome_export"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14,<0.15",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["scripts"]
+testpaths = ["scripts/tests"]

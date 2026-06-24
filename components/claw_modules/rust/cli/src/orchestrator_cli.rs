@@ -18,6 +18,10 @@
 //! ```
 //! cargo run -p claw-agent-cli --bin orchestrator-chat --target x86_64-unknown-linux-gnu
 //! ```
+//!
+//! Pass `--log-file <PATH>` to redirect all log/trace output to a file
+//! (overwritten, plain text); without it, output goes to stderr as before. The
+//! interactive prompt and replies always stay on the console.
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -26,10 +30,8 @@ use claw_agent_cli::{load_env, make_http, make_llm_config, make_memory_deps};
 use claw_core::agent::{FsAgentFactory, MapAgentResolver};
 use claw_core::{
     ChannelEgress, ChannelEgressHub, ChannelIngressSink, ChannelTransport, InboundMessage,
-    Orchestrator, RecordingTransport, SessionId,
+    Orchestrator, RecordingTransport,
 };
-use owo_colors::OwoColorize;
-use serde_json::Value;
 
 const MEMORY_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -40,14 +42,55 @@ const MEMORY_DIR: &str = concat!(
 const CHANNEL: &str = "cli";
 const CHAT_ID: &str = "cli-chat";
 
+/// Parse the optional `--log-file <PATH>` (or `--log-file=<PATH>`) flag into a
+/// [`claw_log::LogOutput`]; absent → [`claw_log::LogOutput::Stderr`]. Exits with a
+/// usage error when the flag is given without a path.
+fn log_output_from_args() -> claw_log::LogOutput {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(path) = arg.strip_prefix("--log-file=") {
+            return claw_log::LogOutput::File(path.into());
+        }
+        if arg == "--log-file" {
+            match args.next() {
+                Some(path) => return claw_log::LogOutput::File(path.into()),
+                None => {
+                    eprintln!("error: --log-file requires a path");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    claw_log::LogOutput::Stderr
+}
+
 fn main() {
     load_env();
+
+    // `--log-file <PATH>` redirects all log/trace output to a file (overwritten);
+    // without it, output goes to stderr as before. The chat prompt/replies always
+    // stay on the console.
+    let log_output = log_output_from_args();
+    let log_file_path = match &log_output {
+        claw_log::LogOutput::File(path) => Some(path.display().to_string()),
+        claw_log::LogOutput::Stderr => None,
+    };
+
     // Install the flat-tree `tracing` subscriber so the layered spans/events
-    // (turn > agent > iteration_loop > toolcall) print as `TR …` lines on
-    // stderr — the same stream a device build sends to `ESP_LOGx`. `init_logger`
-    // routes plain `log::` records to stderr too.
-    claw_log::init_logger(claw_log::LevelFilter::Trace).expect("install log backend");
-    claw_log::init_tracing().expect("install tracing subscriber");
+    // (session > turn > agent > iteration_loop) print as `TRACE …` lines on the
+    // chosen sink — the same stream a device build sends to `ESP_LOGx`.
+    // `init_logger` routes plain `log::` records to that sink too.
+    if let Err(error) = claw_log::init_logger(claw_log::LevelFilter::Trace, log_output) {
+        eprintln!("failed to initialize logging: {error}");
+        std::process::exit(1);
+    }
+    // The caller owns the inherited-context groups; claw_core uses the
+    // `conversation` group (session > turn > agent > iteration).
+    claw_log::init_tracing(
+        claw_log::TracingConfig::default()
+            .with_context_group_keys("conversation", ["session", "turn", "agent", "iteration"]),
+    )
+    .expect("install tracing subscriber");
 
     // Empty resolver: the built-in conversation/worker manifests declare no extra
     // capabilities, so no name->handler mapping is needed yet.
@@ -73,6 +116,9 @@ fn main() {
     let session = orchestrator.session_create();
 
     eprintln!("Memory:  {MEMORY_DIR}");
+    if let Some(path) = &log_file_path {
+        eprintln!("Logs:    {path}");
+    }
     eprintln!("Session: {}", session.to_wire());
     eprintln!("Type your message and press Enter. Empty line or Ctrl-D to quit.\n");
 
@@ -91,11 +137,6 @@ fn main() {
         if input.is_empty() {
             break;
         }
-
-        // Remember where the root's transcript ends so we can show the tool calls
-        // this turn appends (e.g. spawn_subagent, respond_to_approval), after the
-        // reply. `None` before the first turn builds the root.
-        let turn_start = transcript_len(&orchestrator, session);
 
         turn += 1;
         orchestrator.push_user_message(InboundMessage {
@@ -116,50 +157,8 @@ fn main() {
         for reply in replies {
             println!("\n{}", reply.text);
         }
-
-        if let Some(messages) = orchestrator.root_transcript(session) {
-            print_tool_calls_since(&messages, turn_start);
-        }
         println!();
     }
 
     eprintln!("Goodbye.");
-}
-
-/// Number of messages currently in the session root's transcript (0 before the
-/// root exists).
-fn transcript_len(orchestrator: &Orchestrator, session: SessionId) -> usize {
-    orchestrator
-        .root_transcript(session)
-        .and_then(|messages| messages.as_array().map(Vec::len))
-        .unwrap_or(0)
-}
-
-/// Print, in gray under the reply, every tool call recorded after index `start` —
-/// the calls the root made while producing this turn's answer.
-fn print_tool_calls_since(messages: &Value, start: usize) {
-    let Some(items) = messages.as_array() else {
-        return;
-    };
-    for message in items.iter().skip(start) {
-        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-            continue;
-        };
-        for call in calls {
-            let function = call.get("function");
-            let name = function
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
-            }
-            let arguments = match function.and_then(|f| f.get("arguments")) {
-                Some(Value::String(s)) => s.clone(),
-                Some(value) => value.to_string(),
-                None => String::new(),
-            };
-            println!("{}", format!("  ↳ {name}({arguments})").bright_black());
-        }
-    }
 }

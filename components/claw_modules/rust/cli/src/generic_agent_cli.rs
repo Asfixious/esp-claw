@@ -13,7 +13,9 @@
 use std::io::{self, BufRead, Write};
 
 use claw_agent_cli::{load_env, make_llm, make_memory_ingredients};
-use claw_core::agent::{Agent, AgentCommand, AgentConfig, AgentId, GenericAgent, TickOutcome};
+use claw_core::agent::{
+    Agent, AgentCommand, AgentConfig, AgentId, GenericAgent, MapAgentResolver, TickOutcome,
+};
 use owo_colors::OwoColorize;
 use serde_json::Value;
 
@@ -21,18 +23,18 @@ const MEMORY_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../claw_core/output/generic-chat"
 );
-const SYSTEM_PROMPT: &str = "You are a helpful, concise assistant.";
 const AGENT_ID: usize = 1;
 
 fn main() {
     load_env();
 
     let (mem_config, mem_deps) = make_memory_ingredients(MEMORY_DIR);
-    // Tool-calling is required: the agent's control tools (end_conversation, …)
-    // are merged on by the base agent.
-    let config = AgentConfig::builder("conversation")
-        .with_system_prompt(SYSTEM_PROMPT)
-        .build();
+    // The config (system prompt, capabilities, skills) comes from the baked
+    // `conversation` manifest. An empty resolver suffices here: the kind declares
+    // no capability/skill names, and the base agent merges its own control tools.
+    let resolver = MapAgentResolver::new();
+    let config = AgentConfig::resolve("conversation", &resolver, None, None)
+        .expect("resolve conversation config");
     let mut agent = GenericAgent::new(
         AgentId(AGENT_ID),
         make_llm(true),

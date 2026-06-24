@@ -5,26 +5,46 @@ use core::fmt;
 
 use thiserror::Error;
 
+/// Default byte ceiling for [`TruncatedText::new`]. On device, keep trace/log
+/// lines compact (flash + UART bandwidth); on host, print the full text so the
+/// CLI / offline tooling sees everything. `usize::MAX` makes truncation a no-op.
+#[cfg(target_os = "espidf")]
 const LOG_SNIPPET_LEN: usize = 96;
+#[cfg(not(target_os = "espidf"))]
+const LOG_SNIPPET_LEN: usize = usize::MAX;
 
-/// Log-safe view of text: at most [`LOG_SNIPPET_LEN`] bytes on a char boundary, plus `"..."` when truncated.
-pub struct TruncatedText<T>(T);
+/// Log-safe view of text: at most `limit` bytes on a char boundary, plus `"..."`
+/// when truncated. [`new`](Self::new) uses the platform default
+/// ([`LOG_SNIPPET_LEN`]); [`with_limit`](Self::with_limit) overrides it.
+pub struct TruncatedText<T> {
+    text: T,
+    limit: usize,
+}
 
 impl<T: AsRef<str>> TruncatedText<T> {
+    /// Truncate to the platform default ceiling: compact on device, unbounded on host.
     pub fn new(text: T) -> Self {
-        Self(text)
+        Self {
+            text,
+            limit: LOG_SNIPPET_LEN,
+        }
+    }
+
+    /// Truncate to an explicit byte ceiling (call-site override / testable).
+    pub fn with_limit(text: T, limit: usize) -> Self {
+        Self { text, limit }
     }
 }
 
 impl<T: AsRef<str>> fmt::Display for TruncatedText<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = self.0.as_ref();
-        let mut end = text.len().min(LOG_SNIPPET_LEN);
+        let text = self.text.as_ref();
+        let mut end = text.len().min(self.limit);
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }
         write!(f, "{}", &text[..end])?;
-        if text.len() > LOG_SNIPPET_LEN {
+        if text.len() > self.limit {
             write!(f, "...")?;
         }
         Ok(())
@@ -140,23 +160,38 @@ macro_rules! define_prefixed_id {
 mod tests {
     use super::*;
 
+    const TEST_LIMIT: usize = 96;
+
     #[test]
     fn display_short_text_unchanged() {
-        assert_eq!(TruncatedText::new("hi").to_string(), "hi");
+        assert_eq!(
+            TruncatedText::with_limit("hi", TEST_LIMIT).to_string(),
+            "hi"
+        );
     }
 
     #[test]
-    fn display_long_text_truncates_with_suffix() {
-        let long = "x".repeat(LOG_SNIPPET_LEN + 10);
-        let rendered = TruncatedText::new(&long).to_string();
-        assert_eq!(rendered.len(), LOG_SNIPPET_LEN + 3);
+    fn with_limit_truncates_with_suffix() {
+        let long = "x".repeat(TEST_LIMIT + 10);
+        let rendered = TruncatedText::with_limit(&long, TEST_LIMIT).to_string();
+        assert_eq!(rendered.len(), TEST_LIMIT + 3);
         assert!(rendered.ends_with("..."));
     }
 
     #[test]
-    fn display_respects_char_boundary() {
+    fn with_limit_respects_char_boundary() {
+        // 50 × 'é' = 100 bytes; a 95-byte limit lands mid-char, so the slice must
+        // back off to a boundary rather than panic.
         let text = "é".repeat(50);
-        let rendered = TruncatedText::new(text).to_string();
+        let rendered = TruncatedText::with_limit(&text, 95).to_string();
+        assert!(rendered.ends_with("..."));
         assert!(rendered.is_char_boundary(rendered.len()));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "espidf"))]
+    fn new_is_unbounded_on_host() {
+        let long = "x".repeat(10_000);
+        assert_eq!(TruncatedText::new(&long).to_string(), long);
     }
 }

@@ -1,0 +1,33 @@
+[package]
+name = "claw-sandbox"
+authors = ["Finn(Ziheng) Sheng"]
+version = "0.1.0"
+edition = "2021"
+description = "Sandbox filesystem: confines agent file access to a fixed set of virtual roots (/sandbox, /shared, /system) and rejects any path outside them"
+
+[lib]
+name = "claw_sandbox"
+# Pure-Rust rlib bundled (with the other logic crates) into the single `claw_rt`
+# staticlib that the firmware links.
+crate-type = ["rlib"]
+
+[dependencies]
+claw-interface = { path = "../claw-interface" }
+thiserror = "2"
+
+[dev-dependencies]
+# Hermetic in-memory ClawFs double for sandbox tests (host-only).
+claw-interface = { path = "../claw-interface", features = ["memfs"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "forbid"
+expect_used = "forbid"
+indexing_slicing = "forbid"
+panic = "forbid"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+arithmetic_side_effects = "forbid"

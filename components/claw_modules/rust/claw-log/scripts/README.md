@@ -1,99 +1,53 @@
-# claw-trace
+# claw-trace tooling
 
-A small Python library that parses claw-log's flat-tree `TRACE` log format and
-reconstructs the span tree, per-span timing, and the inherited context that each
-line implies. The authoritative grammar is
+Capture a live `TRACE` log from a device monitor and export it as a Chrome trace
+you can open in `chrome://tracing` / Perfetto. The grammar these tools parse is
 [`../docs/trace-format.md`](../docs/trace-format.md).
 
-The uv project lives in `claw-log/`; this library is the `claw_trace` package
-under `claw-log/scripts/`.
+## CLI: `claw-trace-capture`
 
-## Use as a library
-
-```python
-from claw_trace import build_forest, render_tree
-
-with open("device.log", encoding="utf-8") as handle:
-    forest = build_forest(handle)
-
-print(render_tree(forest))
-
-# Or inspect programmatically:
-for span in forest.spans.values():
-    print(span.name, span.duration_ms, span.context)
-```
-
-- `parse(source)` / `parse_line(line)` — turn lines into `TraceRecord`s. Lines
-  with no `TRACE` marker are skipped (`parse_line` returns `None`); a malformed
-  record raises `ParseError`.
-
-### Per-line adapters
-
-Every parse entry point (`parse`, `parse_line`, `build_forest`) takes an optional
-`adapter`: `Callable[[str], str | None]` run on each raw line before the `TRACE`
-marker is located. It can rewrite a line (strip a prefix, drop ANSI colors) or
-return `None` to skip it. `TraceRecord.raw` keeps the original, un-adapted line.
-
-```python
-from claw_trace import build_forest, strip_ansi, keep_after_marker, chain
-
-# Strip ANSI colors emitted on a TTY, then keep only the TRACE payload.
-forest = build_forest(text, adapter=chain(strip_ansi, keep_after_marker()))
-
-# Custom adapter: drop warning lines entirely.
-forest = build_forest(text, adapter=lambda l: None if l.startswith("W ") else l)
-```
-
-Built-ins: `strip_ansi`, `keep_after_marker(marker="TRACE")`, `chain(*adapters)`.
-The default (no adapter) already handles the common
-`I (2153) claw_core::iteration_loop: TRACE ...` transport prefix, since the
-parser searches for the marker instead of anchoring at column 0.
-- `build_forest(source)` — replay `enter`/`exit` per task to rebuild the
-  `(span, parent)` tree, resolve effective context (child keys shadow ancestors),
-  and anchor events to their spans.
-- `render_tree(forest)` — indented, human-readable dump.
-
-The library is intentionally pure (parse + reconstruct only). Format exporters
-that pull in extra dependencies — such as the Chrome Trace exporter below — live
-*outside* the `claw_trace` package as separate tools that consume it.
-
-## CLI
-
-From the `claw-log/` directory:
+The only exported command. Run a monitor as a child process, parse its `TRACE`
+lines live, and write `trace.json` when it exits (or on Ctrl-C).
 
 ```bash
-uv run claw-trace device.log
-# or
-cat device.log | uv run claw-trace
-# strip ANSI colors first (e.g. captured TTY output):
-uv run claw-trace --strip-ansi device.log
+# from claw-log/
+uv run claw-trace-capture --cmd "cargo espflash monitor" -o trace.json --tee
 ```
 
-## Chrome Trace export (separate tool)
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--cmd` | — | Monitor command to run, e.g. `"cargo espflash monitor"` or `"idf.py monitor"`. |
+| `-o` / `--output` | `trace.json` | Output Chrome Trace Event JSON path. |
+| `--encoding` | `utf-8` | Encoding used to decode the monitor's bytes. |
+| `--tee` | off | Also echo each captured line to stderr live (watch the log while capturing). |
 
-The `chrome_export` package (under `scripts/`, **separate from the `claw_trace`
-library**) consumes a forest and writes the Chrome Trace Event Format, loadable
-in `chrome://tracing` / Perfetto. Spans become *complete* events, trace events
-become *instant* events, and numeric `key=value` fields on an event also become
-*counter* tracks (e.g. `free_heap` for RAM). `session` maps to a process, `task`
-to a thread. It depends on `chrometrace`; the `claw_trace` lib does not.
+Why a child process instead of a raw pipe: Ctrl-C is handled cleanly — the
+monitor is terminated and the records collected so far are still exported.
+Chrome export is a batch step (span-tree reconstruction needs the whole
+capture), so the JSON is written once at the end. Occasional corrupt serial
+lines are skipped (and counted) rather than aborting the capture.
 
-```bash
-uv run claw-trace-chrome device.log -o trace.json
-cat device.log | uv run claw-trace-chrome --strip-ansi -o trace.json
-```
+## Libraries
 
-```python
-from claw_trace import build_forest
-from chrome_export import write_chrome_trace
+Three of the packages are importable libraries; `trace_capture` is the glue tool
+above. The first three share `claw-log/pyproject.toml`; `serial_log` is a
+standalone, dependency-free project with its own `pyproject.toml`.
 
-write_chrome_trace(build_forest(open("device.log")), "trace.json")
-```
+| Package | Role |
+|---------|------|
+| `claw_trace` | Pure parser: `parse_line` / `parse` turn lines into `TraceRecord`s; `build_forest` rebuilds the span tree, timing, and inherited context; `render_tree` dumps it. No extra deps. |
+| `chrome_export` | Consumes a `claw_trace` forest and writes Chrome Trace Event JSON (`write_chrome_trace`). Spans → complete events, events → instant events, numeric event fields → counter tracks. Depends on `chrometrace`. |
+| `serial_log` | Standalone, dependency-free: `LogStream` runs a subprocess and pushes each complete stdout line to `on_log` callbacks (strips ANSI, configurable encoding). See `serial_log/README.md`. |
+| `trace_capture` | Glue only: wires `serial_log` → `claw_trace` → `chrome_export` behind `claw-trace-capture`. |
+
+`claw_trace` and `chrome_export` stay importable and are still runnable via
+`python -m claw_trace` / `python -m chrome_export`, but are intentionally not
+registered as console scripts.
 
 ## Develop / test
 
-From `claw-log/`:
-
 ```bash
+# from claw-log/
 uv run pytest
+uv run ruff format
 ```

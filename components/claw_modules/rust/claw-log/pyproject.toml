@@ -6,13 +6,20 @@ readme = "scripts/README.md"
 requires-python = ">=3.11"
 dependencies = [
     "chrometrace>=0.2.1",
+    # Live-capture glue tool (claw-trace-capture) drives a monitor via serial-log.
+    "serial-log",
 ]
 
+[tool.uv.sources]
+serial-log = { path = "scripts/serial_log", editable = true }
+
 [project.scripts]
-# Pretty-print a TRACE log as a reconstructed tree: `uv run claw-trace <file>`.
-claw-trace = "claw_trace.__main__:main"
-# Separate tool (consumes the claw_trace lib): export Chrome Trace Event JSON.
-claw-trace-chrome = "chrome_export.__main__:main"
+# The only exported CLI: capture a live TRACE log from a monitor command and
+# export Chrome trace JSON (serial-log -> claw_trace -> chrome_export).
+# claw_trace and chrome_export stay importable libraries; their __main__ modules
+# remain runnable via `python -m claw_trace` / `python -m chrome_export` but are
+# intentionally not registered as console scripts.
+claw-trace-capture = "trace_capture.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -20,8 +27,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # The library lives under scripts/ rather than the conventional src/. The chrome
-# exporter is a separate top-level package next to it (not part of the lib).
-packages = ["scripts/claw_trace", "scripts/chrome_export"]
+# exporter and the live-capture glue are separate top-level packages next to it
+# (not part of the lib).
+packages = ["scripts/claw_trace", "scripts/chrome_export", "scripts/trace_capture"]
 
 [dependency-groups]
 dev = [

@@ -244,7 +244,10 @@ impl<'groups> FieldVisitor<'groups> {
     /// closed set is a typo and trips `debug_assert!`.
     fn route(&self, name: &'static str) -> Option<(usize, &'static str)> {
         let (group_name, key) = name.split_once('.')?;
-        let group_index = self.groups.iter().position(|group| group.name == group_name)?;
+        let group_index = self
+            .groups
+            .iter()
+            .position(|group| group.name == group_name)?;
         let group = self.groups.get(group_index)?;
         match group.keys.iter().copied().find(|declared| *declared == key) {
             Some(declared) => Some((group_index, declared)),
@@ -409,7 +412,10 @@ impl<S: TraceSink> FlatTreeSubscriber<S> {
     fn render_opened_groups(&self, ancestor: &GroupedContext, full: &GroupedContext) -> String {
         let mut blocks = String::new();
         for (group_index, group) in self.context_groups.iter().enumerate() {
-            let ancestor_bucket = ancestor.get(group_index).map(Vec::as_slice).unwrap_or_default();
+            let ancestor_bucket = ancestor
+                .get(group_index)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let full_bucket = full.get(group_index).map(Vec::as_slice).unwrap_or_default();
             let delta = render_opened_bucket(ancestor_bucket, full_bucket);
             if !delta.is_empty() {
@@ -659,10 +665,7 @@ mod tests {
 
         assert_eq!(visitor.fields, "a=1 b=2 http.method=GET");
         assert_eq!(visitor.message.as_deref(), Some("hello world"));
-        assert_eq!(
-            visitor.context,
-            vec![vec![("session", "s-1".to_string())]]
-        );
+        assert_eq!(visitor.context, vec![vec![("session", "s-1".to_string())]]);
     }
 
     #[test]

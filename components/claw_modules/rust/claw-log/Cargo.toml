@@ -45,6 +45,8 @@ trace_max_trace = ["tracing/release_max_level_trace"]
 # The C-shim boundary that turns a `log::Level` line into `ESP_LOGx` / stderr.
 claw-sys = { path = "../claw-sys" }
 log = "0.4"
+# Ergonomic error enum for `init_logger` (file-open + set-logger failures).
+thiserror = "2"
 # The flat-tree subscriber (`trace.rs`) implements `Subscriber` via `tracing`'s
 # re-exported core traits, and `set_global_default` + the `trace_max_*` ceiling
 # features need it too. NOT `log-always`: the subscriber consumes events directly,

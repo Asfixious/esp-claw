@@ -14,12 +14,14 @@ dependencies = [
 serial-log = { path = "scripts/serial_log", editable = true }
 
 [project.scripts]
-# The only exported CLI: capture a live TRACE log from a monitor command and
-# export Chrome trace JSON (serial-log -> claw_trace -> chrome_export).
-# claw_trace and chrome_export stay importable libraries; their __main__ modules
-# remain runnable via `python -m claw_trace` / `python -m chrome_export` but are
-# intentionally not registered as console scripts.
+# Capture a live TRACE log from a monitor command and export Chrome trace JSON
+# (serial-log -> claw_trace -> chrome_export).
 claw-trace-capture = "trace_capture.__main__:main"
+# Convert an existing TRACE .log file (or stdin) to Chrome trace JSON offline.
+claw-trace-chrome = "chrome_export.__main__:main"
+# claw_trace stays an importable library; its __main__ module remains runnable
+# via `python -m claw_trace` but is intentionally not registered as a console
+# script.
 
 [build-system]
 requires = ["hatchling"]

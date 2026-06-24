@@ -21,11 +21,44 @@
 
 pub mod trace;
 
+use std::io;
+use std::path::PathBuf;
+
 use log::Level;
+use thiserror::Error;
 use tracing::Level as TraceLevel;
 
 pub use log::LevelFilter;
 pub use trace::{FlatTreeSubscriber, TraceSink};
+
+/// Where the host `log` facade (and, through it, the `tracing` stream) writes.
+///
+/// On `espidf` this is ignored — device output always goes through `ESP_LOGx`;
+/// file redirection is a host-only convenience for the CLIs.
+#[derive(Debug, Clone, Default)]
+pub enum LogOutput {
+    /// Standard error — the default, unchanged behavior.
+    #[default]
+    Stderr,
+    /// A file at this path, **truncated** (overwritten) on open. Written without
+    /// ANSI color so the file stays plain text.
+    File(PathBuf),
+}
+
+/// Failure installing the global `log` backend (see [`init_logger`]).
+#[derive(Debug, Error)]
+pub enum InitLoggerError {
+    /// Opening the [`LogOutput::File`] target failed (host only).
+    #[error("failed to open log file {path}: {source}")]
+    OpenLogFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// A global `log` logger was already installed (`log` allows exactly one).
+    #[error("a global logger is already installed")]
+    SetLogger(#[from] log::SetLoggerError),
+}
 
 /// Device-only `log::Log` backend: bridges the `log` facade to `claw_sys`'s
 /// `ESP_LOGx` sink. On host this role is filled by `env_logger` instead.
@@ -66,16 +99,24 @@ static LOGGER: ClawLogger = ClawLogger;
 ///
 /// Pass [`LevelFilter::Trace`] to defer all filtering to those other gates.
 ///
+/// `output` selects the sink: [`LogOutput::Stderr`] (default) or
+/// [`LogOutput::File`] to redirect host log/trace output to a file (host only;
+/// ignored on `espidf`). The interactive CLI output (prompts/replies) is written
+/// directly to stdout/stderr and is unaffected.
+///
 /// # Errors
 ///
-/// Returns [`log::SetLoggerError`] if a global logger is already installed (the
-/// `log` facade allows exactly one).
-pub fn init_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
-    install_logger(max_level)
+/// Returns [`InitLoggerError::SetLogger`] if a global logger is already installed
+/// (the `log` facade allows exactly one), or [`InitLoggerError::OpenLogFile`] if
+/// the [`LogOutput::File`] target cannot be opened.
+pub fn init_logger(max_level: LevelFilter, output: LogOutput) -> Result<(), InitLoggerError> {
+    install_logger(max_level, output)
 }
 
 #[cfg(target_os = "espidf")]
-fn install_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
+fn install_logger(max_level: LevelFilter, _output: LogOutput) -> Result<(), InitLoggerError> {
+    // Device output always goes through `ESP_LOGx`; `_output` (file redirection)
+    // is a host-only convenience and is intentionally ignored here.
     log::set_logger(&LOGGER)?;
     log::set_max_level(max_level);
     Ok(())
@@ -96,7 +137,7 @@ fn esp_idf_style(level: Level) -> (char, Option<&'static str>) {
 }
 
 #[cfg(not(target_os = "espidf"))]
-fn install_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
+fn install_logger(max_level: LevelFilter, output: LogOutput) -> Result<(), InitLoggerError> {
     use std::io::Write;
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -104,7 +145,8 @@ fn install_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
     // Anchored at logger init so the `(ms)` column mirrors ESP-IDF's boot uptime.
     static START: OnceLock<Instant> = OnceLock::new();
 
-    env_logger::Builder::new()
+    let mut builder = env_logger::Builder::new();
+    builder
         // No `parse_env`/`RUST_LOG`. Mirror the tracing target allowlist: noisy
         // dependencies (reqwest/rustls/… emit through the `log` facade) only
         // surface at `Warn`+, while first-party `claw*` targets honor `max_level`.
@@ -112,7 +154,7 @@ fn install_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
         .filter_level(LevelFilter::Warn)
         .filter_module(CLAW_TARGET_PREFIX, max_level)
         // Mirror ESP-IDF's `<L> (<ms>) <tag>: <msg>`; anstream strips the ANSI
-        // when stderr is not a TTY.
+        // when the target is not a TTY.
         .format(|formatter, record| {
             let uptime_ms = START.get_or_init(Instant::now).elapsed().as_millis();
             let (letter, color) = esp_idf_style(record.level());
@@ -124,8 +166,20 @@ fn install_logger(max_level: LevelFilter) -> Result<(), log::SetLoggerError> {
                 ),
                 None => writeln!(formatter, "{letter} ({uptime_ms}) {tag}: {message}"),
             }
-        })
-        .try_init()
+        });
+
+    // Redirect to a file when requested, forcing color off so the file stays
+    // plain text; otherwise keep the default stderr target (auto color on a TTY).
+    if let LogOutput::File(path) = output {
+        let file = std::fs::File::create(&path)
+            .map_err(|source| InitLoggerError::OpenLogFile { path, source })?;
+        builder
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .write_style(env_logger::WriteStyle::Never);
+    }
+
+    builder.try_init()?;
+    Ok(())
 }
 
 /// Map a `tracing` level to the `log::Level` the sink expects.
@@ -190,8 +244,7 @@ impl TracingConfig {
         name: &'static str,
         keys: impl IntoIterator<Item = &'static str>,
     ) -> Self {
-        self.context_groups
-            .push((name, keys.into_iter().collect()));
+        self.context_groups.push((name, keys.into_iter().collect()));
         self
     }
 }
@@ -211,7 +264,9 @@ impl TracingConfig {
 ///
 /// Returns [`tracing::subscriber::SetGlobalDefaultError`] if a global subscriber
 /// is already installed (`tracing` allows exactly one).
-pub fn init_tracing(config: TracingConfig) -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
+pub fn init_tracing(
+    config: TracingConfig,
+) -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
     let mut subscriber =
         FlatTreeSubscriber::with_sink(ClawTraceSink).with_allowed_target_prefix(CLAW_TARGET_PREFIX);
     for (name, keys) in config.context_groups {

@@ -11,7 +11,7 @@ use claw_log::LevelFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // `Trace` defers filtering to the compile-time `log_max_*` ceiling.
-    claw_log::init_logger(LevelFilter::Trace)?;
+    claw_log::init_logger(LevelFilter::Trace, claw_log::LogOutput::Stderr)?;
     claw_log::init_tracing(
         claw_log::TracingConfig::default()
             .with_context_group_keys("conversation", ["session", "turn", "agent", "iteration"]),

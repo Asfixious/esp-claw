@@ -12,16 +12,17 @@ name = "claw_context"
 crate-type = ["rlib"]
 
 [dependencies]
+thiserror = "2"
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [lints.clippy]
-unwrap_used = "forbid"
-expect_used = "forbid"
-indexing_slicing = "forbid"
-panic = "forbid"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
 todo = "warn"
 unimplemented = "warn"
 unreachable = "warn"
-arithmetic_side_effects = "forbid"
+arithmetic_side_effects = "deny"

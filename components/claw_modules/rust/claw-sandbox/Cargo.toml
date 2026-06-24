@@ -22,12 +22,14 @@ claw-interface = { path = "../claw-interface", features = ["memfs"] }
 [lints.rust]
 unsafe_code = "forbid"
 
+# `deny` (not `forbid`) on the restriction lints so the in-crate `#[cfg(test)]`
+# module can `#[allow(clippy::unwrap_used)]` where panicking is acceptable.
 [lints.clippy]
-unwrap_used = "forbid"
-expect_used = "forbid"
-indexing_slicing = "forbid"
-panic = "forbid"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
 todo = "warn"
 unimplemented = "warn"
 unreachable = "warn"
-arithmetic_side_effects = "forbid"
+arithmetic_side_effects = "deny"

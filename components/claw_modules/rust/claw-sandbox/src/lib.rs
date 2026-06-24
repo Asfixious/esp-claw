@@ -8,3 +8,9 @@
 //! applies on-device and in host tests.
 //!
 //! [`ClawFs`]: claw_interface::ClawFs
+
+pub mod fs;
+pub mod sandbox;
+
+pub use fs::{SandboxError, SandboxFs, READ_ONLY_PREFIXES, VISIBLE_PREFIXES};
+pub use sandbox::{RealRoots, Sandbox};

@@ -21,7 +21,10 @@ fn two_skill_fs() -> Arc<MemFs> {
     let fs = MemFs::new();
     fs.write_atomic(
         "skills/alpha/SKILL.md",
-        &skill_md("Alpha skill", "# Alpha\nRun {CUR_SKILL_DIR}/scripts/a.lua\n"),
+        &skill_md(
+            "Alpha skill",
+            "# Alpha\nRun {CUR_SKILL_DIR}/scripts/a.lua\n",
+        ),
     )
     .unwrap();
     fs.write_atomic(

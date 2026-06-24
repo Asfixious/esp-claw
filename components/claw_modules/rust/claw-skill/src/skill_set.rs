@@ -133,32 +133,40 @@ impl SkillSet {
     ///
     /// # Errors
     ///
-    /// Any [`SkillError`] from [`SkillRegistry::document`] when a loaded skill's
-    /// document is (re)read during a rebuild — e.g. [`SkillError::ReadFailed`] or
-    /// a malformed-front-matter error. The cache is left stale so the next read
-    /// retries.
+    /// Any [`SkillError`] from [`SkillRegistry::write_document`] when a loaded
+    /// skill's document is (re)read during a rebuild — e.g. [`SkillError::ReadFailed`]
+    /// or a malformed-front-matter error. On error `dirty` stays set so the next
+    /// read retries (the partially written buffer is cleared and rebuilt).
+    ///
+    /// The buffer is **reused** across rebuilds: `clear()` retains its capacity,
+    /// and each document body is appended straight into it via
+    /// [`SkillRegistry::write_document`], so a rebuild does not free the previous
+    /// buffer nor allocate a `String` per document.
     pub fn context(&mut self) -> Result<&str, SkillError> {
         if self.dirty {
-            self.context_cache = self.build()?;
+            // Borrow disjoint fields: `&self.loaded` (iter), `&self.registry`,
+            // and `&mut self.context_cache` are distinct fields, so this is a
+            // single in-place rebuild with no temporary buffer.
+            self.context_cache.clear();
+            for loaded in &self.loaded {
+                self.context_cache.push_str("## Skill: ");
+                self.context_cache.push_str(loaded.id.as_str());
+                self.context_cache.push_str(" (");
+                self.context_cache.push_str(loaded.group);
+                self.context_cache.push_str(")\n\n");
+                let body_start = self.context_cache.len();
+                self.registry
+                    .write_document(&loaded.id, &mut self.context_cache)?;
+                // Trim the just-appended body's trailing whitespace in place
+                // (real `SKILL.md` bodies carry no leading blank line) without
+                // allocating an intermediate trimmed `String`.
+                let trimmed_len = self.context_cache.trim_end().len().max(body_start);
+                self.context_cache.truncate(trimmed_len);
+                self.context_cache.push_str("\n\n");
+            }
             self.dirty = false;
         }
         Ok(&self.context_cache)
-    }
-
-    /// Assemble the loaded skills' documents into one fragment.
-    fn build(&self) -> Result<String, SkillError> {
-        let mut out = String::new();
-        for loaded in &self.loaded {
-            let document = self.registry.document(&loaded.id)?;
-            out.push_str("## Skill: ");
-            out.push_str(loaded.id.as_str());
-            out.push_str(" (");
-            out.push_str(loaded.group);
-            out.push_str(")\n\n");
-            out.push_str(document.trim());
-            out.push_str("\n\n");
-        }
-        Ok(out)
     }
 }
 

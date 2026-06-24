@@ -35,7 +35,11 @@ pub trait SkillRegistry: Send + Sync {
     /// The full catalog, borrowed. Cheap, in-memory metadata only.
     fn catalog(&self) -> &[SkillMetadata];
 
-    /// Read one skill's full document body (front-matter stripped).
+    /// Append one skill's document body (front-matter stripped) to `out`.
+    ///
+    /// The allocation-frugal primitive: the body is pushed straight into the
+    /// caller's buffer, so a [`SkillSet`] can reuse one buffer across rebuilds
+    /// instead of allocating (and freeing) a fresh `String` per document.
     ///
     /// # Errors
     ///
@@ -44,7 +48,23 @@ pub trait SkillRegistry: Send + Sync {
     ///   cannot be read or decoded.
     /// - [`SkillError::MissingOpeningFence`] / [`SkillError::MissingClosingFence`]
     ///   if the document's front-matter is malformed.
-    fn document(&self, id: &SkillId) -> Result<String, SkillError>;
+    fn write_document(&self, id: &SkillId, out: &mut String) -> Result<(), SkillError>;
+
+    /// One skill's full document body (front-matter stripped), as an owned
+    /// `String`.
+    ///
+    /// Convenience over [`write_document`](Self::write_document) for callers
+    /// that want an owned value; allocation-sensitive callers should prefer
+    /// `write_document` into a reused buffer.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`write_document`](Self::write_document).
+    fn document(&self, id: &SkillId) -> Result<String, SkillError> {
+        let mut out = String::new();
+        self.write_document(id, &mut out)?;
+        Ok(out)
+    }
 
     /// Look up one catalog entry by id, or `None` if there is no such skill.
     fn metadata(&self, id: &SkillId) -> Option<&SkillMetadata> {
@@ -57,8 +77,8 @@ pub struct FsSkillRegistry {
     fs: Arc<dyn ClawFs>,
     roots: Vec<String>,
     catalog: Vec<SkillMetadata>,
-    /// The root each skill id was found under, so [`document`](Self::document)
-    /// can rebuild its path.
+    /// The root each skill id was found under, so a document read can rebuild
+    /// its path.
     root_by_id: HashMap<SkillId, String>,
 }
 
@@ -151,7 +171,7 @@ impl SkillRegistry for FsSkillRegistry {
         &self.catalog
     }
 
-    fn document(&self, id: &SkillId) -> Result<String, SkillError> {
+    fn write_document(&self, id: &SkillId, out: &mut String) -> Result<(), SkillError> {
         let root = self
             .root_by_id
             .get(id)
@@ -161,8 +181,11 @@ impl SkillRegistry for FsSkillRegistry {
             .fs
             .read(&path)
             .map_err(|error| SkillError::ReadFailed(id.clone(), error))?;
+        // `from_utf8` reuses the read buffer's allocation (no extra alloc); the
+        // body slice is then copied straight into the caller's buffer.
         let text = String::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8(id.clone()))?;
-        Ok(strip_front_matter(id, &text)?.to_string())
+        out.push_str(strip_front_matter(id, &text)?);
+        Ok(())
     }
 }
 

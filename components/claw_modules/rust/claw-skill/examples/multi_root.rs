@@ -20,7 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Two distinct roots, each contributing different skills.
     let fs = MemFs::new();
     fs.write_atomic("system/time/SKILL.md", &skill_md("Built-in time helper."))?;
-    fs.write_atomic("data/notes/SKILL.md", &skill_md("User-installed notes skill."))?;
+    fs.write_atomic(
+        "data/notes/SKILL.md",
+        &skill_md("User-installed notes skill."),
+    )?;
 
     let registry = FsSkillRegistry::scan_roots(Arc::new(fs), ["system", "data"])?;
     println!("== merged catalog from system + data ==");

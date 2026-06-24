@@ -18,11 +18,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fs = MemFs::new();
     fs.write_atomic(
         "skills/board_hardware_info/SKILL.md",
-        &skill_md("Board GPIO and peripheral reference.", "# Board hardware\nGPIO map ..."),
+        &skill_md(
+            "Board GPIO and peripheral reference.",
+            "# Board hardware\nGPIO map ...",
+        ),
     )?;
     fs.write_atomic(
         "skills/light_switch/SKILL.md",
-        &skill_md("Control board lights.", "# Light switch\nCall the light capability ..."),
+        &skill_md(
+            "Control board lights.",
+            "# Light switch\nCall the light capability ...",
+        ),
     )?;
 
     let registry: Arc<dyn SkillRegistry> = Arc::new(FsSkillRegistry::scan(Arc::new(fs), "skills")?);

@@ -20,11 +20,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fs = MemFs::new();
     fs.write_atomic(
         "skills/weather_search/SKILL.md",
-        &skill_md("Answer weather and forecast questions via web search.", "# Weather\n..."),
+        &skill_md(
+            "Answer weather and forecast questions via web search.",
+            "# Weather\n...",
+        ),
     )?;
     fs.write_atomic(
         "skills/light_switch/SKILL.md",
-        &skill_md("Turn board lights and LED strips on or off.", "# Light switch\n..."),
+        &skill_md(
+            "Turn board lights and LED strips on or off.",
+            "# Light switch\n...",
+        ),
     )?;
 
     // Scan once; the catalog is cheap in-memory metadata (no bodies read).

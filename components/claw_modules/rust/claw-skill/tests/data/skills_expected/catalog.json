@@ -1,29 +1,14 @@
 [
   {
-    "capability_groups": [
-      "cap_lua"
-    ],
     "description": "Turn a board light on or off, set LED strip color or brightness, and control GPIO lights. Requires board_hardware_info skill.",
-    "id": "light_switch",
-    "manage_mode": "readonly"
+    "id": "light_switch"
   },
   {
-    "capability_groups": [
-      "cap_lua",
-      "cap_scheduler",
-      "cap_router_mgr"
-    ],
     "description": "Add timer-based scheduled tasks, periodic reminders, scheduled agent wake-ups, fixed IM messages, or scheduled Lua script runs. Prefer to use this skill rather than calling scheduler_add and add_router_rule directly.",
-    "id": "scheduled_task",
-    "manage_mode": "readonly"
+    "id": "scheduled_task"
   },
   {
-    "capability_groups": [
-      "cap_time",
-      "cap_web_search"
-    ],
     "description": "How to answer current weather, temperature, and forecast queries through direct web search capabilities.",
-    "id": "weather_search",
-    "manage_mode": "readonly"
+    "id": "weather_search"
   }
 ]

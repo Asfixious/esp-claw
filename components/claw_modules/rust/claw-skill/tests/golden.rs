@@ -5,8 +5,9 @@
 //!   `tests/data/skills_expected/<id>/document.md`
 //!
 //! The registry is scanned over a `DiskFs` rooted at `tests/data` with the
-//! virtual root `skills`, so `{CUR_SKILL_DIR}` expands to a stable, portable
-//! `skills/<id>` — no absolute machine paths leak into the golden files.
+//! virtual root `skills`. Document bodies are returned verbatim (front-matter
+//! stripped) — there is no `{CUR_SKILL_DIR}` expansion, so any such placeholder
+//! is preserved literally in the golden.
 //!
 //! The whole skills folder is discovered dynamically (nothing is hard-coded per
 //! skill), so dropping a new skill into `tests/data/skills/` and regenerating the
@@ -19,8 +20,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use claw_core::{FsSkillRegistry, ManageMode, SkillId, SkillRegistry, SkillSet};
 use claw_interface::DiskFs;
+use claw_skill::{FsSkillRegistry, SkillId, SkillRegistry, SkillSet};
 use serde_json::json;
 
 /// Virtual skills root handed to the registry; maps onto `tests/data/skills`.
@@ -51,13 +52,6 @@ fn registry() -> FsSkillRegistry {
         .expect("scan skills fixtures")
 }
 
-fn manage_mode_str(mode: ManageMode) -> &'static str {
-    match mode {
-        ManageMode::ReadOnly => "readonly",
-        ManageMode::Runtime => "runtime",
-    }
-}
-
 /// The catalog rendered as canonical pretty JSON (trailing newline) for golden
 /// comparison.
 fn catalog_json(registry: &FsSkillRegistry) -> String {
@@ -68,8 +62,6 @@ fn catalog_json(registry: &FsSkillRegistry) -> String {
             json!({
                 "id": metadata.id().as_str(),
                 "description": metadata.description(),
-                "capability_groups": metadata.capability_groups(),
-                "manage_mode": manage_mode_str(metadata.manage_mode()),
             })
         })
         .collect();
@@ -125,10 +117,6 @@ fn documents_match_golden() {
     for metadata in registry.catalog() {
         let id = metadata.id();
         let document = registry.document(id).expect("read skill document");
-        assert!(
-            !document.contains("{CUR_SKILL_DIR}"),
-            "placeholder not expanded for {id}"
-        );
         assert!(
             !document.starts_with("---"),
             "front-matter not stripped for {id}"

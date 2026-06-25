@@ -33,3 +33,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 embedded-executor = "0.6.1"
 lock_api = "0.4.14"
 tokio = { version = "1.52.3", features = ["rt", "net", "time", "io-util"] }
+
+# The DI-seams example drives the host-only `MemFs` / `ScriptedHttp` doubles, so
+# it requires the features that gate them.
+[[example]]
+name = "di_seams"
+required-features = ["memfs", "httpmock"]

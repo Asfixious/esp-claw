@@ -1,10 +1,13 @@
-//! `claw_interface` — the cycle-breaking base crate for the claw_modules Rust
-//! rewrite.
+//! `claw_interface` — the OS / platform abstraction layer for the claw Rust
+//! crates.
 //!
-//! The C `claw_modules` are mutually circular (`cap -> core -> router -> cap`).
-//! Rust crates cannot depend on each other circularly, so shared types and the
-//! dependency-injection traits live here and every module crate depends only on
-//! this one, never on each other.
+//! This is the inbound boundary (C / OS -> Rust): it defines the
+//! dependency-injection traits that abstract over platform facilities —
+//! filesystem ([`ClawFs`](fs::ClawFs)) and networking ([`ClawHttp`](http::ClawHttp)) —
+//! plus the shared types those traits work with. The pure-Rust core crates
+//! (`claw-api`, `claw_core`, `claw_cap`, `claw-memory`, `claw-sandbox`, …)
+//! depend only on these traits, never on a platform directly, so the device
+//! build and host tests can plug in different implementations of the same seam.
 
 pub mod fs;
 pub mod http;

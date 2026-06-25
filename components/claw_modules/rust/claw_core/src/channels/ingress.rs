@@ -1,7 +1,7 @@
 //! Inbound channel port: user messages and orchestrator commands.
 //!
 //! External drivers (IM, CLI, event router adapters) push via
-//! [`ChannelIngressSink`]. [`crate::orchestrator::Orchestrator`] implements
+//! [`ChannelIngressSink`]. [`crate::Orchestrator`] implements
 //! it and delivers into orchestrator callbacks on push.
 
 use super::message::{InboundCommand, InboundMessage};

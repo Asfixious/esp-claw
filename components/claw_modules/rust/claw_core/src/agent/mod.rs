@@ -4,9 +4,11 @@
 //! semantic agent on top of it — [`GenericAgent`] — a flat ReAct loop with no
 //! built-in FSM. What distinguishes one agent "kind" from another is pure data:
 //! its [`AgentConfig`] (system prompt, tool set, skills, spawning), loaded at
-//! compile time from `resources/agents/<kind>/` via [`agent_manifest!`] and
-//! resolved through an [`AgentResolver`]. [`GenericAgent`] implements the unified
-//! [`Agent`] trait the scheduler drives; the trait never reaches into internals.
+//! compile time from `resources/agents/<kind>/` and resolved through an
+//! [`AgentResolver`] — see the crate-internal `manifest` module.
+//! [`GenericAgent`] implements
+//! the unified [`Agent`] trait the scheduler drives; the trait never reaches into
+//! internals.
 //!
 //! Spawning is a model-callable `spawn_subagent(kind, goal)` tool (in
 //! [`internal_tools`]) backed by an injected [`Spawner`]; the [`AgentRegistry`]
@@ -16,20 +18,20 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
 pub mod base_agent;
+pub mod config;
 mod fs_factory;
 mod internal_tools;
+pub mod manifest;
 mod map_resolver;
 pub mod registry;
 
-pub use agent::{
-    builtin_manifest, AgentConfig, AgentConfigBuilder, AgentConfigError, AgentKind, AgentManifest,
-    AgentResolver, GenericAgent, GenericAgentBuildError, BUILTIN_KINDS,
-};
+pub use agent::{AgentKind, GenericAgent, GenericAgentBuildError};
 pub use base_agent::{
     AgentAbortHandle, AgentCommand, AgentCommandError, AgentId, AgentRunError, AgentState,
     ApprovalDecision, ApprovalId, BaseAgent, BaseAgentBuildError, BaseAgentBuilder, CancelReason,
     TickOutcome,
 };
+pub use config::{AgentConfig, AgentConfigError, AgentResolver};
 pub use fs_factory::FsAgentFactory;
 pub use internal_tools::{ApprovalResponder, ApprovalVerdict, Spawner};
 pub use map_resolver::MapAgentResolver;
@@ -64,13 +66,6 @@ pub trait Agent: Send {
 
     /// Advance the agent by one step and report what happened. See [`TickOutcome`].
     fn tick(&mut self) -> TickOutcome;
-
-    /// A read-only snapshot of this agent's conversation transcript, when it
-    /// keeps one — used by inspection tools / CLIs to show what the model did
-    /// (its messages and `tool_calls`). Agents with no transcript return `None`.
-    fn transcript(&self) -> Option<serde_json::Value> {
-        None
-    }
 }
 
 /// Shared: present a subagent's result as a provenance-tagged message and append

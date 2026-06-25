@@ -7,11 +7,8 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::base_agent::{AgentId, ApprovalDecision, ApprovalId};
-use crate::agent::registry::{AgentFactory, DriveOutput, ResolveApprovalError};
-use crate::channels::{
-    ChannelEgress, ChannelEgressHub, ChannelIngressSink, InboundCommand, InboundMessage,
-};
+use crate::agent::registry::{AgentFactory, DriveOutput};
+use crate::channels::{ChannelEgress, ChannelIngressSink, InboundCommand, InboundMessage};
 use crate::orchestrator_instance::OrchestratorInstance;
 use crate::protocol::Command;
 use crate::session::{
@@ -20,18 +17,6 @@ use crate::session::{
 
 /// The first [`crate::agent::AgentId`] handed out (0 reads like "unset").
 const FIRST_AGENT_ID: usize = 1;
-
-/// Failure delivering a human approval decision via
-/// [`Orchestrator::resolve_approval`].
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum ApprovalError {
-    /// No live agent graph for the session (never started, or already deleted).
-    #[error("session {0} has no live agent graph")]
-    UnknownSession(SessionId),
-    /// The agent rejected the decision (gone, or not awaiting this approval).
-    #[error(transparent)]
-    Resolve(#[from] ResolveApprovalError),
-}
 
 pub struct Orchestrator {
     egress: Arc<dyn ChannelEgress>,
@@ -62,8 +47,21 @@ impl Orchestrator {
         let instance = self.instance_for(session_id);
         let output = {
             let mut instance = instance.lock().unwrap_or_else(|poison| poison.into_inner());
+            let turn = instance.next_turn();
+            // session > turn: the session span opens `conversation.session`, the
+            // turn span opens `conversation.turn`. Every agent/iteration/tool span
+            // produced while driving nests under them, so one drive reads as a unit.
+            let _session_span =
+                tracing::info_span!("session", conversation.session = %session_id).entered();
+            let _turn_span = tracing::info_span!(
+                "turn",
+                conversation.turn = turn,
+                message_id = %msg.message_id,
+                cause = "message"
+            )
+            .entered();
             if let Err(error) = instance.deliver(msg.text.clone()) {
-                log::warn!("failed to build/deliver root for {session_id}: {error}");
+                tracing::warn!(session = %session_id, %error, "failed to build/deliver root");
                 return;
             }
             instance.drive()
@@ -94,85 +92,32 @@ impl Orchestrator {
 
     /// Route a [`DriveOutput`] to the session's egress: replies as messages, and
     /// each pending approval as a visible message tagged with its agent/approval
-    /// id (so a human can answer it via [`resolve_approval`](Self::resolve_approval)).
+    /// id. Resolving an approval is an internal concern; there is no public
+    /// resolve entry point on the orchestrator yet.
     fn surface_output(&self, output: DriveOutput) {
         for reply in output.replies {
             if let Err(error) = self.send_message(reply.session, reply.text) {
-                log::warn!("failed to send reply for {}: {error}", reply.session);
+                tracing::warn!(session = %reply.session, %error, "failed to send reply");
             }
         }
         for approval in output.approvals {
             // There is no inbound approval-response binding yet; surface the
             // request so it is visible and resolvable out of band rather than
             // dropped. The id tags let a caller target the exact agent.
-            log::info!(
-                "approval requested: session={} agent={} approval={}",
-                approval.session,
-                approval.agent,
-                approval.approval
+            tracing::info!(
+                session = %approval.session,
+                agent = %approval.agent,
+                approval = %approval.approval,
+                "approval requested"
             );
             let text = format!(
                 "[approval needed · {} · {}] {}",
                 approval.agent, approval.approval, approval.summary
             );
             if let Err(error) = self.send_message(approval.session, text) {
-                log::warn!(
-                    "failed to surface approval for {}: {error}",
-                    approval.session
-                );
+                tracing::warn!(session = %approval.session, %error, "failed to surface approval");
             }
         }
-    }
-
-    /// Deliver a human decision for a pending approval and resume the session.
-    ///
-    /// Routes the decision to the exact agent within `session`, drives the
-    /// session's graph, and surfaces any resulting replies/approvals.
-    ///
-    /// # Errors
-    ///
-    /// [`ApprovalError::UnknownSession`] when the session has no live agent graph,
-    /// or [`ApprovalError::Resolve`] when the agent is gone or not awaiting this
-    /// approval.
-    pub fn resolve_approval(
-        &self,
-        session_id: SessionId,
-        agent: AgentId,
-        approval: ApprovalId,
-        decision: ApprovalDecision,
-    ) -> Result<(), ApprovalError> {
-        let instance = {
-            let instances = self
-                .instances
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            instances
-                .get(&session_id)
-                .map(Arc::clone)
-                .ok_or(ApprovalError::UnknownSession(session_id))?
-        };
-        let output = {
-            let mut instance = instance.lock().unwrap_or_else(|poison| poison.into_inner());
-            instance.resolve_approval(agent, approval, decision)?;
-            instance.drive()
-        };
-        self.surface_output(output);
-        Ok(())
-    }
-
-    /// A read-only snapshot of `session_id`'s root-agent transcript — its messages
-    /// and `tool_calls` — for inspection tools / CLIs. `None` if the session has no
-    /// live root yet. Subagents are ephemeral, so only the root's own calls show.
-    pub fn root_transcript(&self, session_id: SessionId) -> Option<serde_json::Value> {
-        let instance = {
-            let instances = self
-                .instances
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            instances.get(&session_id).map(Arc::clone)?
-        };
-        let instance = instance.lock().unwrap_or_else(|poison| poison.into_inner());
-        instance.root_transcript()
     }
 
     fn on_command(&self, session_id: SessionId, cmd: &Command) {
@@ -180,7 +125,7 @@ impl Orchestrator {
         // protocol still uses the legacy task/run model and must be reconciled
         // with the session/agent/approval model before it can drive the graph.
         // Until then, acknowledge in the log and drop rather than aborting.
-        log::warn!("inbound command for {session_id} ignored (not implemented yet): {cmd:?}");
+        tracing::warn!(session = %session_id, command = ?cmd, "inbound command ignored (not implemented yet)");
     }
 
     fn send_message(
@@ -252,24 +197,14 @@ impl Orchestrator {
 impl ChannelIngressSink for Orchestrator {
     fn push_user_message(&self, msg: InboundMessage) {
         if let Err(err) = self.deliver_user_message(msg) {
-            log::warn!("ingress user message deliver failed: {err}");
+            tracing::warn!(error = %err, "ingress user message deliver failed");
         }
     }
 
     fn push_command(&self, command: InboundCommand) {
         if let Err(err) = self.deliver_command(command) {
-            log::warn!("ingress command deliver failed: {err}");
+            tracing::warn!(error = %err, "ingress command deliver failed");
         }
-    }
-}
-
-impl ChannelIngressSink for Arc<Orchestrator> {
-    fn push_user_message(&self, msg: InboundMessage) {
-        (**self).push_user_message(msg);
-    }
-
-    fn push_command(&self, command: InboundCommand) {
-        (**self).push_command(command);
     }
 }
 
@@ -299,48 +234,27 @@ impl<Channels> OrchestratorBuilder<Channels, FactoryUnset> {
     }
 }
 
+// Typestate markers for `OrchestratorBuilder`. They are `pub` only because they
+// appear in the builder's public method signatures; they carry no usable API and
+// are hidden from the rendered docs.
+#[doc(hidden)]
 pub struct ChannelsUnset;
-pub struct ChannelsBuiltin;
+#[doc(hidden)]
 pub struct ChannelsEgressOnly {
     egress: Arc<dyn ChannelEgress>,
 }
+#[doc(hidden)]
 pub struct FactoryUnset;
+#[doc(hidden)]
 pub struct FactorySet {
     factory: Arc<dyn AgentFactory>,
 }
 
-mod sealed {
-    use super::*;
-
-    pub trait SealedChannelsReady {
-        fn materialize(self) -> Arc<dyn ChannelEgress>;
-    }
-
-    impl SealedChannelsReady for ChannelsBuiltin {
-        fn materialize(self) -> Arc<dyn ChannelEgress> {
-            Arc::new(ChannelEgressHub::new())
-        }
-    }
-
-    impl SealedChannelsReady for ChannelsEgressOnly {
-        fn materialize(self) -> Arc<dyn ChannelEgress> {
-            self.egress
-        }
-    }
-}
-
-trait ChannelsReady: sealed::SealedChannelsReady {}
-impl ChannelsReady for ChannelsBuiltin {}
-impl ChannelsReady for ChannelsEgressOnly {}
-
 impl<Factory> OrchestratorBuilder<ChannelsUnset, Factory> {
-    pub fn with_builtin_channels(self) -> OrchestratorBuilder<ChannelsBuiltin, Factory> {
-        OrchestratorBuilder {
-            channels: ChannelsBuiltin,
-            factory: self.factory,
-        }
-    }
-
+    /// Inject the [`ChannelEgress`] outbound messages are routed through.
+    ///
+    /// Required: [`build`](OrchestratorBuilder::build) is only callable once an
+    /// egress is set, so every reply has somewhere to go.
     pub fn config_egress(
         self,
         egress: Arc<dyn ChannelEgress>,
@@ -352,13 +266,10 @@ impl<Factory> OrchestratorBuilder<ChannelsUnset, Factory> {
     }
 }
 
-impl<C> OrchestratorBuilder<C, FactorySet>
-where
-    C: ChannelsReady,
-{
+impl OrchestratorBuilder<ChannelsEgressOnly, FactorySet> {
     pub fn build(self) -> Arc<Orchestrator> {
         Arc::new(Orchestrator {
-            egress: self.channels.materialize(),
+            egress: self.channels.egress,
             factory: self.factory.factory,
             next_agent_id: Arc::new(AtomicUsize::new(FIRST_AGENT_ID)),
             instances: Mutex::new(HashMap::new()),
@@ -374,10 +285,10 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::agent::base_agent::{AgentCommand, AgentCommandError, AgentId, TickOutcome};
+    use crate::agent::base_agent::{AgentCommand, AgentCommandError, AgentId, ApprovalId, TickOutcome};
     use crate::agent::registry::AgentFactory;
     use crate::agent::{Agent, AgentKind, ApprovalResponder, Spawner};
-    use crate::channels::{ChannelTransport, RecordingTransport};
+    use crate::channels::{ChannelEgressHub, ChannelTransport, RecordingTransport};
 
     // -- A fake factory + agent that echoes each delivered message --------------
 
@@ -548,11 +459,13 @@ mod tests {
     }
 
     #[test]
-    fn approval_is_surfaced_then_resolved_resumes_the_session() {
+    fn root_approval_is_surfaced_as_a_message() {
         let (orch, transport) = orchestrator_with_factory(Arc::new(ApprovalFactory));
         let session = orch.session_create();
 
-        // First message parks the root on an approval, surfaced as a message.
+        // The first message parks the root on an approval, surfaced as a message.
+        // (Resolving an approval is an internal concern — there is no public
+        // resolve entry point on the orchestrator.)
         orch.push_user_message(user_msg(session, "do it"));
         let surfaced = transport.drain_sent();
         assert_eq!(surfaced.len(), 1);
@@ -561,30 +474,6 @@ mod tests {
             "expected an approval surface, got: {}",
             surfaced[0].text
         );
-
-        // The root is the first agent allocated (id 1). Resolving resumes it.
-        orch.resolve_approval(
-            session,
-            AgentId(1),
-            ApprovalId(1),
-            ApprovalDecision::Approved,
-        )
-        .expect("resolve approval");
-        let resumed = transport.drain_sent();
-        assert_eq!(resumed.len(), 1);
-        assert_eq!(resumed[0].text, "approved-done");
-    }
-
-    #[test]
-    fn resolve_approval_for_unknown_session_errors() {
-        let (orch, _transport) = orchestrator_with_factory(Arc::new(ApprovalFactory));
-        let result = orch.resolve_approval(
-            SessionId(42),
-            AgentId(1),
-            ApprovalId(1),
-            ApprovalDecision::Approved,
-        );
-        assert!(matches!(result, Err(ApprovalError::UnknownSession(_))));
     }
 
     #[test]
@@ -601,13 +490,5 @@ mod tests {
         let texts: Vec<String> = transport.drain_sent().into_iter().map(|m| m.text).collect();
         assert!(texts.contains(&"echo:one".to_string()));
         assert!(texts.contains(&"echo:two".to_string()));
-    }
-
-    #[test]
-    fn builds_with_builtin_channels_and_factory() {
-        let _ = Orchestrator::builder()
-            .with_builtin_channels()
-            .with_agent_factory(Arc::new(EchoFactory))
-            .build();
     }
 }

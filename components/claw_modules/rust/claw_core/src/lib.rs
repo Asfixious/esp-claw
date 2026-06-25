@@ -1,6 +1,6 @@
 //! `claw_core` — runtime primitives: orchestrator shell, channels, iteration loop.
 //!
-//! Layer 1: [`orchestrator::Orchestrator`]
+//! Layer 1: [`Orchestrator`]
 //! Layer 3: [`iteration_loop::IterationLoop`]
 
 #![allow(non_camel_case_types)]
@@ -8,11 +8,10 @@
 pub mod agent;
 pub mod channels;
 pub mod iteration_loop;
-pub mod orchestrator;
+mod orchestrator;
 mod orchestrator_instance;
 pub mod protocol;
 pub mod session;
-pub mod skills;
 pub mod tools;
 
 pub use channels::{
@@ -21,15 +20,18 @@ pub use channels::{
     RecordingTransport, ReplyRoute,
 };
 pub use claw_utils::define_prefixed_id;
-pub use orchestrator::{ApprovalError, Orchestrator};
+pub use orchestrator::{
+    ChannelsEgressOnly, ChannelsUnset, FactorySet, FactoryUnset, Orchestrator, OrchestratorBuilder,
+};
 pub use protocol::Command;
 pub use protocol::{IdParseError, IterationId, StepId, TaskId, WorkerId};
 pub use session::{
     DeliverError, SessionError, SessionId, SessionMessage, SessionOut, SessionRecord, SessionStore,
 };
-pub use skills::{
-    FsSkillRegistry, ManageMode, SkillError, SkillGroup, SkillId, SkillMetadata, SkillRegistry,
-    SkillSet,
+// Skills moved to the standalone `claw-skill` crate; re-exported here so
+// `claw_core::Skill*` stays the stable surface for existing callers.
+pub use claw_skill::{
+    FsSkillRegistry, SkillError, SkillGroup, SkillId, SkillMetadata, SkillRegistry, SkillSet,
 };
 pub use tools::{
     AllowedTools, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,

@@ -12,8 +12,8 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use crate::agent::base_agent::{AgentId, ApprovalDecision, ApprovalId};
-use crate::agent::registry::{AgentFactory, AgentRegistry, DriveOutput, ResolveApprovalError};
+use crate::agent::base_agent::AgentId;
+use crate::agent::registry::{AgentFactory, AgentRegistry, DriveOutput};
 use crate::agent::AgentKind;
 use crate::session::SessionId;
 
@@ -26,6 +26,10 @@ pub(crate) struct OrchestratorInstance {
     registry: AgentRegistry,
     /// The root agent's id, set when the first message builds it.
     root: Option<AgentId>,
+    /// Monotonic count of external drive cycles (user message / approval reply).
+    /// Stamped on the top-level `turn` observability span so a whole drive — and
+    /// every nested agent/iteration/tool span under it — reads as one unit.
+    turn: u64,
 }
 
 impl OrchestratorInstance {
@@ -41,7 +45,16 @@ impl OrchestratorInstance {
             session,
             registry: AgentRegistry::with_id_allocator(factory, next_id),
             root: None,
+            turn: 0,
         }
+    }
+
+    /// Advance to the next turn and return its number. A "turn" is one external
+    /// drive cycle (a delivered user message or a resolved approval); callers
+    /// stamp it on the top-level observability span.
+    pub(crate) fn next_turn(&mut self) -> u64 {
+        self.turn = self.turn.saturating_add(1);
+        self.turn
     }
 
     /// Deliver a user message to this session's root.
@@ -75,31 +88,6 @@ impl OrchestratorInstance {
     /// any pending approvals surfaced for a human decision.
     pub(crate) fn drive(&mut self) -> DriveOutput {
         self.registry.run_until_idle()
-    }
-
-    /// A read-only transcript of this session's root agent (its messages and tool
-    /// calls), or `None` before the first message builds the root. Subagents are
-    /// removed once they finish, so only the root's own calls are visible here.
-    pub(crate) fn root_transcript(&self) -> Option<serde_json::Value> {
-        self.root
-            .and_then(|root| self.registry.agent_transcript(root))
-    }
-
-    /// Route a human decision back to the agent waiting on `approval`.
-    ///
-    /// Leaves the agent ready; call [`drive`](Self::drive) afterwards to resume it.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`ResolveApprovalError`] when the agent is gone or is not
-    /// awaiting this approval.
-    pub(crate) fn resolve_approval(
-        &mut self,
-        agent: AgentId,
-        approval: ApprovalId,
-        decision: ApprovalDecision,
-    ) -> Result<(), ResolveApprovalError> {
-        self.registry.resolve_approval(agent, approval, decision)
     }
 }
 
@@ -174,63 +162,6 @@ mod tests {
         }
     }
 
-    /// Parks on an approval the first tick, then yields once the decision lands.
-    struct ApprovalAgent {
-        id: AgentId,
-        asked: bool,
-        approved: bool,
-        done: bool,
-    }
-
-    impl Agent for ApprovalAgent {
-        fn id(&self) -> AgentId {
-            self.id
-        }
-        fn send_command(&mut self, command: AgentCommand) -> Result<(), AgentCommandError> {
-            if matches!(command, AgentCommand::ApprovalResult { .. }) {
-                self.approved = true;
-            }
-            Ok(())
-        }
-        fn deliver_child_result(&mut self, _child: AgentId, _text: String, _ok: bool) {}
-        fn tick(&mut self) -> TickOutcome {
-            if !self.asked {
-                self.asked = true;
-                return TickOutcome::AwaitingApproval {
-                    id: ApprovalId(1),
-                    summary: "ok?".into(),
-                };
-            }
-            if self.approved && !self.done {
-                self.done = true;
-                return TickOutcome::Yielded {
-                    text: "approved".into(),
-                };
-            }
-            TickOutcome::Idle
-        }
-    }
-
-    struct ApprovalFactory;
-
-    impl AgentFactory for ApprovalFactory {
-        fn create_agent(
-            &self,
-            id: AgentId,
-            _kind: &AgentKind,
-            _goal: String,
-            _spawner: Arc<dyn Spawner>,
-            _approval_responder: Option<Arc<dyn ApprovalResponder>>,
-        ) -> Result<Box<dyn Agent>, String> {
-            Ok(Box::new(ApprovalAgent {
-                id,
-                asked: false,
-                approved: false,
-                done: false,
-            }))
-        }
-    }
-
     fn instance(session: SessionId, factory: Arc<dyn AgentFactory>) -> OrchestratorInstance {
         OrchestratorInstance::new(session, factory, Arc::new(AtomicUsize::new(1)))
     }
@@ -271,30 +202,6 @@ mod tests {
         let result = instance.deliver("hi");
         assert_eq!(result, Err("factory refused".to_string()));
         assert_eq!(instance.root, None, "a failed build must not set a root");
-    }
-
-    #[test]
-    fn an_approval_is_surfaced_then_resolved_resumes_the_root() {
-        let mut instance = instance(SessionId(7), Arc::new(ApprovalFactory));
-
-        instance.deliver("do it").unwrap();
-        let output = instance.drive();
-        assert!(output.replies.is_empty());
-        assert_eq!(output.approvals.len(), 1);
-        let approval = &output.approvals[0];
-        assert_eq!(Some(approval.agent), instance.root);
-        assert_eq!(approval.session, SessionId(7));
-
-        instance
-            .resolve_approval(
-                approval.agent,
-                approval.approval,
-                ApprovalDecision::Approved,
-            )
-            .unwrap();
-        let resumed = instance.drive();
-        assert_eq!(resumed.replies.len(), 1);
-        assert_eq!(resumed.replies[0].text, "approved");
     }
 
     #[test]

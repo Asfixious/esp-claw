@@ -1,0 +1,207 @@
+//! Resolving a baked [`AgentManifest`] into a runnable [`AgentConfig`].
+//!
+//! # Relationship to the manifest
+//!
+//! An [`AgentManifest`](crate::agent::manifest::AgentManifest) is pure compile-time
+//! **data**: a system prompt plus the *names* of capabilities/skills. The actual
+//! tool/skill *handlers* are code that lives in firmware (or a test double), so a
+//! manifest cannot run on its own. This module is the **seam** that binds the two:
+//!
+//! ```text
+//!   AgentManifest (data: names)  +  AgentResolver (names -> handler code)
+//!         └──────────────── AgentConfig::resolve(kind, ...) ───────────────┘
+//!                                     │
+//!                                     ▼
+//!                              AgentConfig (runnable)
+//!                                     │
+//!                                     ▼
+//!            GenericAgent::new(id, llm, memory, config)  // the running agent
+//! ```
+//!
+//! - [`AgentResolver`] is the injected boundary that turns a capability/skill
+//!   *name* into a real [`Tool`] / [`SkillSet`].
+//! - [`AgentConfig`] is the fully-resolved, runnable result; [`GenericAgent`] consumes
+//!   only this and never touches a manifest or the filesystem.
+
+use std::sync::Arc;
+
+use claw_api::RetryPolicy;
+use claw_skill::{SkillError, SkillId, SkillSet};
+
+use crate::agent::agent::AgentKind;
+use crate::agent::internal_tools::{ApprovalResponder, SpawnPolicy, Spawner};
+use crate::agent::manifest::{AgentManifest, RetryCount};
+use crate::tools::Tool;
+
+/// Resolves the *names* in a manifest to the *code* that backs them.
+///
+/// A manifest only carries capability/skill names; the handlers live in firmware
+/// (or a test double). The resolver is the injected boundary that turns each name
+/// into a real [`Tool`] / [`SkillSet`]. An unknown name is **not** silently
+/// dropped — the resolver returns `None`/an error and resolution fails.
+pub trait AgentResolver: Send + Sync {
+    /// Resolve a capability name to its [`Tool`], or `None` if this resolver has
+    /// no such capability.
+    fn resolve_tool(&self, name: &str) -> Option<Tool>;
+
+    /// Build a [`SkillSet`] with `skill_ids` loaded.
+    ///
+    /// Returns `Ok(None)` when no skills are configured (`skill_ids` empty) or the
+    /// resolver has no skill support; `Ok(Some(set))` once the ids are loaded.
+    ///
+    /// # Errors
+    ///
+    /// [`SkillError`] if a requested skill id is unknown to the resolver.
+    fn build_skills(&self, skill_ids: &[SkillId]) -> Result<Option<SkillSet>, SkillError>;
+}
+
+/// A fully-resolved agent configuration — the typed seam between a baked manifest
+/// and the agent that runs it. [`GenericAgent`](crate::agent::GenericAgent)
+/// consumes only this and never touches a manifest or the filesystem.
+///
+/// The only way to build one is [`AgentConfig::resolve`]: every config originates
+/// from a compile-time-baked manifest, so there is no hand-rolled builder. The
+/// fields are `pub(in crate::agent)` rather than fully public: only the runtime
+/// that consumes a config ([`GenericAgent`](crate::agent::GenericAgent), a sibling
+/// module) reads them.
+pub struct AgentConfig {
+    pub(in crate::agent) kind: AgentKind,
+    pub(in crate::agent) system_prompt: String,
+    pub(in crate::agent) tools: Vec<Tool>,
+    pub(in crate::agent) skills: Option<SkillSet>,
+    pub(in crate::agent) spawner: Option<Arc<dyn Spawner>>,
+    /// The kinds this agent may spawn (resolved from the manifest's
+    /// `spawn.allowed_kinds`). Enforced by the `spawn_subagent` tool; meaningful
+    /// only when `spawner` is set.
+    pub(in crate::agent) spawn_policy: SpawnPolicy,
+    /// Set only for a session root: gives it the `respond_to_approval` tool so it
+    /// can feed user verdicts back to waiting subagents.
+    pub(in crate::agent) approval_responder: Option<Arc<dyn ApprovalResponder>>,
+    pub(in crate::agent) retry_policy: RetryPolicy,
+    pub(in crate::agent) tool_block_retries: Option<u32>,
+}
+
+impl AgentConfig {
+    /// Resolve a firmware-baked agent kind into a runnable config.
+    ///
+    /// Looks up the compile-time [`AgentManifest`] baked for `kind` and resolves
+    /// every capability/skill *name* in it through `resolver` into handler code.
+    /// The manifest's JSON was already parsed and validated at build time, so this
+    /// does only the runtime-only half: turning names into handlers.
+    ///
+    /// `spawner` is attached only when the kind's manifest enables spawning.
+    /// `approval_responder` is passed straight through (the registry supplies it
+    /// only for a session root); it gives the agent the `respond_to_approval`
+    /// tool. Unlike `spawner` it is not gated by the manifest — being the root is a
+    /// runtime property the registry decides, not a kind property.
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentConfigError::UnknownKind`] if no manifest is baked for `kind`.
+    /// - [`AgentConfigError::UnknownCapability`] if a capability name has no
+    ///   handler in the resolver.
+    /// - [`AgentConfigError::Skill`] if building the skill set fails (e.g. an
+    ///   unknown skill id).
+    pub fn resolve(
+        kind: &str,
+        resolver: &dyn AgentResolver,
+        spawner: Option<Arc<dyn Spawner>>,
+        approval_responder: Option<Arc<dyn ApprovalResponder>>,
+    ) -> Result<AgentConfig, AgentConfigError> {
+        let manifest = AgentManifest::for_kind(kind)
+            .ok_or_else(|| AgentConfigError::UnknownKind(kind.to_string()))?;
+
+        let mut tools = Vec::with_capacity(manifest.capabilities.len());
+        for capability in manifest.capabilities {
+            let tool = resolver.resolve_tool(capability.as_str()).ok_or_else(|| {
+                AgentConfigError::UnknownCapability(capability.as_str().to_string())
+            })?;
+            tools.push(tool);
+        }
+
+        let skills = resolver.build_skills(manifest.skills)?;
+
+        // Spawning is honored only when the kind allows it and a spawner is wired.
+        let spawner = if manifest.spawn_enabled {
+            spawner
+        } else {
+            None
+        };
+
+        Ok(AgentConfig {
+            kind: manifest.kind.clone(),
+            system_prompt: manifest.instructions.trim().to_string(),
+            tools,
+            skills,
+            spawner,
+            spawn_policy: SpawnPolicy::from_allowed_kinds(manifest.allowed_kinds),
+            approval_responder,
+            retry_policy: RetryPolicy::new(manifest.retries.get()),
+            tool_block_retries: manifest.tool_block_retries.map(RetryCount::get),
+        })
+    }
+
+    /// This config's kind.
+    pub fn kind(&self) -> &AgentKind {
+        &self.kind
+    }
+}
+
+/// Failure resolving a baked agent kind into an [`AgentConfig`].
+///
+/// The manifest JSON is parsed and validated at build time, so the failures here
+/// are an unknown kind or runtime resolution misses against the injected
+/// [`AgentResolver`].
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum AgentConfigError {
+    /// No manifest is baked into the firmware for the requested kind.
+    #[error("unknown agent kind: {0}")]
+    UnknownKind(String),
+    /// A capability name in the manifest has no handler in the resolver.
+    #[error("unknown capability: {0}")]
+    UnknownCapability(String),
+    /// Building the skill set failed (e.g. an unknown skill id).
+    #[error(transparent)]
+    Skill(#[from] SkillError),
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::agent::manifest::MANIFESTS;
+
+    /// A test resolver that maps names to no tools and supports no skills.
+    struct StaticResolver;
+
+    impl AgentResolver for StaticResolver {
+        fn resolve_tool(&self, _name: &str) -> Option<Tool> {
+            None
+        }
+        fn build_skills(&self, _skill_ids: &[SkillId]) -> Result<Option<SkillSet>, SkillError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn every_baked_kind_resolves() {
+        for manifest in MANIFESTS {
+            let kind = manifest.kind.as_str();
+            let config = AgentConfig::resolve(kind, &StaticResolver, None, None)
+                .unwrap_or_else(|error| panic!("kind {kind} failed: {error}"));
+            assert_eq!(config.kind().as_str(), kind);
+            assert!(
+                !config.system_prompt.is_empty(),
+                "kind {kind} has no prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_an_unknown_kind() {
+        // `AgentConfig` is not `Debug` (it holds tools/skills/Arcs), so match on
+        // the `Result` directly rather than `expect_err`.
+        let result = AgentConfig::resolve("nope", &StaticResolver, None, None);
+        assert!(matches!(result, Err(AgentConfigError::UnknownKind(kind)) if kind == "nope"));
+    }
+}

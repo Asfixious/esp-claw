@@ -154,12 +154,68 @@ pub trait Spawner: Send + Sync {
     fn spawn(&self, parent: AgentId, kind: AgentKind, goal: String) -> AgentId;
 }
 
+/// Which kinds an agent may spawn — the resolved, runtime form of a manifest's
+/// `spawn.allowed_kinds`.
+///
+/// The wildcard `"*"` is normalized to [`Any`](Self::Any) at resolution time, so
+/// the magic string never reaches the per-call check; every other list becomes a
+/// concrete [`Only`](Self::Only) allow-set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SpawnPolicy {
+    /// Any kind may be spawned (`allowed_kinds` contained `"*"`).
+    Any,
+    /// Only these specific kinds may be spawned.
+    Only(Vec<AgentKind>),
+}
+
+impl SpawnPolicy {
+    /// Resolve a manifest's `allowed_kinds` into a policy: a `"*"` entry anywhere
+    /// means [`Any`](Self::Any); otherwise the exact set is kept.
+    pub(crate) fn from_allowed_kinds(allowed_kinds: &[AgentKind]) -> Self {
+        if allowed_kinds.iter().any(|kind| kind.as_str() == "*") {
+            SpawnPolicy::Any
+        } else {
+            SpawnPolicy::Only(allowed_kinds.to_vec())
+        }
+    }
+
+    /// Whether `kind` may be spawned under this policy.
+    fn allows(&self, kind: &AgentKind) -> bool {
+        match self {
+            SpawnPolicy::Any => true,
+            SpawnPolicy::Only(kinds) => kinds.iter().any(|allowed| allowed == kind),
+        }
+    }
+
+    /// A short, model-facing description of what is permitted, for the rejection
+    /// message handed back when a disallowed kind is requested.
+    fn describe(&self) -> String {
+        match self {
+            SpawnPolicy::Any => "any kind".to_string(),
+            SpawnPolicy::Only(kinds) if kinds.is_empty() => "(none)".to_string(),
+            SpawnPolicy::Only(kinds) => kinds
+                .iter()
+                .map(AgentKind::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+}
+
 /// Build the spawn tool group: a `spawn_subagent` tool that creates children via
-/// `spawner`, parented to `parent`.
-pub(crate) fn spawn_tool_group(spawner: Arc<dyn Spawner>, parent: AgentId) -> ToolGroup {
+/// `spawner`, parented to `parent`, restricted to `policy`'s allowed kinds.
+pub(crate) fn spawn_tool_group(
+    spawner: Arc<dyn Spawner>,
+    parent: AgentId,
+    policy: SpawnPolicy,
+) -> ToolGroup {
     ToolGroup::new(
         SPAWN_TOOL_GROUP,
-        [Tool::new(SpawnSubagentTool { spawner, parent })],
+        [Tool::new(SpawnSubagentTool {
+            spawner,
+            parent,
+            policy,
+        })],
     )
 }
 
@@ -167,6 +223,8 @@ pub(crate) fn spawn_tool_group(spawner: Arc<dyn Spawner>, parent: AgentId) -> To
 struct SpawnSubagentTool {
     spawner: Arc<dyn Spawner>,
     parent: AgentId,
+    /// The parent kind's `allowed_kinds`, enforced before any spawn is requested.
+    policy: SpawnPolicy,
 }
 
 impl ToolHandler for SpawnSubagentTool {
@@ -179,8 +237,27 @@ impl ToolHandler for SpawnSubagentTool {
                 "spawn_subagent requires a non-empty 'kind'".to_string(),
             ));
         }
+        let kind = AgentKind::new(kind);
+
+        // Enforce the manifest's `allowed_kinds`. A disallowed kind is refused with
+        // a matched tool error (`ok = false`, like soft-hide gating) so the model
+        // can pick a permitted kind or do the work itself — not as `Err`, which
+        // would fail the whole iteration and rob the model of self-correction.
+        if !self.policy.allows(&kind) {
+            tracing::warn!(parent_agent = %self.parent, requested_kind = %kind, "spawn kind rejected by allowed_kinds");
+            return Ok(ToolOutput {
+                output: format!(
+                    "spawn_subagent: kind '{kind}' is not permitted for this agent. \
+                     Allowed: {}. This is a policy restriction, not a transient error: \
+                     pick a permitted kind or handle the work yourself.",
+                    self.policy.describe()
+                ),
+                ok: false,
+            });
+        }
+
         let goal = string_argument(call.arguments_json, "goal")?;
-        let child = self.spawner.spawn(self.parent, AgentKind::new(kind), goal);
+        let child = self.spawner.spawn(self.parent, kind, goal);
         Ok(ToolOutput {
             output: format!(
                 "Subagent {child} requested; its result will be reported back when it finishes."
@@ -333,6 +410,103 @@ mod tests {
             ControlSignal::ApprovalRequested {
                 summary: "delete prod".to_string()
             }
+        );
+    }
+
+    /// Records every kind it is asked to spawn; returns a fixed child id.
+    struct RecordingSpawner(Mutex<Vec<AgentKind>>);
+    impl Spawner for RecordingSpawner {
+        fn spawn(&self, _parent: AgentId, kind: AgentKind, _goal: String) -> AgentId {
+            self.0.lock().unwrap().push(kind);
+            AgentId(99)
+        }
+    }
+
+    fn spawn_tool(spawner: Arc<dyn Spawner>, policy: SpawnPolicy) -> Tool {
+        let group = spawn_tool_group(spawner, AgentId(1), policy);
+        group
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "spawn_subagent")
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn spawn_rejects_disallowed_kind_without_spawning() {
+        let spawner = Arc::new(RecordingSpawner(Mutex::new(Vec::new())));
+        let tool = spawn_tool(
+            Arc::clone(&spawner) as Arc<dyn Spawner>,
+            SpawnPolicy::Only(vec![AgentKind::new("worker")]),
+        );
+
+        let output = tool
+            .invoke(&ToolInvocation {
+                id: Some("t1"),
+                name: "spawn_subagent",
+                arguments_json: r#"{"kind":"researcher","goal":"x"}"#,
+            })
+            .unwrap();
+
+        // Refused as a matched tool error (not Err), and no spawn was queued.
+        assert!(!output.ok);
+        assert!(output.output.contains("not permitted"));
+        assert!(output.output.contains("worker"));
+        assert!(spawner.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_allows_permitted_kind() {
+        let spawner = Arc::new(RecordingSpawner(Mutex::new(Vec::new())));
+        let tool = spawn_tool(
+            Arc::clone(&spawner) as Arc<dyn Spawner>,
+            SpawnPolicy::Only(vec![AgentKind::new("worker")]),
+        );
+
+        let output = tool
+            .invoke(&ToolInvocation {
+                id: Some("t1"),
+                name: "spawn_subagent",
+                arguments_json: r#"{"kind":"worker","goal":"x"}"#,
+            })
+            .unwrap();
+
+        assert!(output.ok);
+        assert_eq!(
+            spawner.0.lock().unwrap().as_slice(),
+            &[AgentKind::new("worker")]
+        );
+    }
+
+    #[test]
+    fn spawn_policy_any_allows_every_kind() {
+        let spawner = Arc::new(RecordingSpawner(Mutex::new(Vec::new())));
+        let tool = spawn_tool(Arc::clone(&spawner) as Arc<dyn Spawner>, SpawnPolicy::Any);
+
+        let output = tool
+            .invoke(&ToolInvocation {
+                id: Some("t1"),
+                name: "spawn_subagent",
+                arguments_json: r#"{"kind":"anything","goal":"x"}"#,
+            })
+            .unwrap();
+
+        assert!(output.ok);
+        assert_eq!(
+            spawner.0.lock().unwrap().as_slice(),
+            &[AgentKind::new("anything")]
+        );
+    }
+
+    #[test]
+    fn spawn_policy_resolves_wildcard_to_any() {
+        assert_eq!(
+            SpawnPolicy::from_allowed_kinds(&[AgentKind::new("*")]),
+            SpawnPolicy::Any
+        );
+        assert_eq!(
+            SpawnPolicy::from_allowed_kinds(&[AgentKind::new("worker")]),
+            SpawnPolicy::Only(vec![AgentKind::new("worker")])
         );
     }
 

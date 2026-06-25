@@ -44,10 +44,7 @@ fn render_entry(kind: &ParsedManifest) -> TokenStream {
     };
     let capabilities = kind.capabilities.iter();
     let skills = kind.skills.iter();
-    let instructions = kind
-        .instructions_path
-        .to_str()
-        .expect("instructions.md path is valid UTF-8");
+    let instructions = render_instructions(kind);
 
     quote! {
         AgentManifest {
@@ -59,7 +56,33 @@ fn render_entry(kind: &ParsedManifest) -> TokenStream {
             tool_block_retries: #tool_block_retries,
             capabilities: &[#(CapabilityName::new(#capabilities)),*],
             skills: &[#(SkillId::from_static(#skills)),*],
-            instructions: include_str!(#instructions),
+            instructions: #instructions,
         }
+    }
+}
+
+/// Render the `instructions` field: the shared `common/instructions.md` preamble
+/// prepended (with a blank-line separator) to the kind's own `instructions.md`.
+///
+/// Both files are pulled in with `include_str!` and joined by `concat!` at
+/// compile time, so no instruction bytes are duplicated into the generated
+/// source. (`AgentConfig::resolve` trims the joined result, so an empty preamble
+/// contributes nothing.) The preamble path is always present once `inherit_base`
+/// has folded the common base in; a missing one would be a generator bug, so we
+/// fall back to the kind's own instructions alone rather than emitting nothing.
+fn render_instructions(kind: &ParsedManifest) -> TokenStream {
+    let own = kind
+        .instructions_path
+        .to_str()
+        .expect("instructions.md path is valid UTF-8");
+
+    match &kind.common_instructions_path {
+        Some(preamble) => {
+            let preamble = preamble
+                .to_str()
+                .expect("common/instructions.md path is valid UTF-8");
+            quote! { concat!(include_str!(#preamble), "\n\n", include_str!(#own)) }
+        }
+        None => quote! { include_str!(#own) },
     }
 }

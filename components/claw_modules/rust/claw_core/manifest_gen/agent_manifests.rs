@@ -80,15 +80,26 @@ fn collect_kinds(agents_dir: &Path) -> Result<Vec<ParsedManifest>, Box<dyn Error
     {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let skip = path
+        let name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with('.') || name == SHARED_DIR);
-        if skip {
+            .ok_or_else(|| format!("non-UTF-8 entry name in {}", agents_dir.display()))?
+            .to_string();
+
+        // Hidden entries (e.g. `.gitkeep`, `.DS_Store`) and the reserved shared
+        // base are not kinds; skip them.
+        if name.starts_with('.') || name == SHARED_DIR {
             continue;
+        }
+        // Everything else must be a proper kind directory: a stray file here
+        // would otherwise be silently ignored, so reject it ("no more, no less").
+        if !path.is_dir() {
+            return Err(format!(
+                "{}: unexpected file '{name}' — only agent kind directories (and the \
+                 reserved '{SHARED_DIR}' base) may live under resources/agents",
+                agents_dir.display()
+            )
+            .into());
         }
 
         for file in MANIFEST_FILES {
@@ -101,10 +112,13 @@ fn collect_kinds(agents_dir: &Path) -> Result<Vec<ParsedManifest>, Box<dyn Error
 
 /// Fold the shared `common` base into one kind: the base entries come first,
 /// then the kind's own, with duplicates dropped so a kind can list a capability
-/// or skill already in the base without it appearing twice.
+/// or skill already in the base without it appearing twice. The shared
+/// instructions preamble is recorded so codegen can prepend it to the kind's own
+/// prompt.
 fn inherit_base(kind: &mut ParsedManifest, common: &CommonBase) {
     kind.capabilities = merge_unique(&common.capabilities, &kind.capabilities);
     kind.skills = merge_unique(&common.skills, &kind.skills);
+    kind.common_instructions_path = Some(common.instructions_path.clone());
 }
 
 /// Concatenate `base` then `own`, preserving first-seen order and dropping later

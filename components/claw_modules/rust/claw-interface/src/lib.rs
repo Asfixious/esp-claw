@@ -11,6 +11,7 @@
 
 pub mod fs;
 pub mod http;
+pub mod thread;
 
 #[cfg(feature = "diskfs")]
 pub use fs::DiskFs;
@@ -28,3 +29,6 @@ pub use http::{
 };
 #[cfg(feature = "realhttp")]
 pub use http::{RealHttp, RealHttpAsync};
+#[cfg(feature = "stdthread")]
+pub use thread::StdThread;
+pub use thread::{ClawThread, CoreAffinity, Priority};

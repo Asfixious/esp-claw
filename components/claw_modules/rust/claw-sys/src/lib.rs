@@ -11,6 +11,8 @@ pub mod thread;
 
 #[cfg(target_os = "espidf")]
 pub use http::EspIdfHttp;
+#[cfg(target_os = "espidf")]
+pub use thread::EspIdfThread;
 
 #[cfg(test)]
 mod tests {

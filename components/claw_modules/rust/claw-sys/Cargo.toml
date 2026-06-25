@@ -15,3 +15,9 @@ claw-interface = { path = "../claw-interface" }
 # host stderr fallback both live in `claw-log`.
 log = "0.4"
 serde_json = "1"
+
+# Host builds use claw-interface's `StdThread` for the `spawn_worker` fallback;
+# the device build uses the in-crate `EspIdfThread` instead, so this host-only
+# feature is never pulled into the firmware.
+[target.'cfg(not(target_os = "espidf"))'.dependencies]
+claw-interface = { path = "../claw-interface", features = ["stdthread"] }

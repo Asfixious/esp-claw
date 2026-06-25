@@ -23,6 +23,9 @@ diskfs = []
 diskfs-pretty = ["diskfs", "dep:serde_json"]
 httpmock = ["dep:serde_json"]
 realhttp = ["dep:reqwest"]
+# `StdThread`: a plain `std::thread` host implementation of `ClawThread` (host
+# only; the device build uses `claw-sys`'s `EspIdfThread`).
+stdthread = []
 
 [dependencies]
 thiserror = "2"

@@ -18,7 +18,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use claw_sys::thread::{self, NO_AFFINITY};
+use claw_sys::thread::{self, CoreAffinity, Priority};
 
 /// A unit of background memory work. Runs to completion on one worker thread.
 pub type MemoryJob = Box<dyn FnOnce() + Send + 'static>;
@@ -30,9 +30,6 @@ pub type MemoryJob = Box<dyn FnOnce() + Send + 'static>;
 /// the order of magnitude of the C agent worker stacks.
 const DEFAULT_STACK_SIZE: usize = 32 * 1024;
 
-/// Default worker priority (FreeRTOS task priority; ignored on host).
-const DEFAULT_PRIORITY: u32 = 5;
-
 /// Configuration for a [`MemoryTaskPool`].
 pub struct PoolConfig {
     /// Number of persistent worker threads. One is enough for serialized
@@ -40,10 +37,10 @@ pub struct PoolConfig {
     pub workers: usize,
     /// Per-worker stack size in bytes.
     pub stack_size: usize,
-    /// Per-worker priority (FreeRTOS; ignored on host).
-    pub priority: u32,
-    /// Core affinity ([`NO_AFFINITY`] to let the scheduler choose).
-    pub core: i32,
+    /// Per-worker scheduling priority (ignored on host).
+    pub priority: Priority,
+    /// Per-worker core affinity (ignored on host).
+    pub affinity: CoreAffinity,
 }
 
 impl Default for PoolConfig {
@@ -51,8 +48,8 @@ impl Default for PoolConfig {
         Self {
             workers: 1,
             stack_size: DEFAULT_STACK_SIZE,
-            priority: DEFAULT_PRIORITY,
-            core: NO_AFFINITY,
+            priority: Priority::Normal,
+            affinity: CoreAffinity::Any,
         }
     }
 }
@@ -131,7 +128,7 @@ impl MemoryTaskPool {
                 &name,
                 config.stack_size,
                 config.priority,
-                config.core,
+                config.affinity,
                 move || worker_loop(&shared),
             )?;
             workers.push(handle);

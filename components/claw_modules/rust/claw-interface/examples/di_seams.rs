@@ -16,9 +16,7 @@
 
 use core::sync::atomic::AtomicBool;
 
-use claw_interface::{
-    ClawFs, ClawHttp, HttpHeader, HttpJsonRequest, MemFs, ScriptedHttp,
-};
+use claw_interface::{ClawFs, ClawHttp, HttpHeader, HttpJsonRequest, MemFs, ScriptedHttp};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     filesystem_seam()?;
@@ -37,7 +35,10 @@ fn filesystem_seam() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("== ClawFs (MemFs) ==");
     println!("exists  -> {}", fs.exists("/data/conversations/42.json"));
-    println!("len     -> {} bytes", fs.len("/data/conversations/42.jsonl")?);
+    println!(
+        "len     -> {} bytes",
+        fs.len("/data/conversations/42.jsonl")?
+    );
     println!("listing -> {:?}", fs.list_dir("/data/conversations")?);
 
     // A missing path is a typed error, not a panic.

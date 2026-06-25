@@ -9,7 +9,7 @@ members = [
     "claw-log",
     "claw-skill",
     "claw_core",
-    "claw_cap",
+    "claw-capability",
     "claw-memory",
     "claw-context",
     "claw-sandbox",

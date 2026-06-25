@@ -136,6 +136,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-capability"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "claw-context"
 version = "0.1.0"
 dependencies = [
@@ -213,23 +221,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "claw_cap"
-version = "0.1.0"
-dependencies = [
- "claw_core",
- "thiserror",
-]
-
-[[package]]
 name = "claw_core"
 version = "0.1.0"
 dependencies = [
  "claw-api",
+ "claw-capability",
  "claw-interface",
  "claw-memory",
  "claw-skill",
  "claw-utils",
- "claw_cap",
  "dotenvy",
  "proc-macro2",
  "quote",

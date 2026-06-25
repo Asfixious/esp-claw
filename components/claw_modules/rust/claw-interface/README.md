@@ -6,7 +6,7 @@ This is the **inbound boundary** (C / OS → Rust): it defines the
 **dependency-injection traits** that abstract over platform facilities —
 filesystem (`ClawFs`) and networking (`ClawHttp`) — plus the **shared types**
 those traits work with. The pure-Rust core crates (`claw-api`, `claw_core`,
-`claw_cap`, `claw-memory`, `claw-sandbox`, …) depend only on these traits, never
+`claw-capability`, `claw-memory`, `claw-sandbox`, …) depend only on these traits, never
 on a platform directly, so the device build and host tests can plug in different
 implementations of the same seam.
 
@@ -61,7 +61,7 @@ the modules rely on, and a `ScriptedHttp` serving canned LLM replies through the
 
 ## Where it fits
 
-Everything downstream — `claw-api`, `claw_core`, `claw_cap`, `claw-memory`,
+Everything downstream — `claw-api`, `claw_core`, `claw-capability`, `claw-memory`,
 `claw-sandbox`, … — depends on this crate's traits and types and stays
 platform-agnostic. The on-device implementations live in `claw-sys` (e.g.
 `EspIdfHttp`) and the firmware wiring; the host implementations are the

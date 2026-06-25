@@ -52,7 +52,7 @@ named `std::thread` with the platform's default (multi-MiB) stack. Use the
 Keeping these shims at the boundary lets the rest of the workspace stay pure
 Rust:
 
-- Core crates (`claw_core`, `claw_cap`, `claw-memory`, …) depend on the
+- Core crates (`claw_core`, `claw-capability`, `claw-memory`, …) depend on the
   `ClawHttp` / logging traits, not on `esp_http_client` or `ESP_LOGx`.
 - Tests inject host implementations of the same traits, so core logic runs
   off-device.

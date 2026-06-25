@@ -15,18 +15,31 @@
 //! ignored. The catalog lives entirely in that head, so it is read without
 //! touching the potentially large body.
 
+use std::borrow::Cow;
+
 use claw_interface::FsError;
 use serde::Deserialize;
 use thiserror::Error;
 
 /// A skill's identity — its directory name under the skills root.
+///
+/// Backed by `Cow<'static, str>` so a compile-time-baked id (from a generated
+/// agent manifest) borrows a `&'static str` with no allocation, while a runtime
+/// id owns its `String`. Both compare equal by content, so a baked id matches a
+/// runtime-loaded one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SkillId(String);
+pub struct SkillId(Cow<'static, str>);
 
 impl SkillId {
-    /// Wrap a directory name as a skill id.
+    /// Wrap a runtime directory name as a skill id (owns its `String`).
     pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+        Self(Cow::Owned(id.into()))
+    }
+
+    /// Wrap a `&'static str` as a skill id in a `const` context (no allocation) —
+    /// used by build-script-generated manifests.
+    pub const fn from_static(id: &'static str) -> Self {
+        Self(Cow::Borrowed(id))
     }
 
     /// The id as a string slice.

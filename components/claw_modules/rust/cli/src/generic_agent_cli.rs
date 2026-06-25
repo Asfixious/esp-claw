@@ -118,7 +118,7 @@ fn main() {
 }
 
 /// Number of messages currently in the transcript.
-fn message_count(memory: &claw_memory::ConversationMemory) -> usize {
+fn message_count(memory: &claw_memory::ConversationMemory<claw_agent_cli::CliFs>) -> usize {
     memory.messages().as_array().map_or(0, Vec::len)
 }
 

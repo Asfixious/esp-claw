@@ -8,9 +8,15 @@ transcript with automatic, invisible compaction; the pool amortizes FreeRTOS
 task allocation by giving every memory type one place to submit background work
 (compaction now; profile / long-term extraction later).
 
-The core depends only on `claw-interface` (the `ClawFs` persistence seam) and
-`claw-sys` (worker spawning). Summarization is **injected** via the `Compactor`
-trait, so the crate has no built-in LLM dependency unless you want one.
+As a core crate it depends only on the `claw-interface` inbound traits — the
+`ClawFs` persistence seam and the `ClawThread` worker-spawn seam — never on the
+platform boundary (`claw-sys`). The concrete spawner and filesystem are
+**injected** by the caller: `MemoryTaskPool::new(config, thread)` takes any
+`T: ClawThread`, so the crate bakes in no default spawner (the device firmware
+passes its PSRAM-backed `EspIdfThread`; host CLIs and tests pass
+`claw_interface::StdThread`). Summarization is likewise **injected** via the
+`Compactor` trait, so the crate has no built-in LLM dependency unless you want
+one.
 
 ## Public API
 
@@ -22,8 +28,11 @@ trait, so the crate has no built-in LLM dependency unless you want one.
 | `GroupGuard` | One turn, returned by `group()`. `append_user`, `append_assistant`, `append_tool_result`, `append_patch`. Commits the whole turn as one record on drop. |
 | `Compactor` / `CompactError` | The summarization seam: fold an aged message window into a shorter summary. |
 | `MemoryTaskPool` / `PoolConfig` / `MemoryJob` | The shared background worker pool — created once at boot, shared by every memory type. |
-| `LlmCompactor` | *(feature `llm`, default on)* A ready-made `Compactor` backed by `claw-api`. |
 | `NoopCompactor` | *(feature `compactor-stub`)* A never-compacts stub for host CLIs and tests. |
+
+The ready-made LLM-backed `Compactor` (`LlmCompactor`) lives in `claw_core` (the
+layer that has the LLM client), not here — this crate stays free of any LLM
+dependency and takes the compactor injected through `ConversationDeps`.
 
 ### How a turn flows
 
@@ -43,7 +52,6 @@ in the result. Callers never trigger it.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `llm` | yes | Pulls in `claw-api` and provides `LlmCompactor`. Disable to keep the crate LLM-free and inject your own `Compactor`. |
 | `compactor-stub` | no | Adds `NoopCompactor` (host-only convenience). |
 
 ## Example

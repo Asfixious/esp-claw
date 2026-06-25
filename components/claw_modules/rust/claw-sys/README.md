@@ -39,17 +39,17 @@ target dispatch that falls back to host `stderr` — lives in the `claw-log` cra
 
 ### `thread` — worker spawning
 
-`EspIdfThread` is the device implementation of `claw_interface::ClawThread`,
-mirroring the C `claw_task` policy: it applies the requested stack size,
-`Priority`, `CoreAffinity`, and a **PSRAM-backed stack** (when PSRAM is present)
-to the next `pthread_create` via `esp_pthread`, then restores the prior config so
-unrelated spawns are unaffected. The host implementation (`claw_interface::StdThread`)
-degrades to a plain named `std::thread` with the platform's default (multi-MiB)
-stack. The platform-neutral `Priority` / `CoreAffinity` types come from
-`claw-interface`; the concrete FreeRTOS priority numbers and the `tskNO_AFFINITY`
-sentinel are espidf details kept inside this crate. The free
-`spawn_worker(name, stack_size, priority, affinity, f)` function is a thin shim
-that delegates to whichever implementation applies on the build target.
+`EspIdfThread` is this crate's only export here: the device implementation of
+`claw_interface::ClawThread`, mirroring the C `claw_task` policy. It applies the
+requested stack size, `Priority`, `CoreAffinity`, and a **PSRAM-backed stack**
+(when PSRAM is present) to the next `pthread_create` via `esp_pthread`, then
+restores the prior config so unrelated spawns are unaffected. It is a zero-sized
+type, so injecting it as a `T: ClawThread` is free. The trait and the
+platform-neutral `Priority` / `CoreAffinity` types live in `claw-interface`
+(import them from there, not from here); the host implementation is
+`claw_interface::StdThread`. Only the concrete FreeRTOS priority numbers and the
+`tskNO_AFFINITY` sentinel are espidf details, and they stay private inside this
+crate. The wiring layer injects `EspIdfThread` on device / `StdThread` on host.
 
 ## Why this is a separate crate
 

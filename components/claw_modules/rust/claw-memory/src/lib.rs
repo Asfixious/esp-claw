@@ -6,19 +6,22 @@
 //! submits its background work to the same pool so FreeRTOS task allocation stays
 //! amortized.
 //!
-//! At its core the crate depends only on the cycle-breaking [`claw_interface`]
-//! (for the [`ClawFs`](claw_interface::ClawFs) persistence seam) and
-//! [`claw_sys`] (for worker spawning); summarization is injected via the
-//! [`Compactor`] trait. The default `llm` feature adds a ready-made
-//! `LlmCompactor` backed by `claw-api`; turn the feature off to keep the crate
-//! LLM-free and supply your own [`Compactor`].
+//! As a core crate it depends only on the [`claw_interface`] inbound traits —
+//! the [`ClawFs`](claw_interface::ClawFs) persistence seam and the
+//! [`ClawThread`](claw_interface::ClawThread) worker-spawn seam — never on the
+//! platform boundary (`claw-sys`) or on the LLM client (`claw-api`). The concrete
+//! spawner, filesystem, and summarizer are all **injected** by the caller: the
+//! summarization policy comes in through the [`Compactor`] trait, so this crate
+//! owns the compaction *mechanism* but not the *transformation*. The ready-made
+//! LLM-backed compactor (`LlmCompactor`) lives in `claw_core`, which has the LLM
+//! client; wire it (or your own [`Compactor`]) into [`ConversationDeps`].
 //!
 //! # Using the conversation memory
 //!
 //! ```no_run
 //! use std::sync::Arc;
 //!
-//! use claw_interface::{ClawFs, FsError};
+//! use claw_interface::{ClawFs, FsError, StdThread};
 //! use claw_memory::{
 //!     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
 //!     MemoryTaskPool, PoolConfig,
@@ -53,8 +56,9 @@
 //!     }
 //! }
 //!
-//! // 3. One pool is shared by every memory type — create it once at boot.
-//! let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+//! // 3. One pool is shared by every memory type — create it once at boot. The
+//! //    caller injects the spawn policy (`StdThread` here; `EspIdfThread` on device).
+//! let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
 //!
 //! // 4. Build the conversation memory for one conversation id. Typically one
 //! //    memory per agent instance; all of them share the single pool above.
@@ -63,7 +67,7 @@
 //!     conversation_id,
 //!     ConversationConfig::new("/data/conversations"),
 //!     ConversationDeps {
-//!         fs: Arc::new(MyFs),
+//!         fs: MyFs,
 //!         pool: Arc::clone(&pool),
 //!         compactor: Arc::new(MyCompactor),
 //!     },
@@ -93,8 +97,6 @@
 
 pub mod compaction;
 pub mod conversation_memory;
-#[cfg(feature = "llm")]
-pub mod llm_compactor;
 pub mod pool;
 
 #[cfg(feature = "compactor-stub")]
@@ -103,6 +105,4 @@ pub use compaction::{CompactError, Compactor};
 pub use conversation_memory::{
     ConversationConfig, ConversationDeps, ConversationMemory, GroupGuard,
 };
-#[cfg(feature = "llm")]
-pub use llm_compactor::LlmCompactor;
 pub use pool::{MemoryJob, MemoryTaskPool, PoolConfig};

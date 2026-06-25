@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_interface::http::ClawHttp;
-use claw_interface::{DiskFs, RealHttp};
+use claw_interface::{DiskFs, RealHttp, StdThread};
 use claw_memory::{
     ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
     PoolConfig,
@@ -22,6 +22,11 @@ use claw_memory::{
 // The real network transport is `claw_interface::RealHttp` (the `realhttp`
 // feature); background summarisation is disabled via claw-memory's
 // `NoopCompactor` (the `compactor-stub` feature).
+
+/// The concrete `ClawFs` the CLI runs over: the real disk backend behind an
+/// `Arc` (shared, cheaply cloned per agent, and statically dispatched — `Arc<T>`
+/// itself implements `ClawFs`).
+pub type CliFs = Arc<DiskFs>;
 
 // ---------------------------------------------------------------------------
 // Config / wiring
@@ -98,8 +103,10 @@ pub fn make_llm(supports_tools: bool) -> ClawApi {
 /// # Panics
 ///
 /// If the background memory task pool cannot be created.
-pub fn make_memory_deps() -> ConversationDeps {
-    let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
+pub fn make_memory_deps() -> ConversationDeps<CliFs> {
+    let pool = Arc::new(
+        MemoryTaskPool::new(PoolConfig::default(), StdThread::default()).expect("memory pool"),
+    );
     ConversationDeps {
         fs: Arc::new(DiskFs::absolute()),
         pool,
@@ -115,7 +122,10 @@ pub fn make_memory_deps() -> ConversationDeps {
 /// # Panics
 ///
 /// If the background memory task pool cannot be created.
-pub fn make_memory(agent_id: usize, memory_dir: &str) -> (ConversationMemory, ConversationMemory) {
+pub fn make_memory(
+    agent_id: usize,
+    memory_dir: &str,
+) -> (ConversationMemory<CliFs>, ConversationMemory<CliFs>) {
     let memory = ConversationMemory::new(
         agent_id,
         ConversationConfig::new(memory_dir),
@@ -133,6 +143,6 @@ pub fn make_memory(agent_id: usize, memory_dir: &str) -> (ConversationMemory, Co
 /// # Panics
 ///
 /// If the background memory task pool cannot be created.
-pub fn make_memory_ingredients(memory_dir: &str) -> (ConversationConfig, ConversationDeps) {
+pub fn make_memory_ingredients(memory_dir: &str) -> (ConversationConfig, ConversationDeps<CliFs>) {
     (ConversationConfig::new(memory_dir), make_memory_deps())
 }

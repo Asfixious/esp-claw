@@ -8,14 +8,13 @@
 //! ```
 //!
 //! Summarization is injected via the [`Compactor`] trait, so the example needs
-//! no LLM: we supply a tiny local compactor. (Build with
-//! `--no-default-features` to confirm the crate is LLM-free without the `llm`
-//! feature.) Persistence is an in-memory [`MemFs`] — on device the same code
-//! runs over the DATA root.
+//! no LLM: we supply a tiny local compactor. Persistence is an in-memory
+//! [`MemFs`] and the spawn policy is the host [`StdThread`] — on device the same
+//! code runs over the DATA root with an `EspIdfThread`.
 
 use std::sync::Arc;
 
-use claw_interface::MemFs;
+use claw_interface::{MemFs, StdThread};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -36,15 +35,19 @@ impl Compactor for CountingCompactor {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // One pool is shared by every memory type; create it once at boot.
-    let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    // One pool is shared by every memory type; create it once at boot. The
+    // caller injects the spawn policy (host `StdThread` here).
+    let pool = Arc::new(MemoryTaskPool::new(
+        PoolConfig::default(),
+        StdThread::default(),
+    )?);
 
     let conversation_id = 42;
     let memory = ConversationMemory::new(
         conversation_id,
         ConversationConfig::new("/data/conversations"),
         ConversationDeps {
-            fs: Arc::new(MemFs::new()),
+            fs: MemFs::new(),
             pool: Arc::clone(&pool),
             compactor: Arc::new(CountingCompactor),
         },

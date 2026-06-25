@@ -9,23 +9,24 @@ description = "Agent memory subsystem: conversation tape, compaction, and the sh
 crate-type = ["rlib"]
 
 [features]
-# The default `LlmCompactor` pulls in `claw-api`. Disable to keep the crate
-# LLM-free (inject your own `Compactor`).
-default = ["llm"]
-llm = ["dep:claw-api"]
 # `NoopCompactor`: a never-compacts stub for host CLIs and tests (host-only).
 compactor-stub = []
 
 [dependencies]
+# Core crate: depends only on the inbound trait crate. The concrete `ClawThread`,
+# `ClawFs`, and `Compactor` (e.g. `claw_core::LlmCompactor`) are passed in by the
+# caller (`MemoryTaskPool::new` takes the spawner as an argument), so this crate
+# pulls in neither the platform boundary (`claw-sys`) nor the LLM client
+# (`claw-api`), and bakes in no default thread implementation.
 claw-interface = { path = "../claw-interface" }
-claw-sys = { path = "../claw-sys" }
-claw-api = { path = "../claw-api", optional = true }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
-# Host-only filesystem doubles shared from claw-interface (tests only).
-# diskfs-pretty implies diskfs and pretty-prints on-disk JSON for inspection.
-claw-interface = { path = "../claw-interface", features = ["memfs", "diskfs-pretty"] }
+# Host-only doubles shared from claw-interface (tests/examples/doctests only).
+# diskfs-pretty implies diskfs and pretty-prints on-disk JSON for inspection;
+# stdthread provides `StdThread`, the host spawner that examples/tests pass to
+# `MemoryTaskPool::new`. None of these reach the device build (dev-deps only).
+claw-interface = { path = "../claw-interface", features = ["memfs", "diskfs-pretty", "stdthread"] }

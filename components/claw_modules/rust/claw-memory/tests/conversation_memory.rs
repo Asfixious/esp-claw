@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use claw_interface::{ClawFs, DiskFs, MemFs};
+use claw_interface::{ClawFs, DiskFs, MemFs, StdThread};
 use claw_memory::{
     CompactError, Compactor, ConversationConfig, ConversationDeps, ConversationMemory,
     MemoryTaskPool, PoolConfig,
@@ -44,10 +44,14 @@ impl Compactor for StubCompactor {
 // --- helpers -------------------------------------------------------------
 
 fn pool() -> Arc<MemoryTaskPool> {
-    Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("spawn pool"))
+    Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default()).expect("spawn pool"))
 }
 
-fn deps(fs: Arc<dyn ClawFs>, pool: Arc<MemoryTaskPool>, marker: &str) -> ConversationDeps {
+fn deps(
+    fs: Arc<dyn ClawFs>,
+    pool: Arc<MemoryTaskPool>,
+    marker: &str,
+) -> ConversationDeps<Arc<dyn ClawFs>> {
     ConversationDeps {
         fs,
         pool,
@@ -70,7 +74,7 @@ fn instant_config(dir: &str, threshold: usize, keep_recent_tokens: usize) -> Con
 }
 
 /// A memory with default tuning, conversation id 1, and fresh doubles.
-fn memory_with(fs: Arc<dyn ClawFs>) -> ConversationMemory {
+fn memory_with(fs: Arc<dyn ClawFs>) -> ConversationMemory<Arc<dyn ClawFs>> {
     ConversationMemory::new(
         1,
         ConversationConfig::new("/conversations"),
@@ -95,7 +99,7 @@ fn wait_until(predicate: impl Fn() -> bool) -> bool {
     predicate()
 }
 
-fn messages(memory: &ConversationMemory) -> Vec<Value> {
+fn messages<F: ClawFs + 'static>(memory: &ConversationMemory<F>) -> Vec<Value> {
     memory
         .messages()
         .as_array()
@@ -135,9 +139,9 @@ fn is_compacted_with_tail(
 /// turns (or flushing). An empty `group()` commit is exactly such a boundary: it
 /// applies any finished summary and reschedules the next one if still over
 /// budget. This mirrors that loop deterministically in tests.
-fn pump_until(
-    memory: &mut ConversationMemory,
-    predicate: impl Fn(&ConversationMemory) -> bool,
+fn pump_until<F: ClawFs + 'static>(
+    memory: &mut ConversationMemory<F>,
+    predicate: impl Fn(&ConversationMemory<F>) -> bool,
 ) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -482,7 +486,7 @@ fn compact_line(id_start: u64, id_end: u64, summary_content: &str) -> Vec<u8> {
     line
 }
 
-fn load_from_log(data: Vec<u8>) -> ConversationMemory {
+fn load_from_log(data: Vec<u8>) -> ConversationMemory<Arc<dyn ClawFs>> {
     let fs: Arc<dyn ClawFs> = Arc::new(MemFs::default());
     fs.append("/c/conversation-1.jsonl", &data).unwrap();
     ConversationMemory::new(1, ConversationConfig::new("/c"), deps(fs, pool(), "S"))

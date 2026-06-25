@@ -247,9 +247,15 @@ impl ConversationConfig {
 }
 
 /// Injected collaborators for a [`ConversationMemory`].
-pub struct ConversationDeps {
+///
+/// The persistence backend `F` is a concrete, statically dispatched [`ClawFs`]
+/// (held by value, not behind `Arc<dyn>`): the device passes its single on-disk
+/// implementation, host CLIs and tests pass `MemFs`/`DiskFs`. Calls compile down
+/// to direct (monomorphized) calls with no vtable. The summarization seam stays
+/// dynamic (`Arc<dyn Compactor>`): it is swapped per build and not a hot path.
+pub struct ConversationDeps<F: ClawFs + 'static> {
     /// Persistence backend (read on construction, written on the foreground).
-    pub fs: Arc<dyn ClawFs>,
+    pub fs: F,
     /// Shared worker pool that runs the summarization compute off the tick path.
     pub pool: Arc<MemoryTaskPool>,
     /// How aged windows are summarized.
@@ -363,7 +369,7 @@ struct MemoryState {
 
 /// Shared inner state — held behind an `Arc` so the pool worker and the agent
 /// reference the same memory.
-struct MemoryInner {
+struct MemoryInner<F: ClawFs + 'static> {
     conversation_id: usize,
     data_path: String,
     index_path: String,
@@ -371,7 +377,7 @@ struct MemoryInner {
     /// Single-flight guard: at most one compaction job in the pool at a time.
     compaction_in_flight: AtomicBool,
     config: ConversationConfig,
-    deps: ConversationDeps,
+    deps: ConversationDeps<F>,
 }
 
 /// The agent's short-term conversation memory. See the module docs for the
@@ -386,7 +392,7 @@ struct MemoryInner {
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use claw_interface::{ClawFs, FsError};
+/// # use claw_interface::{ClawFs, FsError, StdThread};
 /// # use claw_memory::{
 /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
 /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -408,12 +414,12 @@ struct MemoryInner {
 /// # impl Compactor for StubCompactor {
 /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
 /// # }
-/// let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+/// let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
 /// let mut memory = ConversationMemory::new(
 ///     42,
 ///     ConversationConfig::new("/data/conversations"),
 ///     ConversationDeps {
-///         fs: Arc::new(StubFs),
+///         fs: StubFs,
 ///         pool: Arc::clone(&pool),
 ///         compactor: Arc::new(StubCompactor),
 ///     },
@@ -431,12 +437,21 @@ struct MemoryInner {
 /// memory.flush(); // checkpoint, e.g. on a clean shutdown
 /// # Ok::<(), std::io::Error>(())
 /// ```
-#[derive(Clone)]
-pub struct ConversationMemory {
-    inner: Arc<MemoryInner>,
+pub struct ConversationMemory<F: ClawFs + 'static> {
+    inner: Arc<MemoryInner<F>>,
 }
 
-impl ConversationMemory {
+// Manual `Clone`: only the `Arc` is cloned, so this is cheap and does **not**
+// require `F: Clone` (a `#[derive(Clone)]` would wrongly add that bound).
+impl<F: ClawFs + 'static> Clone for ConversationMemory<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<F: ClawFs + 'static> ConversationMemory<F> {
     /// Build the memory for `conversation_id`, restoring its persisted contents
     /// if present (missing or unreadable files start empty).
     ///
@@ -448,7 +463,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interface::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError, StdThread};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -470,23 +485,27 @@ impl ConversationMemory {
     /// # impl Compactor for StubCompactor {
     /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
     /// # }
-    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
     /// let memory = ConversationMemory::new(
     ///     7,
     ///     ConversationConfig::new("/data/conversations"),
-    ///     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    ///     ConversationDeps { fs: StubFs, pool, compactor: Arc::new(StubCompactor) },
     /// );
     /// assert_eq!(memory.conversation_id(), 7);
     /// assert!(memory.messages().as_array().unwrap().is_empty()); // missing files start empty
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn new(conversation_id: usize, config: ConversationConfig, deps: ConversationDeps) -> Self {
+    pub fn new(
+        conversation_id: usize,
+        config: ConversationConfig,
+        deps: ConversationDeps<F>,
+    ) -> Self {
         let data_path = conversation_path(&config.dir, conversation_id, DATA_EXT);
         let index_path = conversation_path(&config.dir, conversation_id, INDEX_EXT);
-        let (mut state, needs_rebuild) = load_state(deps.fs.as_ref(), &data_path, &index_path);
+        let (mut state, needs_rebuild) = load_state(&deps.fs, &data_path, &index_path);
         if needs_rebuild {
             write_live_set_to_files(
-                deps.fs.as_ref(),
+                &deps.fs,
                 &data_path,
                 &index_path,
                 &mut state,
@@ -523,7 +542,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interface::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError, StdThread};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -545,11 +564,11 @@ impl ConversationMemory {
     /// # impl Compactor for StubCompactor {
     /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
     /// # }
-    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
     /// # let mut memory = ConversationMemory::new(
     /// #     1,
     /// #     ConversationConfig::new("/data/conversations"),
-    /// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// #     ConversationDeps { fs: StubFs, pool, compactor: Arc::new(StubCompactor) },
     /// # );
     /// {
     ///     let turn = memory.group();
@@ -561,7 +580,7 @@ impl ConversationMemory {
     /// assert_eq!(memory.messages().as_array().map(|m| m.len()), Some(3));
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn group(&self) -> GroupGuard {
+    pub fn group(&self) -> GroupGuard<F> {
         GroupGuard {
             inner: Arc::clone(&self.inner),
         }
@@ -579,7 +598,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interface::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError, StdThread};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -601,11 +620,11 @@ impl ConversationMemory {
     /// # impl Compactor for StubCompactor {
     /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
     /// # }
-    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
     /// # let mut memory = ConversationMemory::new(
     /// #     1,
     /// #     ConversationConfig::new("/data/conversations"),
-    /// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// #     ConversationDeps { fs: StubFs, pool, compactor: Arc::new(StubCompactor) },
     /// # );
     /// memory.group().append_user("first");
     /// memory.group().append_user("second");
@@ -668,7 +687,7 @@ impl ConversationMemory {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use claw_interface::{ClawFs, FsError};
+    /// # use claw_interface::{ClawFs, FsError, StdThread};
     /// # use claw_memory::{
     /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
     /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -690,11 +709,11 @@ impl ConversationMemory {
     /// # impl Compactor for StubCompactor {
     /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
     /// # }
-    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+    /// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
     /// # let mut memory = ConversationMemory::new(
     /// #     1,
     /// #     ConversationConfig::new("/data/conversations"),
-    /// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+    /// #     ConversationDeps { fs: StubFs, pool, compactor: Arc::new(StubCompactor) },
     /// # );
     /// memory.group().append_user("remember this");
     /// memory.flush(); // committed turn is now on disk
@@ -727,7 +746,7 @@ impl ConversationMemory {
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use claw_interface::{ClawFs, FsError};
+/// # use claw_interface::{ClawFs, FsError, StdThread};
 /// # use claw_memory::{
 /// #     CompactError, Compactor, ConversationConfig, ConversationDeps,
 /// #     ConversationMemory, MemoryTaskPool, PoolConfig,
@@ -749,11 +768,11 @@ impl ConversationMemory {
 /// # impl Compactor for StubCompactor {
 /// #     fn compact(&self, _: &[Value]) -> Result<Vec<Value>, CompactError> { Ok(vec![]) }
 /// # }
-/// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default())?);
+/// # let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?);
 /// # let mut memory = ConversationMemory::new(
 /// #     1,
 /// #     ConversationConfig::new("/data/conversations"),
-/// #     ConversationDeps { fs: Arc::new(StubFs), pool, compactor: Arc::new(StubCompactor) },
+/// #     ConversationDeps { fs: StubFs, pool, compactor: Arc::new(StubCompactor) },
 /// # );
 /// let turn = memory.group();
 /// turn.append_user("call the weather tool");
@@ -774,11 +793,11 @@ impl ConversationMemory {
 /// or inside structs like `BaseAgent`.  Only one group should be open at a time per
 /// memory instance; behaviour is unspecified if two live `GroupGuard`s share the
 /// same memory (their messages interleave in the single `open_group` buffer).
-pub struct GroupGuard {
-    inner: Arc<MemoryInner>,
+pub struct GroupGuard<F: ClawFs + 'static> {
+    inner: Arc<MemoryInner<F>>,
 }
 
-impl GroupGuard {
+impl<F: ClawFs + 'static> GroupGuard<F> {
     /// Append a user (or addon) message to the open turn.
     pub fn append_user(&self, content: impl Into<String>) {
         self.push_open(json!({ "role": "user", "content": content.into() }));
@@ -878,7 +897,7 @@ impl GroupGuard {
     }
 }
 
-impl Drop for GroupGuard {
+impl<F: ClawFs + 'static> Drop for GroupGuard<F> {
     fn drop(&mut self) {
         self.commit();
     }
@@ -934,7 +953,7 @@ fn compute_verbatim_count(state: &MemoryState, keep_recent_tokens: usize) -> usi
 /// Strategy: find the next window of aged groups not yet covered by a compact
 /// segment (advancing-cursor approach), pack up to `segment_token_budget` tokens
 /// from that window, and summarise it. The verbatim tail is always excluded.
-fn schedule_compaction(inner: &Arc<MemoryInner>) {
+fn schedule_compaction<F: ClawFs + 'static>(inner: &Arc<MemoryInner<F>>) {
     if inner.compaction_in_flight.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -949,7 +968,7 @@ fn schedule_compaction(inner: &Arc<MemoryInner>) {
 
 ///
 /// Returns without touching state if there is nothing to compact.
-fn compute_compact_chunk(inner: &MemoryInner) {
+fn compute_compact_chunk<F: ClawFs + 'static>(inner: &MemoryInner<F>) {
     let keep_recent_tokens = inner.config.keep_recent_tokens;
     let segment_budget = inner.config.segment_token_budget;
 
@@ -1030,7 +1049,7 @@ fn compute_compact_chunk(inner: &MemoryInner) {
 /// strand the ids it covered (their groups are already retired), leaving a hole
 /// in the index. Unbounded summary growth is a job for re-compacting compacts
 /// ("leveling"), never for deleting coverage.
-fn apply_parked_compact(inner: &MemoryInner) -> bool {
+fn apply_parked_compact<F: ClawFs + 'static>(inner: &MemoryInner<F>) -> bool {
     let mut state = lock_state(inner);
     let Some(result) = state.parked_compact.take() else {
         return false;
@@ -1110,7 +1129,7 @@ fn coverage_is_contiguous(state: &MemoryState) -> bool {
 }
 
 /// Flush pending records (one `append`) and, when needed, rewrite the manifest.
-fn persist(inner: &MemoryInner, force_manifest: bool) {
+fn persist<F: ClawFs + 'static>(inner: &MemoryInner<F>, force_manifest: bool) {
     let mut state = lock_state(inner);
     // Pending data always makes the manifest stale: after the append the
     // data log has records the index doesn't know about. Fold that into
@@ -1166,7 +1185,7 @@ fn persist(inner: &MemoryInner, force_manifest: bool) {
 }
 
 /// Rewrite both files when dead bytes dominate.
-fn maybe_collapse(inner: &MemoryInner) {
+fn maybe_collapse<F: ClawFs + 'static>(inner: &MemoryInner<F>) {
     let collapse = {
         let state = lock_state(inner);
         let live = live_bytes(&state);
@@ -1181,7 +1200,7 @@ fn maybe_collapse(inner: &MemoryInner) {
 /// to the new layout on success. Compact segments are written first (sorted by
 /// id_start), then groups in id order.
 fn write_live_set_to_files(
-    fs: &dyn ClawFs,
+    fs: &impl ClawFs,
     data_path: &str,
     index_path: &str,
     state: &mut MemoryState,
@@ -1267,10 +1286,10 @@ fn write_live_set_to_files(
     }
 }
 
-fn collapse_locked(inner: &MemoryInner) {
+fn collapse_locked<F: ClawFs + 'static>(inner: &MemoryInner<F>) {
     let mut state = lock_state(inner);
     write_live_set_to_files(
-        inner.deps.fs.as_ref(),
+        &inner.deps.fs,
         &inner.data_path,
         &inner.index_path,
         &mut state,
@@ -1363,7 +1382,7 @@ fn live_bytes(state: &MemoryState) -> ByteLen {
     total
 }
 
-fn persist_due(inner: &MemoryInner, state: &MemoryState) -> bool {
+fn persist_due<F: ClawFs + 'static>(inner: &MemoryInner<F>, state: &MemoryState) -> bool {
     if state.pending.is_empty() && !state.index_dirty {
         return false;
     }
@@ -1396,7 +1415,7 @@ fn verify_entry(entry: &IndexEntry, record: &LogRecord) -> bool {
 /// Load and rehydrate persisted state. Returns `(state, needs_rebuild)`.
 /// `needs_rebuild` is true when a manifest existed but its entries did not match
 /// the data log — the caller should rewrite both files from the recovered state.
-fn load_state(fs: &dyn ClawFs, data_path: &str, index_path: &str) -> (MemoryState, bool) {
+fn load_state(fs: &impl ClawFs, data_path: &str, index_path: &str) -> (MemoryState, bool) {
     let mut state = MemoryState::default();
     let mut covered_len = ByteLen::default();
     let mut manifest_next_id = RecordId::default();
@@ -1565,7 +1584,7 @@ fn conversation_path(dir: &str, conversation_id: usize, ext: &str) -> String {
     )
 }
 
-fn lock_state(inner: &MemoryInner) -> MutexGuard<'_, MemoryState> {
+fn lock_state<F: ClawFs + 'static>(inner: &MemoryInner<F>) -> MutexGuard<'_, MemoryState> {
     inner
         .state
         .lock()

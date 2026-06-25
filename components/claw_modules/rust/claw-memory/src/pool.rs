@@ -5,8 +5,9 @@
 //! tearing down a task per piece of work churns the heap and risks fragmentation
 //! and stack-allocation failures. The C firmware policy is to allocate worker
 //! tasks once and keep them. This pool mirrors that: it spawns
-//! [`PoolConfig::workers`] threads at construction (via [`claw_sys`], which gives
-//! them a PSRAM-backed stack on device) and they live until the pool is dropped.
+//! [`PoolConfig::workers`] threads at construction through an injected
+//! [`ClawThread`] (the device impl gives them a PSRAM-backed stack) and they
+//! live until the pool is dropped.
 //!
 //! Every memory type (conversation compaction today; profile / long-term
 //! extraction later) submits its background work here as a [`MemoryJob`]. The
@@ -18,7 +19,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use claw_sys::thread::{self, CoreAffinity, Priority};
+use claw_interface::{ClawThread, CoreAffinity, Priority};
 
 /// A unit of background memory work. Runs to completion on one worker thread.
 pub type MemoryJob = Box<dyn FnOnce() + Send + 'static>;
@@ -78,9 +79,12 @@ struct Queue {
 /// ```
 /// use std::sync::{Arc, mpsc};
 ///
+/// use claw_interface::StdThread;
 /// use claw_memory::{MemoryTaskPool, PoolConfig};
 ///
-/// let pool = MemoryTaskPool::new(PoolConfig::default())?;
+/// // The caller supplies the spawn policy: `StdThread` on the host, the
+/// // PSRAM-backed `EspIdfThread` on device.
+/// let pool = MemoryTaskPool::new(PoolConfig::default(), StdThread::default())?;
 ///
 /// // Submit a job and wait for it to run on a worker thread.
 /// let (tx, rx) = mpsc::channel();
@@ -96,22 +100,19 @@ pub struct MemoryTaskPool {
 }
 
 impl MemoryTaskPool {
-    /// Spawn the worker threads. They block on an empty queue until work arrives.
+    /// Spawn the worker threads using the caller-supplied [`ClawThread`] spawner.
+    /// They block on an empty queue until work arrives.
+    ///
+    /// This core crate bakes in no default spawner: the caller injects the spawn
+    /// policy — the device firmware its PSRAM-backed `EspIdfThread`, host CLIs and
+    /// tests `claw_interface::StdThread`. The spawner is a zero-sized type, so the
+    /// `T: ClawThread` bound is statically dispatched with no allocation or vtable.
+    ///
+    /// # Errors
     ///
     /// Returns the OS error if a worker thread cannot be spawned; on device that
     /// means the task/stack allocation failed.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use claw_memory::{MemoryTaskPool, PoolConfig};
-    ///
-    /// // One worker is enough for serialized compaction; raise `workers` for more.
-    /// let pool = MemoryTaskPool::new(PoolConfig { workers: 2, ..PoolConfig::default() })?;
-    /// # let _ = pool;
-    /// # Ok::<(), std::io::Error>(())
-    /// ```
-    pub fn new(config: PoolConfig) -> io::Result<Self> {
+    pub fn new<T: ClawThread>(config: PoolConfig, thread: T) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
@@ -124,7 +125,7 @@ impl MemoryTaskPool {
         for index in 0..config.workers {
             let shared = Arc::clone(&shared);
             let name = format!("claw_mem_{index}");
-            let handle = thread::spawn_worker(
+            let handle = thread.spawn_worker(
                 &name,
                 config.stack_size,
                 config.priority,

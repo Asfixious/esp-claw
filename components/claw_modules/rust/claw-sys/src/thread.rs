@@ -10,21 +10,23 @@
 //! uses on ESP-IDF) via `esp_pthread`, then restores the previous config so
 //! unrelated spawns are unaffected.
 //!
-//! The platform-neutral [`Priority`] / [`CoreAffinity`] types are re-exported from
-//! `claw-interface`; the concrete FreeRTOS priority numbers and the
-//! `tskNO_AFFINITY` sentinel are espidf details that live in this crate (see the
-//! `espidf` module), not in the cross-platform trait.
+//! This crate owns only the device implementation. The trait
+//! `claw_interface::ClawThread` and the platform-neutral `Priority` /
+//! `CoreAffinity` types live in `claw-interface` (consumers import them from
+//! there, not from here); the host implementation is `claw_interface::StdThread`.
+//! Only the concrete FreeRTOS priority numbers and the `tskNO_AFFINITY` sentinel
+//! are espidf details, and they stay private inside the `espidf` module below.
 //!
-//! The host implementation ([`claw_interface::StdThread`]) lives in
-//! `claw-interface`. The free [`spawn_worker`] function is a thin convenience
-//! that delegates to whichever implementation applies on the build target, for
-//! callers that have not yet taken an injected `T: ClawThread`.
+//! The wiring layer selects the implementation to inject: `EspIdfThread` on
+//! device, `StdThread` on host. Both are zero-sized, so a `T: ClawThread` bound
+//! costs nothing.
 
+#[cfg(target_os = "espidf")]
+use claw_interface::{ClawThread, CoreAffinity, Priority};
+#[cfg(target_os = "espidf")]
 use std::io;
+#[cfg(target_os = "espidf")]
 use std::thread::JoinHandle;
-
-use claw_interface::ClawThread;
-pub use claw_interface::{CoreAffinity, Priority};
 
 /// Device implementation of [`ClawThread`] over `esp_pthread`, giving worker
 /// threads a PSRAM-backed stack (when PSRAM is available). Zero-sized.
@@ -52,36 +54,6 @@ impl ClawThread for EspIdfThread {
             .name(name.to_string())
             .stack_size(stack_size)
             .spawn(f)
-    }
-}
-
-/// Spawn a long-running worker thread, delegating to the platform
-/// [`ClawThread`] implementation: [`EspIdfThread`] on device, the host
-/// [`StdThread`](claw_interface::StdThread) otherwise.
-///
-/// Kept as a free function for callers that have not yet taken an injected
-/// `T: ClawThread`; new code should depend on the trait instead.
-///
-/// # Errors
-///
-/// Returns the platform [`io::Error`] if the worker thread cannot be spawned.
-pub fn spawn_worker<F>(
-    name: &str,
-    stack_size: usize,
-    priority: Priority,
-    affinity: CoreAffinity,
-    f: F,
-) -> io::Result<JoinHandle<()>>
-where
-    F: FnOnce() + Send + 'static,
-{
-    #[cfg(target_os = "espidf")]
-    {
-        EspIdfThread.spawn_worker(name, stack_size, priority, affinity, f)
-    }
-    #[cfg(not(target_os = "espidf"))]
-    {
-        claw_interface::StdThread.spawn_worker(name, stack_size, priority, affinity, f)
     }
 }
 

@@ -1,15 +1,18 @@
 //! The agent's built-in tools and the control channels they speak through.
 //!
 //! Internal tools are model-callable like any other [`Tool`], but instead of
-//! returning a result to the conversation they steer the *agent itself*: ending
-//! the conversation, requesting human approval, or spawning a subagent. A tool
-//! handler only has `&self`, so it cannot touch the agent's state directly — it
-//! pushes onto a shared sink (a [`ControlSink`] for end/approval, a [`SpawnSink`]
-//! for spawn) that the owning agent drains each tick.
+//! returning a result to the conversation they steer the *agent graph*. A tool
+//! handler only has `&self`, so it cannot touch state directly — it routes
+//! through one of two seams:
+//! - **self-affecting** control (`end_conversation`, `request_approval`) pushes a
+//!   [`ControlSignal`] onto the agent's own [`ControlSink`], drained each tick;
+//! - **graph-affecting** actions (`spawn_subagent`, `respond_to_approval`) emit a
+//!   [`GraphEffect`] through an [`AgentContext`]/[`GraphHost`], queued and applied
+//!   by the orchestrator instance after the tick.
 //!
-//! `spawn_subagent` is shared by both semantic agents (whether it is present at
-//! all is a build-time knob); the actual creation of a child agent is implemented
-//! in the multi-agent phase.
+//! Which tools an agent actually gets is a build-time knob: `spawn_subagent` only
+//! when its manifest enables spawning, `respond_to_approval` only for a session
+//! root.
 //!
 //! Keeping this in one place means [`IterationLoop`](crate::iteration_loop) stays
 //! fully agnostic: it runs these like ordinary tools and never learns their
@@ -29,8 +32,8 @@ use crate::tools::{
 /// Group label for the agent's built-in tools (provenance only).
 pub(crate) const INTERNAL_TOOL_GROUP: &str = "agent";
 
-/// Group label for the spawn tool (provenance only).
-pub(crate) const SPAWN_TOOL_GROUP: &str = "spawn";
+/// Group label for the subagent-management tools (provenance only).
+pub(crate) const SUBAGENT_TOOL_GROUP: &str = "subagents";
 
 /// Group label for the approval-response tool (provenance only).
 pub(crate) const APPROVAL_TOOL_GROUP: &str = "approval";
@@ -141,17 +144,277 @@ impl ToolHandler for RequestApprovalTool {
 // not track its children locally: a child's result re-enters via
 // `deliver_child_result`, so no per-agent spawn bookkeeping is needed.
 
-/// Dependency-injection seam for creating subagents.
+/// What becomes of a subagent once it yields a result.
 ///
-/// The agent-graph owner (an `AgentRegistry`/orchestrator) implements this so a
-/// `spawn_subagent` tool can request a child without knowing how the graph is
-/// stored. [`spawn`](Self::spawn) allocates and returns the child's id
-/// synchronously; the implementor queues the actual creation for a borrow-safe
-/// point rather than mutating the live node map mid-tick.
-pub trait Spawner: Send + Sync {
-    /// Request a child of `kind` for `goal`, parented to `parent`; returns the id
-    /// assigned to the child.
-    fn spawn(&self, parent: AgentId, kind: AgentKind, goal: String) -> AgentId;
+/// A subagent runs to a result and reports it to its parent regardless; this
+/// policy only decides whether it then *lingers*:
+/// - [`AutoOnIdle`](Self::AutoOnIdle) (default): one-shot — the subagent is
+///   removed as soon as it yields, so its id immediately becomes invalid.
+/// - [`Manual`](Self::Manual): persistent — after yielding (still delivering its
+///   result to the parent) the subagent stays alive and idle, so the parent can
+///   observe it, hand it more work, or delete it explicitly. It is removed only on
+///   an explicit delete, on its parent's removal (cascade), or at session end.
+///   Terminal outcomes (end / cancel / fail) always remove it, even under
+///   `Manual` — there is nothing left to re-task.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminationPolicy {
+    /// Remove the subagent as soon as it yields (one-shot).
+    #[default]
+    AutoOnIdle,
+    /// Keep the subagent alive and idle after it yields, until explicitly removed.
+    Manual,
+}
+
+impl TerminationPolicy {
+    /// A short, stable, model-facing label (the inverse of [`parse`](Self::parse)).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TerminationPolicy::AutoOnIdle => "auto",
+            TerminationPolicy::Manual => "manual",
+        }
+    }
+
+    /// Parse the `spawn_subagent` tool's `termination` argument; empty defaults to
+    /// [`AutoOnIdle`](Self::AutoOnIdle).
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::InvokeFailed`] for any value other than `auto` / `manual`.
+    fn parse(raw: &str) -> Result<Self, ToolError> {
+        match raw.trim() {
+            "" | "auto" => Ok(Self::AutoOnIdle),
+            "manual" => Ok(Self::Manual),
+            other => Err(ToolError::InvokeFailed(format!(
+                "spawn_subagent 'termination' must be one of auto|manual, got '{other}'"
+            ))),
+        }
+    }
+}
+
+// -- Graph back-channel: the one seam tools use to touch the agent graph ----
+//
+// Self-affecting control (end / approval) flows through the [`ControlSink`]
+// above. Everything that touches *another* node of the agent graph — spawning a
+// child, resolving a waiting agent's approval, (later) deleting a subtree — is a
+// [`GraphEffect`] the tool *emits* through a [`GraphHost`]. The host (the
+// orchestrator instance) queues the effect and applies it after the tick, at a
+// borrow-safe point, so a tool never mutates the live graph mid-tick.
+
+/// A graph / lifecycle mutation an agent requests during its tick.
+///
+/// Emitted via [`GraphHost::emit`] and applied by the orchestrator instance once
+/// the requesting agent's tick has returned (never mid-tick). A new internal tool
+/// adds a variant here rather than a new seam, keeping [`GraphHost`] stable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphEffect {
+    /// Create a child of `kind` for `goal`, parented to the emitter, with the
+    /// given lifecycle policy. `id` was handed out by [`GraphHost::next_id`] so the
+    /// requesting tool could report it to the model synchronously.
+    Spawn {
+        /// The id pre-allocated for the child.
+        id: AgentId,
+        /// Which kind (role/template) of agent to create.
+        kind: AgentKind,
+        /// The goal handed to the child.
+        goal: String,
+        /// What becomes of the child once it yields (one-shot vs. persistent).
+        termination: TerminationPolicy,
+    },
+    /// Resolve `target`'s pending approval with the root's classified `verdict`
+    /// (and optional free-text `note`).
+    ResolveApproval {
+        /// The agent whose pending approval is being resolved.
+        target: AgentId,
+        /// The root's classification of the user's reply.
+        verdict: ApprovalVerdict,
+        /// The user's words / reason, used when rejecting.
+        note: Option<String>,
+    },
+    /// Remove `target` and its whole subtree. The instance honors this only when
+    /// `target` is a descendant of the emitter (an agent may reap its own
+    /// subagents, not arbitrary nodes).
+    Delete {
+        /// The subagent to remove (with everything beneath it).
+        target: AgentId,
+    },
+}
+
+/// A subagent's coarse lifecycle state, as observed by its parent through
+/// [`AgentContext::list_subagents`] / [`AgentContext::get_subagent`].
+///
+/// Derived by the orchestrator instance from its own scheduling state, not asked
+/// of the agent — so it reflects what the graph owner knows: queued, parked, or
+/// neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// Queued to run on the next drive step.
+    Ready,
+    /// Parked on a human decision (an approval is outstanding).
+    AwaitingApproval,
+    /// Alive with nothing queued (e.g. a persistent subagent that has yielded).
+    Idle,
+}
+
+impl AgentStatus {
+    /// A short, stable, model-facing label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentStatus::Ready => "ready",
+            AgentStatus::AwaitingApproval => "awaiting_approval",
+            AgentStatus::Idle => "idle",
+        }
+    }
+}
+
+/// An observable view of one live agent — what a parent sees when it lists or
+/// watches its subagents. A read-only projection of the graph owner's state,
+/// taken as of the start of the requesting agent's tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSnapshot {
+    /// The agent's id.
+    pub id: AgentId,
+    /// Its kind (role/template).
+    pub kind: AgentKind,
+    /// Its creator, or `None` for a session root.
+    pub parent: Option<AgentId>,
+    /// Distance from the root (root = 0).
+    pub depth: u16,
+    /// What becomes of it once it yields (one-shot vs. persistent).
+    pub termination: TerminationPolicy,
+    /// Its coarse lifecycle state.
+    pub status: AgentStatus,
+}
+
+/// The services an agent's graph owner exposes to that agent's internal tools.
+///
+/// This is the *single* back-channel from an agent to the orchestrator: identity
+/// allocation ([`next_id`](Self::next_id)) plus a deferred-effect queue
+/// ([`emit`](Self::emit)). The orchestrator instance implements it; tools reach
+/// it through an [`AgentContext`]. Keeping the surface to these two methods means
+/// new tools extend [`GraphEffect`], not this trait.
+pub trait GraphHost: Send + Sync {
+    /// Allocate the next process-unique [`AgentId`] (e.g. for a child a tool is
+    /// about to request), so the tool can report it before the child is built.
+    fn next_id(&self) -> AgentId;
+
+    /// Queue `effect`, requested by `requester`, to be applied after the current
+    /// tick at a borrow-safe point. Never touches the live graph itself.
+    fn emit(&self, requester: AgentId, effect: GraphEffect);
+
+    /// A consistent read-only snapshot of every live agent, as of the start of the
+    /// current tick. Reads (`list_subagents` / `watch_subagent`) return data to the
+    /// model synchronously, so unlike [`emit`](Self::emit) this is not deferred.
+    fn snapshot(&self) -> Vec<AgentSnapshot>;
+}
+
+/// The handle an agent's internal tools call to act on the agent graph.
+///
+/// One per agent, built at construction over the agent's own id and its
+/// [`GraphHost`]. It is the ergonomic façade over [`GraphHost`]: tools call typed
+/// methods ([`spawn`](Self::spawn), [`respond_to_approval`](Self::respond_to_approval))
+/// and never touch [`GraphEffect`] or the queue directly. Self-affecting control
+/// (`end_conversation`, `request_approval`) does *not* go through here — it stays
+/// on the agent's own [`ControlSink`].
+pub(crate) struct AgentContext {
+    /// The owning agent's id — stamped as the `requester`/parent on every effect.
+    id: AgentId,
+    /// The graph owner this context emits effects to and draws ids from.
+    host: Arc<dyn GraphHost>,
+}
+
+impl AgentContext {
+    /// Build a context for agent `id` over its graph `host`.
+    pub(crate) fn new(id: AgentId, host: Arc<dyn GraphHost>) -> Self {
+        Self { id, host }
+    }
+
+    /// Request a child of `kind` for `goal` with lifecycle `termination`; returns
+    /// the id assigned to the child (allocated now, built after the tick).
+    pub(crate) fn spawn(
+        &self,
+        kind: AgentKind,
+        goal: String,
+        termination: TerminationPolicy,
+    ) -> AgentId {
+        let child = self.host.next_id();
+        self.host.emit(
+            self.id,
+            GraphEffect::Spawn {
+                id: child,
+                kind,
+                goal,
+                termination,
+            },
+        );
+        child
+    }
+
+    /// Report the root's `verdict` (with optional `note`) for `target`'s pending
+    /// approval.
+    pub(crate) fn respond_to_approval(
+        &self,
+        target: AgentId,
+        verdict: ApprovalVerdict,
+        note: Option<String>,
+    ) {
+        self.host.emit(
+            self.id,
+            GraphEffect::ResolveApproval {
+                target,
+                verdict,
+                note,
+            },
+        );
+    }
+
+    /// Request removal of `target` (and its subtree). The instance ignores it
+    /// unless `target` is a descendant of this agent.
+    pub(crate) fn delete_subagent(&self, target: AgentId) {
+        self.host.emit(self.id, GraphEffect::Delete { target });
+    }
+
+    /// Every agent in this agent's subtree (its strict descendants), sorted by
+    /// `(depth, id)` for a stable, parent-before-child reading order.
+    pub(crate) fn list_subagents(&self) -> Vec<AgentSnapshot> {
+        let all = self.host.snapshot();
+        let mut descendants: Vec<AgentSnapshot> = all
+            .iter()
+            .filter(|snapshot| is_strict_descendant(&all, self.id, snapshot.id))
+            .cloned()
+            .collect();
+        descendants.sort_by_key(|snapshot| (snapshot.depth, snapshot.id.0));
+        descendants
+    }
+
+    /// The snapshot of `target`, but only if it is a descendant of this agent
+    /// (so an agent cannot watch a sibling, an ancestor, or itself). `None`
+    /// otherwise — an unknown id or one outside this agent's subtree.
+    pub(crate) fn get_subagent(&self, target: AgentId) -> Option<AgentSnapshot> {
+        let all = self.host.snapshot();
+        is_strict_descendant(&all, self.id, target)
+            .then(|| all.into_iter().find(|snapshot| snapshot.id == target))
+            .flatten()
+    }
+}
+
+/// The parent of `id` in a snapshot set, or `None` if absent / a root.
+fn snapshot_parent(all: &[AgentSnapshot], id: AgentId) -> Option<AgentId> {
+    all.iter()
+        .find(|snapshot| snapshot.id == id)
+        .and_then(|snapshot| snapshot.parent)
+}
+
+/// Whether `node` is a strict descendant of `ancestor` (walking parent edges in
+/// the snapshot). `false` when `node == ancestor` or the chain never reaches it.
+fn is_strict_descendant(all: &[AgentSnapshot], ancestor: AgentId, node: AgentId) -> bool {
+    let mut current = snapshot_parent(all, node);
+    while let Some(parent) = current {
+        if parent == ancestor {
+            return true;
+        }
+        current = snapshot_parent(all, parent);
+    }
+    false
 }
 
 /// Which kinds an agent may spawn — the resolved, runtime form of a manifest's
@@ -202,27 +465,34 @@ impl SpawnPolicy {
     }
 }
 
-/// Build the spawn tool group: a `spawn_subagent` tool that creates children via
-/// `spawner`, parented to `parent`, restricted to `policy`'s allowed kinds.
-pub(crate) fn spawn_tool_group(
-    spawner: Arc<dyn Spawner>,
-    parent: AgentId,
-    policy: SpawnPolicy,
-) -> ToolGroup {
+/// Build the subagent-management tool group, all routed through `context`
+/// (parented to / scoped by the context's agent):
+/// - `spawn_subagent` — create a child (restricted to `policy`'s allowed kinds);
+/// - `list_subagents` — enumerate this agent's subtree;
+/// - `watch_subagent` — snapshot one descendant;
+/// - `delete_subagent` — remove one descendant (and its subtree).
+pub(crate) fn subagent_tool_group(context: Arc<AgentContext>, policy: SpawnPolicy) -> ToolGroup {
     ToolGroup::new(
-        SPAWN_TOOL_GROUP,
-        [Tool::new(SpawnSubagentTool {
-            spawner,
-            parent,
-            policy,
-        })],
+        SUBAGENT_TOOL_GROUP,
+        [
+            Tool::new(SpawnSubagentTool {
+                context: Arc::clone(&context),
+                policy,
+            }),
+            Tool::new(ListSubagentsTool {
+                context: Arc::clone(&context),
+            }),
+            Tool::new(WatchSubagentTool {
+                context: Arc::clone(&context),
+            }),
+            Tool::new(DeleteSubagentTool { context }),
+        ],
     )
 }
 
 /// `spawn_subagent(kind, goal)` — request a child agent of `kind` to work on `goal`.
 struct SpawnSubagentTool {
-    spawner: Arc<dyn Spawner>,
-    parent: AgentId,
+    context: Arc<AgentContext>,
     /// The parent kind's `allowed_kinds`, enforced before any spawn is requested.
     policy: SpawnPolicy,
 }
@@ -244,7 +514,7 @@ impl ToolHandler for SpawnSubagentTool {
         // can pick a permitted kind or do the work itself — not as `Err`, which
         // would fail the whole iteration and rob the model of self-correction.
         if !self.policy.allows(&kind) {
-            tracing::warn!(parent_agent = %self.parent, requested_kind = %kind, "spawn kind rejected by allowed_kinds");
+            tracing::warn!(requested_kind = %kind, "spawn kind rejected by allowed_kinds");
             return Ok(ToolOutput {
                 output: format!(
                     "spawn_subagent: kind '{kind}' is not permitted for this agent. \
@@ -257,7 +527,11 @@ impl ToolHandler for SpawnSubagentTool {
         }
 
         let goal = string_argument(call.arguments_json, "goal")?;
-        let child = self.spawner.spawn(self.parent, kind, goal);
+        // Optional lifecycle policy: default one-shot (`auto`); `manual` keeps the
+        // child alive and idle after it yields so this agent can supervise it.
+        let termination =
+            TerminationPolicy::parse(&string_argument(call.arguments_json, "termination")?)?;
+        let child = self.context.spawn(kind, goal, termination);
         Ok(ToolOutput {
             output: format!(
                 "Subagent {child} requested; its result will be reported back when it finishes."
@@ -267,14 +541,108 @@ impl ToolHandler for SpawnSubagentTool {
     }
 }
 
+/// Render a snapshot as a compact JSON object for the model to read.
+fn snapshot_json(snapshot: &AgentSnapshot) -> Value {
+    serde_json::json!({
+        "agent": snapshot.id.to_string(),
+        "kind": snapshot.kind.as_str(),
+        "parent": snapshot.parent.map(|parent| parent.to_string()),
+        "depth": snapshot.depth,
+        "status": snapshot.status.as_str(),
+        "termination": snapshot.termination.as_str(),
+    })
+}
+
+/// `list_subagents()` — enumerate this agent's subtree.
+struct ListSubagentsTool {
+    context: Arc<AgentContext>,
+}
+
+impl ToolHandler for ListSubagentsTool {
+    tool_metadata!("list_subagents");
+
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        let subagents: Vec<Value> = self
+            .context
+            .list_subagents()
+            .iter()
+            .map(snapshot_json)
+            .collect();
+        Ok(ToolOutput {
+            output: serde_json::json!({ "subagents": subagents }).to_string(),
+            ok: true,
+        })
+    }
+}
+
+/// `watch_subagent(agent)` — snapshot one descendant by id.
+struct WatchSubagentTool {
+    context: Arc<AgentContext>,
+}
+
+impl ToolHandler for WatchSubagentTool {
+    tool_metadata!("watch_subagent");
+
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        let agent = string_argument(call.arguments_json, "agent")?;
+        let target = AgentId::from_wire(agent.trim()).map_err(|error| {
+            ToolError::InvokeFailed(format!("invalid agent id '{agent}': {error}"))
+        })?;
+        match self.context.get_subagent(target) {
+            Some(snapshot) => Ok(ToolOutput {
+                output: snapshot_json(&snapshot).to_string(),
+                ok: true,
+            }),
+            None => Ok(ToolOutput {
+                output: format!(
+                    "No subagent {target} in your subtree (unknown id, or not one of yours)."
+                ),
+                ok: false,
+            }),
+        }
+    }
+}
+
+/// `delete_subagent(agent)` — remove one descendant (and its subtree) by id.
+struct DeleteSubagentTool {
+    context: Arc<AgentContext>,
+}
+
+impl ToolHandler for DeleteSubagentTool {
+    tool_metadata!("delete_subagent");
+
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        let agent = string_argument(call.arguments_json, "agent")?;
+        let target = AgentId::from_wire(agent.trim()).map_err(|error| {
+            ToolError::InvokeFailed(format!("invalid agent id '{agent}': {error}"))
+        })?;
+        // Authorize against the same subtree view watch uses, so the refusal is
+        // immediate (the instance re-checks before actually removing).
+        if self.context.get_subagent(target).is_none() {
+            return Ok(ToolOutput {
+                output: format!(
+                    "Cannot delete {target}: it is not a subagent in your subtree."
+                ),
+                ok: false,
+            });
+        }
+        self.context.delete_subagent(target);
+        Ok(ToolOutput {
+            output: format!("Subagent {target} and its subtree scheduled for deletion."),
+            ok: true,
+        })
+    }
+}
+
 // -- Root-side approval resolution ------------------------------------------
 //
 // Only the session root talks to the user, so any agent's `request_approval`
-// bubbles up to the root (done by the registry). The root presents it, reads the
-// user's free-text reply, classifies it into yes/no/other, and reports the
-// verdict back with the `respond_to_approval` tool. Like `spawn_subagent`, this
-// affects *another* agent, so it delegates to an injected responder that the
-// registry drains at a borrow-safe point rather than touching the node map here.
+// bubbles up to the root (done by the orchestrator instance). The root presents
+// it, reads the user's free-text reply, classifies it into yes/no/other, and
+// reports the verdict back with the `respond_to_approval` tool. Like
+// `spawn_subagent`, this affects *another* agent, so it emits a
+// [`GraphEffect::ResolveApproval`] through the agent's [`AgentContext`] for the
+// instance to apply at a borrow-safe point rather than touching the graph here.
 
 /// The root's classification of a user's reply to a pending approval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,32 +656,19 @@ pub enum ApprovalVerdict {
     Other,
 }
 
-/// Dependency-injection seam for routing a root's approval verdict back to the
-/// agent that requested it.
-///
-/// The agent-graph owner (an `AgentRegistry`) implements this; the
-/// `respond_to_approval` tool calls [`respond`](Self::respond) during the root's
-/// tick, and the owner applies the decision to the `target` agent at a
-/// borrow-safe point.
-pub trait ApprovalResponder: Send + Sync {
-    /// Record the root's `verdict` (with an optional free-text `note`) for the
-    /// `target` agent's pending approval.
-    fn respond(&self, target: AgentId, verdict: ApprovalVerdict, note: Option<String>);
-}
-
 /// Build the approval-response tool group: a `respond_to_approval` tool that
-/// reports verdicts through `responder`.
-pub(crate) fn respond_to_approval_tool_group(responder: Arc<dyn ApprovalResponder>) -> ToolGroup {
+/// reports verdicts through `context`.
+pub(crate) fn respond_to_approval_tool_group(context: Arc<AgentContext>) -> ToolGroup {
     ToolGroup::new(
         APPROVAL_TOOL_GROUP,
-        [Tool::new(RespondToApprovalTool { responder })],
+        [Tool::new(RespondToApprovalTool { context })],
     )
 }
 
 /// `respond_to_approval(agent, verdict, note)` — the root reports its
 /// classification of a user's reply to a subagent's approval request.
 struct RespondToApprovalTool {
-    responder: Arc<dyn ApprovalResponder>,
+    context: Arc<AgentContext>,
 }
 
 impl ToolHandler for RespondToApprovalTool {
@@ -340,7 +695,7 @@ impl ToolHandler for RespondToApprovalTool {
         let note_raw = string_argument(call.arguments_json, "note")?;
         let note = (!note_raw.trim().is_empty()).then_some(note_raw);
 
-        self.responder.respond(target, verdict, note);
+        self.context.respond_to_approval(target, verdict, note);
         Ok(ToolOutput {
             output: format!("Recorded '{verdict_raw}' for {target}."),
             ok: true,
@@ -413,30 +768,104 @@ mod tests {
         );
     }
 
-    /// Records every kind it is asked to spawn; returns a fixed child id.
-    struct RecordingSpawner(Mutex<Vec<AgentKind>>);
-    impl Spawner for RecordingSpawner {
-        fn spawn(&self, _parent: AgentId, kind: AgentKind, _goal: String) -> AgentId {
-            self.0.lock().unwrap().push(kind);
-            AgentId(99)
+    /// A [`GraphHost`] that records every emitted effect, hands out ascending ids
+    /// from a private counter, and returns a preset snapshot.
+    #[derive(Default)]
+    struct RecordingHost {
+        next: Mutex<usize>,
+        effects: Mutex<Vec<(AgentId, GraphEffect)>>,
+        snapshot: Mutex<Vec<AgentSnapshot>>,
+    }
+
+    impl GraphHost for RecordingHost {
+        fn next_id(&self) -> AgentId {
+            let mut next = self.next.lock().unwrap();
+            *next += 1;
+            AgentId(*next)
+        }
+        fn emit(&self, requester: AgentId, effect: GraphEffect) {
+            self.effects.lock().unwrap().push((requester, effect));
+        }
+        fn snapshot(&self) -> Vec<AgentSnapshot> {
+            self.snapshot.lock().unwrap().clone()
         }
     }
 
-    fn spawn_tool(spawner: Arc<dyn Spawner>, policy: SpawnPolicy) -> Tool {
-        let group = spawn_tool_group(spawner, AgentId(1), policy);
+    /// A minimal snapshot of `id` parented to `parent` for the read-path tests.
+    fn snap(id: usize, parent: Option<usize>, depth: u16) -> AgentSnapshot {
+        AgentSnapshot {
+            id: AgentId(id),
+            kind: AgentKind::new("worker"),
+            parent: parent.map(AgentId),
+            depth,
+            termination: TerminationPolicy::Manual,
+            status: AgentStatus::Idle,
+        }
+    }
+
+    /// Build a host whose snapshot is `tree`.
+    fn host_with_tree(tree: Vec<AgentSnapshot>) -> Arc<RecordingHost> {
+        let host = RecordingHost::default();
+        *host.snapshot.lock().unwrap() = tree;
+        Arc::new(host)
+    }
+
+    fn tool_named(group: &ToolGroup, name: &str) -> Tool {
         group
             .tools()
             .iter()
-            .find(|tool| tool.name() == "spawn_subagent")
+            .find(|tool| tool.name() == name)
             .unwrap()
             .clone()
     }
 
+    /// The kinds recorded as `Spawn` effects on `host`.
+    fn spawned_kinds(host: &RecordingHost) -> Vec<AgentKind> {
+        host.effects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, effect)| match effect {
+                GraphEffect::Spawn { kind, .. } => Some(kind.clone()),
+                GraphEffect::ResolveApproval { .. } | GraphEffect::Delete { .. } => None,
+            })
+            .collect()
+    }
+
+    fn context_for(host: Arc<dyn GraphHost>, id: AgentId) -> Arc<AgentContext> {
+        Arc::new(AgentContext::new(id, host))
+    }
+
+    #[test]
+    fn termination_policy_parses_auto_manual_and_rejects_others() {
+        assert_eq!(
+            TerminationPolicy::parse("").unwrap(),
+            TerminationPolicy::AutoOnIdle
+        );
+        assert_eq!(
+            TerminationPolicy::parse("auto").unwrap(),
+            TerminationPolicy::AutoOnIdle
+        );
+        assert_eq!(
+            TerminationPolicy::parse("manual").unwrap(),
+            TerminationPolicy::Manual
+        );
+        assert!(matches!(
+            TerminationPolicy::parse("forever"),
+            Err(ToolError::InvokeFailed(_))
+        ));
+    }
+
+    fn spawn_tool(host: Arc<RecordingHost>, policy: SpawnPolicy) -> Tool {
+        let context = context_for(host as Arc<dyn GraphHost>, AgentId(1));
+        tool_named(&subagent_tool_group(context, policy), "spawn_subagent")
+    }
+
     #[test]
     fn spawn_rejects_disallowed_kind_without_spawning() {
-        let spawner = Arc::new(RecordingSpawner(Mutex::new(Vec::new())));
+        let host = Arc::new(RecordingHost::default());
         let tool = spawn_tool(
-            Arc::clone(&spawner) as Arc<dyn Spawner>,
+            Arc::clone(&host),
             SpawnPolicy::Only(vec![AgentKind::new("worker")]),
         );
 
@@ -448,18 +877,18 @@ mod tests {
             })
             .unwrap();
 
-        // Refused as a matched tool error (not Err), and no spawn was queued.
+        // Refused as a matched tool error (not Err), and no spawn was emitted.
         assert!(!output.ok);
         assert!(output.output.contains("not permitted"));
         assert!(output.output.contains("worker"));
-        assert!(spawner.0.lock().unwrap().is_empty());
+        assert!(host.effects.lock().unwrap().is_empty());
     }
 
     #[test]
     fn spawn_allows_permitted_kind() {
-        let spawner = Arc::new(RecordingSpawner(Mutex::new(Vec::new())));
+        let host = Arc::new(RecordingHost::default());
         let tool = spawn_tool(
-            Arc::clone(&spawner) as Arc<dyn Spawner>,
+            Arc::clone(&host),
             SpawnPolicy::Only(vec![AgentKind::new("worker")]),
         );
 
@@ -472,16 +901,13 @@ mod tests {
             .unwrap();
 
         assert!(output.ok);
-        assert_eq!(
-            spawner.0.lock().unwrap().as_slice(),
-            &[AgentKind::new("worker")]
-        );
+        assert_eq!(spawned_kinds(&host), &[AgentKind::new("worker")]);
     }
 
     #[test]
     fn spawn_policy_any_allows_every_kind() {
-        let spawner = Arc::new(RecordingSpawner(Mutex::new(Vec::new())));
-        let tool = spawn_tool(Arc::clone(&spawner) as Arc<dyn Spawner>, SpawnPolicy::Any);
+        let host = Arc::new(RecordingHost::default());
+        let tool = spawn_tool(Arc::clone(&host), SpawnPolicy::Any);
 
         let output = tool
             .invoke(&ToolInvocation {
@@ -492,10 +918,7 @@ mod tests {
             .unwrap();
 
         assert!(output.ok);
-        assert_eq!(
-            spawner.0.lock().unwrap().as_slice(),
-            &[AgentKind::new("anything")]
-        );
+        assert_eq!(spawned_kinds(&host), &[AgentKind::new("anything")]);
     }
 
     #[test]
@@ -511,18 +934,114 @@ mod tests {
     }
 
     #[test]
+    fn list_subagents_returns_strict_descendants_sorted() {
+        let tree = vec![
+            snap(1, None, 0),
+            snap(2, Some(1), 1),
+            snap(3, Some(2), 2),
+            snap(9, None, 0),
+        ];
+        let host = host_with_tree(tree);
+
+        let ctx1 = context_for(Arc::clone(&host) as Arc<dyn GraphHost>, AgentId(1));
+        let ids: Vec<usize> = ctx1.list_subagents().iter().map(|s| s.id.0).collect();
+        assert_eq!(ids, vec![2, 3]);
+
+        let ctx2 = context_for(host as Arc<dyn GraphHost>, AgentId(2));
+        let ids: Vec<usize> = ctx2.list_subagents().iter().map(|s| s.id.0).collect();
+        assert_eq!(ids, vec![3]);
+    }
+
+    #[test]
+    fn get_subagent_authorizes_to_the_subtree() {
+        let host = host_with_tree(vec![
+            snap(1, None, 0),
+            snap(2, Some(1), 1),
+            snap(3, Some(2), 2),
+            snap(9, None, 0),
+        ]);
+        let ctx2 = context_for(host as Arc<dyn GraphHost>, AgentId(2));
+        assert!(ctx2.get_subagent(AgentId(3)).is_some(), "a descendant");
+        assert!(ctx2.get_subagent(AgentId(1)).is_none(), "an ancestor");
+        assert!(ctx2.get_subagent(AgentId(2)).is_none(), "itself");
+        assert!(ctx2.get_subagent(AgentId(9)).is_none(), "unrelated");
+    }
+
+    #[test]
+    fn delete_subagent_emits_only_for_a_descendant() {
+        let host = host_with_tree(vec![
+            snap(1, None, 0),
+            snap(2, Some(1), 1),
+            snap(3, Some(2), 2),
+        ]);
+        let context = context_for(Arc::clone(&host) as Arc<dyn GraphHost>, AgentId(2));
+        let delete = tool_named(&subagent_tool_group(context, SpawnPolicy::Any), "delete_subagent");
+
+        let ok = delete
+            .invoke(&ToolInvocation {
+                id: Some("d1"),
+                name: "delete_subagent",
+                arguments_json: r#"{"agent":"agent-3"}"#,
+            })
+            .unwrap();
+        assert!(ok.ok);
+
+        let refused = delete
+            .invoke(&ToolInvocation {
+                id: Some("d2"),
+                name: "delete_subagent",
+                arguments_json: r#"{"agent":"agent-1"}"#,
+            })
+            .unwrap();
+        assert!(!refused.ok);
+
+        // Only the descendant delete was emitted.
+        let effects = host.effects.lock().unwrap();
+        assert_eq!(
+            effects.as_slice(),
+            &[(
+                AgentId(2),
+                GraphEffect::Delete {
+                    target: AgentId(3)
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn watch_subagent_reports_snapshot_or_refuses() {
+        let host = host_with_tree(vec![snap(1, None, 0), snap(2, Some(1), 1)]);
+        let context = context_for(host as Arc<dyn GraphHost>, AgentId(1));
+        let watch = tool_named(&subagent_tool_group(context, SpawnPolicy::Any), "watch_subagent");
+
+        let ok = watch
+            .invoke(&ToolInvocation {
+                id: Some("w1"),
+                name: "watch_subagent",
+                arguments_json: r#"{"agent":"agent-2"}"#,
+            })
+            .unwrap();
+        assert!(ok.ok);
+        assert!(ok.output.contains("agent-2"));
+        assert!(ok.output.contains("manual"));
+
+        // Watching itself (not a descendant) is refused.
+        let refused = watch
+            .invoke(&ToolInvocation {
+                id: Some("w2"),
+                name: "watch_subagent",
+                arguments_json: r#"{"agent":"agent-1"}"#,
+            })
+            .unwrap();
+        assert!(!refused.ok);
+    }
+
+    #[test]
     fn respond_to_approval_parses_target_and_verdict() {
-        let recorded: Arc<Mutex<Vec<(AgentId, ApprovalVerdict, Option<String>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let host = Arc::new(RecordingHost::default());
+        let context = context_for(Arc::clone(&host) as Arc<dyn GraphHost>, AgentId(1));
 
-        struct FakeResponder(Arc<Mutex<Vec<(AgentId, ApprovalVerdict, Option<String>)>>>);
-        impl ApprovalResponder for FakeResponder {
-            fn respond(&self, target: AgentId, verdict: ApprovalVerdict, note: Option<String>) {
-                self.0.lock().unwrap().push((target, verdict, note));
-            }
-        }
-
-        let group = respond_to_approval_tool_group(Arc::new(FakeResponder(Arc::clone(&recorded))));
+        let group = respond_to_approval_tool_group(context);
         let tool = group
             .tools()
             .iter()
@@ -537,24 +1056,25 @@ mod tests {
         })
         .unwrap();
 
-        let recorded = recorded.lock().unwrap();
+        let effects = host.effects.lock().unwrap();
         assert_eq!(
-            recorded.as_slice(),
+            effects.as_slice(),
             &[(
-                AgentId(7),
-                ApprovalVerdict::No,
-                Some("not allowed".to_string())
+                AgentId(1),
+                GraphEffect::ResolveApproval {
+                    target: AgentId(7),
+                    verdict: ApprovalVerdict::No,
+                    note: Some("not allowed".to_string()),
+                }
             )]
         );
     }
 
     #[test]
     fn respond_to_approval_rejects_unknown_verdict() {
-        struct NoopResponder;
-        impl ApprovalResponder for NoopResponder {
-            fn respond(&self, _t: AgentId, _v: ApprovalVerdict, _n: Option<String>) {}
-        }
-        let group = respond_to_approval_tool_group(Arc::new(NoopResponder));
+        let host = Arc::new(RecordingHost::default());
+        let context = context_for(host as Arc<dyn GraphHost>, AgentId(1));
+        let group = respond_to_approval_tool_group(context);
         let tool = group.tools().iter().next().unwrap().clone();
 
         let error = tool

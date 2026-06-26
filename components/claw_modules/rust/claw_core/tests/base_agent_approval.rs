@@ -9,16 +9,15 @@
 mod common;
 
 use claw_core::agent::{
-    AgentCommandError, AgentId, AgentState, ApprovalDecision, ApprovalId, BaseAgent, CancelReason,
-    TickOutcome,
+    AgentCommandError, AgentId, AgentState, ApprovalDecision, ApprovalId, CancelReason, TickOutcome,
 };
 use common::{
     agent_builder, body_plain_text, body_request_approval, builder_with_view, capturing_llm,
-    scripted_llm, transcript_contents,
+    scripted_llm, transcript_contents, TestAgent,
 };
 
 /// Build an agent over fresh disk memory with the given scripted LLM.
-fn build_agent(name: &str, llm: claw_api::ClawApi) -> BaseAgent {
+fn build_agent(name: &str, llm: claw_api::ClawApi) -> TestAgent {
     let dir = common::test_output_dir(name);
     agent_builder(llm, AgentId(1), dir.display().to_string())
         .build()

@@ -126,11 +126,18 @@ impl RegistryState {
             return false;
         }
         use crate::descriptor::CapabilityFlags;
-        if !entry.descriptor.flags.contains(CapabilityFlags::CALLABLE_BY_LLM) {
+        if !entry
+            .descriptor
+            .flags
+            .contains(CapabilityFlags::CALLABLE_BY_LLM)
+        {
             return false;
         }
         if caller == CapabilityCaller::SubAgent
-            && entry.descriptor.flags.contains(CapabilityFlags::ROOT_AGENT_ONLY)
+            && entry
+                .descriptor
+                .flags
+                .contains(CapabilityFlags::ROOT_AGENT_ONLY)
         {
             return false;
         }
@@ -202,8 +209,9 @@ impl Registry {
     ) -> Result<(), CapabilityError> {
         use crate::descriptor::CapabilityFlags;
         let id = id_or_name.into();
-        let descriptor = CapabilityDescriptor::new(id.clone(), id, Arc::new(ClosureHandler(handler)))
-            .with_flags(CapabilityFlags::CALLABLE_BY_LLM);
+        let descriptor =
+            CapabilityDescriptor::new(id.clone(), id, Arc::new(ClosureHandler(handler)))
+                .with_flags(CapabilityFlags::CALLABLE_BY_LLM);
         self.register(descriptor)
     }
 
@@ -220,8 +228,7 @@ impl Registry {
                 hooks.init()?;
             }
 
-            let member_ids: Vec<String> =
-                group.descriptors.iter().map(|d| d.id.clone()).collect();
+            let member_ids: Vec<String> = group.descriptors.iter().map(|d| d.id.clone()).collect();
             for descriptor in group.descriptors {
                 state
                     .name_to_id
@@ -255,7 +262,10 @@ impl Registry {
         Ok(())
     }
 
-    fn validate_group(state: &RegistryState, group: &CapabilityGroup) -> Result<(), CapabilityError> {
+    fn validate_group(
+        state: &RegistryState,
+        group: &CapabilityGroup,
+    ) -> Result<(), CapabilityError> {
         if group.group_id.is_empty() || group.descriptors.is_empty() {
             return Err(CapabilityError::InvalidArg);
         }
@@ -335,7 +345,10 @@ impl Registry {
 
         let (hooks, members) = {
             let mut state = self.state();
-            let group = state.groups.get(group_id).ok_or(CapabilityError::NotFound)?;
+            let group = state
+                .groups
+                .get(group_id)
+                .ok_or(CapabilityError::NotFound)?;
             match group.state {
                 CapabilityState::Draining | CapabilityState::Unloading => {
                     return Err(CapabilityError::InvalidState);
@@ -401,7 +414,10 @@ impl Registry {
 
         let (hooks, members) = {
             let mut state = self.state();
-            let group = state.groups.get(group_id).ok_or(CapabilityError::NotFound)?;
+            let group = state
+                .groups
+                .get(group_id)
+                .ok_or(CapabilityError::NotFound)?;
             match group.state {
                 CapabilityState::Disabled => return Ok(()),
                 CapabilityState::Draining | CapabilityState::Unloading => {
@@ -452,7 +468,10 @@ impl Registry {
 
         {
             let mut state = self.state();
-            let group = state.groups.get(group_id).ok_or(CapabilityError::NotFound)?;
+            let group = state
+                .groups
+                .get(group_id)
+                .ok_or(CapabilityError::NotFound)?;
             if group.state == CapabilityState::Unloading {
                 return Err(CapabilityError::InvalidState);
             }
@@ -511,7 +530,9 @@ impl Registry {
         }
         let group_id = {
             let state = self.state();
-            let id = state.resolve_id(id_or_name).ok_or(CapabilityError::NotFound)?;
+            let id = state
+                .resolve_id(id_or_name)
+                .ok_or(CapabilityError::NotFound)?;
             let group_id = state
                 .descriptors
                 .get(&id)
@@ -616,7 +637,10 @@ impl Registry {
                 }
             }
 
-            let entry = state.descriptors.get_mut(&id).ok_or(CapabilityError::Failed)?;
+            let entry = state
+                .descriptors
+                .get_mut(&id)
+                .ok_or(CapabilityError::Failed)?;
             entry.active_calls += 1;
             (id, entry.descriptor.handler.clone())
         };
@@ -653,8 +677,13 @@ impl Registry {
         id_or_name: &str,
     ) -> Result<DescriptorRuntimeInfo, CapabilityError> {
         let state = self.state();
-        let id = state.resolve_id(id_or_name).ok_or(CapabilityError::NotFound)?;
-        let entry = state.descriptors.get(&id).ok_or(CapabilityError::NotFound)?;
+        let id = state
+            .resolve_id(id_or_name)
+            .ok_or(CapabilityError::NotFound)?;
+        let entry = state
+            .descriptors
+            .get(&id)
+            .ok_or(CapabilityError::NotFound)?;
         Ok(DescriptorRuntimeInfo {
             id: entry.descriptor.id.clone(),
             name: entry.descriptor.name.clone(),
@@ -778,7 +807,10 @@ mod tests {
             input_json: &str,
             _context: &CapabilityContext,
         ) -> Result<CapabilityInvokeResult, CapabilityError> {
-            Ok(CapabilityInvokeResult { output: input_json.to_string(), ok: true })
+            Ok(CapabilityInvokeResult {
+                output: input_json.to_string(),
+                ok: true,
+            })
         }
         fn init(&self) -> Result<(), CapabilityError> {
             self.init.fetch_add(1, Ordering::SeqCst);
@@ -884,7 +916,10 @@ mod tests {
                 _ctx: &CapabilityContext,
             ) -> Result<CapabilityInvokeResult, CapabilityError> {
                 assert_eq!(name, "from_c");
-                Ok(CapabilityInvokeResult { output: "c".to_string(), ok: true })
+                Ok(CapabilityInvokeResult {
+                    output: "c".to_string(),
+                    ok: true,
+                })
             }
         }
         let registry = Registry::new(Some(Box::new(Backend)));
@@ -926,7 +961,10 @@ mod tests {
         assert_eq!(handler.start.load(Ordering::SeqCst), 1);
         registry.disable_group("svc").unwrap();
         assert_eq!(handler.stop.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.get_group_state("svc").unwrap(), CapabilityState::Disabled);
+        assert_eq!(
+            registry.get_group_state("svc").unwrap(),
+            CapabilityState::Disabled
+        );
     }
 
     #[test]
@@ -941,7 +979,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(handler.start.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.get_group_state("late").unwrap(), CapabilityState::Started);
+        assert_eq!(
+            registry.get_group_state("late").unwrap(),
+            CapabilityState::Started
+        );
     }
 
     #[test]
@@ -981,8 +1022,12 @@ mod tests {
     #[test]
     fn root_agent_only_hidden_from_sub_agent() {
         let registry = Registry::new(None);
-        let descriptor = CapabilityDescriptor::new("root_tool", "root_tool", Arc::new(CountingHandler::default()))
-            .with_flags(CapabilityFlags::CALLABLE_BY_LLM | CapabilityFlags::ROOT_AGENT_ONLY);
+        let descriptor = CapabilityDescriptor::new(
+            "root_tool",
+            "root_tool",
+            Arc::new(CountingHandler::default()),
+        )
+        .with_flags(CapabilityFlags::CALLABLE_BY_LLM | CapabilityFlags::ROOT_AGENT_ONLY);
         registry.register(descriptor).unwrap();
 
         assert!(registry.call("root_tool", "{}", &agent_ctx()).is_ok());
@@ -1001,7 +1046,11 @@ mod tests {
         let registry = Registry::new(None);
         // No CALLABLE_BY_LLM flag.
         registry
-            .register(CapabilityDescriptor::new("internal", "internal", Arc::new(CountingHandler::default())))
+            .register(CapabilityDescriptor::new(
+                "internal",
+                "internal",
+                Arc::new(CountingHandler::default()),
+            ))
             .unwrap();
         let system_ctx = CapabilityContext {
             caller: CapabilityCaller::System,
@@ -1077,15 +1126,27 @@ mod tests {
         assert_eq!(handler.init.load(Ordering::SeqCst), 1);
         assert_eq!(handler.start.load(Ordering::SeqCst), 2);
         assert_eq!(handler.stop.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.get_group_state("svc").unwrap(), CapabilityState::Started);
+        assert_eq!(
+            registry.get_group_state("svc").unwrap(),
+            CapabilityState::Started
+        );
     }
 
     #[test]
     fn enable_disable_unknown_group_errors() {
         let registry = Registry::new(None);
-        assert_eq!(registry.enable_group("nope"), Err(CapabilityError::NotFound));
-        assert_eq!(registry.disable_group("nope"), Err(CapabilityError::NotFound));
-        assert_eq!(registry.get_group_state("nope"), Err(CapabilityError::NotFound));
+        assert_eq!(
+            registry.enable_group("nope"),
+            Err(CapabilityError::NotFound)
+        );
+        assert_eq!(
+            registry.disable_group("nope"),
+            Err(CapabilityError::NotFound)
+        );
+        assert_eq!(
+            registry.get_group_state("nope"),
+            Err(CapabilityError::NotFound)
+        );
     }
 
     #[test]
@@ -1094,7 +1155,9 @@ mod tests {
         registry
             .register_group(CapabilityGroup::new("g1", "g1", "1", [callable("a")]))
             .unwrap();
-        registry.set_llm_visible_groups(["other".to_string()]).unwrap();
+        registry
+            .set_llm_visible_groups(["other".to_string()])
+            .unwrap();
         let ctx = CapabilityContext {
             caller: CapabilityCaller::Agent,
             session_id: Some("s".to_string()),
@@ -1107,7 +1170,10 @@ mod tests {
         assert!(registry.call("a", "{}", &ctx).is_ok());
         // Clearing the session removes the grant => hidden again.
         registry.set_session_llm_visible_groups("s", []).unwrap();
-        assert_eq!(registry.call("a", "{}", &ctx), Err(CapabilityError::NotVisible));
+        assert_eq!(
+            registry.call("a", "{}", &ctx),
+            Err(CapabilityError::NotVisible)
+        );
     }
 
     #[test]
@@ -1135,7 +1201,10 @@ mod tests {
                 while *phase != 2 {
                     phase = self.0.cv.wait(phase).unwrap();
                 }
-                Ok(CapabilityInvokeResult { output: String::new(), ok: true })
+                Ok(CapabilityInvokeResult {
+                    output: String::new(),
+                    ok: true,
+                })
             }
         }
 
@@ -1181,6 +1250,9 @@ mod tests {
         caller.join().unwrap();
 
         // The drain attempt left the group in Draining state.
-        assert_eq!(registry.get_group_state("block").unwrap(), CapabilityState::Draining);
+        assert_eq!(
+            registry.get_group_state("block").unwrap(),
+            CapabilityState::Draining
+        );
     }
 }

@@ -13,15 +13,19 @@
 //! `manifest` module. This module only consumes the resolved config.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use claw_api::ClawApi;
+use claw_interface::ClawFs;
 use claw_memory::{ConversationConfig, ConversationDeps, ConversationMemory};
 
 use crate::agent::base_agent::{
     AgentCommand, AgentCommandError, AgentId, BaseAgent, BaseAgentBuildError, TickOutcome,
 };
 use crate::agent::config::AgentConfig;
-use crate::agent::internal_tools::{respond_to_approval_tool_group, spawn_tool_group};
+use crate::agent::internal_tools::{
+    respond_to_approval_tool_group, subagent_tool_group, AgentContext, GraphHost,
+};
 use crate::agent::{append_child_result, Agent};
 use crate::tools::{ToolSet, ToolSetError};
 
@@ -68,16 +72,16 @@ impl std::fmt::Display for AgentKind {
 
 /// The one agent type: a flat ReAct loop over a [`BaseAgent`], configured by an
 /// [`AgentConfig`]. No semantic FSM — `tick` forwards straight to the base.
-pub struct GenericAgent {
+pub struct GenericAgent<F: ClawFs + 'static> {
     id: AgentId,
     kind: AgentKind,
     /// A view sharing inner state with the base agent's memory, for reads and
     /// persistence inspection (a cheap `Arc` clone of the live transcript).
-    memory: ConversationMemory,
-    base: BaseAgent,
+    memory: ConversationMemory<F>,
+    base: BaseAgent<F>,
 }
 
-impl GenericAgent {
+impl<F: ClawFs + 'static> GenericAgent<F> {
     /// Build a generic agent with `id` over `llm`, configured by `config`.
     ///
     /// The agent constructs its **own** [`ConversationMemory`] from the injected
@@ -86,8 +90,11 @@ impl GenericAgent {
     /// caller cannot wire a transcript that belongs to a different agent: the
     /// conversation identity always follows the agent identity.
     ///
-    /// The config's capability tools are merged with the spawn tool (when a
-    /// spawner is set); the base agent then adds its built-in control tools.
+    /// The config's capability tools are merged with the graph tools that require
+    /// a [`GraphHost`]: `spawn_subagent` when `config.spawn_enabled`, and
+    /// `respond_to_approval` when `is_root`. With no `host` (a standalone agent,
+    /// no graph) neither is attached. The base agent then adds its built-in
+    /// self-control tools (`end_conversation`, `request_approval`).
     ///
     /// # Errors
     ///
@@ -96,8 +103,10 @@ impl GenericAgent {
         id: AgentId,
         llm: ClawApi,
         memory_config: ConversationConfig,
-        memory_deps: ConversationDeps,
+        memory_deps: ConversationDeps<F>,
         config: AgentConfig,
+        host: Option<Arc<dyn GraphHost>>,
+        is_root: bool,
     ) -> Result<Self, GenericAgentBuildError> {
         // Memory identity follows agent identity: the conversation is keyed by the
         // agent's own id, so the transcript can never be mismatched by the caller.
@@ -105,11 +114,19 @@ impl GenericAgent {
         let memory_view = memory.clone();
 
         let mut tool_set = ToolSet::new(config.tools)?;
-        if let Some(spawner) = config.spawner {
-            tool_set.extend_with_group(spawn_tool_group(spawner, id, config.spawn_policy))?;
-        }
-        if let Some(responder) = config.approval_responder {
-            tool_set.extend_with_group(respond_to_approval_tool_group(responder))?;
+        // Graph-affecting tools need a back-channel; without one (standalone agent)
+        // the agent simply has no spawn/approval-routing tools.
+        if let Some(host) = host {
+            let context = Arc::new(AgentContext::new(id, host));
+            if config.spawn_enabled {
+                tool_set.extend_with_group(subagent_tool_group(
+                    Arc::clone(&context),
+                    config.spawn_policy,
+                ))?;
+            }
+            if is_root {
+                tool_set.extend_with_group(respond_to_approval_tool_group(context))?;
+            }
         }
 
         let mut base_builder = BaseAgent::builder(llm, memory)
@@ -142,12 +159,12 @@ impl GenericAgent {
     /// Shares inner state with the live agent (cheap `Arc` clone), so reads always
     /// reflect the current transcript. Intended for inspection and persistence,
     /// not direct mutation (the agent owns writes through its tick loop).
-    pub fn memory(&self) -> &ConversationMemory {
+    pub fn memory(&self) -> &ConversationMemory<F> {
         &self.memory
     }
 }
 
-impl Agent for GenericAgent {
+impl<F: ClawFs + 'static> Agent for GenericAgent<F> {
     fn id(&self) -> AgentId {
         self.id
     }
@@ -180,10 +197,10 @@ pub enum GenericAgentBuildError {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use claw_api::{ClawApi, ClawApiConfig, RetryPolicy};
-    use claw_interface::{MemFs, ScriptedHttp};
+    use claw_interface::{MemFs, ScriptedHttp, StdThread};
     use claw_memory::{
         ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
         PoolConfig,
@@ -191,7 +208,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::agent::internal_tools::SpawnPolicy;
+    use crate::agent::internal_tools::{GraphEffect, SpawnPolicy};
 
     fn scripted_llm(bodies: Vec<String>) -> ClawApi {
         ClawApi::init(
@@ -211,8 +228,10 @@ mod tests {
     /// The ingredients [`GenericAgent::new`] needs to build its own memory: a
     /// base config plus the in-memory collaborators. The agent keys the
     /// conversation by its own id.
-    fn memory_ingredients(agent_id: AgentId) -> (ConversationConfig, ConversationDeps) {
-        let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
+    fn memory_ingredients(agent_id: AgentId) -> (ConversationConfig, ConversationDeps<Arc<MemFs>>) {
+        let pool = Arc::new(
+            MemoryTaskPool::new(PoolConfig::default(), StdThread::default()).expect("memory pool"),
+        );
         (
             ConversationConfig::new(format!("/mem/agent-{}", agent_id.0)),
             ConversationDeps {
@@ -242,7 +261,7 @@ mod tests {
         .to_string()
     }
 
-    fn transcript_contents(memory: &ConversationMemory) -> Vec<String> {
+    fn transcript_contents(memory: &ConversationMemory<Arc<MemFs>>) -> Vec<String> {
         memory
             .messages()
             .as_array()
@@ -256,7 +275,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn drive(agent: &mut GenericAgent) -> TickOutcome {
+    fn drive(agent: &mut GenericAgent<Arc<MemFs>>) -> TickOutcome {
         loop {
             match agent.tick() {
                 TickOutcome::Working => continue,
@@ -274,12 +293,37 @@ mod tests {
             system_prompt: String::new(),
             tools: Vec::new(),
             skills: None,
-            spawner: None,
+            spawn_enabled: false,
             spawn_policy: SpawnPolicy::Any,
-            approval_responder: None,
             retry_policy: RetryPolicy::default(),
             tool_block_retries: None,
         }
+    }
+
+    /// A [`GraphHost`] that records every emitted effect and hands out ascending
+    /// ids; doubles as a no-op host for the single-agent tests.
+    #[derive(Default)]
+    struct RecordingHost {
+        next: Mutex<usize>,
+        effects: Mutex<Vec<(AgentId, GraphEffect)>>,
+    }
+
+    impl GraphHost for RecordingHost {
+        fn next_id(&self) -> AgentId {
+            let mut next = self.next.lock().unwrap();
+            *next += 1;
+            AgentId(*next)
+        }
+        fn emit(&self, requester: AgentId, effect: GraphEffect) {
+            self.effects.lock().unwrap().push((requester, effect));
+        }
+        fn snapshot(&self) -> Vec<crate::agent::internal_tools::AgentSnapshot> {
+            Vec::new()
+        }
+    }
+
+    fn noop_host() -> Option<Arc<dyn GraphHost>> {
+        Some(Arc::new(RecordingHost::default()))
     }
 
     #[test]
@@ -293,6 +337,8 @@ mod tests {
             mem_config,
             mem_deps,
             config,
+            noop_host(),
+            false,
         )
         .unwrap();
 
@@ -321,6 +367,8 @@ mod tests {
             mem_config,
             mem_deps,
             config,
+            noop_host(),
+            false,
         )
         .unwrap();
 
@@ -343,6 +391,8 @@ mod tests {
             mem_config,
             mem_deps,
             config,
+            noop_host(),
+            false,
         )
         .unwrap();
 
@@ -355,23 +405,14 @@ mod tests {
     }
 
     #[test]
-    fn respond_to_approval_tool_is_wired_when_a_responder_is_configured() {
-        use std::sync::Mutex;
+    fn respond_to_approval_tool_is_wired_for_a_root() {
+        use crate::agent::internal_tools::ApprovalVerdict;
 
-        use crate::agent::internal_tools::{ApprovalResponder, ApprovalVerdict};
-
-        #[derive(Default)]
-        struct RecordingResponder(Mutex<Vec<(AgentId, ApprovalVerdict, Option<String>)>>);
-        impl ApprovalResponder for RecordingResponder {
-            fn respond(&self, target: AgentId, verdict: ApprovalVerdict, note: Option<String>) {
-                self.0.lock().unwrap().push((target, verdict, note));
-            }
-        }
-
-        let responder = Arc::new(RecordingResponder::default());
+        let host = Arc::new(RecordingHost::default());
         let (mem_config, mem_deps) = memory_ingredients(AgentId(1));
-        let mut config = test_config("conversation");
-        config.approval_responder = Some(Arc::clone(&responder) as Arc<dyn ApprovalResponder>);
+        let config = test_config("conversation");
+        // A root (is_root = true) with a graph host gets the `respond_to_approval`
+        // tool; calling it emits a `ResolveApproval` effect on the host.
         let mut agent = GenericAgent::new(
             AgentId(1),
             scripted_llm(vec![
@@ -386,6 +427,8 @@ mod tests {
             mem_config,
             mem_deps,
             config,
+            Some(Arc::clone(&host) as Arc<dyn GraphHost>),
+            true,
         )
         .unwrap();
 
@@ -394,13 +437,16 @@ mod tests {
             .unwrap();
         let _ = drive(&mut agent);
 
-        let recorded = responder.0.lock().unwrap();
+        let effects = host.effects.lock().unwrap();
         assert_eq!(
-            recorded.as_slice(),
+            effects.as_slice(),
             &[(
-                AgentId(7),
-                ApprovalVerdict::No,
-                Some("too risky".to_string())
+                AgentId(1),
+                GraphEffect::ResolveApproval {
+                    target: AgentId(7),
+                    verdict: ApprovalVerdict::No,
+                    note: Some("too risky".to_string()),
+                }
             )]
         );
     }

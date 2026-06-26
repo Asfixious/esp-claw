@@ -10,11 +10,11 @@
 
 mod common;
 
-use claw_core::agent::{
-    AgentCommandError, AgentId, AgentState, BaseAgent, CancelReason, TickOutcome,
-};
+use claw_core::agent::{AgentCommandError, AgentId, AgentState, CancelReason, TickOutcome};
 use claw_core::{Tool, ToolGroup, ToolSet};
-use common::{agent_builder, body_echo_call, body_plain_text, capturing_llm, scripted_llm};
+use common::{
+    agent_builder, body_echo_call, body_plain_text, capturing_llm, scripted_llm, TestAgent,
+};
 
 /// A `ToolSet` exposing only the `echo` test tool.
 fn echo_tools() -> ToolSet {
@@ -23,7 +23,7 @@ fn echo_tools() -> ToolSet {
 }
 
 /// Build an agent over the given LLM with a unique on-disk transcript dir.
-fn build_agent(name: &str, llm: claw_api::ClawApi) -> BaseAgent {
+fn build_agent(name: &str, llm: claw_api::ClawApi) -> TestAgent {
     let dir = common::test_output_dir(name);
     agent_builder(llm, AgentId(1), dir.display().to_string())
         .build()

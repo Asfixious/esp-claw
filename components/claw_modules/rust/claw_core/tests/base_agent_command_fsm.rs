@@ -10,12 +10,12 @@
 mod common;
 
 use claw_core::agent::{
-    AgentCommand, AgentCommandError, AgentId, AgentState, ApprovalDecision, ApprovalId, BaseAgent,
+    AgentCommand, AgentCommandError, AgentId, AgentState, ApprovalDecision, ApprovalId,
     CancelReason, TickOutcome,
 };
-use common::{agent_builder, body_plain_text, scripted_llm};
+use common::{agent_builder, body_plain_text, scripted_llm, TestAgent};
 
-fn idle_agent(name: &str) -> BaseAgent {
+fn idle_agent(name: &str) -> TestAgent {
     let dir = common::test_output_dir(name);
     agent_builder(scripted_llm(vec![]), AgentId(1), dir.display().to_string())
         .build()

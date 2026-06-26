@@ -177,9 +177,7 @@ dependencies = [
 name = "claw-memory"
 version = "0.1.0"
 dependencies = [
- "claw-api",
  "claw-interface",
- "claw-sys",
  "log",
  "serde",
  "serde_json",

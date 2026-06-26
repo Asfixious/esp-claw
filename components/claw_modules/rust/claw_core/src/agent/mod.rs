@@ -11,9 +11,9 @@
 //! internals.
 //!
 //! Spawning is a model-callable `spawn_subagent(kind, goal)` tool (in
-//! [`internal_tools`]) backed by an injected [`Spawner`]; the [`AgentRegistry`]
-//! owns the flattened agent graph and materializes children through an
-//! [`AgentFactory`].
+//! [`internal_tools`]) that emits a [`GraphEffect`] through a [`GraphHost`]; the
+//! [`OrchestratorInstance`](crate::orchestrator_instance) owns the flattened
+//! agent graph and materializes children through an [`AgentFactory`].
 
 #[allow(clippy::module_inception)]
 pub mod agent;
@@ -23,7 +23,7 @@ mod fs_factory;
 mod internal_tools;
 pub mod manifest;
 mod map_resolver;
-pub mod registry;
+pub(crate) mod registry;
 
 pub use agent::{AgentKind, GenericAgent, GenericAgentBuildError};
 pub use base_agent::{
@@ -33,11 +33,16 @@ pub use base_agent::{
 };
 pub use config::{AgentConfig, AgentConfigError, AgentResolver};
 pub use fs_factory::FsAgentFactory;
-pub use internal_tools::{ApprovalResponder, ApprovalVerdict, Spawner};
-pub use map_resolver::MapAgentResolver;
-pub use registry::{
-    AgentFactory, AgentRegistry, ApprovalRequest, DriveOutput, ResolveApprovalError, RootReply,
+pub use internal_tools::{
+    AgentSnapshot, AgentStatus, ApprovalVerdict, GraphEffect, GraphHost, TerminationPolicy,
 };
+// Re-exported only so the orchestrator instance's tests (outside the `agent`
+// module) can build agents over an `AgentContext`; the runtime uses it via the
+// in-module path.
+#[cfg(test)]
+pub(crate) use internal_tools::AgentContext;
+pub use map_resolver::MapAgentResolver;
+pub use registry::AgentFactory;
 
 #[doc(no_inline)]
 pub use claw_api::RetryPolicy;
@@ -74,7 +79,12 @@ pub trait Agent: Send {
 /// Child results re-enter the conversation as information the model re-decides
 /// over (no counting, no gating); both semantic agents handle them identically,
 /// so the formatting lives here once.
-fn append_child_result(base: &mut BaseAgent, child: AgentId, text: String, ok: bool) {
+fn append_child_result<F: claw_interface::ClawFs + 'static>(
+    base: &mut BaseAgent<F>,
+    child: AgentId,
+    text: String,
+    ok: bool,
+) {
     let status = if ok { "ok" } else { "failed" };
     base.append_message(format!("[subagent {child} {status}] {text}"));
 }

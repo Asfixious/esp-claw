@@ -185,6 +185,9 @@ impl IterationLoop<'_> {
 
 fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> IterationResult {
     let iteration_id = step.iteration_id;
+    // One span per iteration; tool-call spans nest beneath it.
+    let _span =
+        tracing::info_span!("iteration_loop", conversation.iteration = %iteration_id).entered();
     let mut appended = AppendedMessages::empty();
 
     if let Some(outcome) = check_preempt_at_checkpoint(
@@ -229,10 +232,19 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
             return Ok(IterationOutcome::Preempted(outcome));
         }
 
+        // Always emit a `toolcall` span so the trace keeps the consistent
+        // turn > agent > iteration_loop > toolcall shape. With no tool call this
+        // iteration, `tool=none` (and no `call_id`) marks the placeholder; a real
+        // call carries `tool=<name>,call_id=<id>` — same `tool=` key either way.
+        tracing::info_span!("toolcall", tool = "none").in_scope(|| {});
+
         let text = llm_response.text.clone().unwrap_or_default();
-        log::info!(
-            "completion iteration={} status=done raw={}",
-            iteration_id,
+        // Free-form model text goes in the message slot (after ` | `, line end):
+        // it may contain spaces/commas, which would break the `key=value` fields.
+        tracing::info!(
+            iteration = %iteration_id,
+            status = "done",
+            "{}",
             TruncatedText::new(&text)
         );
         return Ok(IterationOutcome::Completed(CompletedOutcome {
@@ -311,11 +323,7 @@ fn check_preempt_at_checkpoint(
         return None;
     }
 
-    log::info!(
-        "iteration_preempted iteration={} checkpoint={:?}",
-        iteration_id,
-        checkpoint
-    );
+    tracing::info!(iteration = %iteration_id, checkpoint = ?checkpoint, "iteration preempted");
 
     Some(PreemptedOutcome {
         iteration_id,
@@ -371,16 +379,19 @@ fn run_tool_calls(
             return ToolRoundResult::Preempted(outcome);
         }
 
-        log::info!(
-            "tool_call iteration={} name={} args={}",
-            iteration_id,
-            if tc.name.is_empty() {
-                "(null)"
-            } else {
-                &tc.name
-            },
-            tc.arguments_json
-        );
+        let display_name = if tc.name.is_empty() {
+            "(null)"
+        } else {
+            tc.name.as_str()
+        };
+        // One span per tool call, covering gating + invoke + result. It lives
+        // here (not in `ToolSet::invoke`) so a call refused by soft-hide gating —
+        // which never reaches `invoke` — is still represented, and the "tool
+        // done" event below carries this span's `span=`.
+        let _span =
+            tracing::info_span!("toolcall", tool = display_name, call_id = %tc.id).entered();
+        // Tool arguments are arbitrary JSON (spaces/commas) -> message slot.
+        tracing::debug!("{}", TruncatedText::new(&tc.arguments_json));
 
         // Soft-hide gating: the schema superset reached the model, but a tool
         // not in `allowed_tools` must not run this phase. Refuse it with a tool
@@ -388,15 +399,7 @@ fn run_tool_calls(
         // well-formed) instead of invoking it.
         let blocked = allowed_tools.is_some_and(|allowed| !allowed.contains(&tc.name));
         let (content, ok) = if blocked {
-            log::warn!(
-                "tool_blocked iteration={} name={} reason=not_in_allowed_set",
-                iteration_id,
-                if tc.name.is_empty() {
-                    "(null)"
-                } else {
-                    &tc.name
-                },
-            );
+            tracing::warn!(reason = "not_in_allowed_set", "tool blocked");
             (blocked_tool_message(&tc.name), false)
         } else {
             let ToolOutput { output, ok } = match tools.invoke(&ToolInvocation {
@@ -407,19 +410,10 @@ fn run_tool_calls(
                 Ok(output) => output,
                 Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
             };
-            log::info!(
-                "tool_result iteration={} name={} ok={} output={}",
-                iteration_id,
-                if tc.name.is_empty() {
-                    "(null)"
-                } else {
-                    &tc.name
-                },
-                ok,
-                output
-            );
             (output, ok)
         };
+        // Tool output is free-form text -> message slot; keep ok/blocked as fields.
+        tracing::info!(ok, blocked, "{}", TruncatedText::new(&content));
 
         let tool_message = serde_json::json!({
             "role": "tool",
@@ -473,11 +467,11 @@ fn log_tool_call_names(iteration_id: IterationId, response: &LlmResponse) {
             }
         })
         .collect();
-    log::debug!(
-        "llm_tool_calls iteration={} count={} names={}",
-        iteration_id,
-        response.tool_calls.len(),
-        names.join(",")
+    tracing::debug!(
+        iteration = %iteration_id,
+        count = response.tool_calls.len(),
+        names = %names.join(","),
+        "llm tool calls"
     );
 }
 

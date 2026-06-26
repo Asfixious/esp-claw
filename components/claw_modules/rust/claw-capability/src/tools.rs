@@ -57,7 +57,10 @@ impl Registry {
         for snapshot in self.list() {
             let family = snapshot.family.as_deref().unwrap_or("cap");
             let description = snapshot.description.as_deref().unwrap_or("");
-            catalog.push_str(&format!("- {} [{}]: {}\n", snapshot.name, family, description));
+            catalog.push_str(&format!(
+                "- {} [{}]: {}\n",
+                snapshot.name, family, description
+            ));
         }
         catalog
     }
@@ -104,7 +107,10 @@ mod tests {
             _input_json: &str,
             _context: &CapabilityContext,
         ) -> Result<CapabilityInvokeResult, CapabilityError> {
-            Ok(CapabilityInvokeResult { output: String::new(), ok: true })
+            Ok(CapabilityInvokeResult {
+                output: String::new(),
+                ok: true,
+            })
         }
     }
 
@@ -123,7 +129,9 @@ mod tests {
                     .with_family("time")
                     .with_description("Return the current time")
                     .with_flags(CapabilityFlags::CALLABLE_BY_LLM)
-                    .with_input_schema(r#"{"type":"object","properties":{"tz":{"type":"string"}}}"#),
+                    .with_input_schema(
+                        r#"{"type":"object","properties":{"tz":{"type":"string"}}}"#,
+                    ),
             )
             .unwrap();
         registry
@@ -148,7 +156,10 @@ mod tests {
         let tool = &value.as_array().unwrap()[0];
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["function"]["name"], "get_time");
-        assert_eq!(tool["function"]["parameters"]["properties"]["tz"]["type"], "string");
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["tz"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -208,7 +219,11 @@ mod tests {
             .unwrap();
         // Hidden: no CALLABLE_BY_LLM flag.
         registry
-            .register(CapabilityDescriptor::new("internal", "internal", Arc::new(Noop)))
+            .register(CapabilityDescriptor::new(
+                "internal",
+                "internal",
+                Arc::new(Noop),
+            ))
             .unwrap();
         // Hidden: event source kind even with the flag set.
         registry

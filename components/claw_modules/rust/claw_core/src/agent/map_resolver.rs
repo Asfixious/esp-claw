@@ -12,10 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::skills::{SkillError, SkillId, SkillRegistry, SkillSet};
 use crate::tools::Tool;
+use claw_skill::{SkillError, SkillId, SkillRegistry, SkillSet};
 
-use super::agent::AgentResolver;
+use super::config::AgentResolver;
 
 /// Group label applied to every skill a manifest asks for (parallels a
 /// `ToolGroup` name — it tags provenance in the assembled skill context).

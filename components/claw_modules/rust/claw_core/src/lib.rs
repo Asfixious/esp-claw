@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod channels;
 pub mod iteration_loop;
+pub mod memory;
 mod orchestrator;
 mod orchestrator_instance;
 pub mod protocol;
@@ -20,6 +21,7 @@ pub use channels::{
     RecordingTransport, ReplyRoute,
 };
 pub use claw_utils::define_prefixed_id;
+pub use memory::LlmCompactor;
 pub use orchestrator::{
     ChannelsEgressOnly, ChannelsUnset, FactorySet, FactoryUnset, Orchestrator, OrchestratorBuilder,
 };

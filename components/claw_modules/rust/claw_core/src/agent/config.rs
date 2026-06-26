@@ -23,13 +23,11 @@
 //! - [`AgentConfig`] is the fully-resolved, runnable result; [`GenericAgent`] consumes
 //!   only this and never touches a manifest or the filesystem.
 
-use std::sync::Arc;
-
 use claw_api::RetryPolicy;
 use claw_skill::{SkillError, SkillId, SkillSet};
 
 use crate::agent::agent::AgentKind;
-use crate::agent::internal_tools::{ApprovalResponder, SpawnPolicy, Spawner};
+use crate::agent::internal_tools::SpawnPolicy;
 use crate::agent::manifest::{AgentManifest, RetryCount};
 use crate::tools::Tool;
 
@@ -69,14 +67,14 @@ pub struct AgentConfig {
     pub(in crate::agent) system_prompt: String,
     pub(in crate::agent) tools: Vec<Tool>,
     pub(in crate::agent) skills: Option<SkillSet>,
-    pub(in crate::agent) spawner: Option<Arc<dyn Spawner>>,
+    /// Whether this kind may spawn subagents (the manifest's `spawn.enabled`). The
+    /// `spawn_subagent` tool is attached only when this is set *and* the agent has
+    /// a graph host.
+    pub(in crate::agent) spawn_enabled: bool,
     /// The kinds this agent may spawn (resolved from the manifest's
     /// `spawn.allowed_kinds`). Enforced by the `spawn_subagent` tool; meaningful
-    /// only when `spawner` is set.
+    /// only when `spawn_enabled`.
     pub(in crate::agent) spawn_policy: SpawnPolicy,
-    /// Set only for a session root: gives it the `respond_to_approval` tool so it
-    /// can feed user verdicts back to waiting subagents.
-    pub(in crate::agent) approval_responder: Option<Arc<dyn ApprovalResponder>>,
     pub(in crate::agent) retry_policy: RetryPolicy,
     pub(in crate::agent) tool_block_retries: Option<u32>,
 }
@@ -89,11 +87,10 @@ impl AgentConfig {
     /// The manifest's JSON was already parsed and validated at build time, so this
     /// does only the runtime-only half: turning names into handlers.
     ///
-    /// `spawner` is attached only when the kind's manifest enables spawning.
-    /// `approval_responder` is passed straight through (the registry supplies it
-    /// only for a session root); it gives the agent the `respond_to_approval`
-    /// tool. Unlike `spawner` it is not gated by the manifest — being the root is a
-    /// runtime property the registry decides, not a kind property.
+    /// The result is pure data: whether the `spawn_subagent` /
+    /// `respond_to_approval` tools actually attach is decided later by
+    /// [`GenericAgent::new`](crate::agent::GenericAgent) from `spawn_enabled`, the
+    /// presence of a graph host, and the root flag.
     ///
     /// # Errors
     ///
@@ -105,8 +102,6 @@ impl AgentConfig {
     pub fn resolve(
         kind: &str,
         resolver: &dyn AgentResolver,
-        spawner: Option<Arc<dyn Spawner>>,
-        approval_responder: Option<Arc<dyn ApprovalResponder>>,
     ) -> Result<AgentConfig, AgentConfigError> {
         let manifest = AgentManifest::for_kind(kind)
             .ok_or_else(|| AgentConfigError::UnknownKind(kind.to_string()))?;
@@ -121,21 +116,13 @@ impl AgentConfig {
 
         let skills = resolver.build_skills(manifest.skills)?;
 
-        // Spawning is honored only when the kind allows it and a spawner is wired.
-        let spawner = if manifest.spawn_enabled {
-            spawner
-        } else {
-            None
-        };
-
         Ok(AgentConfig {
             kind: manifest.kind.clone(),
             system_prompt: manifest.instructions.trim().to_string(),
             tools,
             skills,
-            spawner,
+            spawn_enabled: manifest.spawn_enabled,
             spawn_policy: SpawnPolicy::from_allowed_kinds(manifest.allowed_kinds),
-            approval_responder,
             retry_policy: RetryPolicy::new(manifest.retries.get()),
             tool_block_retries: manifest.tool_block_retries.map(RetryCount::get),
         })
@@ -187,7 +174,7 @@ mod tests {
     fn every_baked_kind_resolves() {
         for manifest in MANIFESTS {
             let kind = manifest.kind.as_str();
-            let config = AgentConfig::resolve(kind, &StaticResolver, None, None)
+            let config = AgentConfig::resolve(kind, &StaticResolver)
                 .unwrap_or_else(|error| panic!("kind {kind} failed: {error}"));
             assert_eq!(config.kind().as_str(), kind);
             assert!(
@@ -201,7 +188,7 @@ mod tests {
     fn resolve_rejects_an_unknown_kind() {
         // `AgentConfig` is not `Debug` (it holds tools/skills/Arcs), so match on
         // the `Result` directly rather than `expect_err`.
-        let result = AgentConfig::resolve("nope", &StaticResolver, None, None);
+        let result = AgentConfig::resolve("nope", &StaticResolver);
         assert!(matches!(result, Err(AgentConfigError::UnknownKind(kind)) if kind == "nope"));
     }
 }

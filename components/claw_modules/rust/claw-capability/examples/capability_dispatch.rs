@@ -44,7 +44,10 @@ impl CapabilityHandler for RebootHandler {
         _input_json: &str,
         _context: &CapabilityContext,
     ) -> Result<CapabilityInvokeResult, CapabilityError> {
-        Ok(CapabilityInvokeResult { output: "rebooting".to_string(), ok: true })
+        Ok(CapabilityInvokeResult {
+            output: "rebooting".to_string(),
+            ok: true,
+        })
     }
 }
 

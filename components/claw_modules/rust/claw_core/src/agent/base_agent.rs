@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use claw_api::{ClawApi, RetryPolicy};
+use claw_interface::ClawFs;
 use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
@@ -63,8 +64,8 @@ use crate::iteration_loop::{
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
     PreemptedOutcome, SystemPrompt, ToolRun,
 };
-use crate::skills::{SkillError, SkillGroup, SkillId, SkillSet};
 use crate::tools::{AllowedTools, ToolSet, ToolSetError};
+use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
 crate::define_prefixed_id!(ApprovalId, "approval-", "approval");
@@ -370,12 +371,12 @@ impl InterruptionControl for AgentInterruption {
 ///     }
 /// }
 /// ```
-pub struct BaseAgent {
+pub struct BaseAgent<F: ClawFs + 'static> {
     llm: ClawApi,
     /// Retry policy applied to every per-iteration LLM call.
     retry_policy: RetryPolicy,
     interruption: AgentInterruption,
-    memory: ConversationMemory,
+    memory: ConversationMemory<F>,
     tools: Option<ToolSet>,
     /// Tools allowed to execute this phase ("soft-hide" gating). `None` = ungated
     /// (every tool in `tools` may run). Set per semantic state by an upper layer
@@ -405,7 +406,7 @@ pub struct BaseAgent {
     /// Open group guard from task start until the first response, so the user turn
     /// and the assistant reply commit as one group (compaction never orphans a
     /// reply with no user turn).
-    open_turn: Option<GroupGuard>,
+    open_turn: Option<GroupGuard<F>>,
     next_iteration: IterationId,
     next_approval: usize,
     pending_approval: Option<ApprovalId>,
@@ -426,7 +427,7 @@ pub struct BaseAgent {
     inbox: VecDeque<Inbound>,
 }
 
-impl BaseAgent {
+impl<F: ClawFs + 'static> BaseAgent<F> {
     /// Start building an agent over a caller-owned [`ConversationMemory`].
     ///
     /// The caller decides how the memory is built and keyed (via
@@ -439,7 +440,7 @@ impl BaseAgent {
     /// let agent = BaseAgent::builder(llm, memory).build()?;
     /// // later: let messages = view.messages();
     /// ```
-    pub fn builder(llm: ClawApi, memory: ConversationMemory) -> BaseAgentBuilder {
+    pub fn builder(llm: ClawApi, memory: ConversationMemory<F>) -> BaseAgentBuilder<F> {
         BaseAgentBuilder {
             llm,
             memory,
@@ -481,7 +482,7 @@ impl BaseAgent {
     /// # Ok::<(), AgentCommandError>(())
     /// ```
     pub fn send_command(&mut self, command: AgentCommand) -> Result<(), AgentCommandError> {
-        let next = Self::classify(self.projected_lifecycle, &command, self.pending_approval)?;
+        let next = classify(self.projected_lifecycle, &command, self.pending_approval)?;
         self.projected_lifecycle = next;
         self.inbox.push_back(Inbound::Command(command));
         Ok(())
@@ -850,67 +851,6 @@ impl BaseAgent {
         }
     }
 
-    /// The FSM transition table: the single authority on whether `command` is
-    /// legal in `state`, and what state it leads to. Pure (no `&self`) so it is
-    /// trivially testable and is the one place command validity is decided —
-    /// [`apply_inbound`](Self::apply_inbound) trusts its verdict.
-    ///
-    /// `pending_approval` is the id the agent is currently waiting on; it is only
-    /// consulted in the [`AwaitingApproval`](AgentState::AwaitingApproval) state.
-    /// The match is exhaustive over every `(state, command)` pair so a new state
-    /// or command cannot be silently mishandled.
-    fn classify(
-        state: AgentState,
-        command: &AgentCommand,
-        pending_approval: Option<ApprovalId>,
-    ) -> Result<AgentState, AgentCommandError> {
-        use AgentCommand as Command;
-        use AgentState as State;
-        match (state, command) {
-            // AppendMessage is accepted in every state: from idle it starts a
-            // fresh task (-> Running); otherwise it joins without changing state.
-            (State::Idle, Command::AppendMessage(_)) => Ok(State::Running),
-            (State::Running, Command::AppendMessage(_)) => Ok(State::Running),
-            (State::Paused, Command::AppendMessage(_)) => Ok(State::Paused),
-            (State::AwaitingApproval, Command::AppendMessage(_)) => Ok(State::AwaitingApproval),
-
-            // Cancel ends an active task; there is nothing to cancel when idle.
-            (State::Idle, Command::Cancel { .. }) => Err(AgentCommandError::NothingToCancel),
-            (State::Running | State::Paused | State::AwaitingApproval, Command::Cancel { .. }) => {
-                Ok(State::Idle)
-            }
-
-            // Pause only makes sense while actively running.
-            (State::Running, Command::Pause) => Ok(State::Paused),
-            (state @ (State::Idle | State::Paused | State::AwaitingApproval), Command::Pause) => {
-                Err(AgentCommandError::CannotPause { state })
-            }
-
-            // Resume only from a paused task.
-            (State::Paused, Command::Resume) => Ok(State::Running),
-            (state @ (State::Idle | State::Running | State::AwaitingApproval), Command::Resume) => {
-                Err(AgentCommandError::CannotResume { state })
-            }
-
-            // An approval result needs a matching pending request.
-            (State::AwaitingApproval, Command::ApprovalResult { id, .. }) => match pending_approval
-            {
-                Some(pending) if pending == *id => Ok(State::Running),
-                Some(pending) => Err(AgentCommandError::ApprovalMismatch {
-                    expected: pending,
-                    got: *id,
-                }),
-                // AwaitingApproval always carries a pending id; a missing one is
-                // an impossible invariant, surfaced rather than silently accepted.
-                None => Err(AgentCommandError::NotAwaitingApproval { state }),
-            },
-            (
-                state @ (State::Idle | State::Running | State::Paused),
-                Command::ApprovalResult { .. },
-            ) => Err(AgentCommandError::NotAwaitingApproval { state }),
-        }
-    }
-
     /// Reduce one iteration outcome into the tick's outcome and lifecycle. The
     /// second funnel (the first being [`apply_inbound`](Self::apply_inbound)) — its
     /// input is the LLM/tool round result, not a command.
@@ -960,11 +900,11 @@ impl BaseAgent {
         }
 
         self.consecutive_tool_blocks = self.consecutive_tool_blocks.saturating_add(1);
-        log::warn!(
-            "tool_gate_blocked consecutive={} budget={} tools={:?}",
-            self.consecutive_tool_blocks,
-            self.tool_block_retries,
-            blocked
+        tracing::warn!(
+            consecutive = self.consecutive_tool_blocks,
+            budget = self.tool_block_retries,
+            tools = ?blocked,
+            "tool gate blocked"
         );
 
         if self.consecutive_tool_blocks > self.tool_block_retries {
@@ -978,7 +918,7 @@ impl BaseAgent {
 
     /// End the task with a failure outcome, leaving the agent idle and reusable.
     fn fail_with(&mut self, error: AgentRunError) {
-        log::warn!("base_agent task failed: {error}");
+        tracing::warn!(%error, "base_agent task failed");
         self.lifecycle = AgentState::Idle;
         self.outcome = Some(TickOutcome::Failed(error));
     }
@@ -1024,7 +964,7 @@ impl BaseAgent {
             return;
         };
         if has_dangling_tool_calls(&produced.0) {
-            log::info!("base_agent dropping preempted partial patch: unmatched tool_calls");
+            tracing::info!("dropping preempted partial patch: unmatched tool_calls");
             return;
         }
         let turn = self.open_turn.take().unwrap_or_else(|| self.memory.group());
@@ -1136,9 +1076,9 @@ fn has_dangling_tool_calls(patch: &Value) -> bool {
 /// skills are set here (optional, any order), and [`build`](Self::build) produces
 /// a finished agent that exposes only the runtime command/tick API.
 #[must_use = "a BaseAgentBuilder does nothing until `.build()` is called"]
-pub struct BaseAgentBuilder {
+pub struct BaseAgentBuilder<F: ClawFs + 'static> {
     llm: ClawApi,
-    memory: ConversationMemory,
+    memory: ConversationMemory<F>,
     tools: Option<ToolSet>,
     skills: Option<SkillSet>,
     system_prompt: String,
@@ -1146,7 +1086,7 @@ pub struct BaseAgentBuilder {
     tool_block_retries: u32,
 }
 
-impl BaseAgentBuilder {
+impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
     /// Set the tools available to the agent across all tasks.
     ///
     /// Takes a pre-built [`ToolSet`]; the agent's built-in tools
@@ -1230,7 +1170,7 @@ impl BaseAgentBuilder {
     ///   caller tool.
     /// - [`BaseAgentBuildError::ToolsUnsupported`] if tools were provided but the
     ///   configured LLM cannot call tools.
-    pub fn build(self) -> Result<BaseAgent, BaseAgentBuildError> {
+    pub fn build(self) -> Result<BaseAgent<F>, BaseAgentBuildError> {
         let control: ControlSink = Arc::new(Mutex::new(VecDeque::new()));
         let supports_tools = self.llm.profile().supports_tools;
 
@@ -1279,6 +1219,67 @@ impl BaseAgentBuilder {
 // Tests: the FSM transition table
 // ===========================================================================
 
+/// The FSM transition table: the single authority on whether `command` is legal
+/// in `state`, and what state it leads to. A free function (no `&self`, and
+/// independent of the memory backend `F`) so it is trivially testable and is the
+/// one place command validity is decided — [`BaseAgent::apply_inbound`] trusts
+/// its verdict.
+///
+/// `pending_approval` is the id the agent is currently waiting on; it is only
+/// consulted in the [`AwaitingApproval`](AgentState::AwaitingApproval) state.
+/// The match is exhaustive over every `(state, command)` pair so a new state or
+/// command cannot be silently mishandled.
+fn classify(
+    state: AgentState,
+    command: &AgentCommand,
+    pending_approval: Option<ApprovalId>,
+) -> Result<AgentState, AgentCommandError> {
+    use AgentCommand as Command;
+    use AgentState as State;
+    match (state, command) {
+        // AppendMessage is accepted in every state: from idle it starts a
+        // fresh task (-> Running); otherwise it joins without changing state.
+        (State::Idle, Command::AppendMessage(_)) => Ok(State::Running),
+        (State::Running, Command::AppendMessage(_)) => Ok(State::Running),
+        (State::Paused, Command::AppendMessage(_)) => Ok(State::Paused),
+        (State::AwaitingApproval, Command::AppendMessage(_)) => Ok(State::AwaitingApproval),
+
+        // Cancel ends an active task; there is nothing to cancel when idle.
+        (State::Idle, Command::Cancel { .. }) => Err(AgentCommandError::NothingToCancel),
+        (State::Running | State::Paused | State::AwaitingApproval, Command::Cancel { .. }) => {
+            Ok(State::Idle)
+        }
+
+        // Pause only makes sense while actively running.
+        (State::Running, Command::Pause) => Ok(State::Paused),
+        (state @ (State::Idle | State::Paused | State::AwaitingApproval), Command::Pause) => {
+            Err(AgentCommandError::CannotPause { state })
+        }
+
+        // Resume only from a paused task.
+        (State::Paused, Command::Resume) => Ok(State::Running),
+        (state @ (State::Idle | State::Running | State::AwaitingApproval), Command::Resume) => {
+            Err(AgentCommandError::CannotResume { state })
+        }
+
+        // An approval result needs a matching pending request.
+        (State::AwaitingApproval, Command::ApprovalResult { id, .. }) => match pending_approval {
+            Some(pending) if pending == *id => Ok(State::Running),
+            Some(pending) => Err(AgentCommandError::ApprovalMismatch {
+                expected: pending,
+                got: *id,
+            }),
+            // AwaitingApproval always carries a pending id; a missing one is
+            // an impossible invariant, surfaced rather than silently accepted.
+            None => Err(AgentCommandError::NotAwaitingApproval { state }),
+        },
+        (
+            state @ (State::Idle | State::Running | State::Paused),
+            Command::ApprovalResult { .. },
+        ) => Err(AgentCommandError::NotAwaitingApproval { state }),
+    }
+}
+
 #[cfg(test)]
 mod transition_tests {
     use super::*;
@@ -1304,7 +1305,7 @@ mod transition_tests {
         state: AgentState,
         command: &AgentCommand,
     ) -> Result<AgentState, AgentCommandError> {
-        BaseAgent::classify(state, command, None)
+        super::classify(state, command, None)
     }
 
     #[test]
@@ -1402,13 +1403,13 @@ mod transition_tests {
         // Not awaiting in any other state.
         for state in [AgentState::Idle, AgentState::Running, AgentState::Paused] {
             assert_eq!(
-                BaseAgent::classify(state, &approval(1), None),
+                super::classify(state, &approval(1), None),
                 Err(AgentCommandError::NotAwaitingApproval { state })
             );
         }
         // Matching id resumes; a mismatch is reported with both ids.
         assert_eq!(
-            BaseAgent::classify(
+            super::classify(
                 AgentState::AwaitingApproval,
                 &approval(7),
                 Some(ApprovalId(7))
@@ -1416,7 +1417,7 @@ mod transition_tests {
             Ok(AgentState::Running)
         );
         assert_eq!(
-            BaseAgent::classify(
+            super::classify(
                 AgentState::AwaitingApproval,
                 &approval(7),
                 Some(ApprovalId(9))
@@ -1441,7 +1442,7 @@ mod gating_tests {
     use std::sync::Arc;
 
     use claw_api::{ClawApi, ClawApiConfig};
-    use claw_interface::{CapturingHttp, ClawHttp, MemFs, ScriptedHttp};
+    use claw_interface::{CapturingHttp, ClawHttp, MemFs, ScriptedHttp, StdThread};
     use claw_memory::{
         ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
         PoolConfig,
@@ -1520,8 +1521,10 @@ mod gating_tests {
         build_llm(Arc::new(ScriptedHttp::new(bodies)))
     }
 
-    fn test_memory(agent_id: AgentId) -> ConversationMemory {
-        let pool = Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"));
+    fn test_memory(agent_id: AgentId) -> ConversationMemory<Arc<MemFs>> {
+        let pool = Arc::new(
+            MemoryTaskPool::new(PoolConfig::default(), StdThread::default()).expect("memory pool"),
+        );
         ConversationMemory::new(
             agent_id.0,
             ConversationConfig::new(format!("/mem/agent-{}", agent_id.0)),
@@ -1537,7 +1540,7 @@ mod gating_tests {
     fn builder_with_view(
         llm: ClawApi,
         agent_id: AgentId,
-    ) -> (BaseAgentBuilder, ConversationMemory) {
+    ) -> (BaseAgentBuilder<Arc<MemFs>>, ConversationMemory<Arc<MemFs>>) {
         let memory = test_memory(agent_id);
         let view = memory.clone();
         (BaseAgent::builder(llm, memory), view)
@@ -1570,7 +1573,7 @@ mod gating_tests {
         )
     }
 
-    fn run_to_completion(agent: &mut BaseAgent) -> String {
+    fn run_to_completion(agent: &mut BaseAgent<Arc<MemFs>>) -> String {
         loop {
             match agent.tick() {
                 TickOutcome::Working => continue,
@@ -1582,7 +1585,7 @@ mod gating_tests {
         }
     }
 
-    fn transcript_contents(view: &ConversationMemory) -> Vec<String> {
+    fn transcript_contents(view: &ConversationMemory<Arc<MemFs>>) -> Vec<String> {
         view.messages()
             .as_array()
             .map(|items| {

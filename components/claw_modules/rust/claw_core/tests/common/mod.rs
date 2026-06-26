@@ -13,12 +13,9 @@ use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, TickOutcome};
-use claw_core::{
-    FsSkillRegistry, SkillId, SkillRegistry, SkillSet, ToolError, ToolHandler, ToolInvocation,
-    ToolOutput,
-};
+use claw_core::{ToolError, ToolHandler, ToolInvocation, ToolOutput};
 use claw_interface::{
-    CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp,
+    CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp, StdThread,
 };
 use claw_memory::{
     ConversationConfig, ConversationDeps, ConversationMemory, MemoryTaskPool, NoopCompactor,
@@ -169,7 +166,7 @@ impl ToolHandler for EchoTool {
 
 /// A fresh background memory pool.
 pub fn test_pool() -> Arc<MemoryTaskPool> {
-    Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool"))
+    Arc::new(MemoryTaskPool::new(PoolConfig::default(), StdThread::default()).expect("memory pool"))
 }
 
 /// `<crate>/output/<name>/`, wiped clean and recreated. Use a UNIQUE `name` per
@@ -183,12 +180,22 @@ pub fn test_output_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// The concrete `ClawFs` these integration tests run over: the real disk
+/// backend behind an `Arc` (shared, cheap to clone, statically dispatched).
+pub type TestFs = Arc<DiskFs>;
+
+/// A disk-backed [`BaseAgent`] for the integration tests.
+pub type TestAgent = BaseAgent<TestFs>;
+
+/// A disk-backed [`ConversationMemory`] view for the integration tests.
+pub type TestMemory = ConversationMemory<TestFs>;
+
 /// Real disk-backed conversation memory.
 pub fn test_memory(
     agent_id: AgentId,
     dir: impl Into<String>,
     pool: Arc<MemoryTaskPool>,
-) -> ConversationMemory {
+) -> TestMemory {
     ConversationMemory::new(
         agent_id.0,
         ConversationConfig::new(dir),
@@ -201,7 +208,11 @@ pub fn test_memory(
 }
 
 /// A `BaseAgentBuilder` over fresh disk memory.
-pub fn agent_builder(llm: ClawApi, agent_id: AgentId, dir: impl Into<String>) -> BaseAgentBuilder {
+pub fn agent_builder(
+    llm: ClawApi,
+    agent_id: AgentId,
+    dir: impl Into<String>,
+) -> BaseAgentBuilder<TestFs> {
     BaseAgent::builder(llm, test_memory(agent_id, dir, test_pool()))
 }
 
@@ -211,7 +222,7 @@ pub fn builder_with_view(
     llm: ClawApi,
     agent_id: AgentId,
     dir: impl Into<String>,
-) -> (BaseAgentBuilder, ConversationMemory) {
+) -> (BaseAgentBuilder<TestFs>, TestMemory) {
     let memory = test_memory(agent_id, dir, test_pool());
     let view = memory.clone();
     (BaseAgent::builder(llm, memory), view)
@@ -224,7 +235,7 @@ pub fn builder_with_view(
 /// Pump until the task hands back an answer (`Yielded`) or ends (`Ended`),
 /// returning that text. Panics on `Failed` or any other non-progress outcome so
 /// an unexpected pause/approval/cancel surfaces instead of hanging.
-pub fn run_to_completion(agent: &mut BaseAgent) -> String {
+pub fn run_to_completion(agent: &mut TestAgent) -> String {
     loop {
         match agent.tick() {
             TickOutcome::Working => continue,
@@ -237,7 +248,7 @@ pub fn run_to_completion(agent: &mut BaseAgent) -> String {
 }
 
 /// The `content` strings of every message in the committed transcript, in order.
-pub fn transcript_contents(view: &ConversationMemory) -> Vec<String> {
+pub fn transcript_contents(view: &TestMemory) -> Vec<String> {
     view.messages()
         .as_array()
         .map(|items| {
@@ -248,35 +259,4 @@ pub fn transcript_contents(view: &ConversationMemory) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-// ===========================================================================
-// Skills
-// ===========================================================================
-
-fn skills_data_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data")
-}
-
-/// A skill registry scanned over the `tests/data/skills` fixtures.
-pub fn skill_registry() -> Arc<dyn SkillRegistry> {
-    Arc::new(
-        FsSkillRegistry::scan(Arc::new(DiskFs::rooted(skills_data_dir())), "skills")
-            .expect("scan skills fixtures"),
-    )
-}
-
-/// An empty skill set over the fixture registry.
-pub fn skill_set() -> SkillSet {
-    SkillSet::new(skill_registry())
-}
-
-/// The id of the first fixture skill (chosen dynamically, not hard-coded).
-pub fn first_skill_id() -> SkillId {
-    skill_registry()
-        .catalog()
-        .first()
-        .expect("at least one fixture skill")
-        .id()
-        .clone()
 }

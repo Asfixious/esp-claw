@@ -328,6 +328,9 @@ impl ToolSet {
     ///
     /// Returns [`ToolError::NotFound`] when no tool owns `call.name`.
     pub fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        // Note: the per-call `toolcall` span is created one layer up, in
+        // `iteration_loop::run_tool_calls`, so it also covers calls refused by
+        // soft-hide gating (which never reach here).
         match self.by_name.get(call.name) {
             Some(entry) => entry.tool.invoke(call),
             None => Err(ToolError::NotFound(call.name.to_string())),

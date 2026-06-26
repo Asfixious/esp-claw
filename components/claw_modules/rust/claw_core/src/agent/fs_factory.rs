@@ -3,27 +3,30 @@
 //! This is the concrete counterpart to the test factories: it turns a kind into a
 //! real, running [`GenericAgent`] by tying the four pieces together:
 //!
-//! 1. the kind's compile-time-baked [`AgentManifest`](super::agent::AgentManifest)
+//! 1. the kind's compile-time-baked [`AgentManifest`](super::manifest::AgentManifest)
 //!    (pure data: prompt + capability/skill *names*),
 //! 2. an injected [`AgentResolver`] that maps those names to handler *code*,
 //! 3. a live LLM client minted per agent from a shared config + transport, and
 //! 4. per-agent on-disk conversation memory (one base dir; the agent keys its own
 //!    files by id).
 //!
-//! The registry calls [`create_agent`](AgentFactory::create_agent) for every root
-//! and subagent, passing the spawner (always) and the approval responder (only for
-//! a session root). The `goal` is seeded as the agent's first user message so it
-//! starts working immediately.
+//! The orchestrator instance calls
+//! [`create_agent`](AgentFactory::create_agent) for every root and subagent,
+//! handing it the graph host (always) and the root flag (only a session root gets
+//! the `respond_to_approval` tool). The `goal` is seeded as the agent's first
+//! user message so it starts working immediately.
 
 use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_interface::http::ClawHttp;
+use claw_interface::ClawFs;
 use claw_memory::{ConversationConfig, ConversationDeps};
 
-use crate::agent::agent::{builtin_manifest, AgentConfig, AgentKind, AgentResolver, GenericAgent};
+use crate::agent::agent::{AgentKind, GenericAgent};
 use crate::agent::base_agent::{AgentCommand, AgentId};
-use crate::agent::internal_tools::{ApprovalResponder, Spawner};
+use crate::agent::config::{AgentConfig, AgentResolver};
+use crate::agent::internal_tools::GraphHost;
 use crate::agent::registry::AgentFactory;
 use crate::agent::Agent;
 
@@ -33,7 +36,7 @@ use crate::agent::Agent;
 /// Construct one and hand it to the orchestrator via
 /// [`with_agent_factory`](crate::OrchestratorBuilder::with_agent_factory); the
 /// registry then uses it for every agent in every session.
-pub struct FsAgentFactory {
+pub struct FsAgentFactory<F: ClawFs + Clone + 'static> {
     /// Maps a manifest's capability/skill *names* to handler code.
     resolver: Arc<dyn AgentResolver>,
     /// Template for the per-agent LLM client (cloned, then `init`-ed per agent so
@@ -43,12 +46,14 @@ pub struct FsAgentFactory {
     http: Arc<dyn ClawHttp>,
     /// Base directory for conversation files; each agent keys its own files by id.
     memory_dir: String,
-    /// Shared memory collaborators (fs/pool/compactor); the `Arc`s are cloned into
-    /// each agent's own [`ConversationDeps`].
-    memory_deps: ConversationDeps,
+    /// Template memory collaborators (fs/pool/compactor) cloned into each agent's
+    /// own [`ConversationDeps`]. `F` is a concrete, statically dispatched
+    /// [`ClawFs`]; it must be `Clone` because every agent gets its own handle
+    /// (use `Arc<ConcreteFs>` for a shared backend — `Arc<T>` is itself `ClawFs`).
+    memory_deps: ConversationDeps<F>,
 }
 
-impl FsAgentFactory {
+impl<F: ClawFs + Clone + 'static> FsAgentFactory<F> {
     /// Build a factory over the injected `resolver`, an LLM `llm_config` +
     /// `http` transport, and the memory base dir + collaborators.
     ///
@@ -60,7 +65,7 @@ impl FsAgentFactory {
         llm_config: ClawApiConfig,
         http: Arc<dyn ClawHttp>,
         memory_dir: impl Into<String>,
-        memory_deps: ConversationDeps,
+        memory_deps: ConversationDeps<F>,
     ) -> Self {
         Self {
             resolver,
@@ -71,47 +76,46 @@ impl FsAgentFactory {
         }
     }
 
-    /// A fresh [`ConversationDeps`] sharing this factory's collaborators (cheap
-    /// `Arc` clones).
-    fn clone_memory_deps(&self) -> ConversationDeps {
+    /// A fresh [`ConversationDeps`] sharing this factory's collaborators (a cheap
+    /// `fs` clone — typically an `Arc` bump — plus `Arc` clones of pool/compactor).
+    fn clone_memory_deps(&self) -> ConversationDeps<F> {
         ConversationDeps {
-            fs: Arc::clone(&self.memory_deps.fs),
+            fs: self.memory_deps.fs.clone(),
             pool: Arc::clone(&self.memory_deps.pool),
             compactor: Arc::clone(&self.memory_deps.compactor),
         }
     }
 }
 
-impl AgentFactory for FsAgentFactory {
+impl<F: ClawFs + Clone + 'static> AgentFactory for FsAgentFactory<F> {
     fn create_agent(
         &self,
         id: AgentId,
         kind: &AgentKind,
         goal: String,
-        spawner: Arc<dyn Spawner>,
-        approval_responder: Option<Arc<dyn ApprovalResponder>>,
+        host: Arc<dyn GraphHost>,
+        is_root: bool,
     ) -> Result<Box<dyn Agent>, String> {
-        let manifest = builtin_manifest(kind.as_str())
-            .ok_or_else(|| format!("unknown agent kind '{kind}'"))?;
-
-        // Whether `spawner`/`approval_responder` actually attach a tool is decided
-        // downstream: spawn by the manifest's `spawn.enabled`, the responder by the
-        // registry (it passes `Some` only for a session root).
-        let config = AgentConfig::from_manifest(
-            kind.as_str(),
-            manifest,
-            self.resolver.as_ref(),
-            Some(spawner),
-            approval_responder,
-        )
-        .map_err(|error| format!("resolving config for kind '{kind}': {error}"))?;
+        // The config is pure data; which graph tools attach is decided in
+        // `GenericAgent::new` from the manifest's `spawn.enabled`, the host's
+        // presence, and `is_root`.
+        let config = AgentConfig::resolve(kind.as_str(), self.resolver.as_ref())
+            .map_err(|error| format!("resolving config for kind '{kind}': {error}"))?;
 
         let llm = ClawApi::init(self.llm_config.clone(), Arc::clone(&self.http))
             .map_err(|error| format!("initializing LLM for {id}: {error}"))?;
 
         let memory_config = ConversationConfig::new(self.memory_dir.clone());
-        let mut agent = GenericAgent::new(id, llm, memory_config, self.clone_memory_deps(), config)
-            .map_err(|error| format!("building {kind} agent {id}: {error}"))?;
+        let mut agent = GenericAgent::new(
+            id,
+            llm,
+            memory_config,
+            self.clone_memory_deps(),
+            config,
+            Some(host),
+            is_root,
+        )
+        .map_err(|error| format!("building {kind} agent {id}: {error}"))?;
 
         // The goal is the agent's first task: seed it as a user message so the
         // agent has something to work on as soon as it is ticked.
@@ -128,14 +132,15 @@ impl AgentFactory for FsAgentFactory {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use claw_interface::{MemFs, ScriptedHttp};
+    use claw_interface::{MemFs, ScriptedHttp, StdThread};
     use claw_memory::{MemoryTaskPool, NoopCompactor, PoolConfig};
     use serde_json::json;
 
     use super::*;
     use crate::agent::base_agent::TickOutcome;
-    use crate::skills::{SkillError, SkillId, SkillSet};
+    use crate::agent::internal_tools::GraphEffect;
     use crate::tools::Tool;
+    use claw_skill::{SkillError, SkillId, SkillSet};
 
     /// A resolver with no capabilities or skills — enough for the built-in
     /// manifests, whose capability/skill lists are currently empty.
@@ -149,11 +154,15 @@ mod tests {
         }
     }
 
-    /// A spawner that is never expected to fire in these single-agent tests.
-    struct NoopSpawner;
-    impl Spawner for NoopSpawner {
-        fn spawn(&self, _parent: AgentId, _kind: AgentKind, _goal: String) -> AgentId {
+    /// A graph host that is never expected to fire in these single-agent tests.
+    struct NoopHost;
+    impl GraphHost for NoopHost {
+        fn next_id(&self) -> AgentId {
             AgentId(0)
+        }
+        fn emit(&self, _requester: AgentId, _effect: GraphEffect) {}
+        fn snapshot(&self) -> Vec<crate::agent::internal_tools::AgentSnapshot> {
+            Vec::new()
         }
     }
 
@@ -161,7 +170,7 @@ mod tests {
         json!({ "choices": [{ "message": { "role": "assistant", "content": text } }] }).to_string()
     }
 
-    fn factory(bodies: Vec<String>) -> FsAgentFactory {
+    fn factory(bodies: Vec<String>) -> FsAgentFactory<Arc<MemFs>> {
         let llm_config = ClawApiConfig {
             api_key: Some("sk-test".into()),
             backend_type: "openai_compatible".into(),
@@ -172,7 +181,10 @@ mod tests {
         };
         let memory_deps = ConversationDeps {
             fs: Arc::new(MemFs::default()),
-            pool: Arc::new(MemoryTaskPool::new(PoolConfig::default()).expect("memory pool")),
+            pool: Arc::new(
+                MemoryTaskPool::new(PoolConfig::default(), StdThread::default())
+                    .expect("memory pool"),
+            ),
             compactor: Arc::new(NoopCompactor),
         };
         FsAgentFactory::new(
@@ -192,8 +204,8 @@ mod tests {
                 AgentId(1),
                 &AgentKind::new("conversation"),
                 "say hi".into(),
-                Arc::new(NoopSpawner),
-                None,
+                Arc::new(NoopHost),
+                true,
             )
             .expect("agent builds");
 
@@ -217,8 +229,8 @@ mod tests {
             AgentId(1),
             &AgentKind::new("nope"),
             "x".into(),
-            Arc::new(NoopSpawner),
-            None,
+            Arc::new(NoopHost),
+            false,
         );
         assert!(result.is_err());
     }

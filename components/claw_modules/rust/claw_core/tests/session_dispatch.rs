@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use claw_core::agent::{
-    Agent, AgentCommand, AgentCommandError, AgentFactory, AgentId, AgentKind, ApprovalResponder,
-    Spawner, TickOutcome,
+    Agent, AgentCommand, AgentCommandError, AgentFactory, AgentId, AgentKind, GraphHost,
+    TickOutcome,
 };
 use claw_core::{
     ChannelEgressHub, ChannelIngressSink, Command, InboundCommand, InboundMessage, Orchestrator,
@@ -42,8 +42,8 @@ impl AgentFactory for IdleFactory {
         id: AgentId,
         _kind: &AgentKind,
         _goal: String,
-        _spawner: Arc<dyn Spawner>,
-        _approval_responder: Option<Arc<dyn ApprovalResponder>>,
+        _host: Arc<dyn GraphHost>,
+        _is_root: bool,
     ) -> Result<Box<dyn Agent>, String> {
         Ok(Box::new(IdleAgent { id }))
     }

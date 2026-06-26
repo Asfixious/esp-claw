@@ -4,19 +4,15 @@
 //! [`Orchestrator::on_command`].
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::registry::{AgentFactory, DriveOutput};
+use crate::agent::registry::{AgentFactory, AgentIdAllocator};
 use crate::channels::{ChannelEgress, ChannelIngressSink, InboundCommand, InboundMessage};
-use crate::orchestrator_instance::OrchestratorInstance;
+use crate::orchestrator_instance::{DriveOutput, OrchestratorInstance};
 use crate::protocol::Command;
 use crate::session::{
     DeliverError, SessionError, SessionId, SessionMessage, SessionOut, SessionRoutes, SessionStore,
 };
-
-/// The first [`crate::agent::AgentId`] handed out (0 reads like "unset").
-const FIRST_AGENT_ID: usize = 1;
 
 pub struct Orchestrator {
     egress: Arc<dyn ChannelEgress>,
@@ -24,9 +20,9 @@ pub struct Orchestrator {
     /// (enforced by the builder typestate): the orchestrator owns no LLM client
     /// of its own — the factory holds whatever an agent needs to run.
     factory: Arc<dyn AgentFactory>,
-    /// Global agent-id counter shared by every per-session registry so ids are
+    /// Global agent-id allocator shared by every per-session registry so ids are
     /// unique across the whole process, not merely within one session.
-    next_agent_id: Arc<AtomicUsize>,
+    next_agent_id: AgentIdAllocator,
     /// One isolated agent graph per session. Each instance is behind its own
     /// lock so driving one session does not serialize the others; the outer lock
     /// guards only insert/lookup/remove on the map.
@@ -85,7 +81,7 @@ impl Orchestrator {
             Arc::new(Mutex::new(OrchestratorInstance::new(
                 session_id,
                 Arc::clone(&self.factory),
-                Arc::clone(&self.next_agent_id),
+                self.next_agent_id.clone(),
             )))
         }))
     }
@@ -271,7 +267,7 @@ impl OrchestratorBuilder<ChannelsEgressOnly, FactorySet> {
         Arc::new(Orchestrator {
             egress: self.channels.egress,
             factory: self.factory.factory,
-            next_agent_id: Arc::new(AtomicUsize::new(FIRST_AGENT_ID)),
+            next_agent_id: AgentIdAllocator::new(),
             instances: Mutex::new(HashMap::new()),
             sessions: SessionStore::new(),
             routes: SessionRoutes::new(),
@@ -285,9 +281,11 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::agent::base_agent::{AgentCommand, AgentCommandError, AgentId, ApprovalId, TickOutcome};
+    use crate::agent::base_agent::{
+        AgentCommand, AgentCommandError, AgentId, ApprovalId, TickOutcome,
+    };
     use crate::agent::registry::AgentFactory;
-    use crate::agent::{Agent, AgentKind, ApprovalResponder, Spawner};
+    use crate::agent::{Agent, AgentKind, GraphHost};
     use crate::channels::{ChannelEgressHub, ChannelTransport, RecordingTransport};
 
     // -- A fake factory + agent that echoes each delivered message --------------
@@ -332,8 +330,8 @@ mod tests {
             id: AgentId,
             _kind: &AgentKind,
             goal: String,
-            _spawner: Arc<dyn Spawner>,
-            _approval_responder: Option<Arc<dyn ApprovalResponder>>,
+            _host: Arc<dyn GraphHost>,
+            _is_root: bool,
         ) -> Result<Box<dyn Agent>, String> {
             Ok(Box::new(EchoAgent {
                 id,
@@ -391,8 +389,8 @@ mod tests {
             id: AgentId,
             _kind: &AgentKind,
             _goal: String,
-            _spawner: Arc<dyn Spawner>,
-            _approval_responder: Option<Arc<dyn ApprovalResponder>>,
+            _host: Arc<dyn GraphHost>,
+            _is_root: bool,
         ) -> Result<Box<dyn Agent>, String> {
             Ok(Box::new(ApprovalAgent {
                 id,

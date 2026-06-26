@@ -13,6 +13,11 @@
         "goal": {
           "type": "string",
           "description": "The goal to delegate to the subagent."
+        },
+        "termination": {
+          "type": "string",
+          "enum": ["auto", "manual"],
+          "description": "Lifecycle policy. 'auto' (default): one-shot — the subagent is removed as soon as it returns its result. 'manual': persistent — after returning its result the subagent stays alive and idle so you can watch it, give it more work, or delete it with delete_subagent."
         }
       },
       "required": ["kind", "goal"]

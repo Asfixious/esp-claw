@@ -3,38 +3,43 @@
 //! contract at build time.
 //!
 //! The crate sits below `claw-core` (and beside `claw-permission`): it knows
-//! nothing about agents or the orchestrator, only about *tools*. Three layers:
+//! nothing about agents or the orchestrator, only about *tools*. Four layers:
 //!
 //! - **define** ([`handler`]): the [`ToolHandler`] trait and the
 //!   [`tool_metadata!`] macro that bakes a tool's `name`/`schema`/`usage` from
 //!   `resources/tools/<name>/`, plus the cheap-to-clone [`Tool`] value.
-//! - **aggregate** ([`set`]): [`ToolGroup`], the per-agent [`ToolSet`] (combined
-//!   schema JSON + flat dispatch + the soft-tools [`tool_context`](ToolSet::tool_context)),
-//!   and the [`AllowedTools`] phase allow-set.
+//! - **aggregate** ([`set`]): [`ToolGroup`] and the per-agent [`ToolSet`] —
+//!   combined schema JSON + flat dispatch, plus the **soft-tools** state it fully
+//!   owns: the [`AllowedTools`] phase allow-set ([`set_active_tools`](ToolSet::set_active_tools)
+//!   / [`is_allowed`](ToolSet::is_allowed)) and its two prompt surfaces, the static
+//!   [`tool_context`](ToolSet::tool_context) and the dynamic
+//!   [`extra_tool_context`](ToolSet::extra_tool_context) phase note.
+//! - **registry** ([`registry`]): the [`ToolRegistry`] pool that both baked and
+//!   runtime-registered tools live in; [`ToolSet`]s are assembled from it.
 //! - **execute** ([`runner`]): the [`ToolRunner`] seam — soft-hide gating, the
-//!   permission [`ToolGate`], and dispatch — shaped for future async concurrency.
+//!   permission [`ToolGate`], and dispatch — shaped for future async concurrency,
+//!   with [`PermissionGate`] (in [`gate`]) the policy-backed `ToolGate` the agent
+//!   installs.
 //!
-//! The on-disk contract those three rely on (`resources/tools/<name>/` holds
+//! The on-disk contract those layers rely on (`resources/tools/<name>/` holds
 //! exactly `schema.json` + `usage.md`, and the directory name equals the schema's
-//! `function.name`) is enforced at build time by [`bake`] — the *same* crate that
-//! defines the macro reading those files, so the runtime and build-time halves of
-//! the contract can never drift. Dependents call it from their build script via a
-//! light `[build-dependencies]` entry with `default-features = false,
-//! features = ["bake"]`.
+//! `function.name`) is enforced at build time by [`bake`] — the *same* crate
+//! that defines the macro reading those files, so the runtime and build-time
+//! halves of the contract can never drift.
 
-#[cfg(feature = "bake")]
 pub mod bake;
 
-#[cfg(feature = "runtime")]
+mod gate;
 mod handler;
-#[cfg(feature = "runtime")]
+mod registry;
 mod runner;
-#[cfg(feature = "runtime")]
 mod set;
 
-#[cfg(feature = "runtime")]
+pub use gate::PermissionGate;
 pub use handler::{Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput};
-#[cfg(feature = "runtime")]
+pub use registry::ToolRegistry;
 pub use runner::{ApprovalNeeded, CallOutcome, ToolGate, ToolRunner};
-#[cfg(feature = "runtime")]
-pub use set::{AllowedTools, ToolGroup, ToolSet, ToolSetError, DEFAULT_TOOL_GROUP};
+pub use set::{
+    AllowedTools, ToolBlockVerdict, ToolGroup, ToolSet, ToolSetError, DEFAULT_BLOCK_RETRIES,
+    DEFAULT_TOOL_GROUP,
+};

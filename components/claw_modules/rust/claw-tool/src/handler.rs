@@ -2,7 +2,6 @@
 //! bakes its metadata from `resources/tools/<name>/`, and the cheap-to-clone
 //! [`Tool`] value built from a handler.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use claw_permission::{Action, RiskClass};
@@ -28,8 +27,6 @@ pub enum ToolError {
     NotFound(String),
     #[error("tool invoke failed: {0}")]
     InvokeFailed(String),
-    #[error("out of memory")]
-    NoMem,
 }
 
 /// One model-callable tool: the full, concise shape a caller must provide.
@@ -42,20 +39,20 @@ pub trait ToolHandler: Send + Sync {
     /// The tool's name. Must match the `name` field inside [`schema`](Self::schema)
     /// and what the model emits in its `tool_call`.
     ///
-    /// `&'static str` because tool names are compile-time identities: this lets a
-    /// [`ToolSet`](crate::ToolSet) key its dispatch map on the borrowed name with
-    /// no allocation.
-    fn name(&self) -> &'static str;
+    /// Returns `&str` tied to `&self` — baked tools return a `&'static str` (which
+    /// coerces), runtime-registered tools may return a field borrow.
+    /// [`ToolSet`](crate::ToolSet) copies the name into an owned `String` key.
+    fn name(&self) -> &str;
 
     /// This tool's OpenAI function schema as JSON text — one
     /// `{"type":"function", ...}` object.
     ///
-    /// `&'static str` because the schema is a compile-time constant (typically a
-    /// string literal). [`ToolSet`](crate::ToolSet) splices these texts into the
-    /// tools array without building or serializing any `serde_json::Value`. The
-    /// returned text must be a valid JSON object; this is checked with a
-    /// `debug_assert!` when the set is built.
-    fn schema(&self) -> &'static str;
+    /// Returns `&str` tied to `&self` — typically a compile-time constant (string
+    /// literal or `include_str!`). [`ToolSet`](crate::ToolSet) splices these texts
+    /// into the tools array without building or serializing any
+    /// `serde_json::Value`. The returned text must be a valid JSON object; this is
+    /// checked with a `debug_assert!` when the set is built.
+    fn schema(&self) -> &str;
 
     /// This tool's soft-tools prompt prose, or `None` when it has none.
     ///
@@ -65,7 +62,7 @@ pub trait ToolHandler: Send + Sync {
     /// hand-written handlers that opt out; the [`tool_metadata!`] macro overrides
     /// it from the baked file. The aggregate stitches every non-empty value into
     /// the tool-policy prompt block (assembled by `claw-context`).
-    fn usage(&self) -> Option<Cow<'static, str>> {
+    fn usage(&self) -> Option<&str> {
         None
     }
 
@@ -105,11 +102,11 @@ pub trait ToolHandler: Send + Sync {
 #[macro_export]
 macro_rules! tool_metadata {
     ($name:literal) => {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             $name
         }
 
-        fn schema(&self) -> &'static str {
+        fn schema(&self) -> &str {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/resources/tools/",
@@ -118,7 +115,7 @@ macro_rules! tool_metadata {
             ))
         }
 
-        fn usage(&self) -> ::std::option::Option<::std::borrow::Cow<'static, str>> {
+        fn usage(&self) -> ::std::option::Option<&str> {
             const USAGE: &str = include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/resources/tools/",
@@ -128,7 +125,7 @@ macro_rules! tool_metadata {
             if USAGE.trim().is_empty() {
                 ::std::option::Option::None
             } else {
-                ::std::option::Option::Some(::std::borrow::Cow::Borrowed(USAGE))
+                ::std::option::Option::Some(USAGE)
             }
         }
     };
@@ -157,17 +154,17 @@ impl Tool {
     }
 
     /// The tool's name (delegates to the handler).
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         self.handler.name()
     }
 
     /// The tool's function schema as JSON text (delegates to the handler).
-    pub fn schema(&self) -> &'static str {
+    pub fn schema(&self) -> &str {
         self.handler.schema()
     }
 
     /// The tool's soft-tools prompt prose, if any (delegates to the handler).
-    pub fn usage(&self) -> Option<Cow<'static, str>> {
+    pub fn usage(&self) -> Option<&str> {
         self.handler.usage()
     }
 

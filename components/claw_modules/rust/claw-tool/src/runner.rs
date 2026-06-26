@@ -19,7 +19,7 @@
 use claw_permission::{Action, PermissionDecision};
 
 use crate::handler::{ToolError, ToolInvocation, ToolOutput};
-use crate::set::{AllowedTools, ToolSet};
+use crate::set::ToolSet;
 
 /// The permission seam the runner consults before executing a classified call.
 ///
@@ -68,28 +68,19 @@ impl CallOutcome {
 }
 
 /// Gates and executes individual tool calls for one iteration. Cheap to build per
-/// batch; borrows the tool set, the optional soft-hide allow-set, and the optional
-/// permission gate.
+/// batch; borrows the tool set (which carries its own soft-hide allow-set) and the
+/// optional permission gate.
 pub struct ToolRunner<'a> {
     tools: &'a ToolSet,
-    allowed: Option<&'a AllowedTools>,
     gate: Option<&'a dyn ToolGate>,
 }
 
 impl<'a> ToolRunner<'a> {
-    /// Build a runner over `tools`, the soft-hide `allowed` set (`None` = ungated),
-    /// and the permission `gate` (`None` = no permission layer; every call that
-    /// passes soft-hide runs).
-    pub fn new(
-        tools: &'a ToolSet,
-        allowed: Option<&'a AllowedTools>,
-        gate: Option<&'a dyn ToolGate>,
-    ) -> Self {
-        Self {
-            tools,
-            allowed,
-            gate,
-        }
+    /// Build a runner over `tools` and the permission `gate` (`None` = no
+    /// permission layer; every call that passes soft-hide runs). Soft-hide gating
+    /// is read from `tools` itself (see [`ToolSet::set_active_tools`]).
+    pub fn new(tools: &'a ToolSet, gate: Option<&'a dyn ToolGate>) -> Self {
+        Self { tools, gate }
     }
 
     /// Whether `name`'s tool may run concurrently (the async-seam hint; unknown
@@ -111,8 +102,8 @@ impl<'a> ToolRunner<'a> {
     /// they come back as a [`CallOutcome`] the model can react to.
     pub fn run_one(&self, call: &ToolInvocation<'_>) -> Result<CallOutcome, ToolError> {
         // 1. Soft-hide gating: the schema superset reached the model, but a tool
-        //    not in `allowed` must not run this phase.
-        if self.allowed.is_some_and(|allowed| !allowed.contains(call.name)) {
+        //    the set does not currently allow must not run this phase.
+        if !self.tools.is_allowed(call.name) {
             return Ok(CallOutcome {
                 content: blocked_tool_message(call.name),
                 ok: false,
@@ -195,17 +186,17 @@ fn display_name(name: &str) -> &str {
 mod tests {
     use super::*;
     use crate::handler::{Tool, ToolHandler, ToolOutput};
-    use crate::set::ToolGroup;
+    use crate::set::{AllowedTools, ToolGroup};
     use claw_permission::{Action, RiskClass};
 
     /// A tool that records nothing and returns a fixed result; risk-classified so
     /// the permission path can be exercised.
     struct RiskyTool;
     impl ToolHandler for RiskyTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "risky"
         }
-        fn schema(&self) -> &'static str {
+        fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"risky"}}"#
         }
         fn classify(&self, _call: &ToolInvocation<'_>) -> Action {
@@ -243,7 +234,7 @@ mod tests {
     fn allow_runs_the_tool() {
         let tools = tools();
         let gate = FixedGate(PermissionDecision::Allow);
-        let runner = ToolRunner::new(&tools, None, Some(&gate));
+        let runner = ToolRunner::new(&tools, Some(&gate));
         let outcome = runner.run_one(&call()).unwrap();
         assert_eq!(outcome.content, "ran");
         assert!(outcome.ok);
@@ -256,7 +247,7 @@ mod tests {
         let gate = FixedGate(PermissionDecision::Deny {
             reason: "no".into(),
         });
-        let runner = ToolRunner::new(&tools, None, Some(&gate));
+        let runner = ToolRunner::new(&tools, Some(&gate));
         let outcome = runner.run_one(&call()).unwrap();
         assert!(!outcome.ok);
         assert!(outcome.approval.is_none());
@@ -269,7 +260,7 @@ mod tests {
         let gate = FixedGate(PermissionDecision::Ask {
             reason: "confirm".into(),
         });
-        let runner = ToolRunner::new(&tools, None, Some(&gate));
+        let runner = ToolRunner::new(&tools, Some(&gate));
         let outcome = runner.run_one(&call()).unwrap();
         assert!(!outcome.ok);
         let approval = outcome.approval.expect("approval needed");
@@ -279,11 +270,11 @@ mod tests {
 
     #[test]
     fn soft_hide_blocks_before_permission() {
-        let tools = tools();
-        let allowed = AllowedTools::new(["other"]);
+        let mut tools = tools();
+        tools.set_active_tools(AllowedTools::new(["other"]));
         // Even an Allow gate never runs: soft-hide refuses first.
         let gate = FixedGate(PermissionDecision::Allow);
-        let runner = ToolRunner::new(&tools, Some(&allowed), Some(&gate));
+        let runner = ToolRunner::new(&tools, Some(&gate));
         let outcome = runner.run_one(&call()).unwrap();
         assert!(outcome.blocked);
         assert!(!outcome.ok);
@@ -292,7 +283,7 @@ mod tests {
     #[test]
     fn no_gate_runs_normally() {
         let tools = tools();
-        let runner = ToolRunner::new(&tools, None, None);
+        let runner = ToolRunner::new(&tools, None);
         let outcome = runner.run_one(&call()).unwrap();
         assert_eq!(outcome.content, "ran");
         assert!(outcome.ok);

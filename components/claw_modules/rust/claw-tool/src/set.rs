@@ -1,7 +1,6 @@
 //! Aggregating tools: named [`ToolGroup`]s, the per-agent [`ToolSet`] the
 //! iteration loop consumes, and the [`AllowedTools`] phase allow-set.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use claw_permission::Action;
@@ -44,6 +43,11 @@ impl ToolGroup {
 /// Group label for tools registered without an explicit [`ToolGroup`].
 pub const DEFAULT_TOOL_GROUP: &str = "default";
 
+/// Consecutive gating-blocked tool rounds tolerated before
+/// [`record_round`](ToolSet::record_round) reports [`ToolBlockVerdict::Exhausted`].
+/// One round buys the model a single self-correction nudge.
+pub const DEFAULT_BLOCK_RETRIES: u32 = 1;
+
 /// One tool plus its group identity, as stored for dispatch.
 struct Entry {
     tool: Tool,
@@ -57,21 +61,86 @@ pub enum ToolSetError {
     /// Two tools (within or across groups) share a name; dispatch is by flat
     /// name, so this would silently shadow one — rejected at construction.
     #[error("duplicate tool name across groups: {0}")]
-    DuplicateToolName(&'static str),
+    DuplicateToolName(String),
 }
 
 /// A set of [`Tool`]s, organized by group, ready for one or more iterations.
 ///
 /// Built once from groups; precomputes the combined schemas JSON and a flat
-/// flat name→tool dispatch map. Keys are the tools' own `&'static str` names —
-/// borrowed, never cloned — and each entry carries its group label (also
-/// borrowed). Dispatch is O(1) and flat across all groups; the group is metadata
-/// only. This is the aggregate the iteration loop consumes directly, via
+/// name→tool dispatch map. Keys are owned `String`s copied from each tool's
+/// [`name()`](crate::ToolHandler::name), and each entry carries its group label.
+/// Dispatch is O(1) and flat across all groups; the group is metadata only.
+/// This is the aggregate the iteration loop consumes directly, via
 /// [`schemas_json`](Self::schemas_json) and [`invoke`](Self::invoke).
+///
+/// # Soft tools (phase gating)
+///
+/// The set is also the single owner of the "soft-hide" gating state: the full
+/// schema in [`schemas_json`](Self::schemas_json) is always sent (so the cached
+/// `tools` prefix never moves), while [`active`](Self::set_active_tools) — when
+/// set — restricts which of those tools may actually *run* this phase. The two
+/// prompt surfaces it produces stay together here:
+/// - [`tool_context`](Self::tool_context): the **static** per-tool usage block
+///   (belongs in the cached system prefix), and
+/// - [`extra_tool_context`](Self::extra_tool_context): the **dynamic** phase note
+///   naming the currently-active tools (belongs in the ephemeral request tail).
+///
+/// The runner consults [`is_allowed`](Self::is_allowed) before invoking; callers
+/// place the two context strings. Soft tools are thus wholly a `claw-tool`
+/// concern — the agent only decides *when* to flip the set and *where* the two
+/// strings go.
+///
+/// # Wire surfaces are precomputed
+///
+/// All three strings handed to a request are **rendered once and cached**, so
+/// per-request access is a free borrow (not a rebuild): [`schemas_json`](Self::schemas_json)
+/// and [`tool_context`](Self::tool_context) are rebuilt only when the tool
+/// membership changes, and [`extra_tool_context`](Self::extra_tool_context) only
+/// when the active allow-set changes. The two static surfaces are emitted in tool
+/// **name order**, so their bytes are stable across process restarts — the
+/// server-side prompt cache keys on those bytes.
 pub struct ToolSet {
-    by_name: HashMap<&'static str, Entry>,
-    /// `[schema, schema, …]` serialized once, or `None` when empty.
+    by_name: HashMap<String, Entry>,
+    /// `[schema, schema, …]` serialized once in name order, or `None` when empty.
     schemas_json: Option<String>,
+    /// The static per-tool usage block, rendered once in name order, or `None`
+    /// when no tool carries usage. Rebuilt alongside `schemas_json`.
+    tool_context: Option<String>,
+    /// The soft-hide allow-set: which tools may *execute* this phase. `None` is
+    /// ungated (every tool may run); `Some` restricts execution to its names
+    /// without touching the schema sent to the model.
+    active: Option<AllowedTools>,
+    /// The dynamic phase note rendered from `active`, or `None` when ungated.
+    /// Rebuilt whenever `active` changes.
+    extra_context: Option<String>,
+    /// How many consecutive gating-blocked rounds to tolerate (each with a
+    /// self-correction nudge) before [`record_round`](Self::record_round) reports
+    /// [`ToolBlockVerdict::Exhausted`]. See [`set_block_retries`](Self::set_block_retries).
+    block_retries: u32,
+    /// Count of consecutive rounds that had at least one gating-blocked call.
+    /// Reset to 0 by any clean round; compared against `block_retries`.
+    consecutive_blocks: u32,
+}
+
+/// The verdict [`ToolSet::record_round`] returns after a tool round, driving the
+/// soft-hide "retry then fail" policy.
+///
+/// The set counts consecutive rounds with a gating-blocked call (the model
+/// already received a tool error to self-correct from); once that streak exceeds
+/// the tolerated budget the round is [`Exhausted`](Self::Exhausted) and the
+/// caller (the agent) should end the task. A clean round resets the streak and
+/// yields [`Continue`](Self::Continue).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolBlockVerdict {
+    /// Keep iterating: the round was clean, or the blocked streak is still within
+    /// the retry budget.
+    Continue,
+    /// The blocked streak exceeded the budget. `name` is one offending tool, for
+    /// the caller's failure report.
+    Exhausted {
+        /// A tool that was blocked this round.
+        name: String,
+    },
 }
 
 /// Dev-time consistency check for a tool's schema, run when a [`ToolSet`] is
@@ -100,6 +169,34 @@ fn debug_validate_schema(name: &str, schema: &str) {
     );
 }
 
+/// Insert one `tool` under `group_name`, enforcing the flat-unique-name rule.
+/// Shared by [`ToolSet::from_groups`] and [`ToolSet::extend_with_group`] so the
+/// invariant (no name collision + a dev-time schema check) lives in one place.
+///
+/// # Errors
+///
+/// [`ToolSetError::DuplicateToolName`] when `tool`'s name already exists in
+/// `by_name`; the map is left unchanged in that case.
+fn insert_tool(
+    by_name: &mut HashMap<String, Entry>,
+    tool: Tool,
+    group_name: &'static str,
+) -> Result<(), ToolSetError> {
+    let name = tool.name();
+    if by_name.contains_key(name) {
+        return Err(ToolSetError::DuplicateToolName(name.to_string()));
+    }
+    debug_validate_schema(name, tool.schema());
+    by_name.insert(
+        name.to_string(),
+        Entry {
+            tool,
+            group: group_name,
+        },
+    );
+    Ok(())
+}
+
 impl ToolSet {
     /// Assemble ungrouped tools under [`DEFAULT_TOOL_GROUP`].
     ///
@@ -116,34 +213,23 @@ impl ToolSet {
     /// The combined schema array is serialized once here so
     /// [`schemas_json`](Self::schemas_json) is free per request.
     pub fn from_groups(groups: impl IntoIterator<Item = ToolGroup>) -> Result<Self, ToolSetError> {
-        let mut by_name: HashMap<&'static str, Entry> = HashMap::new();
-        let mut schemas: Vec<&'static str> = Vec::new();
+        let mut by_name: HashMap<String, Entry> = HashMap::new();
         for group in groups {
-            let group_name = group.name;
             for tool in group.tools {
-                let name = tool.name();
-                if by_name.contains_key(name) {
-                    return Err(ToolSetError::DuplicateToolName(name));
-                }
-                let schema = tool.schema();
-                debug_validate_schema(name, schema);
-                schemas.push(schema);
-                by_name.insert(
-                    name,
-                    Entry {
-                        tool,
-                        group: group_name,
-                    },
-                );
+                insert_tool(&mut by_name, tool, group.name)?;
             }
         }
-        // Splice the per-tool schema texts into one `[obj, obj, …]` array — no
-        // `Value` is built or serialized; claw-api parses the result once.
-        let schemas_json = (!schemas.is_empty()).then(|| format!("[{}]", schemas.join(",")));
-        Ok(Self {
+        let mut set = Self {
             by_name,
-            schemas_json,
-        })
+            schemas_json: None,
+            tool_context: None,
+            active: None,
+            extra_context: None,
+            block_retries: DEFAULT_BLOCK_RETRIES,
+            consecutive_blocks: 0,
+        };
+        set.rebuild_static_caches();
+        Ok(set)
     }
 
     /// An empty set — no tools, no schemas. The infallible base other groups are
@@ -152,6 +238,11 @@ impl ToolSet {
         Self {
             by_name: HashMap::new(),
             schemas_json: None,
+            tool_context: None,
+            active: None,
+            extra_context: None,
+            block_retries: DEFAULT_BLOCK_RETRIES,
+            consecutive_blocks: 0,
         }
     }
 
@@ -159,42 +250,72 @@ impl ToolSet {
     /// rule against the tools already present.
     ///
     /// Used to fold an agent's built-in (internal) tool group onto the caller's
-    /// tools after construction. The combined schema array is rebuilt once here.
+    /// tools after construction. The cached wire surfaces are rebuilt once here.
     ///
     /// # Errors
     ///
     /// [`ToolSetError::DuplicateToolName`] if a tool in `group` collides with one
     /// already in the set (or another in the same group); no tool is inserted past
-    /// the collision and the existing schema array is left intact.
+    /// the collision and the existing caches are left intact.
     pub fn extend_with_group(&mut self, group: ToolGroup) -> Result<(), ToolSetError> {
-        let group_name = group.name;
         for tool in group.tools {
-            let name = tool.name();
-            if self.by_name.contains_key(name) {
-                return Err(ToolSetError::DuplicateToolName(name));
-            }
-            let schema = tool.schema();
-            debug_validate_schema(name, schema);
-            self.by_name.insert(
-                name,
-                Entry {
-                    tool,
-                    group: group_name,
-                },
-            );
+            insert_tool(&mut self.by_name, tool, group.name)?;
         }
-        self.rebuild_schemas();
+        self.rebuild_static_caches();
         Ok(())
     }
 
-    /// Re-serialize the combined `[schema, …]` array from the current entries.
-    fn rebuild_schemas(&mut self) {
-        let schemas: Vec<&str> = self
+    /// Re-render the membership-derived caches (`schemas_json` + `tool_context`)
+    /// from the current entries, both in tool **name order** so the cached wire
+    /// bytes are deterministic across builds (the backing map is unordered). One
+    /// sort serves both surfaces.
+    fn rebuild_static_caches(&mut self) {
+        let mut entries: Vec<(&str, &Entry)> = self
             .by_name
-            .values()
-            .map(|entry| entry.tool.schema())
+            .iter()
+            .map(|(name, entry)| (name.as_str(), entry))
             .collect();
-        self.schemas_json = (!schemas.is_empty()).then(|| format!("[{}]", schemas.join(",")));
+        entries.sort_unstable_by_key(|(name, _)| *name);
+
+        // Schema array: splice each tool's schema text, no re-serialization.
+        self.schemas_json = (!entries.is_empty()).then(|| {
+            let schemas: Vec<&str> = entries.iter().map(|(_, entry)| entry.tool.schema()).collect();
+            format!("[{}]", schemas.join(","))
+        });
+
+        // Usage block: stitch every tool's usage prose under one Markdown header.
+        let mut usage_block = String::new();
+        for (name, entry) in &entries {
+            let Some(usage) = entry.tool.usage() else {
+                continue;
+            };
+            usage_block.push_str(if usage_block.is_empty() {
+                "# Tool usage\n\n## "
+            } else {
+                "\n\n## "
+            });
+            usage_block.push_str(name);
+            usage_block.push('\n');
+            usage_block.push_str(usage.trim());
+        }
+        self.tool_context = (!usage_block.is_empty()).then_some(usage_block);
+    }
+
+    /// Re-render the dynamic phase note from the current `active` allow-set, or
+    /// clear it when ungated. Called whenever `active` changes.
+    fn rebuild_active_context(&mut self) {
+        self.extra_context = self.active.as_ref().map(|active| {
+            let names = active.sorted_names();
+            if names.is_empty() {
+                "No tools are available in the current phase; do not call any tool.".to_string()
+            } else {
+                format!(
+                    "Tools available in the current phase: {}. Other tools are \
+                     temporarily unavailable — do not call them.",
+                    names.join(", ")
+                )
+            }
+        });
     }
 
     /// True when no tools were added.
@@ -219,27 +340,109 @@ impl ToolSet {
     /// (`claw-context`) decides where it goes. The schema (the API surface) is the
     /// separate [`schemas_json`](Self::schemas_json) output.
     ///
-    /// Tools are emitted in name order so the block is deterministic (the backing
-    /// map is unordered), keeping the cached prompt prefix stable across builds.
-    pub fn tool_context(&self) -> Option<String> {
-        let mut sections: Vec<(&'static str, Cow<'static, str>)> = self
-            .by_name
-            .iter()
-            .filter_map(|(name, entry)| entry.tool.usage().map(|usage| (*name, usage)))
-            .collect();
-        if sections.is_empty() {
-            return None;
-        }
-        sections.sort_by_key(|(name, _)| *name);
+    /// Rendered once in name order (see [`schemas_json`](Self::schemas_json)); this
+    /// is a free borrow of the cache.
+    pub fn tool_context(&self) -> Option<&str> {
+        self.tool_context.as_deref()
+    }
 
-        let mut rendered = String::from("# Tool usage");
-        for (name, usage) in sections {
-            rendered.push_str("\n\n## ");
-            rendered.push_str(name);
-            rendered.push('\n');
-            rendered.push_str(usage.trim());
+    // -- Soft tools (phase gating) ------------------------------------------
+
+    /// Restrict execution to `allowed` for the current phase ("soft-hide").
+    ///
+    /// The schema sent to the model is unchanged; only [`is_allowed`](Self::is_allowed)
+    /// (and the [`extra_tool_context`](Self::extra_tool_context) note) reflect the
+    /// new set. Replaces any previous allow-set.
+    pub fn set_active_tools(&mut self, allowed: AllowedTools) {
+        self.active = Some(allowed);
+        self.rebuild_active_context();
+    }
+
+    /// Drop phase gating: every tool in the set may run again (the default).
+    pub fn clear_active_tools(&mut self) {
+        self.active = None;
+        self.rebuild_active_context();
+    }
+
+    /// Builder form of [`set_active_tools`](Self::set_active_tools).
+    #[must_use]
+    pub fn with_active_tools(mut self, allowed: AllowedTools) -> Self {
+        self.set_active_tools(allowed);
+        self
+    }
+
+    /// The current soft-hide allow-set, or `None` when ungated.
+    pub fn active_tools(&self) -> Option<&AllowedTools> {
+        self.active.as_ref()
+    }
+
+    /// Whether the tool named `name` may *execute* this phase. `true` when
+    /// ungated (no allow-set) or when `name` is in the allow-set; the runner
+    /// consults this before invoking.
+    pub fn is_allowed(&self, name: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.contains(name))
+    }
+
+    /// The **dynamic** soft-tools prompt note: a single line naming the tools
+    /// permitted this phase, or `None` when ungated (no note).
+    ///
+    /// This is the volatile counterpart to [`tool_context`](Self::tool_context)
+    /// (the static usage block): it changes whenever the active set changes, so
+    /// it belongs in the **ephemeral request tail** (never the cached prefix, and
+    /// never persisted). Its wording is kept here, beside enforcement, so the
+    /// prose the model reads can never drift from what [`is_allowed`](Self::is_allowed)
+    /// will actually permit. An empty allow-set yields a "no tools" note.
+    ///
+    /// Rendered once when the active set changes; this is a free borrow of the cache.
+    pub fn extra_tool_context(&self) -> Option<&str> {
+        self.extra_context.as_deref()
+    }
+
+    // -- Soft-hide "retry then fail" policy ---------------------------------
+
+    /// Set how many consecutive gating-blocked rounds to tolerate before
+    /// [`record_round`](Self::record_round) reports
+    /// [`ToolBlockVerdict::Exhausted`]. `0` fails on the first blocked round.
+    ///
+    /// This is a **toolset-wide** policy (the soft-hide allow-set is per-set), not
+    /// per-tool: any round with a blocked call bumps one shared streak. Defaults
+    /// to [`DEFAULT_BLOCK_RETRIES`].
+    pub fn set_block_retries(&mut self, retries: u32) {
+        self.block_retries = retries;
+    }
+
+    /// Builder form of [`set_block_retries`](Self::set_block_retries).
+    #[must_use]
+    pub fn with_block_retries(mut self, retries: u32) -> Self {
+        self.set_block_retries(retries);
+        self
+    }
+
+    /// Account for one completed tool round and report whether soft-hide gating
+    /// has now blocked too many rounds in a row.
+    ///
+    /// `blocked` is the names of the calls the round refused via soft-hide (empty
+    /// for a clean round). A clean round resets the streak; a blocked round bumps
+    /// it and, once it exceeds [`block_retries`](Self::set_block_retries), returns
+    /// [`Exhausted`](ToolBlockVerdict::Exhausted) naming one offender so the agent
+    /// can end the task. The model already received a tool error for each blocked
+    /// call, so an `Exhausted` verdict means it ignored the restriction past the
+    /// budget.
+    pub fn record_round(&mut self, blocked: &[&str]) -> ToolBlockVerdict {
+        let Some(first) = blocked.first() else {
+            self.consecutive_blocks = 0;
+            return ToolBlockVerdict::Continue;
+        };
+        self.consecutive_blocks = self.consecutive_blocks.saturating_add(1);
+        if self.consecutive_blocks > self.block_retries {
+            ToolBlockVerdict::Exhausted {
+                name: (*first).to_string(),
+            }
+        } else {
+            ToolBlockVerdict::Continue
         }
-        Some(rendered)
     }
 
     /// Classify `call` into a permission [`Action`] via its tool, or `None` when
@@ -271,17 +474,19 @@ impl ToolSet {
 }
 
 /// The set of tool names allowed to *execute* in the current phase ("soft-hide"
-/// gating).
+/// gating) — the input vocabulary handed to
+/// [`ToolSet::set_active_tools`](ToolSet::set_active_tools).
 ///
 /// Soft-hide keeps the full [`ToolSet`] schema (the superset) in the prompt so
 /// the cached `tools` prefix never changes, while restricting which of those
-/// tools may actually run right now. The iteration loop consults this before
-/// invoking each tool and refuses any call whose name is absent (the model is
-/// handed a tool error instead). A `None` allow-set elsewhere means "ungated":
-/// every tool in the set may run.
+/// tools may actually run right now. Once installed on a [`ToolSet`], the runner
+/// consults [`ToolSet::is_allowed`](ToolSet::is_allowed) before invoking each
+/// tool and refuses any call whose name is absent (the model is handed a tool
+/// error instead). A set with no allow-set installed is "ungated": every tool
+/// may run.
 ///
-/// Names are `&'static str` to match [`ToolHandler::name`](crate::ToolHandler::name);
-/// the allow-set is built from the same compile-time identities.
+/// Names are owned `String`s so both baked tools (compile-time names) and
+/// runtime-registered tools (dynamic names) can be gated uniformly.
 ///
 /// # Examples
 ///
@@ -294,14 +499,14 @@ impl ToolSet {
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AllowedTools {
-    names: HashSet<&'static str>,
+    names: HashSet<String>,
 }
 
 impl AllowedTools {
     /// Build an allow-set from a collection of permitted tool names.
-    pub fn new(names: impl IntoIterator<Item = &'static str>) -> Self {
+    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
-            names: names.into_iter().collect(),
+            names: names.into_iter().map(Into::into).collect(),
         }
     }
 
@@ -319,17 +524,17 @@ impl AllowedTools {
     ///
     /// The backing set is unordered; sorting gives deterministic output for the
     /// phase note built from this allow-set (and for tests).
-    pub fn sorted_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = self.names.iter().copied().collect();
+    pub fn sorted_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         names.sort_unstable();
         names
     }
 }
 
-impl FromIterator<&'static str> for AllowedTools {
-    fn from_iter<T: IntoIterator<Item = &'static str>>(iter: T) -> Self {
+impl<'a> FromIterator<&'a str> for AllowedTools {
+    fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
         Self {
-            names: iter.into_iter().collect(),
+            names: iter.into_iter().map(str::to_string).collect(),
         }
     }
 }
@@ -345,11 +550,11 @@ mod tests {
     struct MismatchedNameTool;
 
     impl ToolHandler for MismatchedNameTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "alpha"
         }
 
-        fn schema(&self) -> &'static str {
+        fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"beta","parameters":{"type":"object"}}}"#
         }
 
@@ -373,23 +578,30 @@ mod tests {
 
     /// A tool carrying soft-tools usage prose, for the `tool_context` tests.
     struct UsageTool {
-        name: &'static str,
-        usage: Option<&'static str>,
+        name: String,
+        schema: String,
+        usage: Option<String>,
+    }
+
+    impl UsageTool {
+        fn new(name: &str, usage: Option<&str>) -> Self {
+            Self {
+                schema: format!(r#"{{"type":"function","function":{{"name":"{name}"}}}}"#),
+                name: name.to_string(),
+                usage: usage.map(str::to_string),
+            }
+        }
     }
 
     impl ToolHandler for UsageTool {
-        fn name(&self) -> &'static str {
-            self.name
+        fn name(&self) -> &str {
+            &self.name
         }
-        fn schema(&self) -> &'static str {
-            // function.name must match name(); the leaked string keeps it 'static.
-            Box::leak(
-                format!(r#"{{"type":"function","function":{{"name":"{}"}}}}"#, self.name)
-                    .into_boxed_str(),
-            )
+        fn schema(&self) -> &str {
+            &self.schema
         }
-        fn usage(&self) -> Option<Cow<'static, str>> {
-            self.usage.map(Cow::Borrowed)
+        fn usage(&self) -> Option<&str> {
+            self.usage.as_deref()
         }
         fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput {
@@ -401,36 +613,107 @@ mod tests {
 
     #[test]
     fn tool_context_is_none_when_no_tool_has_usage() {
-        let set = ToolSet::new([Tool::new(UsageTool {
-            name: "bare",
-            usage: None,
-        })])
-        .unwrap();
+        let set = ToolSet::new([Tool::new(UsageTool::new("bare", None))]).unwrap();
         assert_eq!(set.tool_context(), None);
     }
 
     #[test]
     fn tool_context_stitches_usage_in_name_order() {
-        // Inserted out of order; only the two with usage appear, sorted by name.
         let set = ToolSet::new([
-            Tool::new(UsageTool {
-                name: "zeta",
-                usage: Some("Zeta does Z."),
-            }),
-            Tool::new(UsageTool {
-                name: "alpha",
-                usage: Some("Alpha does A."),
-            }),
-            Tool::new(UsageTool {
-                name: "silent",
-                usage: None,
-            }),
+            Tool::new(UsageTool::new("zeta", Some("Zeta does Z."))),
+            Tool::new(UsageTool::new("alpha", Some("Alpha does A."))),
+            Tool::new(UsageTool::new("silent", None)),
         ])
         .unwrap();
 
         assert_eq!(
-            set.tool_context().as_deref(),
+            set.tool_context(),
             Some("# Tool usage\n\n## alpha\nAlpha does A.\n\n## zeta\nZeta does Z.")
+        );
+    }
+
+    #[test]
+    fn ungated_set_allows_every_tool_and_has_no_extra_context() {
+        let set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
+        assert!(set.is_allowed("read"));
+        assert!(set.is_allowed("anything")); // ungated: even unknown names pass gating
+        assert_eq!(set.active_tools(), None);
+        assert_eq!(set.extra_tool_context(), None);
+    }
+
+    #[test]
+    fn active_set_gates_execution_and_renders_a_phase_note() {
+        let mut set = ToolSet::new([
+            Tool::new(UsageTool::new("read", None)),
+            Tool::new(UsageTool::new("write", None)),
+        ])
+        .unwrap();
+        set.set_active_tools(AllowedTools::new(["read"]));
+
+        assert!(set.is_allowed("read"));
+        assert!(!set.is_allowed("write"));
+
+        let note = set.extra_tool_context().unwrap();
+        assert!(note.contains("Tools available in the current phase"));
+        assert!(note.contains("read"));
+        assert!(!note.contains("write"));
+    }
+
+    #[test]
+    fn empty_active_set_blocks_everything_with_a_no_tools_note() {
+        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
+        set.set_active_tools(AllowedTools::default());
+
+        assert!(!set.is_allowed("read"));
+        assert_eq!(
+            set.extra_tool_context(),
+            Some("No tools are available in the current phase; do not call any tool.")
+        );
+    }
+
+    #[test]
+    fn clearing_active_tools_restores_ungated() {
+        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
+        set.set_active_tools(AllowedTools::new(["other"]));
+        assert!(!set.is_allowed("read"));
+
+        set.clear_active_tools();
+        assert!(set.is_allowed("read"));
+        assert_eq!(set.extra_tool_context(), None);
+    }
+
+    #[test]
+    fn clean_round_keeps_continuing_and_resets_the_streak() {
+        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
+        assert_eq!(set.record_round(&["read"]), ToolBlockVerdict::Continue);
+        // A clean round clears the streak so the next block starts over.
+        assert_eq!(set.record_round(&[]), ToolBlockVerdict::Continue);
+        assert_eq!(set.record_round(&["read"]), ToolBlockVerdict::Continue);
+    }
+
+    #[test]
+    fn streak_past_the_budget_is_exhausted() {
+        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
+        set.set_block_retries(1);
+        // First blocked round is tolerated (one nudge); the second exhausts it.
+        assert_eq!(set.record_round(&["read"]), ToolBlockVerdict::Continue);
+        assert_eq!(
+            set.record_round(&["read"]),
+            ToolBlockVerdict::Exhausted {
+                name: "read".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn zero_retries_exhausts_on_the_first_block() {
+        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
+        set.set_block_retries(0);
+        assert_eq!(
+            set.record_round(&["read"]),
+            ToolBlockVerdict::Exhausted {
+                name: "read".to_string()
+            }
         );
     }
 }

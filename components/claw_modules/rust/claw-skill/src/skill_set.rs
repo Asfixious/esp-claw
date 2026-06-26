@@ -144,6 +144,16 @@ impl SkillSet {
     /// because a stale cache is rebuilt in place; the agent calls this inside its
     /// `tick(&mut self)`.
     ///
+    /// Unlike [`catalog`](Self::catalog), this cache tracks the **loaded set**,
+    /// not the registry snapshot: it is invalidated by [`load`](Self::load) /
+    /// [`unload`](Self::unload), *not* by a [`reload`](crate::FsSkillRegistry::reload).
+    /// That is deliberate — each fragment tracks the state it projects (this one
+    /// projects what the agent loaded, the menu projects what the registry offers).
+    /// Consequence: if a loaded skill's document changes or is removed on disk and
+    /// the registry reloads, this keeps serving the cached body until the next
+    /// load/unload forces a rebuild (at which point a now-missing skill surfaces as
+    /// [`SkillError::NotFound`]).
+    ///
     /// # Errors
     ///
     /// Any [`SkillError`] from [`SkillRegistry::write_document`] when a loaded

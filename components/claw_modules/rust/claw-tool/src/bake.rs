@@ -1,10 +1,9 @@
 //! The build-time **tool-directory contract** validator.
 //!
 //! Call [`validate_tools_dir`] from a dependent crate's build script (add
-//! `claw-tool` to `[build-dependencies]` with `default-features = false,
-//! features = ["bake"]`). It enforces, at compile time, the same on-disk layout
-//! the [`tool_metadata!`](crate::tool_metadata) macro reads at runtime, so the
-//! two halves of the contract cannot drift:
+//! `claw-tool` to its `[build-dependencies]`). It enforces, at compile time, the
+//! same on-disk layout the [`tool_metadata!`](crate::tool_metadata) macro reads
+//! at runtime, so the two halves of the contract cannot drift:
 //!
 //! - `resources/tools/<name>/` holds **exactly** `schema.json` + `usage.md`
 //!   (a missing or stray entry fails the build),
@@ -15,8 +14,8 @@
 //! `debug_assert!` when a `ToolSet` is built), so the full chain
 //! `handler.name() == dir == function.name` is closed.
 //!
-//! This module depends only on `std` + `serde_json`, so a build-dependency on it
-//! does not pull the runtime framework (or `claw-permission`) into the build graph.
+//! The validator itself uses only `std` + `serde_json`; the rest of the crate is
+//! not exercised at build time.
 
 use std::error::Error;
 use std::fs;

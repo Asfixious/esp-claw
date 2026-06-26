@@ -22,7 +22,7 @@ name = "orchestrator-chat"
 path = "src/orchestrator_cli.rs"
 
 [dependencies]
-claw_core = { path = "../claw_core" }
+claw-core = { path = "../claw-core" }
 claw-log = { path = "../claw-log" }
 claw-api = { path = "../claw-api" }
 claw-memory = { path = "../claw-memory", features = ["compactor-stub"] }

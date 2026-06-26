@@ -8,7 +8,7 @@ members = [
     "claw-sys",
     "claw-log",
     "claw-skill",
-    "claw_core",
+    "claw-core",
     "claw-capability",
     "claw-memory",
     "claw-context",

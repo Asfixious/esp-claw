@@ -3,8 +3,8 @@
 //! Drives the single flat agent (here the `conversation` kind) against a live
 //! LLM — no semantic FSM, the model drives its own flow. Subagent spawning is
 //! left disabled (no registry is wired here), so this exercises the
-//! single-agent path. LLM config is read from `claw_core/.env.local`; memory is
-//! written to `claw_core/output/generic-chat/`.
+//! single-agent path. LLM config is read from `claw-core/.env.local`; memory is
+//! written to `claw-core/output/generic-chat/`.
 //!
 //! ```
 //! cargo run -p claw-agent-cli --bin generic-agent-chat --target x86_64-unknown-linux-gnu
@@ -21,7 +21,7 @@ use serde_json::Value;
 
 const MEMORY_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../claw_core/output/generic-chat"
+    "/../claw-core/output/generic-chat"
 );
 const AGENT_ID: usize = 1;
 

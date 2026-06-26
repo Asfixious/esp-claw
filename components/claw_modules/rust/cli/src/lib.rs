@@ -5,7 +5,7 @@
 //! dependencies are identical, so the real-disk [`ClawFs`], live [`ClawHttp`], the
 //! no-op [`Compactor`], and the env/LLM/memory wiring live here once.
 //!
-//! LLM config is read from `claw_core/.env.local` (the same file the integration
+//! LLM config is read from `claw-core/.env.local` (the same file the integration
 //! tests use): `CLAW_LLM_API_KEY`, `CLAW_LLM_BASE_URL`, `CLAW_LLM_MODEL`.
 
 use std::path::Path;
@@ -32,14 +32,14 @@ pub type CliFs = Arc<DiskFs>;
 // Config / wiring
 // ---------------------------------------------------------------------------
 
-/// Load `claw_core/.env.local` into the process environment if present.
+/// Load `claw-core/.env.local` into the process environment if present.
 ///
 /// # Panics
 ///
 /// If the file exists but cannot be parsed — a misconfigured env file is a setup
 /// error the operator should see, not silently ignore.
 pub fn load_env() {
-    let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../claw_core/.env.local");
+    let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../claw-core/.env.local");
     if env_path.is_file() {
         dotenvy::from_path(&env_path)
             .unwrap_or_else(|e| panic!("failed to load {}: {e}", env_path.display()));

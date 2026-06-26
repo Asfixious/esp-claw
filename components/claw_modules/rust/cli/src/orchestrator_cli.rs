@@ -12,8 +12,8 @@
 //! ordinary messages; this simple loop does not resolve them (matching the other
 //! CLIs).
 //!
-//! LLM config is read from `claw_core/.env.local`; memory is written to
-//! `claw_core/output/orchestrator-chat/`.
+//! LLM config is read from `claw-core/.env.local`; memory is written to
+//! `claw-core/output/orchestrator-chat/`.
 //!
 //! ```
 //! cargo run -p claw-agent-cli --bin orchestrator-chat --target x86_64-unknown-linux-gnu
@@ -35,7 +35,7 @@ use claw_core::{
 
 const MEMORY_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../claw_core/output/orchestrator-chat"
+    "/../claw-core/output/orchestrator-chat"
 );
 /// The CLI's single inbound/outbound channel; the transport registers under it
 /// and inbound messages carry it so the reply route resolves back to us.

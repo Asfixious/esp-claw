@@ -1,7 +1,7 @@
 //! Interactive chat CLI backed by [`BaseAgent`] with persistent memory.
 //!
-//! Reads LLM config from `claw_core/.env.local` (same file as the integration
-//! tests). Conversation memory is written to `claw_core/output/chat/`.
+//! Reads LLM config from `claw-core/.env.local` (same file as the integration
+//! tests). Conversation memory is written to `claw-core/output/chat/`.
 //!
 //! ```
 //! cargo run -p claw-agent-cli --bin base-agent --target x86_64-unknown-linux-gnu
@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 use claw_agent_cli::{load_env, make_llm, make_memory};
 use claw_core::agent::{ApprovalDecision, BaseAgent, TickOutcome};
 
-const MEMORY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../claw_core/output/chat");
+const MEMORY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../claw-core/output/chat");
 const SYSTEM_PROMPT: &str = "You are a helpful, concise assistant.";
 const AGENT_ID: usize = 1;
 

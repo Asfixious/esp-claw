@@ -56,6 +56,32 @@ impl<'a> PermissionRequest<'a> {
 /// Implement this to add a rule; compose several with [`PolicyChain`]. Object-safe
 /// so a chain can hold `Box<dyn PermissionPolicy>` (heterogeneous rules), per the
 /// crate's `dyn`-for-pluggable-drivers guidance.
+///
+/// # Examples
+///
+/// A custom rule that denies one verb outright and allows everything else:
+///
+/// ```
+/// use claw_permission::{
+///     Action, PermissionDecision, PermissionPolicy, PermissionRequest, RiskClass,
+/// };
+///
+/// struct DenyVerb(&'static str);
+///
+/// impl PermissionPolicy for DenyVerb {
+///     fn evaluate(&self, request: &PermissionRequest<'_>) -> PermissionDecision {
+///         if request.action.verb() == self.0 {
+///             PermissionDecision::Deny { reason: format!("'{}' is forbidden", self.0) }
+///         } else {
+///             PermissionDecision::Allow
+///         }
+///     }
+/// }
+///
+/// let action = Action::new("rm", RiskClass::High);
+/// let request = PermissionRequest::new(1, "worker", &action);
+/// assert!(matches!(DenyVerb("rm").evaluate(&request), PermissionDecision::Deny { .. }));
+/// ```
 pub trait PermissionPolicy: Send + Sync {
     /// Classify `request` into a decision.
     fn evaluate(&self, request: &PermissionRequest<'_>) -> PermissionDecision;
@@ -74,6 +100,27 @@ impl PermissionPolicy for AllowAll {
 
 /// Asks for human approval when an action's risk is at or above `threshold`;
 /// otherwise allows. The common "confirm risky things" rule.
+///
+/// # Examples
+///
+/// ```
+/// use claw_permission::{
+///     Action, AskAtOrAbove, PermissionDecision, PermissionPolicy, PermissionRequest, RiskClass,
+/// };
+///
+/// let policy = AskAtOrAbove::new(RiskClass::Moderate);
+/// let safe = Action::new("read", RiskClass::Safe);
+/// let risky = Action::new("delete", RiskClass::High);
+///
+/// assert_eq!(
+///     policy.evaluate(&PermissionRequest::new(1, "worker", &safe)),
+///     PermissionDecision::Allow,
+/// );
+/// assert!(matches!(
+///     policy.evaluate(&PermissionRequest::new(1, "worker", &risky)),
+///     PermissionDecision::Ask { .. },
+/// ));
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct AskAtOrAbove {
     threshold: RiskClass,
@@ -107,6 +154,26 @@ impl PermissionPolicy for AskAtOrAbove {
 ///
 /// "Most restrictive" is the safe composition: adding a rule can only ever
 /// tighten access, never loosen it.
+///
+/// # Examples
+///
+/// ```
+/// use claw_permission::{
+///     Action, AllowAll, AskAtOrAbove, PermissionDecision, PermissionPolicy,
+///     PermissionRequest, PolicyChain, RiskClass,
+/// };
+///
+/// let chain = PolicyChain::new()
+///     .with(AskAtOrAbove::new(RiskClass::Moderate))
+///     .with(AllowAll);
+///
+/// // Ask + Allow -> Ask: the more restrictive verdict wins.
+/// let action = Action::new("write", RiskClass::Moderate);
+/// assert!(matches!(
+///     chain.evaluate(&PermissionRequest::new(1, "worker", &action)),
+///     PermissionDecision::Ask { .. },
+/// ));
+/// ```
 #[derive(Default)]
 pub struct PolicyChain {
     policies: Vec<Box<dyn PermissionPolicy>>,

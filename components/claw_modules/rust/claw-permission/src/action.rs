@@ -7,7 +7,17 @@ use std::fmt;
 /// How dangerous an [`Action`] is, ordered low → high. Policies threshold on it
 /// (e.g. "ask at or above [`Moderate`](Self::Moderate)").
 ///
-/// Ordering follows declaration order, so `RiskClass::Safe < RiskClass::High`.
+/// Ordering follows declaration order, so a policy can compare risks directly.
+///
+/// # Examples
+///
+/// ```
+/// use claw_permission::RiskClass;
+///
+/// assert!(RiskClass::Safe < RiskClass::Moderate);
+/// assert!(RiskClass::High >= RiskClass::Moderate);
+/// assert_eq!(RiskClass::default(), RiskClass::Safe);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RiskClass {
     /// No side effects — reads, queries, lookups.
@@ -24,6 +34,18 @@ pub enum RiskClass {
 /// The target an [`Action`] touches, when there is a meaningful one. Used both
 /// for policy decisions (e.g. gate a host) and as part of the grant signature so
 /// an approval is scoped to *that* resource, not the verb in general.
+///
+/// The [`Display`](fmt::Display) form is `kind:value`, which is also how it
+/// appears inside an [`Action::signature`].
+///
+/// # Examples
+///
+/// ```
+/// use claw_permission::Resource;
+///
+/// assert_eq!(Resource::Path("/data/x".into()).to_string(), "path:/data/x");
+/// assert_eq!(Resource::Host("example.com".into()).to_string(), "host:example.com");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Resource {
@@ -60,16 +82,16 @@ impl fmt::Display for Resource {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
-    verb: &'static str,
+    verb: String,
     resource: Option<Resource>,
     risk: RiskClass,
 }
 
 impl Action {
     /// An action with `verb` and `risk` and no specific resource.
-    pub fn new(verb: &'static str, risk: RiskClass) -> Self {
+    pub fn new(verb: impl Into<String>, risk: RiskClass) -> Self {
         Self {
-            verb,
+            verb: verb.into(),
             resource: None,
             risk,
         }
@@ -82,8 +104,8 @@ impl Action {
     }
 
     /// The action's verb (the tool's stable label).
-    pub fn verb(&self) -> &'static str {
-        self.verb
+    pub fn verb(&self) -> &str {
+        &self.verb
     }
 
     /// The resource this action targets, if any.
@@ -102,7 +124,7 @@ impl Action {
     pub fn signature(&self) -> String {
         match &self.resource {
             Some(resource) => format!("{}:{resource}", self.verb),
-            None => self.verb.to_string(),
+            None => self.verb.clone(),
         }
     }
 }

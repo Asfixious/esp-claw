@@ -19,6 +19,24 @@ pub enum Grant {
 /// directly (proceed / refuse) instead of asking again — which both honors the
 /// decision and prevents an ask/retry loop.
 ///
+/// # Examples
+///
+/// ```
+/// use claw_permission::{Action, Grant, GrantStore, Resource, RiskClass};
+///
+/// let action = Action::new("write_file", RiskClass::Moderate)
+///     .with_resource(Resource::Path("/data/x".into()));
+///
+/// let mut grants = GrantStore::new();
+/// assert_eq!(grants.lookup(&action.signature()), None); // never asked yet
+///
+/// grants.grant(action.signature()); // human approved
+/// assert_eq!(grants.lookup(&action.signature()), Some(&Grant::Granted));
+///
+/// grants.forget(&action.signature()); // ask again next time
+/// assert_eq!(grants.lookup(&action.signature()), None);
+/// ```
+///
 /// [`Action::signature`]: crate::Action::signature
 #[derive(Clone, Debug, Default)]
 pub struct GrantStore {

@@ -1,0 +1,43 @@
+[package]
+name = "claw-tool"
+authors = ["Finn(Ziheng) Sheng"]
+version = "0.1.0"
+edition = "2021"
+description = "Tool framework: model-callable tools, aggregation, gating, execution, and the build-time bake contract"
+
+[lib]
+name = "claw_tool"
+# Pure-Rust rlib bundled (with the other logic crates) into the single `claw_rt`
+# staticlib that the firmware links.
+crate-type = ["rlib"]
+
+[features]
+# The runtime tool framework (traits, `Tool`/`ToolSet`, the runner). Enabled by
+# default for normal (target) dependents.
+default = ["runtime"]
+runtime = ["dep:claw-permission", "dep:thiserror"]
+# The build-time directory contract validator (`bake`), used from a dependent's
+# build script. Deliberately depends on nothing but `std` + `serde_json`, so a
+# `[build-dependencies]` entry stays light (no permission/thiserror in the build
+# graph).
+bake = []
+
+[dependencies]
+# Action/RiskClass for classification + the permission decision the runner gates
+# on. Only needed by the runtime framework, so it is optional and feature-gated.
+claw-permission = { path = "../claw-permission", optional = true }
+serde_json = "1"
+thiserror = { version = "2", optional = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+arithmetic_side_effects = "deny"

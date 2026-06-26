@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tools::Tool;
+use claw_tool::Tool;
 use claw_skill::{SkillError, SkillId, SkillRegistry, SkillSet};
 
 use super::config::AgentResolver;
@@ -103,7 +103,7 @@ impl AgentResolver for MapAgentResolver {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::tools::{ToolHandler, ToolInvocation, ToolOutput};
+    use claw_tool::{ToolHandler, ToolInvocation, ToolOutput};
 
     struct DummyTool;
 
@@ -117,7 +117,7 @@ mod tests {
         fn invoke(
             &self,
             _call: &ToolInvocation<'_>,
-        ) -> Result<ToolOutput, crate::tools::ToolError> {
+        ) -> Result<ToolOutput, claw_tool::ToolError> {
             Ok(ToolOutput {
                 output: "ok".into(),
                 ok: true,

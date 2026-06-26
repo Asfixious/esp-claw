@@ -13,7 +13,13 @@ members = [
     "claw-memory",
     "claw-context",
     "claw-permission",
+    "claw-tool",
     "claw-sandbox",
+    # Device-only (`#![cfg(target_os = "espidf")]`) staticlib crates that back
+    # the on-device ESP-IDF integration test apps. They build to empty archives
+    # on the host, so they are harmless members of `cargo build --workspace`.
+    "claw-sys/tests/esp_idf/claw-sys-selftest",
+    "claw-api/tests/esp_idf/claw-api-selftest",
 ]
 
 # Device images are built with the release profile (panic = abort, since the

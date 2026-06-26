@@ -1,25 +1,25 @@
 //! The tool-execution seam: per-call gating and dispatch, isolated from the
-//! iteration's orchestration (preemption checkpoints, tracing spans, and message
-//! assembly stay in [`crate::iteration_loop`]).
+//! caller's orchestration (preemption checkpoints, tracing spans, and message
+//! assembly stay in the iteration loop that drives this).
 //!
 //! One call passes through three stages: **soft-hide** gating (is the tool
 //! permitted this phase?), **permission** gating (does the policy allow / ask /
 //! deny it?), then **execution**. The runner returns a neutral [`CallOutcome`]
-//! the iteration loop turns into a tool message and a [`ToolRun`].
-//!
-//! [`ToolRun`]: crate::iteration_loop::ToolRun
+//! the caller turns into a tool message and a per-call record.
 //!
 //! ## Async / concurrency seam
 //!
 //! Today every call runs synchronously, in the model's order. The shape here —
-//! *classify → gate → execute*, with a per-tool [`concurrent`](ToolSet::concurrent)
+//! *classify → gate → execute*, with a per-tool [`concurrent`](crate::ToolSet::concurrent)
 //! hint surfaced via [`is_concurrent`](ToolRunner::is_concurrent) — is the seam a
 //! future async runner grows into: side-effect-free `concurrent` calls awaited
 //! together, serializing ones run in order. Keeping that decision *here* means the
-//! iteration loop does not change when concurrency lands.
+//! caller does not change when concurrency lands.
 
-use crate::tools::{AllowedTools, ToolError, ToolInvocation, ToolOutput, ToolSet};
 use claw_permission::{Action, PermissionDecision};
+
+use crate::handler::{ToolError, ToolInvocation, ToolOutput};
+use crate::set::{AllowedTools, ToolSet};
 
 /// The permission seam the runner consults before executing a classified call.
 ///
@@ -34,15 +34,15 @@ pub trait ToolGate {
 /// What an `Ask` decision needs the agent layer to remember to resolve it: the
 /// human-facing `summary` and the action `signature` to grant/deny against.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ApprovalNeeded {
+pub struct ApprovalNeeded {
     /// Shown to the approver (the policy's reason).
     pub summary: String,
     /// The action signature a grant/denial is recorded under.
     pub signature: String,
 }
 
-/// The runner's verdict for one call, ready for the iteration loop to render.
-pub(crate) struct CallOutcome {
+/// The runner's verdict for one call, ready for the caller to render.
+pub struct CallOutcome {
     /// The tool-message content handed back to the model.
     pub content: String,
     /// Whether the call succeeded (false for blocked / denied / asked / a tool
@@ -70,7 +70,7 @@ impl CallOutcome {
 /// Gates and executes individual tool calls for one iteration. Cheap to build per
 /// batch; borrows the tool set, the optional soft-hide allow-set, and the optional
 /// permission gate.
-pub(crate) struct ToolRunner<'a> {
+pub struct ToolRunner<'a> {
     tools: &'a ToolSet,
     allowed: Option<&'a AllowedTools>,
     gate: Option<&'a dyn ToolGate>,
@@ -80,7 +80,7 @@ impl<'a> ToolRunner<'a> {
     /// Build a runner over `tools`, the soft-hide `allowed` set (`None` = ungated),
     /// and the permission `gate` (`None` = no permission layer; every call that
     /// passes soft-hide runs).
-    pub(crate) fn new(
+    pub fn new(
         tools: &'a ToolSet,
         allowed: Option<&'a AllowedTools>,
         gate: Option<&'a dyn ToolGate>,
@@ -98,7 +98,7 @@ impl<'a> ToolRunner<'a> {
     /// Reserved for the future async runner (see the module docs): today every
     /// call runs in order, so nothing consults this yet.
     #[allow(dead_code)]
-    pub(crate) fn is_concurrent(&self, name: &str) -> bool {
+    pub fn is_concurrent(&self, name: &str) -> bool {
         self.tools.concurrent(name).unwrap_or(false)
     }
 
@@ -109,7 +109,7 @@ impl<'a> ToolRunner<'a> {
     /// Propagates [`ToolError`] from dispatch (e.g. an unknown tool or a tool that
     /// errored). Refusals (soft-hide / permission deny / ask) are *not* errors —
     /// they come back as a [`CallOutcome`] the model can react to.
-    pub(crate) fn run_one(&self, call: &ToolInvocation<'_>) -> Result<CallOutcome, ToolError> {
+    pub fn run_one(&self, call: &ToolInvocation<'_>) -> Result<CallOutcome, ToolError> {
         // 1. Soft-hide gating: the schema superset reached the model, but a tool
         //    not in `allowed` must not run this phase.
         if self.allowed.is_some_and(|allowed| !allowed.contains(call.name)) {
@@ -153,7 +153,7 @@ impl<'a> ToolRunner<'a> {
 /// Content handed to the model when soft-hide gating refuses a call. Worded so
 /// the model treats it as a policy restriction (not a transient failure to
 /// retry) and switches to a permitted tool.
-pub(crate) fn blocked_tool_message(name: &str) -> String {
+fn blocked_tool_message(name: &str) -> String {
     let name = display_name(name);
     format!(
         "Tool \"{name}\" is not available in the current phase and was not executed. \
@@ -194,7 +194,8 @@ fn display_name(name: &str) -> &str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::tools::{Tool, ToolGroup, ToolHandler, ToolOutput};
+    use crate::handler::{Tool, ToolHandler, ToolOutput};
+    use crate::set::ToolGroup;
     use claw_permission::{Action, RiskClass};
 
     /// A tool that records nothing and returns a fixed result; risk-classified so

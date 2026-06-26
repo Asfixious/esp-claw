@@ -12,8 +12,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::tool_runner::{ApprovalNeeded, CallOutcome, ToolGate, ToolRunner};
-use crate::tools::{AllowedTools, ToolError, ToolInvocation, ToolSet};
+use claw_tool::{AllowedTools, ApprovalNeeded, CallOutcome, ToolError, ToolGate, ToolInvocation, ToolRunner, ToolSet};
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
 
 use claw_utils::TruncatedText;
@@ -476,7 +475,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::tools::{Tool, ToolGroup, ToolHandler, ToolOutput};
+    use claw_tool::{Tool, ToolGroup, ToolHandler, ToolOutput};
     use claw_api::ToolCall;
     use serde_json::json;
 

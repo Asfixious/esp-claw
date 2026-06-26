@@ -26,7 +26,7 @@ use claw_memory::{ConversationConfig, ConversationDeps};
 use crate::agent::agent::{AgentKind, GenericAgent};
 use crate::agent::base_agent::{AgentCommand, AgentId};
 use crate::agent::config::{AgentConfig, AgentResolver};
-use crate::agent::internal_tools::GraphHost;
+use crate::agent::graph::GraphHost;
 use crate::agent::registry::AgentFactory;
 use crate::agent::Agent;
 
@@ -138,8 +138,8 @@ mod tests {
 
     use super::*;
     use crate::agent::base_agent::TickOutcome;
-    use crate::agent::internal_tools::GraphEffect;
-    use crate::tools::Tool;
+    use crate::agent::graph::GraphEffect;
+    use claw_tool::Tool;
     use claw_skill::{SkillError, SkillId, SkillSet};
 
     /// A resolver with no capabilities or skills — enough for the built-in
@@ -161,7 +161,7 @@ mod tests {
             AgentId(0)
         }
         fn emit(&self, _requester: AgentId, _effect: GraphEffect) {}
-        fn snapshot(&self) -> Vec<crate::agent::internal_tools::AgentSnapshot> {
+        fn snapshot(&self) -> Vec<crate::agent::graph::AgentSnapshot> {
             Vec::new()
         }
     }

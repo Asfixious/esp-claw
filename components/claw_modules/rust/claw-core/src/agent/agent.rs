@@ -23,11 +23,10 @@ use crate::agent::base_agent::{
     AgentCommand, AgentCommandError, AgentId, BaseAgent, BaseAgentBuildError, TickOutcome,
 };
 use crate::agent::config::AgentConfig;
-use crate::agent::internal_tools::{
-    respond_to_approval_tool_group, subagent_tool_group, AgentContext, GraphHost,
-};
+use crate::agent::graph::{AgentContext, GraphHost};
+use crate::agent::tools::{respond_to_approval_tool_group, subagent_tool_group};
 use crate::agent::{append_child_result, Agent};
-use crate::tools::{ToolSet, ToolSetError};
+use claw_tool::{ToolSet, ToolSetError};
 
 // ===========================================================================
 // AgentKind
@@ -208,7 +207,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::agent::internal_tools::{GraphEffect, SpawnPolicy};
+    use crate::agent::graph::{GraphEffect, SpawnPolicy};
 
     fn scripted_llm(bodies: Vec<String>) -> ClawApi {
         ClawApi::init(
@@ -317,7 +316,7 @@ mod tests {
         fn emit(&self, requester: AgentId, effect: GraphEffect) {
             self.effects.lock().unwrap().push((requester, effect));
         }
-        fn snapshot(&self) -> Vec<crate::agent::internal_tools::AgentSnapshot> {
+        fn snapshot(&self) -> Vec<crate::agent::graph::AgentSnapshot> {
             Vec::new()
         }
     }
@@ -406,7 +405,7 @@ mod tests {
 
     #[test]
     fn respond_to_approval_tool_is_wired_for_a_root() {
-        use crate::agent::internal_tools::ApprovalVerdict;
+        use crate::agent::graph::ApprovalVerdict;
 
         let host = Arc::new(RecordingHost::default());
         let (mem_config, mem_deps) = memory_ingredients(AgentId(1));

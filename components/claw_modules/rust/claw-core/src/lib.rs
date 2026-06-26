@@ -13,8 +13,6 @@ mod orchestrator;
 mod orchestrator_instance;
 pub mod protocol;
 pub mod session;
-pub mod tool_runner;
-pub mod tools;
 
 pub use channels::{
     ChannelEgress, ChannelEgressHub, ChannelError, ChannelIngress, ChannelIngressSink,
@@ -36,9 +34,11 @@ pub use session::{
 pub use claw_skill::{
     FsSkillRegistry, SkillError, SkillGroup, SkillId, SkillMetadata, SkillRegistry, SkillSet,
 };
-pub use tools::{
-    AllowedTools, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
-    ToolSetError, DEFAULT_TOOL_GROUP,
+// The tool framework moved to the standalone `claw-tool` crate; re-exported here
+// so `claw_core::Tool*` stays the stable surface for existing callers.
+pub use claw_tool::{
+    AllowedTools, Tool, ToolError, ToolGate, ToolGroup, ToolHandler, ToolInvocation, ToolOutput,
+    ToolSet, ToolSetError, DEFAULT_TOOL_GROUP,
 };
 // The permission layer authoring surface — re-exported so callers can build the
 // policies that `BaseAgentBuilder::with_permission_policy` accepts without
@@ -47,4 +47,3 @@ pub use claw_permission::{
     Action, AllowAll, AskAtOrAbove, PermissionDecision, PermissionPolicy, PermissionRequest,
     PolicyChain, Resource, RiskClass,
 };
-pub use tool_runner::ToolGate;

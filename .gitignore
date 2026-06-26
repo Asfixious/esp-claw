@@ -51,3 +51,6 @@ docs/**/*.bin
 # Rust
 target/
 output/
+
+# On-device test secrets (Wi-Fi creds, API keys); copy from test_secrets.h.example
+test_secrets.h

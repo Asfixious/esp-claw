@@ -136,6 +136,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-api-selftest"
+version = "0.1.0"
+dependencies = [
+ "claw-api",
+ "claw-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "claw-capability"
 version = "0.1.0"
 dependencies = [
@@ -161,6 +170,7 @@ dependencies = [
  "claw-memory",
  "claw-permission",
  "claw-skill",
+ "claw-tool",
  "claw-utils",
  "dotenvy",
  "proc-macro2",
@@ -237,6 +247,26 @@ dependencies = [
  "claw-interface",
  "log",
  "serde_json",
+]
+
+[[package]]
+name = "claw-sys-selftest"
+version = "0.1.0"
+dependencies = [
+ "claw-interface",
+ "claw-sys",
+ "embedded-executor",
+ "lock_api",
+ "log",
+]
+
+[[package]]
+name = "claw-tool"
+version = "0.1.0"
+dependencies = [
+ "claw-permission",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

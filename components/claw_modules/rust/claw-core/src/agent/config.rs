@@ -27,9 +27,9 @@ use claw_api::RetryPolicy;
 use claw_skill::{SkillError, SkillId, SkillSet};
 
 use crate::agent::agent::AgentKind;
-use crate::agent::internal_tools::SpawnPolicy;
+use crate::agent::graph::SpawnPolicy;
 use crate::agent::manifest::{AgentManifest, RetryCount};
-use crate::tools::Tool;
+use claw_tool::Tool;
 
 /// Resolves the *names* in a manifest to the *code* that backs them.
 ///

@@ -58,14 +58,13 @@ use claw_interface::ClawFs;
 use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
-use crate::agent::internal_tools::{internal_tool_group, ControlSignal, ControlSink};
+use crate::agent::tools::{internal_tool_group, ControlSignal, ControlSink};
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
     PreemptedOutcome, SystemPrompt, ToolRun,
 };
-use crate::tool_runner::ToolGate;
-use crate::tools::{AllowedTools, ToolSet, ToolSetError};
+use claw_tool::{AllowedTools, ToolGate, ToolSet, ToolSetError};
 use claw_context::{Block, BlockKind, ContextBuilder};
 use claw_permission::{Action, Grant, GrantStore, PermissionDecision, PermissionPolicy, PermissionRequest};
 use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
@@ -736,7 +735,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     /// (only the gating tests exercise it), so it is `dead_code` until a phased
     /// agent reattaches; the enforcement path in [`ToolRunner`] stays wired.
     ///
-    /// [`ToolRunner`]: crate::tool_runner::ToolRunner
+    /// [`ToolRunner`]: claw_tool::ToolRunner
     #[allow(dead_code)]
     pub(crate) fn set_active_tools(&mut self, allowed: AllowedTools) {
         self.tail_note = Some(Self::phase_note(&allowed));
@@ -1654,7 +1653,7 @@ mod gating_tests {
     use serde_json::{json, Value};
 
     use crate::agent::{AgentId, AgentRunError, BaseAgent, BaseAgentBuilder, TickOutcome};
-    use crate::tools::{
+    use claw_tool::{
         AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
     };
 

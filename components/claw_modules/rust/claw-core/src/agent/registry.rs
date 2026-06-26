@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::agent::AgentKind;
 use crate::agent::base_agent::AgentId;
-use crate::agent::internal_tools::GraphHost;
+use crate::agent::graph::GraphHost;
 use crate::agent::Agent;
 
 /// The first [`AgentId`] handed out (0 reads like "unset").

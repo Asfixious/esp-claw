@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::registry::{AgentFactory, AgentIdAllocator};
+use crate::agent::factory::AgentFactory;
+use crate::agent::registry::AgentIdAllocator;
 use crate::channels::{ChannelEgress, ChannelIngressSink, InboundCommand, InboundMessage};
 use crate::orchestrator_instance::{DriveOutput, OrchestratorInstance};
 use crate::protocol::Command;
@@ -284,7 +285,7 @@ mod tests {
     use crate::agent::base_agent::{
         AgentCommand, AgentCommandError, AgentId, ApprovalId, TickOutcome,
     };
-    use crate::agent::registry::AgentFactory;
+    use crate::agent::factory::AgentFactory;
     use crate::agent::{Agent, AgentKind, GraphHost};
     use crate::channels::{ChannelEgressHub, ChannelTransport, RecordingTransport};
 

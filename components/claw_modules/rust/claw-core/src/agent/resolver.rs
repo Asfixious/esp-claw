@@ -1,13 +1,14 @@
-//! A concrete, data-driven [`AgentResolver`]: a capability-name -> [`Tool`] map
-//! plus an optional [`SkillRegistry`] backing for skills.
+//! Resolving capability/skill *names* into handler *code*: the [`AgentResolver`]
+//! seam and its concrete, data-driven implementation [`MapAgentResolver`].
 //!
-//! This is the resolver firmware (and tests) hand to an [`FsAgentFactory`]: the
-//! manifest only names capabilities/skills, and this maps those names to the real
-//! handlers. An unknown name is never silently dropped — `resolve_tool` returns
-//! `None` (so the config build fails with `UnknownCapability`) and `build_skills`
-//! returns [`SkillError::NotFound`].
-//!
-//! [`FsAgentFactory`]: crate::agent::FsAgentFactory
+//! A baked manifest only carries *names*; the handlers live in firmware (or a
+//! test double). [`AgentResolver`] is the injected boundary that turns each name
+//! into a real [`Tool`] / [`SkillSet`], and [`MapAgentResolver`] is the resolver
+//! firmware (and tests) hand to an [`FsAgentFactory`](crate::agent::FsAgentFactory):
+//! a capability-name -> [`Tool`] map plus an optional [`SkillRegistry`] backing.
+//! An unknown name is never silently dropped — `resolve_tool` returns `None` (so
+//! the config build fails with `UnknownCapability`) and `build_skills` returns
+//! [`SkillError::NotFound`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +16,27 @@ use std::sync::Arc;
 use claw_tool::Tool;
 use claw_skill::{SkillError, SkillId, SkillRegistry, SkillSet};
 
-use super::config::AgentResolver;
+/// Resolves the *names* in a manifest to the *code* that backs them.
+///
+/// A manifest only carries capability/skill names; the handlers live in firmware
+/// (or a test double). The resolver is the injected boundary that turns each name
+/// into a real [`Tool`] / [`SkillSet`]. An unknown name is **not** silently
+/// dropped — the resolver returns `None`/an error and resolution fails.
+pub trait AgentResolver: Send + Sync {
+    /// Resolve a capability name to its [`Tool`], or `None` if this resolver has
+    /// no such capability.
+    fn resolve_tool(&self, name: &str) -> Option<Tool>;
+
+    /// Build a [`SkillSet`] with `skill_ids` loaded.
+    ///
+    /// Returns `Ok(None)` when no skills are configured (`skill_ids` empty) or the
+    /// resolver has no skill support; `Ok(Some(set))` once the ids are loaded.
+    ///
+    /// # Errors
+    ///
+    /// [`SkillError`] if a requested skill id is unknown to the resolver.
+    fn build_skills(&self, skill_ids: &[SkillId]) -> Result<Option<SkillSet>, SkillError>;
+}
 
 /// Group label applied to every skill a manifest asks for (parallels a
 /// `ToolGroup` name — it tags provenance in the assembled skill context).

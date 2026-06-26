@@ -255,8 +255,6 @@ version = "0.1.0"
 dependencies = [
  "claw-interface",
  "claw-sys",
- "embedded-executor",
- "lock_api",
  "log",
 ]
 

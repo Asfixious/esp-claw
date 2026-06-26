@@ -24,34 +24,13 @@
 //!   only this and never touches a manifest or the filesystem.
 
 use claw_api::RetryPolicy;
-use claw_skill::{SkillError, SkillId, SkillSet};
+use claw_skill::{SkillError, SkillSet};
 
-use crate::agent::agent::AgentKind;
+use crate::agent::kind::AgentKind;
 use crate::agent::graph::SpawnPolicy;
 use crate::agent::manifest::{AgentManifest, RetryCount};
+use crate::agent::resolver::AgentResolver;
 use claw_tool::Tool;
-
-/// Resolves the *names* in a manifest to the *code* that backs them.
-///
-/// A manifest only carries capability/skill names; the handlers live in firmware
-/// (or a test double). The resolver is the injected boundary that turns each name
-/// into a real [`Tool`] / [`SkillSet`]. An unknown name is **not** silently
-/// dropped — the resolver returns `None`/an error and resolution fails.
-pub trait AgentResolver: Send + Sync {
-    /// Resolve a capability name to its [`Tool`], or `None` if this resolver has
-    /// no such capability.
-    fn resolve_tool(&self, name: &str) -> Option<Tool>;
-
-    /// Build a [`SkillSet`] with `skill_ids` loaded.
-    ///
-    /// Returns `Ok(None)` when no skills are configured (`skill_ids` empty) or the
-    /// resolver has no skill support; `Ok(Some(set))` once the ids are loaded.
-    ///
-    /// # Errors
-    ///
-    /// [`SkillError`] if a requested skill id is unknown to the resolver.
-    fn build_skills(&self, skill_ids: &[SkillId]) -> Result<Option<SkillSet>, SkillError>;
-}
 
 /// A fully-resolved agent configuration — the typed seam between a baked manifest
 /// and the agent that runs it. [`GenericAgent`](crate::agent::GenericAgent)
@@ -157,6 +136,7 @@ pub enum AgentConfigError {
 mod tests {
     use super::*;
     use crate::agent::manifest::MANIFESTS;
+    use claw_skill::SkillId;
 
     /// A test resolver that maps names to no tools and supports no skills.
     struct StaticResolver;

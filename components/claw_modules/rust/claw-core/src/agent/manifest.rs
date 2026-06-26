@@ -15,7 +15,7 @@
 
 use claw_skill::SkillId;
 
-use crate::agent::agent::AgentKind;
+use crate::agent::kind::AgentKind;
 
 /// A retry budget: a count of extra attempts.
 ///

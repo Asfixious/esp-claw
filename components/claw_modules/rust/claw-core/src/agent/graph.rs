@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::agent::AgentKind;
+use crate::agent::kind::AgentKind;
 use crate::agent::base_agent::AgentId;
 
 /// What becomes of a subagent once it yields a result.

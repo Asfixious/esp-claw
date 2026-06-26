@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use crate::agent::base_agent::{
     AgentCommand, AgentCommandError, AgentId, ApprovalDecision, ApprovalId, TickOutcome,
 };
-use crate::agent::registry::{AgentFactory, AgentIdAllocator, AgentRegistry};
+use crate::agent::factory::AgentFactory;
+use crate::agent::registry::{AgentIdAllocator, AgentRegistry};
 use crate::agent::{
     AgentKind, AgentSnapshot, AgentStatus, ApprovalVerdict, GraphEffect, GraphHost,
     TerminationPolicy,
@@ -759,7 +760,7 @@ mod tests {
 
     use super::*;
     use crate::agent::base_agent::AgentCommand;
-    use crate::agent::registry::AgentFactory;
+    use crate::agent::factory::AgentFactory;
     use crate::agent::{Agent, AgentContext};
 
     /// The kind every test child is spawned as.

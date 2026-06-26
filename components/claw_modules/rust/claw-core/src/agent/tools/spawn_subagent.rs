@@ -6,7 +6,7 @@ use std::sync::Arc;
 use claw_permission::{Action, RiskClass};
 use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
 
-use crate::agent::agent::AgentKind;
+use crate::agent::kind::AgentKind;
 use crate::agent::graph::{AgentContext, SpawnPolicy, TerminationPolicy};
 
 use super::string_argument;

@@ -12,17 +12,15 @@
 //! nothing of edges, depth, readiness, or what a tick outcome means; it only
 //! stores what the instance hands it and gives back handles on request.
 //!
-//! This module also defines the shared [`AgentIdAllocator`] (process-unique ids)
-//! and the [`AgentFactory`] seam (how an agent of a kind is built). Both are used
-//! by the instance, not by the store itself: they are colocated here because they
-//! are agent-identity / agent-construction infrastructure.
+//! This module also defines the shared [`AgentIdAllocator`] (process-unique ids),
+//! used by the instance, not by the store itself: it is colocated here because it
+//! is agent-identity infrastructure. The companion construction seam — how an
+//! agent of a kind is built — is [`AgentFactory`](crate::agent::factory::AgentFactory).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::agent::AgentKind;
 use crate::agent::base_agent::AgentId;
-use crate::agent::graph::GraphHost;
 use crate::agent::Agent;
 
 /// The first [`AgentId`] handed out (0 reads like "unset").
@@ -67,36 +65,6 @@ impl AgentIdAllocator {
         *next = AgentId(id.0.saturating_add(1));
         id
     }
-}
-
-/// Creates a concrete agent for a goal.
-///
-/// Injected so the agent runtime stays free of LLM/memory wiring and
-/// unit-testable with a fake factory. The factory wires the new agent's tools to
-/// the provided [`GraphHost`] so it can spawn children and (for a root) resolve
-/// approvals.
-pub trait AgentFactory: Send + Sync {
-    /// Build an agent of `kind` with id `id` already tasked with `goal`, handing
-    /// it `host` as its back-channel to the agent graph. Used for both spawned
-    /// subagents and a session's root agent.
-    ///
-    /// `is_root` is `true` only for a session **root**: the root is the one agent
-    /// that talks to the user, so it (and only it) gets the `respond_to_approval`
-    /// tool to feed user verdicts back to waiting subagents. Subagents pass
-    /// `false`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable error string when `kind` is unknown or the agent
-    /// cannot be assembled; the caller logs it and drops the spawn.
-    fn create_agent(
-        &self,
-        id: AgentId,
-        kind: &AgentKind,
-        goal: String,
-        host: Arc<dyn GraphHost>,
-        is_root: bool,
-    ) -> Result<Box<dyn Agent>, String>;
 }
 
 /// The per-session agent store: a flat map of agents keyed by [`AgentId`].

@@ -1,7 +1,11 @@
-//! [`FsAgentFactory`] — the production [`AgentFactory`].
+//! Building an agent of a kind: the [`AgentFactory`] seam and its production
+//! implementation [`FsAgentFactory`].
 //!
-//! This is the concrete counterpart to the test factories: it turns a kind into a
-//! real, running [`GenericAgent`] by tying the four pieces together:
+//! [`AgentFactory`] is the injected boundary the orchestrator instance calls to
+//! construct every root and subagent, so the runtime stays free of LLM/memory
+//! wiring and unit-testable with a fake factory. [`FsAgentFactory`] is the
+//! concrete counterpart to those test factories: it turns a kind into a real,
+//! running [`GenericAgent`] by tying four pieces together:
 //!
 //! 1. the kind's compile-time-baked [`AgentManifest`](super::manifest::AgentManifest)
 //!    (pure data: prompt + capability/skill *names*),
@@ -23,12 +27,43 @@ use claw_interface::http::ClawHttp;
 use claw_interface::ClawFs;
 use claw_memory::{ConversationConfig, ConversationDeps};
 
-use crate::agent::agent::{AgentKind, GenericAgent};
 use crate::agent::base_agent::{AgentCommand, AgentId};
-use crate::agent::config::{AgentConfig, AgentResolver};
+use crate::agent::config::AgentConfig;
+use crate::agent::generic_agent::GenericAgent;
 use crate::agent::graph::GraphHost;
-use crate::agent::registry::AgentFactory;
+use crate::agent::kind::AgentKind;
+use crate::agent::resolver::AgentResolver;
 use crate::agent::Agent;
+
+/// Creates a concrete agent for a goal.
+///
+/// Injected so the agent runtime stays free of LLM/memory wiring and
+/// unit-testable with a fake factory. The factory wires the new agent's tools to
+/// the provided [`GraphHost`] so it can spawn children and (for a root) resolve
+/// approvals.
+pub trait AgentFactory: Send + Sync {
+    /// Build an agent of `kind` with id `id` already tasked with `goal`, handing
+    /// it `host` as its back-channel to the agent graph. Used for both spawned
+    /// subagents and a session's root agent.
+    ///
+    /// `is_root` is `true` only for a session **root**: the root is the one agent
+    /// that talks to the user, so it (and only it) gets the `respond_to_approval`
+    /// tool to feed user verdicts back to waiting subagents. Subagents pass
+    /// `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error string when `kind` is unknown or the agent
+    /// cannot be assembled; the caller logs it and drops the spawn.
+    fn create_agent(
+        &self,
+        id: AgentId,
+        kind: &AgentKind,
+        goal: String,
+        host: Arc<dyn GraphHost>,
+        is_root: bool,
+    ) -> Result<Box<dyn Agent>, String>;
+}
 
 /// Builds real [`GenericAgent`]s from compile-time manifests, an injected
 /// resolver, a shared LLM config/transport, and shared memory collaborators.

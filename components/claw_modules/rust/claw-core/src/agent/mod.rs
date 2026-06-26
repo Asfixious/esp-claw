@@ -15,25 +15,25 @@
 //! [`graph`]); the [`OrchestratorInstance`](crate::orchestrator_instance) owns the
 //! flattened agent graph and materializes children through an [`AgentFactory`].
 
-#[allow(clippy::module_inception)]
-pub mod agent;
 pub mod base_agent;
 pub mod config;
-mod fs_factory;
+pub(crate) mod factory;
+pub mod generic_agent;
 pub(crate) mod graph;
+pub(crate) mod kind;
 pub mod manifest;
-mod map_resolver;
 pub(crate) mod registry;
+pub(crate) mod resolver;
 pub(crate) mod tools;
 
-pub use agent::{AgentKind, GenericAgent, GenericAgentBuildError};
 pub use base_agent::{
     AgentAbortHandle, AgentCommand, AgentCommandError, AgentId, AgentRunError, AgentState,
     ApprovalDecision, ApprovalId, BaseAgent, BaseAgentBuildError, BaseAgentBuilder, CancelReason,
     TickOutcome,
 };
-pub use config::{AgentConfig, AgentConfigError, AgentResolver};
-pub use fs_factory::FsAgentFactory;
+pub use config::{AgentConfig, AgentConfigError};
+pub use factory::{AgentFactory, FsAgentFactory};
+pub use generic_agent::{GenericAgent, GenericAgentBuildError};
 pub use graph::{
     AgentSnapshot, AgentStatus, ApprovalVerdict, GraphEffect, GraphHost, TerminationPolicy,
 };
@@ -42,8 +42,8 @@ pub use graph::{
 // in-module path.
 #[cfg(test)]
 pub(crate) use graph::AgentContext;
-pub use map_resolver::MapAgentResolver;
-pub use registry::AgentFactory;
+pub use kind::AgentKind;
+pub use resolver::{AgentResolver, MapAgentResolver};
 
 #[doc(no_inline)]
 pub use claw_api::RetryPolicy;

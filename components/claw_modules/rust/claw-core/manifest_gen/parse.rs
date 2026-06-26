@@ -189,7 +189,7 @@ pub fn parse_kind(dir: &Path) -> Result<ParsedManifest, Box<dyn Error>> {
 ///
 /// Errors if `dir` cannot be read, a required entry is missing, or an
 /// unexpected entry is present.
-fn ensure_exact_entries(dir: &Path, expected: &[&str]) -> Result<(), Box<dyn Error>> {
+pub(crate) fn ensure_exact_entries(dir: &Path, expected: &[&str]) -> Result<(), Box<dyn Error>> {
     let mut actual: Vec<String> = Vec::new();
     for entry in fs::read_dir(dir).map_err(|error| format!("reading {}: {error}", dir.display()))? {
         let entry = entry?;

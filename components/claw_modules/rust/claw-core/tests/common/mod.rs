@@ -58,18 +58,15 @@ pub fn body_end_conversation(final_message: &str) -> String {
     )
 }
 
-/// The built-in `request_approval` tool call (pauses for a human decision).
-pub fn body_request_approval(summary: &str) -> String {
-    body_tool_call(
-        "a1",
-        "request_approval",
-        &json!({ "summary": summary }).to_string(),
-    )
-}
-
 /// A call to the `echo` test tool (see [`EchoTool`]).
 pub fn body_echo_call(input: &str) -> String {
     body_tool_call("t1", "echo", &json!({ "input": input }).to_string())
+}
+
+/// A call to the `echo` test tool with an explicit `id`, so a test can issue more
+/// than one echo call across rounds (distinct tool_call ids).
+pub fn body_echo_call_id(id: &str, input: &str) -> String {
+    body_tool_call(id, "echo", &json!({ "input": input }).to_string())
 }
 
 // ===========================================================================

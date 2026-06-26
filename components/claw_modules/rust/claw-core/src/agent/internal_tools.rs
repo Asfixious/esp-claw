@@ -4,11 +4,15 @@
 //! returning a result to the conversation they steer the *agent graph*. A tool
 //! handler only has `&self`, so it cannot touch state directly — it routes
 //! through one of two seams:
-//! - **self-affecting** control (`end_conversation`, `request_approval`) pushes a
-//!   [`ControlSignal`] onto the agent's own [`ControlSink`], drained each tick;
+//! - **self-affecting** control (`end_conversation`) pushes a [`ControlSignal`]
+//!   onto the agent's own [`ControlSink`], drained each tick;
 //! - **graph-affecting** actions (`spawn_subagent`, `respond_to_approval`) emit a
 //!   [`GraphEffect`] through an [`AgentContext`]/[`GraphHost`], queued and applied
 //!   by the orchestrator instance after the tick.
+//!
+//! Human approval is **not** a tool: it is raised by the permission layer (an
+//! `Ask` decision in `base_agent`), not requested by the model. Only the
+//! root-side `respond_to_approval` (the human's verdict) remains a tool.
 //!
 //! Which tools an agent actually gets is a build-time knob: `spawn_subagent` only
 //! when its manifest enables spawning, `respond_to_approval` only for a session
@@ -21,6 +25,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use claw_permission::{Action, Resource, RiskClass};
 use serde_json::Value;
 
 use crate::agent::agent::AgentKind;
@@ -28,6 +33,15 @@ use crate::agent::base_agent::AgentId;
 use crate::tools::{
     tool_metadata, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput,
 };
+
+/// Best-effort `Resource::Agent` for a tool call's `agent` argument, for
+/// classification only — a missing/malformed id just yields `None` (the verb
+/// alone still classifies; `invoke` is where a bad id is reported).
+fn agent_resource(call: &ToolInvocation<'_>) -> Option<Resource> {
+    let raw = string_argument(call.arguments_json, "agent").ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| Resource::Agent(trimmed.to_string()))
+}
 
 /// Group label for the agent's built-in tools (provenance only).
 pub(crate) const INTERNAL_TOOL_GROUP: &str = "agent";
@@ -40,15 +54,12 @@ pub(crate) const APPROVAL_TOOL_GROUP: &str = "approval";
 
 /// A signal an internal tool raises for the agent to act on next tick.
 ///
-/// These are *internal*: they are not part of the public `AgentCommand` surface,
-/// so a caller cannot forge an end-of-conversation or an approval request.
+/// This is *internal*: it is not part of the public `AgentCommand` surface, so a
+/// caller cannot forge an end-of-conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ControlSignal {
     /// The agent decided it is done; carries its closing message.
     EndConversation { final_message: String },
-    /// The agent wants a human decision before continuing; carries the summary
-    /// shown to the approver.
-    ApprovalRequested { summary: String },
 }
 
 /// The shared queue internal tools push [`ControlSignal`]s onto.
@@ -60,15 +71,7 @@ pub(crate) type ControlSink = Arc<Mutex<VecDeque<ControlSignal>>>;
 
 /// Build the agent's built-in tool group over a control sink.
 pub(crate) fn internal_tool_group(sink: ControlSink) -> ToolGroup {
-    ToolGroup::new(
-        INTERNAL_TOOL_GROUP,
-        [
-            Tool::new(EndConversationTool {
-                sink: Arc::clone(&sink),
-            }),
-            Tool::new(RequestApprovalTool { sink }),
-        ],
-    )
+    ToolGroup::new(INTERNAL_TOOL_GROUP, [Tool::new(EndConversationTool { sink })])
 }
 
 /// Read one string argument out of a tool call, or `""` when it is absent.
@@ -110,24 +113,6 @@ impl ToolHandler for EndConversationTool {
         push(&self.sink, ControlSignal::EndConversation { final_message });
         Ok(ToolOutput {
             output: "Conversation ended.".to_string(),
-            ok: true,
-        })
-    }
-}
-
-/// `request_approval(summary)` — the agent pauses for a human decision.
-struct RequestApprovalTool {
-    sink: ControlSink,
-}
-
-impl ToolHandler for RequestApprovalTool {
-    tool_metadata!("request_approval");
-
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
-        let summary = string_argument(call.arguments_json, "summary")?;
-        push(&self.sink, ControlSignal::ApprovalRequested { summary });
-        Ok(ToolOutput {
-            output: "Approval requested; awaiting a human decision.".to_string(),
             ok: true,
         })
     }
@@ -313,8 +298,9 @@ pub trait GraphHost: Send + Sync {
 /// [`GraphHost`]. It is the ergonomic façade over [`GraphHost`]: tools call typed
 /// methods ([`spawn`](Self::spawn), [`respond_to_approval`](Self::respond_to_approval))
 /// and never touch [`GraphEffect`] or the queue directly. Self-affecting control
-/// (`end_conversation`, `request_approval`) does *not* go through here — it stays
-/// on the agent's own [`ControlSink`].
+/// (`end_conversation`) does *not* go through here — it stays on the agent's own
+/// [`ControlSink`]. Approval is no longer a tool: it is raised by the permission
+/// policy (an `Ask` decision) inside the tool runner.
 pub(crate) struct AgentContext {
     /// The owning agent's id — stamped as the `requester`/parent on every effect.
     id: AgentId,
@@ -500,6 +486,11 @@ struct SpawnSubagentTool {
 impl ToolHandler for SpawnSubagentTool {
     tool_metadata!("spawn_subagent");
 
+    fn classify(&self, _call: &ToolInvocation<'_>) -> Action {
+        // Creating a child mutates the graph — worth a policy look, but reversible.
+        Action::new("spawn_subagent", RiskClass::Moderate)
+    }
+
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let kind = string_argument(call.arguments_json, "kind")?;
         if kind.trim().is_empty() {
@@ -561,6 +552,11 @@ struct ListSubagentsTool {
 impl ToolHandler for ListSubagentsTool {
     tool_metadata!("list_subagents");
 
+    // A pure read of the graph snapshot — safe to run alongside other calls.
+    fn concurrent(&self) -> bool {
+        true
+    }
+
     fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let subagents: Vec<Value> = self
             .context
@@ -582,6 +578,19 @@ struct WatchSubagentTool {
 
 impl ToolHandler for WatchSubagentTool {
     tool_metadata!("watch_subagent");
+
+    // A pure read of one snapshot — safe to run alongside other calls.
+    fn concurrent(&self) -> bool {
+        true
+    }
+
+    fn classify(&self, call: &ToolInvocation<'_>) -> Action {
+        let action = Action::new("watch_subagent", RiskClass::Safe);
+        match agent_resource(call) {
+            Some(resource) => action.with_resource(resource),
+            None => action,
+        }
+    }
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let agent = string_argument(call.arguments_json, "agent")?;
@@ -611,6 +620,15 @@ struct DeleteSubagentTool {
 impl ToolHandler for DeleteSubagentTool {
     tool_metadata!("delete_subagent");
 
+    fn classify(&self, call: &ToolInvocation<'_>) -> Action {
+        // Removing an agent and its subtree is irreversible — high risk.
+        let action = Action::new("delete_subagent", RiskClass::High);
+        match agent_resource(call) {
+            Some(resource) => action.with_resource(resource),
+            None => action,
+        }
+    }
+
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let agent = string_argument(call.arguments_json, "agent")?;
         let target = AgentId::from_wire(agent.trim()).map_err(|error| {
@@ -636,8 +654,9 @@ impl ToolHandler for DeleteSubagentTool {
 
 // -- Root-side approval resolution ------------------------------------------
 //
-// Only the session root talks to the user, so any agent's `request_approval`
-// bubbles up to the root (done by the orchestrator instance). The root presents
+// Only the session root talks to the user, so any agent's pending approval (an
+// `Ask` decision raised by its permission policy) bubbles up to the root (done by
+// the orchestrator instance). The root presents
 // it, reads the user's free-text reply, classifies it into yes/no/other, and
 // reports the verdict back with the `respond_to_approval` tool. Like
 // `spawn_subagent`, this affects *another* agent, so it emits a
@@ -673,6 +692,14 @@ struct RespondToApprovalTool {
 
 impl ToolHandler for RespondToApprovalTool {
     tool_metadata!("respond_to_approval");
+
+    fn classify(&self, call: &ToolInvocation<'_>) -> Action {
+        let action = Action::new("respond_to_approval", RiskClass::Low);
+        match agent_resource(call) {
+            Some(resource) => action.with_resource(resource),
+            None => action,
+        }
+    }
 
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let agent = string_argument(call.arguments_json, "agent")?;
@@ -737,33 +764,6 @@ mod tests {
             signal,
             ControlSignal::EndConversation {
                 final_message: "all done".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn request_approval_pushes_summary() {
-        let sink = sink();
-        let group = internal_tool_group(Arc::clone(&sink));
-        let tool = group
-            .tools()
-            .iter()
-            .find(|tool| tool.name() == "request_approval")
-            .unwrap()
-            .clone();
-
-        tool.invoke(&ToolInvocation {
-            id: Some("t1"),
-            name: "request_approval",
-            arguments_json: r#"{"summary":"delete prod"}"#,
-        })
-        .unwrap();
-
-        let signal = sink.lock().unwrap().pop_front().unwrap();
-        assert_eq!(
-            signal,
-            ControlSignal::ApprovalRequested {
-                summary: "delete prod".to_string()
             }
         );
     }

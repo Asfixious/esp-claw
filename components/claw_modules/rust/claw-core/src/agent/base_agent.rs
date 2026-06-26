@@ -64,7 +64,10 @@ use crate::iteration_loop::{
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
     PreemptedOutcome, SystemPrompt, ToolRun,
 };
+use crate::tool_runner::ToolGate;
 use crate::tools::{AllowedTools, ToolSet, ToolSetError};
+use claw_context::{Block, BlockKind, ContextBuilder};
+use claw_permission::{Action, Grant, GrantStore, PermissionDecision, PermissionPolicy, PermissionRequest};
 use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
@@ -127,7 +130,7 @@ pub enum AgentState {
     Running,
     /// A running task whose iteration scheduling is [`Pause`](AgentCommand::Pause)d.
     Paused,
-    /// Stopped on a built-in `request_approval`, awaiting an
+    /// Paused on a permission-policy `Ask`, awaiting an
     /// [`ApprovalResult`](AgentCommand::ApprovalResult).
     AwaitingApproval,
 }
@@ -218,8 +221,8 @@ pub enum TickOutcome {
         /// The model's user-facing answer.
         text: String,
     },
-    /// The agent called `request_approval` and is paused for a human decision.
-    /// Resolve it with [`resolve_approval`](BaseAgent::resolve_approval).
+    /// A tool call's permission policy returned `Ask`; the agent is paused for a
+    /// human decision. Resolve it with [`resolve_approval`](BaseAgent::resolve_approval).
     AwaitingApproval {
         /// The id to pass back via [`resolve_approval`](BaseAgent::resolve_approval).
         id: ApprovalId,
@@ -342,6 +345,58 @@ impl InterruptionControl for AgentInterruption {
     }
 }
 
+/// The agent's permission gate: a policy, the acting agent's identity, and the
+/// grant store of human decisions, implementing [`ToolGate`] for the tool runner.
+///
+/// [`decide`](ToolGate::decide) is read-only — it answers from a recorded
+/// [`Grant`] first (so a previously approved/denied action resolves without
+/// asking again, which also prevents an ask/retry loop), then falls back to the
+/// policy. Recording a decision happens separately, on an
+/// [`ApprovalResult`](AgentCommand::ApprovalResult), via
+/// [`record_decision`](Self::record_decision).
+struct PermissionGate {
+    policy: Arc<dyn PermissionPolicy>,
+    agent_id: u64,
+    agent_kind: String,
+    grants: GrantStore,
+}
+
+impl PermissionGate {
+    /// Record a human decision against `signatures` (the actions that were asked
+    /// about), so the matching retried calls resolve directly.
+    fn record_decision(&mut self, signatures: &[String], decision: &ApprovalDecision) {
+        for signature in signatures {
+            match decision {
+                ApprovalDecision::Approved => self.grants.grant(signature.clone()),
+                ApprovalDecision::Rejected(reason) => {
+                    self.grants.deny(signature.clone(), reason.clone())
+                }
+            }
+        }
+    }
+}
+
+impl ToolGate for PermissionGate {
+    fn decide(&self, action: &Action) -> PermissionDecision {
+        // A recorded decision wins over the policy: it both honors the human and
+        // breaks the ask → retry → ask loop.
+        match self.grants.lookup(&action.signature()) {
+            Some(Grant::Granted) => return PermissionDecision::Allow,
+            Some(Grant::Denied(reason)) => {
+                return PermissionDecision::Deny {
+                    reason: reason.clone(),
+                }
+            }
+            None => {}
+        }
+        self.policy.evaluate(&PermissionRequest::new(
+            self.agent_id,
+            &self.agent_kind,
+            action,
+        ))
+    }
+}
+
 // ===========================================================================
 // BaseAgent
 // ===========================================================================
@@ -399,14 +454,29 @@ pub struct BaseAgent<F: ClawFs + 'static> {
     skills: Option<SkillSet>,
     /// Agent-level system prompt (its persona/identity), fixed across tasks.
     system_prompt: String,
-    /// Cached `system_prompt` + skills context. Empty means "no skill content,
-    /// borrow `system_prompt` directly". Rebuilt only when `effective_prompt_dirty`.
+    /// The tool-policy prompt section — every tool's usage prose, produced once
+    /// from the final [`ToolSet`] at build (`None` when no tool carries usage).
+    /// Placed into the assembled prompt by `claw-context`; fixed across tasks.
+    tool_context: Option<String>,
+    /// Cached assembled prompt (instruction + tool policy + skills context). Empty
+    /// means "nothing to assemble, borrow `system_prompt` directly". Rebuilt only
+    /// when `effective_prompt_dirty`.
     effective_prompt: String,
     effective_prompt_dirty: bool,
     /// Open group guard from task start until the first response, so the user turn
     /// and the assistant reply commit as one group (compaction never orphans a
     /// reply with no user turn).
     open_turn: Option<GroupGuard<F>>,
+    /// The permission gate consulted per tool call (`None` = no permission layer:
+    /// every call that passes soft-hide runs). Owns the grant store of human
+    /// decisions; mutated when an [`ApprovalResult`](AgentCommand::ApprovalResult)
+    /// resolves a pending ask.
+    gate: Option<PermissionGate>,
+    /// Action signatures awaiting the current human decision — the calls the
+    /// permission policy asked about this tick. Recorded into the gate's grant
+    /// store when the [`ApprovalResult`](AgentCommand::ApprovalResult) arrives,
+    /// then cleared.
+    pending_grant_signatures: Vec<String>,
     next_iteration: IterationId,
     next_approval: usize,
     pending_approval: Option<ApprovalId>,
@@ -449,6 +519,9 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             system_prompt: String::new(),
             retry_policy: RetryPolicy::default(),
             tool_block_retries: DEFAULT_TOOL_BLOCK_RETRIES,
+            permission_policy: None,
+            agent_id: 0,
+            agent_kind: String::new(),
         }
     }
 
@@ -555,7 +628,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     /// ```ignore
     /// use claw_core::agent::{ApprovalDecision, AgentCommandError, TickOutcome};
     ///
-    /// // A tick that stopped on a built-in `request_approval` hands back the id.
+    /// // A tick that paused on a permission `Ask` hands back the id.
     /// if let TickOutcome::AwaitingApproval { id, .. } = agent.tick() {
     ///     agent.resolve_approval(id, ApprovalDecision::Approved)?;
     /// }
@@ -658,6 +731,13 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     /// each semantic state change (including mid-task), so gating tracks the
     /// FSM. It is not part of the public boundary — external callers drive the
     /// agent through semantic commands, not by toggling gating directly.
+    ///
+    /// Reserved soft-tools seam: no in-crate driver toggles phase gating today
+    /// (only the gating tests exercise it), so it is `dead_code` until a phased
+    /// agent reattaches; the enforcement path in [`ToolRunner`] stays wired.
+    ///
+    /// [`ToolRunner`]: crate::tool_runner::ToolRunner
+    #[allow(dead_code)]
     pub(crate) fn set_active_tools(&mut self, allowed: AllowedTools) {
         self.tail_note = Some(Self::phase_note(&allowed));
         self.allowed_tools = Some(allowed);
@@ -665,6 +745,9 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
 
     /// Remove tool gating: every tool in the set may run again (the default),
     /// and drop the accompanying phase note.
+    ///
+    /// Reserved soft-tools seam (see [`set_active_tools`](Self::set_active_tools)).
+    #[allow(dead_code)]
     pub(crate) fn clear_active_tools(&mut self) {
         self.allowed_tools = None;
         self.tail_note = None;
@@ -673,6 +756,9 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     /// Build the transient phase note from the allow-set: a single
     /// "system-reminder" line naming the tools the model may use this phase, so
     /// its wording stays in lock-step with what enforcement will actually allow.
+    ///
+    /// Reserved soft-tools seam (see [`set_active_tools`](Self::set_active_tools)).
+    #[allow(dead_code)]
     fn phase_note(allowed: &AllowedTools) -> String {
         let names = allowed.sorted_names();
         if names.is_empty() {
@@ -743,6 +829,12 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         })
     }
 
+    /// The permission gate to consult this iteration, as a trait object (`None`
+    /// when no permission policy is configured).
+    fn tool_gate(&self) -> Option<&dyn ToolGate> {
+        self.gate.as_ref().map(|gate| gate as &dyn ToolGate)
+    }
+
     /// Run exactly one [`IterationLoop`] round over current context.
     fn run_iteration(&self, iteration_id: IterationId) -> IterationResult {
         let system_prompt = self.effective_prompt();
@@ -769,6 +861,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             messages: ChatMessages(&messages),
             tools: self.tools.as_ref(),
             allowed_tools: self.allowed_tools.as_ref(),
+            gate: self.tool_gate(),
         };
         iteration_loop.run(step)
     }
@@ -819,6 +912,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
                 // task does not inherit an unexplained, half-finished exchange.
                 self.commit_cancellation(&reason);
                 self.pending_approval = None;
+                self.pending_grant_signatures.clear();
                 self.lifecycle = AgentState::Idle;
                 self.outcome = Some(TickOutcome::Cancelled { reason });
             }
@@ -830,6 +924,9 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             }
             Inbound::Command(AgentCommand::ApprovalResult { id, decision }) => {
                 self.commit_approval_decision(id, &decision);
+                // Record the decision against the asked-about actions so the
+                // retried tool calls resolve without asking again.
+                self.record_grants(&decision);
                 self.pending_approval = None;
                 self.lifecycle = AgentState::Running;
             }
@@ -841,12 +938,6 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
                 drop(turn);
                 self.lifecycle = AgentState::Idle;
                 self.outcome = Some(TickOutcome::Ended { final_message });
-            }
-            Inbound::Control(ControlSignal::ApprovalRequested { summary }) => {
-                let id = self.allocate_approval_id();
-                self.pending_approval = Some(id);
-                self.lifecycle = AgentState::AwaitingApproval;
-                self.outcome = Some(TickOutcome::AwaitingApproval { id, summary });
             }
         }
     }
@@ -867,10 +958,15 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
                     // A tool round: merge the messages and keep working. The
                     // per-tool summary (`tools.runs`) stays internal — base_agent
                     // does not surface it as an outcome. The patch is well-formed
-                    // even for gating-blocked calls (each got a matched tool
-                    // error), so committing here never leaves a dangling call.
+                    // even for gating-blocked / permission-refused calls (each got
+                    // a matched tool error), so committing never leaves a dangling
+                    // call.
                     self.commit_patch(&tools.appended.0);
                     self.apply_tool_block_policy(&tools.runs);
+                    // A permission `Ask` pauses the agent for a human decision
+                    // (unless the round already failed the task via the block
+                    // policy above).
+                    self.maybe_raise_approval(&tools.runs);
                 }
             },
             Ok(IterationOutcome::Preempted(outcome)) => {
@@ -913,6 +1009,44 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
                 .map(|name| (*name).to_string())
                 .unwrap_or_default();
             self.fail_with(AgentRunError::ToolNotPermitted { name });
+        }
+    }
+
+    /// Pause for a human decision when the permission policy asked about any call
+    /// this round. No-op if the round already produced an outcome (e.g. the block
+    /// policy failed the task) or no call needs approval.
+    ///
+    /// The asked-about action signatures are remembered so the
+    /// [`ApprovalResult`](AgentCommand::ApprovalResult) can grant/deny them; the
+    /// approver sees the first call's reason as the summary.
+    fn maybe_raise_approval(&mut self, runs: &[ToolRun]) {
+        if self.outcome.is_some() {
+            return;
+        }
+        let pending: Vec<(String, String)> = runs
+            .iter()
+            .filter_map(|run| {
+                run.approval
+                    .as_ref()
+                    .map(|approval| (approval.summary.clone(), approval.signature.clone()))
+            })
+            .collect();
+        let Some((summary, _)) = pending.first().cloned() else {
+            return;
+        };
+        self.pending_grant_signatures = pending.into_iter().map(|(_, sig)| sig).collect();
+        let id = self.allocate_approval_id();
+        self.pending_approval = Some(id);
+        self.lifecycle = AgentState::AwaitingApproval;
+        self.outcome = Some(TickOutcome::AwaitingApproval { id, summary });
+    }
+
+    /// Record a human decision against the actions that were asked about, so the
+    /// retried calls resolve directly. No-op without a permission gate.
+    fn record_grants(&mut self, decision: &ApprovalDecision) {
+        let signatures = std::mem::take(&mut self.pending_grant_signatures);
+        if let Some(gate) = self.gate.as_mut() {
+            gate.record_decision(&signatures, decision);
         }
     }
 
@@ -1008,11 +1142,13 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
 
     // -- Effective prompt cache ---------------------------------------------
 
-    /// Rebuild the cached combined prompt if stale; otherwise a no-op.
+    /// Rebuild the cached assembled prompt if stale; otherwise a no-op.
     ///
-    /// When the loaded skills produce content, the cache holds `system_prompt`
-    /// concatenated with it (allocated once per change). When there is none, the
-    /// cache is left empty as the signal to borrow `system_prompt` directly.
+    /// Assembles the agent's system prompt from its sections via `claw-context`,
+    /// which owns placement (the Static instruction + tool-policy band, then the
+    /// Durable active-skills band). When the agent has neither tool-usage prose nor
+    /// active skill content, the cache is left empty as the signal to borrow
+    /// `system_prompt` directly (no allocation).
     fn refresh_effective_prompt(&mut self) -> Result<(), SkillError> {
         if !self.effective_prompt_dirty {
             return Ok(());
@@ -1022,10 +1158,12 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             None => "",
         };
         self.effective_prompt.clear();
-        if !skill_context.is_empty() {
-            self.effective_prompt.push_str(&self.system_prompt);
-            self.effective_prompt.push_str("\n\n");
-            self.effective_prompt.push_str(skill_context);
+        if self.tool_context.is_some() || !skill_context.is_empty() {
+            self.effective_prompt = assemble_system_prompt(
+                &self.system_prompt,
+                self.tool_context.as_deref(),
+                skill_context,
+            );
         }
         self.effective_prompt_dirty = false;
         Ok(())
@@ -1041,6 +1179,34 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             &self.effective_prompt
         }
     }
+}
+
+/// Assemble the per-iteration system prompt from its sections, letting
+/// `claw-context` own placement: the Static instruction and tool-policy blocks,
+/// then the Durable active-skills block. Absent sections are omitted.
+fn assemble_system_prompt(
+    instruction: &str,
+    tool_context: Option<&str>,
+    skill_context: &str,
+) -> String {
+    let mut builder =
+        ContextBuilder::new().with(Block::new(BlockKind::AgentInstruction, instruction));
+    if let Some(tool_context) = tool_context {
+        builder = builder.with(Block::new(BlockKind::ToolPolicy, tool_context));
+    }
+    if !skill_context.is_empty() {
+        builder = builder.with(Block::new(BlockKind::ActiveSkills, skill_context));
+    }
+    builder
+        .build()
+        .map(|context| context.into_string())
+        .unwrap_or_else(|error| {
+            // The only build error is a duplicate canonical block; the kinds added
+            // above are distinct, so this branch is unreachable. Degrade to the raw
+            // instruction rather than panic if that invariant is ever broken.
+            tracing::error!(%error, "system-prompt assembly failed; using base instruction");
+            instruction.to_string()
+        })
 }
 
 /// True when `patch` contains an assistant `tool_calls` id with no matching
@@ -1084,14 +1250,16 @@ pub struct BaseAgentBuilder<F: ClawFs + 'static> {
     system_prompt: String,
     retry_policy: RetryPolicy,
     tool_block_retries: u32,
+    permission_policy: Option<Arc<dyn PermissionPolicy>>,
+    agent_id: u64,
+    agent_kind: String,
 }
 
 impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
     /// Set the tools available to the agent across all tasks.
     ///
-    /// Takes a pre-built [`ToolSet`]; the agent's built-in tools
-    /// (`end_conversation`, `request_approval`) are merged on at
-    /// [`build`](Self::build).
+    /// Takes a pre-built [`ToolSet`]; the agent's built-in control tool
+    /// (`end_conversation`) is merged on at [`build`](Self::build).
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
         self.tools = Some(tools);
         self
@@ -1159,6 +1327,28 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
         self
     }
 
+    /// Install a permission policy that gates every tool call. Each classified
+    /// call is evaluated to `Allow` / `Ask` / `Deny`; `Ask` pauses the agent for a
+    /// human decision (reusing the approval flow), and the decision is remembered
+    /// so the retried call resolves directly.
+    ///
+    /// Without this, the agent has no permission layer: every call that passes
+    /// soft-hide gating runs. Pair with [`with_identity`](Self::with_identity) so
+    /// the policy sees the acting agent.
+    pub fn with_permission_policy(mut self, policy: Arc<dyn PermissionPolicy>) -> Self {
+        self.permission_policy = Some(policy);
+        self
+    }
+
+    /// Set the acting agent's identity (numeric id + kind), passed to the
+    /// permission policy on each evaluation. Defaults to `(0, "")`; only relevant
+    /// when a [permission policy](Self::with_permission_policy) is installed.
+    pub fn with_identity(mut self, agent_id: u64, agent_kind: impl Into<String>) -> Self {
+        self.agent_id = agent_id;
+        self.agent_kind = agent_kind.into();
+        self
+    }
+
     /// Finish configuration and produce a runnable [`BaseAgent`].
     ///
     /// The built-in tool group is merged onto the caller's tools when the LLM
@@ -1185,6 +1375,17 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
             None
         };
 
+        // Produce the tool-policy prompt section once from the final tool set (the
+        // assembler places it each iteration). Fixed for the agent's lifetime.
+        let tool_context = tools.as_ref().and_then(ToolSet::tool_context);
+
+        let gate = self.permission_policy.map(|policy| PermissionGate {
+            policy,
+            agent_id: self.agent_id,
+            agent_kind: self.agent_kind,
+            grants: GrantStore::new(),
+        });
+
         Ok(BaseAgent {
             llm: self.llm,
             retry_policy: self.retry_policy,
@@ -1199,10 +1400,13 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
             tool_block_retries: self.tool_block_retries,
             skills: self.skills,
             system_prompt: self.system_prompt,
+            tool_context,
             effective_prompt: String::new(),
             // Build the combined prompt on the first tick.
             effective_prompt_dirty: true,
             open_turn: None,
+            gate,
+            pending_grant_signatures: Vec::new(),
             next_iteration: IterationId(0),
             next_approval: 0,
             pending_approval: None,

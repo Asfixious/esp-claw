@@ -12,6 +12,7 @@ members = [
     "claw-capability",
     "claw-memory",
     "claw-context",
+    "claw-permission",
     "claw-sandbox",
 ]
 

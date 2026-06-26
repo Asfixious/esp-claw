@@ -58,8 +58,9 @@ pub(crate) struct RootReply {
 
 /// A pending human decision surfaced out of the graph.
 ///
-/// A **subagent**'s `request_approval` never reaches here — it bubbles to the
-/// session root (the only agent that talks to the user), which classifies the
+/// A **subagent**'s pending approval (a permission `Ask`) never reaches here — it
+/// bubbles to the session root (the only agent that talks to the user), which
+/// classifies the
 /// reply and resolves it with `respond_to_approval`. Only a **root**'s own
 /// approval is surfaced as an `ApprovalRequest`, to be resolved via
 /// [`OrchestratorInstance::resolve_approval`].

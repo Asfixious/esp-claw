@@ -13,6 +13,7 @@ mod orchestrator;
 mod orchestrator_instance;
 pub mod protocol;
 pub mod session;
+pub mod tool_runner;
 pub mod tools;
 
 pub use channels::{
@@ -39,3 +40,11 @@ pub use tools::{
     AllowedTools, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
     ToolSetError, DEFAULT_TOOL_GROUP,
 };
+// The permission layer authoring surface — re-exported so callers can build the
+// policies that `BaseAgentBuilder::with_permission_policy` accepts without
+// depending on `claw-permission` directly. The runtime grant store stays internal.
+pub use claw_permission::{
+    Action, AllowAll, AskAtOrAbove, PermissionDecision, PermissionPolicy, PermissionRequest,
+    PolicyChain, Resource, RiskClass,
+};
+pub use tool_runner::ToolGate;

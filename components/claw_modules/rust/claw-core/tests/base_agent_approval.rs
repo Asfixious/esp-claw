@@ -2,24 +2,52 @@
 
 //! Integration tests for `BaseAgent`'s human-in-the-loop approval flow.
 //!
-//! These exercise the built-in `request_approval` tool: the agent pauses into
-//! `AwaitingApproval`, a human resolves (or cancels) the pending decision, and
-//! the recorded transcript / resumed run reflect that decision exactly.
+//! Approval is now **permission-driven**: a tool call whose [`PermissionPolicy`]
+//! returns `Ask` pauses the agent into `AwaitingApproval` (there is no
+//! model-callable `request_approval` tool). A human resolves (or cancels) the
+//! pending decision; the recorded transcript and the resumed run reflect it, and
+//! a recorded grant lets the retried call run without asking again.
 
 mod common;
+
+use std::sync::Arc;
 
 use claw_core::agent::{
     AgentCommandError, AgentId, AgentState, ApprovalDecision, ApprovalId, CancelReason, TickOutcome,
 };
+use claw_core::{AskAtOrAbove, PermissionPolicy, RiskClass, Tool, ToolGroup, ToolSet};
 use common::{
-    agent_builder, body_plain_text, body_request_approval, builder_with_view, capturing_llm,
-    scripted_llm, transcript_contents, TestAgent,
+    agent_builder, body_echo_call, body_echo_call_id, body_plain_text, builder_with_view,
+    capturing_llm, scripted_llm, transcript_contents, EchoTool, TestAgent, TestFs,
 };
 
-/// Build an agent over fresh disk memory with the given scripted LLM.
+/// A policy that asks for approval on every tool call (every action is at least
+/// `Safe` risk), so a plain `echo` call exercises the approval path.
+fn ask_everything() -> Arc<dyn PermissionPolicy> {
+    Arc::new(AskAtOrAbove::new(RiskClass::Safe))
+}
+
+/// The single caller tool (`echo`) used to trigger the policy.
+fn echo_tools() -> ToolSet {
+    ToolSet::from_groups([ToolGroup::new("echo", [Tool::new(EchoTool)])]).expect("tools")
+}
+
+/// A `BaseAgentBuilder` wired with the echo tool, the ask-everything policy, and
+/// an identity — ready to `.build()`.
+fn asking_builder(
+    llm: claw_api::ClawApi,
+    dir: impl Into<String>,
+) -> claw_core::agent::BaseAgentBuilder<TestFs> {
+    agent_builder(llm, AgentId(1), dir)
+        .with_tools(echo_tools())
+        .with_permission_policy(ask_everything())
+        .with_identity(1, "worker")
+}
+
+/// Build an asking agent over fresh disk memory with the given scripted LLM.
 fn build_agent(name: &str, llm: claw_api::ClawApi) -> TestAgent {
     let dir = common::test_output_dir(name);
-    agent_builder(llm, AgentId(1), dir.display().to_string())
+    asking_builder(llm, dir.display().to_string())
         .build()
         .expect("build")
 }
@@ -27,16 +55,13 @@ fn build_agent(name: &str, llm: claw_api::ClawApi) -> TestAgent {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn request_approval_pauses_for_decision() {
-    let mut agent = build_agent(
-        "appr_request_pauses",
-        scripted_llm(vec![body_request_approval("delete prod")]),
-    );
+fn risky_tool_pauses_for_approval() {
+    let mut agent = build_agent("appr_request_pauses", scripted_llm(vec![body_echo_call("x")]));
 
     agent.run("do it");
     assert!(matches!(
         agent.tick(),
-        TickOutcome::AwaitingApproval { ref summary, .. } if summary == "delete prod"
+        TickOutcome::AwaitingApproval { ref summary, .. } if summary.contains("echo")
     ));
     assert!(!agent.is_running());
 }
@@ -45,21 +70,20 @@ fn request_approval_pauses_for_decision() {
 fn approve_resumes_and_records_decision() {
     let dir = common::test_output_dir("appr_approve_records");
     let (builder, view) = builder_with_view(
-        scripted_llm(vec![
-            body_request_approval("do it"),
-            body_plain_text("done"),
-        ]),
+        scripted_llm(vec![body_echo_call("x"), body_plain_text("done")]),
         AgentId(1),
         dir.display().to_string(),
     );
-    let mut agent = builder.build().expect("build");
+    let mut agent = builder
+        .with_tools(echo_tools())
+        .with_permission_policy(ask_everything())
+        .with_identity(1, "worker")
+        .build()
+        .expect("build");
 
     agent.run("go");
     let id = match agent.tick() {
-        TickOutcome::AwaitingApproval { id, summary } => {
-            assert_eq!(summary, "do it");
-            id
-        }
+        TickOutcome::AwaitingApproval { id, .. } => id,
         other => panic!("expected AwaitingApproval, got {other:?}"),
     };
 
@@ -78,18 +102,20 @@ fn approve_resumes_and_records_decision() {
 fn reject_resumes_and_records_reason() {
     let dir = common::test_output_dir("appr_reject_records");
     let (builder, view) = builder_with_view(
-        scripted_llm(vec![body_request_approval("do it"), body_plain_text("ok")]),
+        scripted_llm(vec![body_echo_call("x"), body_plain_text("ok")]),
         AgentId(1),
         dir.display().to_string(),
     );
-    let mut agent = builder.build().expect("build");
+    let mut agent = builder
+        .with_tools(echo_tools())
+        .with_permission_policy(ask_everything())
+        .with_identity(1, "worker")
+        .build()
+        .expect("build");
 
     agent.run("go");
     let id = match agent.tick() {
-        TickOutcome::AwaitingApproval { id, summary } => {
-            assert_eq!(summary, "do it");
-            id
-        }
+        TickOutcome::AwaitingApproval { id, .. } => id,
         other => panic!("expected AwaitingApproval, got {other:?}"),
     };
 
@@ -104,19 +130,56 @@ fn reject_resumes_and_records_reason() {
         .any(|c| c.contains("rejected by the human") && c.contains("too risky")));
 }
 
+/// After approval, the recorded grant lets the *retried* call actually run
+/// (instead of asking again).
+#[test]
+fn grant_lets_retried_call_run() {
+    let dir = common::test_output_dir("appr_grant_retried");
+    let (builder, view) = builder_with_view(
+        scripted_llm(vec![
+            body_echo_call_id("t1", "first"),  // asked
+            body_echo_call_id("t2", "second"), // retried: now granted -> runs
+            body_plain_text("done"),
+        ]),
+        AgentId(1),
+        dir.display().to_string(),
+    );
+    let mut agent = builder
+        .with_tools(echo_tools())
+        .with_permission_policy(ask_everything())
+        .with_identity(1, "worker")
+        .build()
+        .expect("build");
+
+    agent.run("go");
+    let id = match agent.tick() {
+        TickOutcome::AwaitingApproval { id, .. } => id,
+        other => panic!("expected AwaitingApproval, got {other:?}"),
+    };
+    agent
+        .resolve_approval(id, ApprovalDecision::Approved)
+        .expect("resolve accepted");
+
+    assert_eq!(common::run_to_completion(&mut agent), "done");
+
+    // The second (granted) echo actually executed.
+    let transcript = transcript_contents(&view);
+    assert!(
+        transcript.iter().any(|c| c.contains("echo:") && c.contains("second")),
+        "granted retry did not run: {transcript:?}"
+    );
+}
+
 #[test]
 fn wrong_approval_id_is_rejected_and_stays_awaiting() {
     let mut agent = build_agent(
         "appr_wrong_id",
-        scripted_llm(vec![body_request_approval("x"), body_plain_text("after")]),
+        scripted_llm(vec![body_echo_call("x"), body_plain_text("after")]),
     );
 
     agent.run("go");
     let id = match agent.tick() {
-        TickOutcome::AwaitingApproval { id, summary } => {
-            assert_eq!(summary, "x");
-            id
-        }
+        TickOutcome::AwaitingApproval { id, .. } => id,
         other => panic!("expected AwaitingApproval, got {other:?}"),
     };
 
@@ -139,17 +202,11 @@ fn wrong_approval_id_is_rejected_and_stays_awaiting() {
 
 #[test]
 fn approve_twice_is_rejected() {
-    let mut agent = build_agent(
-        "appr_approve_twice",
-        scripted_llm(vec![body_request_approval("x")]),
-    );
+    let mut agent = build_agent("appr_approve_twice", scripted_llm(vec![body_echo_call("x")]));
 
     agent.run("go");
     let id = match agent.tick() {
-        TickOutcome::AwaitingApproval { id, summary } => {
-            assert_eq!(summary, "x");
-            id
-        }
+        TickOutcome::AwaitingApproval { id, .. } => id,
         other => panic!("expected AwaitingApproval, got {other:?}"),
     };
 
@@ -182,18 +239,20 @@ fn resolve_when_idle_is_rejected() {
 fn cancel_while_awaiting_clears_pending_and_records_marker() {
     let dir = common::test_output_dir("appr_cancel_awaiting");
     let (builder, view) = builder_with_view(
-        scripted_llm(vec![body_request_approval("x")]),
+        scripted_llm(vec![body_echo_call("x")]),
         AgentId(1),
         dir.display().to_string(),
     );
-    let mut agent = builder.build().expect("build");
+    let mut agent = builder
+        .with_tools(echo_tools())
+        .with_permission_policy(ask_everything())
+        .with_identity(1, "worker")
+        .build()
+        .expect("build");
 
     agent.run("go");
     let id = match agent.tick() {
-        TickOutcome::AwaitingApproval { id, summary } => {
-            assert_eq!(summary, "x");
-            id
-        }
+        TickOutcome::AwaitingApproval { id, .. } => id,
         other => panic!("expected AwaitingApproval, got {other:?}"),
     };
 
@@ -223,17 +282,14 @@ fn cancel_while_awaiting_clears_pending_and_records_marker() {
 #[test]
 fn append_while_awaiting_is_included_after_approval() {
     let dir = common::test_output_dir("appr_append_awaiting");
-    let (llm, http) = capturing_llm(vec![body_request_approval("x"), body_plain_text("final")]);
-    let mut agent = agent_builder(llm, AgentId(1), dir.display().to_string())
+    let (llm, http) = capturing_llm(vec![body_echo_call("x"), body_plain_text("final")]);
+    let mut agent = asking_builder(llm, dir.display().to_string())
         .build()
         .expect("build");
 
     agent.run("go");
     let id = match agent.tick() {
-        TickOutcome::AwaitingApproval { id, summary } => {
-            assert_eq!(summary, "x");
-            id
-        }
+        TickOutcome::AwaitingApproval { id, .. } => id,
         other => panic!("expected AwaitingApproval, got {other:?}"),
     };
 

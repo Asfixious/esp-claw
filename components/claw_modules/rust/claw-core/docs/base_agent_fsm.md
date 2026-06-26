@@ -33,7 +33,7 @@ stateDiagram-v2
     Running --> Idle: tick / Yielded (answer, non-terminal)
     Running --> Idle: tick / Ended (end_conversation, terminal)
     Running --> Idle: tick / Failed (terminal)
-    Running --> AwaitingApproval: tick / AwaitingApproval (request_approval)
+    Running --> AwaitingApproval: tick / AwaitingApproval (permission Ask)
 
     Paused --> Running: Resume
     Paused --> Idle: Cancel (tick / Cancelled, terminal)

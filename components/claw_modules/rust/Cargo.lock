@@ -156,8 +156,10 @@ version = "0.1.0"
 dependencies = [
  "claw-api",
  "claw-capability",
+ "claw-context",
  "claw-interface",
  "claw-memory",
+ "claw-permission",
  "claw-skill",
  "claw-utils",
  "dotenvy",
@@ -200,6 +202,13 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "claw-permission"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

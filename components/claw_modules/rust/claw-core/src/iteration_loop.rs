@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::tools::{AllowedTools, ToolError, ToolInvocation, ToolOutput, ToolSet};
+use crate::tool_runner::{ApprovalNeeded, CallOutcome, ToolGate, ToolRunner};
+use crate::tools::{AllowedTools, ToolError, ToolInvocation, ToolSet};
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
 
 use claw_utils::TruncatedText;
@@ -93,6 +94,10 @@ pub struct IterationStep<'a> {
     /// schema is still sent (cache-stable), but a call to a tool not in the set
     /// is refused with a tool error rather than invoked — see [`ToolRun::blocked`].
     pub allowed_tools: Option<&'a AllowedTools>,
+    /// Permission gate consulted before each call after soft-hide passes (`None`
+    /// = no permission layer). On `Deny` the call is refused; on `Ask` it is held
+    /// for human approval (surfaced via [`ToolRun::approval`]) and not run.
+    pub gate: Option<&'a dyn ToolGate>,
 }
 
 /// Terminal outcome of exactly one [`IterationLoop::run`] (completed or preempted).
@@ -128,6 +133,10 @@ pub struct ToolRun {
     /// `ok == false`; upper layers use this to drive the "retry then fail"
     /// policy without treating it as a normal tool failure.
     pub blocked: bool,
+    /// `Some` when the permission policy asked for human approval: the tool did
+    /// not run and the agent layer raises + resolves the request. Crate-internal
+    /// payload — observers outside the crate only see that approval is pending.
+    pub(crate) approval: Option<ApprovalNeeded>,
 }
 
 /// The model issued tool calls and they were executed.
@@ -275,10 +284,10 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
         return Err(err);
     }
 
+    let runner = ToolRunner::new(tools, step.allowed_tools, step.gate);
     match run_tool_calls(
         loop_.interruption,
-        tools,
-        step.allowed_tools,
+        &runner,
         &mut appended,
         &llm_response,
         iteration_id,
@@ -357,8 +366,7 @@ fn append_assistant_tool_calls(
 
 fn run_tool_calls(
     interruption: &dyn InterruptionControl,
-    tools: &ToolSet,
-    allowed_tools: Option<&AllowedTools>,
+    runner: &ToolRunner<'_>,
     appended: &mut AppendedMessages,
     response: &LlmResponse,
     iteration_id: IterationId,
@@ -385,32 +393,30 @@ fn run_tool_calls(
             tc.name.as_str()
         };
         // One span per tool call, covering gating + invoke + result. It lives
-        // here (not in `ToolSet::invoke`) so a call refused by soft-hide gating —
-        // which never reaches `invoke` — is still represented, and the "tool
-        // done" event below carries this span's `span=`.
+        // here (not in the runner / `ToolSet::invoke`) so a call refused by
+        // soft-hide or permission gating — which never reaches `invoke` — is still
+        // represented, and the "tool done" event below carries this span's `span=`.
         let _span =
             tracing::info_span!("toolcall", tool = display_name, call_id = %tc.id).entered();
         // Tool arguments are arbitrary JSON (spaces/commas) -> message slot.
         tracing::debug!("{}", TruncatedText::new(&tc.arguments_json));
 
-        // Soft-hide gating: the schema superset reached the model, but a tool
-        // not in `allowed_tools` must not run this phase. Refuse it with a tool
-        // error (keeping the tool_call_id matched, so the patch stays
-        // well-formed) instead of invoking it.
-        let blocked = allowed_tools.is_some_and(|allowed| !allowed.contains(&tc.name));
-        let (content, ok) = if blocked {
-            tracing::warn!(reason = "not_in_allowed_set", "tool blocked");
-            (blocked_tool_message(&tc.name), false)
-        } else {
-            let ToolOutput { output, ok } = match tools.invoke(&ToolInvocation {
-                id: Some(&tc.id),
-                name: &tc.name,
-                arguments_json: &tc.arguments_json,
-            }) {
-                Ok(output) => output,
-                Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
-            };
-            (output, ok)
+        // The runner owns the decision (soft-hide -> permission -> execute); the
+        // loop owns preemption, spans, message assembly. A matched tool message is
+        // emitted for every call (even refused ones), so the patch stays
+        // well-formed (no dangling tool_call ids).
+        let CallOutcome {
+            content,
+            ok,
+            blocked,
+            approval,
+        } = match runner.run_one(&ToolInvocation {
+            id: Some(&tc.id),
+            name: &tc.name,
+            arguments_json: &tc.arguments_json,
+        }) {
+            Ok(outcome) => outcome,
+            Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
         };
         // Tool output is free-form text -> message slot; keep ok/blocked as fields.
         tracing::info!(ok, blocked, "{}", TruncatedText::new(&content));
@@ -434,22 +440,11 @@ fn run_tool_calls(
             },
             ok,
             blocked,
+            approval,
         });
     }
 
     ToolRoundResult::Completed { runs }
-}
-
-/// The tool-error content handed back to the model when a call is refused by
-/// soft-hide gating. Worded so the model treats it as a policy restriction (not
-/// a transient failure to retry) and switches to a permitted tool.
-fn blocked_tool_message(name: &str) -> String {
-    let name = if name.is_empty() { "(null)" } else { name };
-    format!(
-        "Tool \"{name}\" is not available in the current phase and was not executed. \
-         This is a policy restriction, not a transient error: do not retry it. \
-         Use one of the tools listed as available in the latest instructions instead."
-    )
 }
 
 fn log_tool_call_names(iteration_id: IterationId, response: &LlmResponse) {
@@ -481,7 +476,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::tools::{Tool, ToolGroup, ToolHandler};
+    use crate::tools::{Tool, ToolGroup, ToolHandler, ToolOutput};
     use claw_api::ToolCall;
     use serde_json::json;
 
@@ -640,12 +635,12 @@ mod tests {
             }],
         };
 
+        let runner = ToolRunner::new(&tools, None, None);
         let mut not_array = AppendedMessages(Value::Object(Default::default()));
         assert!(matches!(
             run_tool_calls(
                 &interruption,
-                &tools,
-                None,
+                &runner,
                 &mut not_array,
                 &response,
                 iteration_id
@@ -667,8 +662,7 @@ mod tests {
 
         let ToolRoundResult::Completed { runs } = run_tool_calls(
             &interruption,
-            &tools,
-            None,
+            &runner,
             &mut appended,
             &response,
             iteration_id,
@@ -728,10 +722,10 @@ mod tests {
         )
         .expect("assistant");
 
+        let runner = ToolRunner::new(&tools, Some(&allowed), None);
         let ToolRoundResult::Completed { runs } = run_tool_calls(
             &interruption,
-            &tools,
-            Some(&allowed),
+            &runner,
             &mut appended,
             &response,
             IterationId(1),

@@ -291,6 +291,7 @@ fn run_step(
         messages: ChatMessages(messages),
         tools,
         allowed_tools: None,
+        gate: None,
     };
     IterationLoop {
         llm,

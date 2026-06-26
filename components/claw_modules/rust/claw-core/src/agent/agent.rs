@@ -94,7 +94,7 @@ impl<F: ClawFs + 'static> GenericAgent<F> {
     /// a [`GraphHost`]: `spawn_subagent` when `config.spawn_enabled`, and
     /// `respond_to_approval` when `is_root`. With no `host` (a standalone agent,
     /// no graph) neither is attached. The base agent then adds its built-in
-    /// self-control tools (`end_conversation`, `request_approval`).
+    /// self-control tool (`end_conversation`).
     ///
     /// # Errors
     ///

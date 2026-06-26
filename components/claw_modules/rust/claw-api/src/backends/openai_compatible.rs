@@ -81,6 +81,8 @@ impl OpenAiCompatible {
         if let Some(arr) = request.messages.as_array() {
             messages.extend(arr.iter().cloned());
         }
+        // Ephemeral trailing reminders, appended after the persisted history.
+        messages.extend(request.reminders.iter().cloned());
 
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(self.model));
@@ -110,6 +112,8 @@ impl OpenAiCompatible {
         if let Some(arr) = request.messages.as_array() {
             messages.extend(arr.iter().cloned());
         }
+        // Ephemeral trailing reminders, appended after the persisted history.
+        messages.extend(request.reminders.iter().cloned());
 
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(self.model));

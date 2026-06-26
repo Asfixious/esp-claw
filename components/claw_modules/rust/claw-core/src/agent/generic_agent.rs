@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use claw_api::ClawApi;
+use claw_context::Block;
 use claw_interface::ClawFs;
 use claw_memory::{ConversationConfig, ConversationDeps, ConversationMemory};
 
@@ -58,6 +59,10 @@ impl<F: ClawFs + 'static> GenericAgent<F> {
     /// no graph) neither is attached. The base agent then adds its built-in
     /// self-control tool (`end_conversation`).
     ///
+    /// `inherited_context` is the scope-layered prose injected from above
+    /// (Global -> Session), handed straight to the base agent so it renders ahead
+    /// of the agent's own blocks. Empty for a standalone agent.
+    ///
     /// # Errors
     ///
     /// [`GenericAgentBuildError`] when tool assembly or base construction fails.
@@ -69,6 +74,7 @@ impl<F: ClawFs + 'static> GenericAgent<F> {
         config: AgentConfig,
         host: Option<Arc<dyn GraphHost>>,
         is_root: bool,
+        inherited_context: Arc<[Block<'static>]>,
     ) -> Result<Self, GenericAgentBuildError> {
         // Memory identity follows agent identity: the conversation is keyed by the
         // agent's own id, so the transcript can never be mismatched by the caller.
@@ -94,6 +100,7 @@ impl<F: ClawFs + 'static> GenericAgent<F> {
         let mut base_builder = BaseAgent::builder(llm, memory)
             .with_system_prompt(config.system_prompt)
             .with_tools(tool_set)
+            .with_inherited_context(inherited_context)
             .with_retry_policy(config.retry_policy);
         if let Some(retries) = config.tool_block_retries {
             base_builder = base_builder.with_tool_block_retries(retries);
@@ -301,6 +308,7 @@ mod tests {
             config,
             noop_host(),
             false,
+            Arc::from([]),
         )
         .unwrap();
 
@@ -331,6 +339,7 @@ mod tests {
             config,
             noop_host(),
             false,
+            Arc::from([]),
         )
         .unwrap();
 
@@ -355,6 +364,7 @@ mod tests {
             config,
             noop_host(),
             false,
+            Arc::from([]),
         )
         .unwrap();
 
@@ -391,6 +401,7 @@ mod tests {
             config,
             Some(Arc::clone(&host) as Arc<dyn GraphHost>),
             true,
+            Arc::from([]),
         )
         .unwrap();
 

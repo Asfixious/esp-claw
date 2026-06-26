@@ -109,16 +109,25 @@ fn duplicate_supported_block(block: &Value) -> Option<Value> {
 }
 
 /// `convert_messages_to_anthropic`
-fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, ClawApiError> {
+///
+/// Converts the persisted `messages` history followed by the ephemeral
+/// `reminders` (a two-segment tail) into the Anthropic message shape. The two
+/// segments are viewed as one sequence of references (no `Value` is cloned to
+/// fuse them) so consecutive-tool-message merging still works across the seam.
+fn convert_messages_to_anthropic(
+    messages: &Value,
+    reminders: &[Value],
+) -> Result<Value, ClawApiError> {
     let mut out: Vec<Value> = Vec::new();
-    let arr = match messages.as_array() {
-        Some(a) => a,
-        None => return Ok(Value::Array(out)),
+    let history = match messages.as_array() {
+        Some(a) => a.as_slice(),
+        None => &[],
     };
+    let arr: Vec<&Value> = history.iter().chain(reminders.iter()).collect();
 
     let mut idx = 0usize;
     while idx < arr.len() {
-        let msg = &arr[idx];
+        let msg = arr[idx];
         let role = match str_field(msg, "role") {
             Some(r) if !r.is_empty() => r,
             _ => {
@@ -131,7 +140,7 @@ fn convert_messages_to_anthropic(messages: &Value) -> Result<Value, ClawApiError
         if role == "tool" {
             let mut tool_blocks: Vec<Value> = Vec::new();
             while idx < arr.len() {
-                let inner = &arr[idx];
+                let inner = arr[idx];
                 if str_field(inner, "role") != Some("tool") {
                     break;
                 }
@@ -342,7 +351,7 @@ fn parse_chat_response(body: &str) -> Result<LlmResponse, ClawApiError> {
 impl Anthropic {
     /// `build_chat_body`
     fn build_chat_body(&self, request: &ChatRequest) -> Result<String, ChatError> {
-        let messages = convert_messages_to_anthropic(request.messages)?;
+        let messages = convert_messages_to_anthropic(request.messages, request.reminders)?;
 
         let mut body = Map::new();
         body.insert("model".to_string(), json!(self.model));
@@ -364,7 +373,7 @@ impl Anthropic {
         request: &ChatJsonRequest<'_>,
         schema: &Value,
     ) -> Result<String, ChatError> {
-        let messages = convert_messages_to_anthropic(request.messages)?;
+        let messages = convert_messages_to_anthropic(request.messages, request.reminders)?;
 
         let mut body = Map::new();
         body.insert("model".to_string(), json!(self.model));

@@ -21,6 +21,28 @@ Example: `AgentInstruction` is agent-scoped but immutable, so it sits at the top
 of the wire with `CommonInstruction`, *above* the global-scoped but mutable `Soul`
 and `GlobalMemory`. Mutability moved it, not scope.
 
+## Realization: the two wire fields
+
+The model above is unchanged; this is only how it maps onto the request the API
+client sends. A request has exactly two wire fields, and `claw-context` is the
+single assembler that produces both (`RequestContext::new(system, history,
+reminders)`):
+
+- **`system` (prefix)** — the cacheable prose `Block`s (Bands 1–2, the durable
+  prefix) rendered into one string via `ContextBuilder::build_into` (a reused,
+  dirty-gated buffer).
+- **`messages` (tail)** — the Band-3 structured tail, as **two segments kept
+  separate** so appending never clones history:
+  - the persisted conversation `history` (`ConversationSummary` +
+    `RecentMessages/…` + `CurrentInput`), owned by memory; and
+  - ephemeral **reminders** — per-request nudges (e.g. a soft-hide phase note,
+    or a static-but-last `OutputContract` realized as a trailing
+    `<system-reminder>`) that are **never persisted**.
+
+Determinism rule (one home per item): stable prose by scope -> a `Block`
+(prefix); a real, persisted conversation/tool event -> memory `history` (tail);
+a per-request transient nudge -> `reminders` (tail). There is no fourth option.
+
 ---
 
 # Part A — Architecture

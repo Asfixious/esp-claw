@@ -30,6 +30,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use claw_context::Block;
+
 use crate::agent::base_agent::{
     AgentCommand, AgentCommandError, AgentId, ApprovalDecision, ApprovalId, TickOutcome,
 };
@@ -208,6 +210,11 @@ pub(crate) struct OrchestratorInstance {
     snapshots: SnapshotView,
     /// The [`GraphHost`] handed to every agent this instance builds.
     host: Arc<dyn GraphHost>,
+    /// The scope-layered prose injected into every agent in this session: the
+    /// Global blocks (from the orchestrator) followed by this session's own
+    /// blocks, computed once and shared as an `Arc<[Block]>` so every agent's
+    /// prefix is byte-identical. Empty until scope providers populate it.
+    inherited_context: Arc<[Block<'static>]>,
     /// Monotonic count of external drive cycles (one per delivered user message).
     /// Stamped on the top-level `turn` observability span so a whole drive — and
     /// every nested agent/iteration/tool span under it — reads as one unit.
@@ -218,10 +225,16 @@ impl OrchestratorInstance {
     /// Create an empty instance for `session`. Agents are built with `factory` and
     /// draw ids from the shared `next_agent_id` allocator so they stay unique
     /// across every session.
+    ///
+    /// `global_context` is the orchestrator-wide prose injected into every agent.
+    /// The instance composes it with its own (currently empty) session-scope
+    /// blocks once, into the shared `inherited_context` handed to each agent at
+    /// build time.
     pub(crate) fn new(
         session: SessionId,
         factory: Arc<dyn AgentFactory>,
         next_agent_id: AgentIdAllocator,
+        global_context: Arc<[Block<'static>]>,
     ) -> Self {
         let effects: EffectQueue = Arc::new(Mutex::new(VecDeque::new()));
         let snapshots: SnapshotView = Arc::new(Mutex::new(HashMap::new()));
@@ -230,6 +243,10 @@ impl OrchestratorInstance {
             effects: Arc::clone(&effects),
             snapshots: Arc::clone(&snapshots),
         });
+        // Session-scope blocks are not yet sourced; the inherited set is just the
+        // Global layer. When session blocks exist, prepend Global then append
+        // Session into one `Arc<[Block]>` here so the composition happens once.
+        let inherited_context = global_context;
         Self {
             session,
             registry: AgentRegistry::new(),
@@ -242,6 +259,7 @@ impl OrchestratorInstance {
             effects,
             snapshots,
             host,
+            inherited_context,
             turn: 0,
         }
     }
@@ -262,9 +280,14 @@ impl OrchestratorInstance {
         goal: String,
         is_root: bool,
     ) -> Result<(), String> {
-        let agent = self
-            .factory
-            .create_agent(id, kind, goal, Arc::clone(&self.host), is_root)?;
+        let agent = self.factory.create_agent(
+            id,
+            kind,
+            goal,
+            Arc::clone(&self.host),
+            is_root,
+            Arc::clone(&self.inherited_context),
+        )?;
         self.registry.insert(id, agent);
         Ok(())
     }
@@ -934,6 +957,7 @@ mod tests {
             goal: String,
             host: Arc<dyn GraphHost>,
             _is_root: bool,
+            _inherited_context: Arc<[Block<'static>]>,
         ) -> Result<Box<dyn Agent>, String> {
             Ok(Box::new(FakeAgent {
                 id,
@@ -946,7 +970,7 @@ mod tests {
     }
 
     fn instance_with(factory: Arc<FakeFactory>, session: SessionId) -> OrchestratorInstance {
-        OrchestratorInstance::new(session, factory, AgentIdAllocator::new())
+        OrchestratorInstance::new(session, factory, AgentIdAllocator::new(), Arc::from([]))
     }
 
     #[test]

@@ -289,6 +289,7 @@ fn run_step(
         iteration_id,
         system_prompt: SystemPrompt(system_prompt),
         messages: ChatMessages(messages),
+        reminders: &[],
         tools,
         allowed_tools: None,
         gate: None,

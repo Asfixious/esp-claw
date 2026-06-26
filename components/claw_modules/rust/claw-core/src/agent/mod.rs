@@ -23,6 +23,7 @@ pub(crate) mod graph;
 pub(crate) mod kind;
 pub mod manifest;
 pub(crate) mod registry;
+pub(crate) mod reminder;
 pub(crate) mod resolver;
 pub(crate) mod tools;
 

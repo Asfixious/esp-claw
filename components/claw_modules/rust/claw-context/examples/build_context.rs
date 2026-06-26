@@ -24,7 +24,7 @@ struct StaticSource {
 }
 
 impl ContextProvider for StaticSource {
-    fn block(&self) -> Block {
+    fn block(&self) -> Block<'_> {
         Block::new(self.kind.clone(), self.text)
     }
 }

@@ -868,7 +868,7 @@ fn writes_inspectable_output_files() {
 
     // Write the rendered messages() output for inspection, pretty-printed.
     let messages_path = format!("{disk_dir}/message.json");
-    let messages_json = serde_json::to_string_pretty(&memory.messages()).unwrap();
+    let messages_json = serde_json::to_string_pretty(&*memory.messages()).unwrap();
     std::fs::write(&messages_path, &messages_json).unwrap();
 
     println!("\n=== inspect output files ===");

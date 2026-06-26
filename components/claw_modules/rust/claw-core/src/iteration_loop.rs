@@ -87,6 +87,9 @@ pub struct IterationStep<'a> {
     pub iteration_id: IterationId,
     pub system_prompt: SystemPrompt<'a>,
     pub messages: ChatMessages<'a>,
+    /// Ephemeral trailing messages for this request only (never persisted),
+    /// appended after `messages`. Empty when there is nothing to nudge.
+    pub reminders: &'a [Value],
     pub tools: Option<&'a ToolSet>,
     /// Tools allowed to *execute* this step ("soft-hide" gating). `None` is
     /// ungated: every tool in `tools` may run. When `Some`, the full `tools`
@@ -210,6 +213,7 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
     let chat_request = ChatRequest {
         system_prompt: step.system_prompt.as_ref(),
         messages: step.messages.0,
+        reminders: step.reminders,
         tools_json: step.tools.and_then(|t| t.schemas_json()),
         retry: loop_.retry,
     };

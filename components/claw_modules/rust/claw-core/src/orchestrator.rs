@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use claw_context::Block;
+
 use crate::agent::factory::AgentFactory;
 use crate::agent::registry::AgentIdAllocator;
 use crate::channels::{ChannelEgress, ChannelIngressSink, InboundCommand, InboundMessage};
@@ -30,6 +32,10 @@ pub struct Orchestrator {
     instances: Mutex<HashMap<SessionId, Arc<Mutex<OrchestratorInstance>>>>,
     sessions: SessionStore,
     routes: SessionRoutes,
+    /// Process-wide (Global scope) prose injected into every session's agents.
+    /// Shared as an `Arc<[Block]>` so all sessions reference one computed set for
+    /// byte-identical prefixes. Empty until a Global scope provider populates it.
+    global_context: Arc<[Block<'static>]>,
 }
 
 impl Orchestrator {
@@ -83,6 +89,7 @@ impl Orchestrator {
                 session_id,
                 Arc::clone(&self.factory),
                 self.next_agent_id.clone(),
+                Arc::clone(&self.global_context),
             )))
         }))
     }
@@ -187,6 +194,7 @@ impl Orchestrator {
         OrchestratorBuilder {
             channels: ChannelsUnset,
             factory: FactoryUnset,
+            global_context: Arc::from([]),
         }
     }
 }
@@ -212,6 +220,21 @@ impl ChannelIngressSink for Orchestrator {
 pub struct OrchestratorBuilder<Channels, Factory> {
     channels: Channels,
     factory: Factory,
+    /// Process-wide (Global scope) prose injected into every agent. Optional;
+    /// defaults to empty. Carried through the typestate transitions so it can be
+    /// set before either required dependency.
+    global_context: Arc<[Block<'static>]>,
+}
+
+impl<Channels, Factory> OrchestratorBuilder<Channels, Factory> {
+    /// Inject the Global-scope prose blocks shared by every session's agents.
+    ///
+    /// Optional (defaults to empty). Shared as an `Arc<[Block]>` so all agents
+    /// reference one computed set for byte-identical prefixes.
+    pub fn with_global_context(mut self, blocks: Arc<[Block<'static>]>) -> Self {
+        self.global_context = blocks;
+        self
+    }
 }
 
 impl<Channels> OrchestratorBuilder<Channels, FactoryUnset> {
@@ -227,6 +250,7 @@ impl<Channels> OrchestratorBuilder<Channels, FactoryUnset> {
         OrchestratorBuilder {
             channels: self.channels,
             factory: FactorySet { factory },
+            global_context: self.global_context,
         }
     }
 }
@@ -259,6 +283,7 @@ impl<Factory> OrchestratorBuilder<ChannelsUnset, Factory> {
         OrchestratorBuilder {
             channels: ChannelsEgressOnly { egress },
             factory: self.factory,
+            global_context: self.global_context,
         }
     }
 }
@@ -272,6 +297,7 @@ impl OrchestratorBuilder<ChannelsEgressOnly, FactorySet> {
             instances: Mutex::new(HashMap::new()),
             sessions: SessionStore::new(),
             routes: SessionRoutes::new(),
+            global_context: self.global_context,
         })
     }
 }
@@ -333,6 +359,7 @@ mod tests {
             goal: String,
             _host: Arc<dyn GraphHost>,
             _is_root: bool,
+            _inherited_context: Arc<[Block<'static>]>,
         ) -> Result<Box<dyn Agent>, String> {
             Ok(Box::new(EchoAgent {
                 id,
@@ -392,6 +419,7 @@ mod tests {
             _goal: String,
             _host: Arc<dyn GraphHost>,
             _is_root: bool,
+            _inherited_context: Arc<[Block<'static>]>,
         ) -> Result<Box<dyn Agent>, String> {
             Ok(Box::new(ApprovalAgent {
                 id,

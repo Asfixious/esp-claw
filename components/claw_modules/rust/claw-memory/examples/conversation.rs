@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let messages = memory.messages();
     let count = messages.as_array().map_or(0, Vec::len);
     println!("conversation has {count} message(s) to send to the model:\n");
-    println!("{}", serde_json::to_string_pretty(&messages)?);
+    println!("{}", serde_json::to_string_pretty(&*messages)?);
 
     // Force a checkpoint, e.g. on a clean shutdown.
     memory.flush();

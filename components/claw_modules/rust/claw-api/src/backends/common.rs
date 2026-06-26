@@ -186,7 +186,7 @@ pub fn chat_json_prompt_fallback(
     abort: &AtomicBool,
 ) -> Result<LlmResponse, ChatError> {
     let system = augment_system_with_schema(request.system_prompt, schema);
-    let mut chat_req = ChatRequest::new(&system, request.messages);
+    let mut chat_req = ChatRequest::new(&system, request.messages).with_reminders(request.reminders);
     if let Some(tools_json) = request.tools_json.filter(|s| !s.is_empty()) {
         chat_req = chat_req.with_tools(tools_json);
     }

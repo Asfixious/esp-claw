@@ -29,12 +29,13 @@ mod block;
 mod builder;
 
 pub use block::{Band, Block, BlockKind, Scope};
-pub use builder::{BuildError, Context, ContextBuilder};
+pub use builder::{BuildError, Context, ContextBuilder, RequestContext};
 
 /// The seam for filling blocks. Content sources (instruction loaders, memory
 /// providers, summarizers, …) implement this outside the crate; the builder
 /// consumes them via [`ContextBuilder::with_provider`].
 pub trait ContextProvider {
-    /// Produce this provider's block (placement + content).
-    fn block(&self) -> Block;
+    /// Produce this provider's block (placement + content). The block may borrow
+    /// from `self`, so it must not outlive the provider.
+    fn block(&self) -> Block<'_>;
 }

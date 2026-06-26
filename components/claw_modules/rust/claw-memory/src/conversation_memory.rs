@@ -363,6 +363,13 @@ struct MemoryState {
     /// A compact result a pool worker finished but the foreground has not yet applied.
     parked_compact: Option<CompactionResult>,
 
+    /// Cached model-ready snapshot returned by [`ConversationMemory::messages`].
+    /// Built lazily on first read and shared as a cheap `Arc` clone; invalidated
+    /// (set to `None`) whenever message content changes (an open-turn append or a
+    /// compaction applied), so each iteration bumps a refcount instead of cloning
+    /// the whole transcript.
+    messages_cache: Option<Arc<Value>>,
+
     approx_tokens: usize,
     last_persist: Option<Instant>,
 }
@@ -588,7 +595,7 @@ impl<F: ClawFs + 'static> ConversationMemory<F> {
 
     /// The current messages, ready to send to the model in chronological order:
     /// compact-segment messages interleaved with verbatim groups by id, followed
-    /// by the in-progress open turn. Returns an owned, internally consistent
+    /// by the in-progress open turn. Returns a shared, internally consistent
     /// JSON array snapshot; compaction state is already folded in.
     ///
     /// Compact segments and groups are non-overlapping by construction, so the
@@ -635,12 +642,16 @@ impl<F: ClawFs + 'static> ConversationMemory<F> {
     /// assert_eq!(items[1]["content"], "second");
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    // todo: finalize the return shape — owned `Value` snapshot (current), a
-    // cached `Arc<Value>` snapshot (cheap clone, invalidated on mutation), or a
-    // borrowing guard. The choice trades clone cost against how long the caller
-    // may hold the result while the background compactor wants to mutate.
-    pub fn messages(&self) -> Value {
-        let state = self.lock_state();
+    ///
+    /// The snapshot is cached and shared as an `Arc`: repeated calls between
+    /// mutations return a cheap refcount bump rather than rebuilding/cloning the
+    /// transcript. Holding the returned `Arc` keeps that snapshot alive even if
+    /// the memory mutates afterwards (the next read rebuilds a fresh one).
+    pub fn messages(&self) -> Arc<Value> {
+        let mut state = self.lock_state();
+        if let Some(cached) = &state.messages_cache {
+            return Arc::clone(cached);
+        }
         let mut out = Vec::new();
 
         let mut compact_idx = 0usize;
@@ -672,7 +683,9 @@ impl<F: ClawFs + 'static> ConversationMemory<F> {
         }
 
         out.extend(state.open_group.iter().cloned());
-        Value::Array(out)
+        let snapshot = Arc::new(Value::Array(out));
+        state.messages_cache = Some(Arc::clone(&snapshot));
+        snapshot
     }
 
     /// Apply any parked compact, force pending changes to disk now (ignoring the
@@ -894,6 +907,8 @@ impl<F: ClawFs + 'static> GroupGuard<F> {
             .approx_tokens
             .saturating_add(estimate_message_tokens(&message));
         state.open_group.push(message);
+        // Content changed: the next `messages()` must rebuild.
+        state.messages_cache = None;
     }
 }
 
@@ -1088,6 +1103,8 @@ fn apply_parked_compact<F: ClawFs + 'static>(inner: &MemoryInner<F>) -> bool {
     );
     state.approx_tokens = estimate_state_tokens(&state);
     state.index_dirty = true;
+    // Compaction replaced verbatim groups with a summary: invalidate the snapshot.
+    state.messages_cache = None;
 
     debug_assert!(
         coverage_is_contiguous(&state),

@@ -257,8 +257,13 @@ pub struct StaticOutputSchema<'a> {
 pub struct ChatJsonRequest<'a> {
     /// System prompt / instructions.
     pub system_prompt: &'a str,
-    /// JSON array of chat messages.
+    /// JSON array of chat messages (the persisted history segment).
     pub messages: &'a serde_json::Value,
+    /// Ephemeral trailing messages appended after `messages` for this request
+    /// only (never persisted). Kept as a separate segment so the history is not
+    /// cloned to append them; the backend iterates `messages` then `reminders`.
+    /// Defaults to empty; set with [`with_reminders`](Self::with_reminders).
+    pub reminders: &'a [serde_json::Value],
     /// Optional OpenAI-style tools JSON array.
     pub tools_json: Option<&'a str>,
     /// The required output schema (set via [`Self::with_output_schema`]).
@@ -274,6 +279,7 @@ impl<'a> ChatJsonRequest<'a> {
         Self {
             system_prompt,
             messages,
+            reminders: &[],
             tools_json: None,
             output_schema: None,
             retry: RetryPolicy::default(),
@@ -283,6 +289,12 @@ impl<'a> ChatJsonRequest<'a> {
     /// Attach an OpenAI-style tools JSON array (may be sent with `response_format`).
     pub fn with_tools(mut self, tools_json: &'a str) -> Self {
         self.tools_json = Some(tools_json);
+        self
+    }
+
+    /// Attach ephemeral trailing reminder messages for this request only.
+    pub fn with_reminders(mut self, reminders: &'a [serde_json::Value]) -> Self {
+        self.reminders = reminders;
         self
     }
 
@@ -336,8 +348,13 @@ pub struct ChatJsonResponse<T> {
 pub struct ChatRequest<'a> {
     /// System prompt / instructions.
     pub system_prompt: &'a str,
-    /// JSON array of chat messages.
+    /// JSON array of chat messages (the persisted history segment).
     pub messages: &'a serde_json::Value,
+    /// Ephemeral trailing messages appended after `messages` for this request
+    /// only (never persisted). Kept as a separate segment so the history is not
+    /// cloned to append them; the backend iterates `messages` then `reminders`.
+    /// Defaults to empty; set with [`with_reminders`](Self::with_reminders).
+    pub reminders: &'a [serde_json::Value],
     /// Optional OpenAI-style tools JSON array.
     pub tools_json: Option<&'a str>,
     /// Per-call retry policy. Defaults to [`RetryPolicy::default`]; use
@@ -351,6 +368,7 @@ impl<'a> ChatRequest<'a> {
         ChatRequest {
             system_prompt,
             messages,
+            reminders: &[],
             tools_json: None,
             retry: RetryPolicy::default(),
         }
@@ -359,6 +377,12 @@ impl<'a> ChatRequest<'a> {
     /// Attach an OpenAI-style tools JSON array.
     pub fn with_tools(mut self, tools_json: &'a str) -> Self {
         self.tools_json = Some(tools_json);
+        self
+    }
+
+    /// Attach ephemeral trailing reminder messages for this request only.
+    pub fn with_reminders(mut self, reminders: &'a [serde_json::Value]) -> Self {
+        self.reminders = reminders;
         self
     }
 

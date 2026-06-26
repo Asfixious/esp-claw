@@ -11,56 +11,77 @@ use crate::block::{Block, BlockKind};
 const BLOCK_SEPARATOR: &str = "\n\n";
 
 /// Accumulates blocks and renders the final context. Add blocks in any order.
+///
+/// Blocks may **borrow** their content (see [`Block`]), so the builder carries a
+/// lifetime tying it to its content sources; render before they go out of scope.
 #[derive(Debug, Default)]
-pub struct ContextBuilder {
-    blocks: Vec<Block>,
+pub struct ContextBuilder<'a> {
+    blocks: Vec<Block<'a>>,
 }
 
-impl ContextBuilder {
+impl<'a> ContextBuilder<'a> {
     /// A new, empty builder.
     pub fn new() -> Self {
-        Self::default()
+        Self { blocks: Vec::new() }
     }
 
     /// Add a block (builder style). Order of insertion does not matter.
-    pub fn with(mut self, block: Block) -> Self {
+    pub fn with(mut self, block: Block<'a>) -> Self {
         self.blocks.push(block);
         self
     }
 
     /// Add a block (mutable-reference style).
-    pub fn push(&mut self, block: Block) -> &mut Self {
+    pub fn push(&mut self, block: Block<'a>) -> &mut Self {
         self.blocks.push(block);
         self
     }
 
     /// Add a block produced by a [`ContextProvider`](crate::ContextProvider).
-    pub fn with_provider(self, provider: &impl crate::ContextProvider) -> Self {
+    pub fn with_provider(self, provider: &'a impl crate::ContextProvider) -> Self {
         self.with(provider.block())
     }
 
-    /// Sort, drop absent blocks, and render the prompt string.
+    /// Sort, drop absent blocks, and render the prompt string into a fresh
+    /// [`Context`]. Convenience over [`build_into`](Self::build_into) for callers
+    /// that do not keep a reusable buffer.
     ///
     /// # Errors
     ///
     /// Returns [`BuildError::DuplicateBlock`] if a canonical block kind is added
     /// more than once.
-    pub fn build(mut self) -> Result<Context, BuildError> {
+    pub fn build(self) -> Result<Context, BuildError> {
+        let mut rendered = String::new();
+        self.build_into(&mut rendered)?;
+        Ok(Context { rendered })
+    }
+
+    /// Sort, drop absent blocks, and render the prompt prefix into `out`,
+    /// **reusing** its allocation (`out` is cleared first; its capacity is
+    /// retained). This is the hot-path entry: an agent owns one buffer and
+    /// rebuilds the prefix into it only when a block changes, avoiding a fresh
+    /// `String` every iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::DuplicateBlock`] if a canonical block kind is added
+    /// more than once (`out` is left untouched in that case).
+    pub fn build_into(mut self, out: &mut String) -> Result<(), BuildError> {
         if let Some(kind) = first_canonical_duplicate(&self.blocks) {
             return Err(BuildError::DuplicateBlock(kind));
         }
 
         self.blocks.sort_by_key(|block| block.kind.sort_key());
 
-        let mut rendered = String::new();
+        out.clear();
         for block in self.blocks.iter().filter(|block| !block.is_absent()) {
-            if !rendered.is_empty() {
-                rendered.push_str(BLOCK_SEPARATOR);
+            if !out.is_empty() {
+                out.push_str(BLOCK_SEPARATOR);
             }
-            rendered.push_str(block.content.trim());
+            out.push_str(block.content.trim());
         }
 
-        Ok(Context { rendered })
+        Ok(())
     }
 }
 
@@ -100,6 +121,56 @@ impl Context {
 impl AsRef<str> for Context {
     fn as_ref(&self) -> &str {
         &self.rendered
+    }
+}
+
+/// The two wire fields of one LLM request, assembled by this crate and fed
+/// straight into the API client: a `system` prefix string and the `messages`
+/// tail. It is the single `context() -> (system, messages)` hand-off — no other
+/// code path assembles a request.
+///
+/// Every field is a **borrow**, so assembling per iteration allocates nothing:
+/// `system` points into the agent's reused prefix buffer (see
+/// [`ContextBuilder::build_into`]), `history` into the memory snapshot, and
+/// `reminders` into the agent's reused reminder buffer. The tail is a
+/// **two-segment view** — persisted `history` plus ephemeral `reminders` — kept
+/// separate so appending a reminder never clones the transcript; the backend
+/// iterates `history` then `reminders`.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestContext<'a> {
+    system: &'a str,
+    history: &'a serde_json::Value,
+    reminders: &'a [serde_json::Value],
+}
+
+impl<'a> RequestContext<'a> {
+    /// Pair an assembled `system` prefix with the message tail's two segments:
+    /// the persisted `history` (a JSON array) and the ephemeral `reminders`.
+    pub fn new(
+        system: &'a str,
+        history: &'a serde_json::Value,
+        reminders: &'a [serde_json::Value],
+    ) -> Self {
+        Self {
+            system,
+            history,
+            reminders,
+        }
+    }
+
+    /// The rendered system-prompt prefix.
+    pub fn system(&self) -> &'a str {
+        self.system
+    }
+
+    /// The persisted conversation history (a JSON array of messages).
+    pub fn history(&self) -> &'a serde_json::Value {
+        self.history
+    }
+
+    /// The ephemeral trailing reminders (never persisted), in order.
+    pub fn reminders(&self) -> &'a [serde_json::Value] {
+        self.reminders
     }
 }
 

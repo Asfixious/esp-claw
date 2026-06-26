@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use claw_context::Block;
 use claw_core::agent::{
     Agent, AgentCommand, AgentCommandError, AgentFactory, AgentId, AgentKind, GraphHost,
     TickOutcome,
@@ -44,6 +45,7 @@ impl AgentFactory for IdleFactory {
         _goal: String,
         _host: Arc<dyn GraphHost>,
         _is_root: bool,
+        _inherited_context: Arc<[Block<'static>]>,
     ) -> Result<Box<dyn Agent>, String> {
         Ok(Box::new(IdleAgent { id }))
     }

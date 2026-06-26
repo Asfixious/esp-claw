@@ -169,15 +169,21 @@ impl BlockKind {
 
 /// A context block: a placement (`kind`) plus injected `content`. Empty or
 /// whitespace-only content marks the block absent — it renders to zero bytes.
+///
+/// `content` is a [`Cow`] so a block can **borrow** its source (the default for
+/// an agent's per-iteration prose — `system_prompt`, tool policy, skill text)
+/// and avoid a clone, or own it when the source is transient. Inherited/shared
+/// blocks are typically `Block<'static>`.
 #[derive(Debug, Clone)]
-pub struct Block {
+pub struct Block<'a> {
     pub kind: BlockKind,
-    pub content: String,
+    pub content: Cow<'a, str>,
 }
 
-impl Block {
-    /// Construct a block from any string-like content.
-    pub fn new(kind: BlockKind, content: impl Into<String>) -> Self {
+impl<'a> Block<'a> {
+    /// Construct a block from any string-like content (borrowed `&str`, owned
+    /// `String`, or a `Cow`). Borrowed content renders without a copy.
+    pub fn new(kind: BlockKind, content: impl Into<Cow<'a, str>>) -> Self {
         Self {
             kind,
             content: content.into(),

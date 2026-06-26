@@ -11,6 +11,7 @@
 //! ```
 
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 use claw_agent_cli::{load_env, make_llm, make_memory_ingredients};
 use claw_core::agent::{
@@ -45,6 +46,7 @@ fn main() {
         config,
         None,
         false,
+        Arc::from([]),
     )
     .expect("failed to build agent");
 
@@ -70,7 +72,7 @@ fn main() {
             let messages = agent.memory().messages();
             println!(
                 "{}",
-                serde_json::to_string_pretty(&messages)
+                serde_json::to_string_pretty(&*messages)
                     .unwrap_or_else(|e| format!("(serialize error: {e})"))
             );
             println!();

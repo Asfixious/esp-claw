@@ -58,6 +58,7 @@ use claw_interface::ClawFs;
 use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
+use crate::agent::reminder::Reminders;
 use crate::agent::tools::{internal_tool_group, ControlSignal, ControlSink};
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
@@ -65,7 +66,7 @@ use crate::iteration_loop::{
     PreemptedOutcome, SystemPrompt, ToolRun,
 };
 use claw_tool::{AllowedTools, ToolGate, ToolSet, ToolSetError};
-use claw_context::{Block, BlockKind, ContextBuilder};
+use claw_context::{Block, BlockKind, ContextBuilder, RequestContext};
 use claw_permission::{Action, Grant, GrantStore, PermissionDecision, PermissionPolicy, PermissionRequest};
 use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
 
@@ -437,12 +438,13 @@ pub struct BaseAgent<F: ClawFs + 'static> {
     /// via [`set_active_tools`](Self::set_active_tools); the full `tools` schema
     /// is always sent regardless, so the cached prompt prefix stays stable.
     allowed_tools: Option<AllowedTools>,
-    /// A transient instruction appended to the tail of the messages sent to the
-    /// LLM (never persisted to memory). Carries the soft-hide phase note (the
-    /// permitted tools), generated from the allow-set by
+    /// Ephemeral per-request reminders appended to the tail of the messages sent
+    /// to the LLM (never persisted). Carries the soft-hide phase note (the
+    /// permitted tools), set from the allow-set by
     /// [`set_active_tools`](Self::set_active_tools) and dropped by
-    /// [`clear_active_tools`](Self::clear_active_tools).
-    tail_note: Option<String>,
+    /// [`clear_active_tools`](Self::clear_active_tools). See
+    /// [`Reminders`](crate::agent::reminder::Reminders).
+    reminders: Reminders,
     /// Count of consecutive tool rounds that had at least one gating-blocked
     /// call. Reset to 0 by any clean tool round. When it exceeds
     /// `tool_block_retries`, the task fails with [`AgentRunError::ToolNotPermitted`].
@@ -457,6 +459,10 @@ pub struct BaseAgent<F: ClawFs + 'static> {
     /// from the final [`ToolSet`] at build (`None` when no tool carries usage).
     /// Placed into the assembled prompt by `claw-context`; fixed across tasks.
     tool_context: Option<String>,
+    /// Scope-layered prose blocks injected from above (Global, then Session),
+    /// shared across agents as an `Arc`. Rendered ahead of the agent's own blocks
+    /// by `claw-context`. Empty by default (the standalone-agent behavior).
+    inherited_context: Arc<[Block<'static>]>,
     /// Cached assembled prompt (instruction + tool policy + skills context). Empty
     /// means "nothing to assemble, borrow `system_prompt` directly". Rebuilt only
     /// when `effective_prompt_dirty`.
@@ -516,6 +522,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             tools: None,
             skills: None,
             system_prompt: String::new(),
+            inherited_context: Arc::from([]),
             retry_policy: RetryPolicy::default(),
             tool_block_retries: DEFAULT_TOOL_BLOCK_RETRIES,
             permission_policy: None,
@@ -738,18 +745,18 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     /// [`ToolRunner`]: claw_tool::ToolRunner
     #[allow(dead_code)]
     pub(crate) fn set_active_tools(&mut self, allowed: AllowedTools) {
-        self.tail_note = Some(Self::phase_note(&allowed));
+        self.reminders.set_single(Self::phase_note(&allowed));
         self.allowed_tools = Some(allowed);
     }
 
     /// Remove tool gating: every tool in the set may run again (the default),
-    /// and drop the accompanying phase note.
+    /// and drop the accompanying phase-note reminder.
     ///
     /// Reserved soft-tools seam (see [`set_active_tools`](Self::set_active_tools)).
     #[allow(dead_code)]
     pub(crate) fn clear_active_tools(&mut self) {
         self.allowed_tools = None;
-        self.tail_note = None;
+        self.reminders.clear();
     }
 
     /// Build the transient phase note from the allow-set: a single
@@ -809,6 +816,8 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             if let Err(error) = self.refresh_effective_prompt() {
                 self.fail_with(AgentRunError::Skill(error));
             } else {
+                // Rebuild the ephemeral reminder tail (dirty-gated, reused buffer).
+                self.reminders.refresh();
                 let outcome = self.run_iteration(iteration_id);
                 self.reduce_outcome(outcome);
                 // 3. Internal-tool signals raised during the iteration, folded
@@ -835,20 +844,20 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     }
 
     /// Run exactly one [`IterationLoop`] round over current context.
+    ///
+    /// `claw-context` is the single assembler: it pairs the cached system prefix
+    /// with the message tail's two segments — the persisted history snapshot
+    /// (a cheap `Arc` clone) and the ephemeral [`Reminders`] — into one
+    /// [`RequestContext`]. No request stitching happens anywhere else; reminders
+    /// are never written to memory, so the cached system/history prefix is
+    /// untouched.
     fn run_iteration(&self, iteration_id: IterationId) -> IterationResult {
-        let system_prompt = self.effective_prompt();
-        let mut messages = self.memory.messages();
-        // Append the transient phase note at the tail of this request only; it is
-        // never committed to memory, so the cached system/tools prefix is untouched.
-        // TODO: provisional soft-hide injection — a single user message at the
-        // messages tail. Revisit placement/format once the semantic layer lands
-        // (e.g. richer system-reminder-style notes, or attaching guidance next to
-        // the latest tool result for stronger recency).
-        if let Some(note) = &self.tail_note {
-            if let Some(items) = messages.as_array_mut() {
-                items.push(json!({ "role": "user", "content": note }));
-            }
-        }
+        let history = self.memory.messages();
+        let context = RequestContext::new(
+            self.effective_prompt(),
+            history.as_ref(),
+            self.reminders.as_slice(),
+        );
         let iteration_loop = IterationLoop {
             llm: &self.llm,
             interruption: &self.interruption,
@@ -856,8 +865,9 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         };
         let step = IterationStep {
             iteration_id,
-            system_prompt: SystemPrompt(system_prompt),
-            messages: ChatMessages(&messages),
+            system_prompt: SystemPrompt(context.system()),
+            messages: ChatMessages(context.history()),
+            reminders: context.reminders(),
             tools: self.tools.as_ref(),
             allowed_tools: self.allowed_tools.as_ref(),
             gate: self.tool_gate(),
@@ -1141,35 +1151,62 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
 
     // -- Effective prompt cache ---------------------------------------------
 
-    /// Rebuild the cached assembled prompt if stale; otherwise a no-op.
+    /// Rebuild the cached system-prompt prefix if stale; otherwise a no-op.
     ///
-    /// Assembles the agent's system prompt from its sections via `claw-context`,
-    /// which owns placement (the Static instruction + tool-policy band, then the
-    /// Durable active-skills band). When the agent has neither tool-usage prose nor
-    /// active skill content, the cache is left empty as the signal to borrow
-    /// `system_prompt` directly (no allocation).
+    /// `claw-context` is the single assembler and owns placement: it gathers the
+    /// inherited scope blocks (Global/Session, injected from above) and the
+    /// agent's own blocks (its instruction, the tool-policy prose, the active
+    /// skills) and renders them in wire order **into the reused
+    /// `effective_prompt` buffer** (`build_into` clears + rewrites, keeping the
+    /// allocation). The buffer is rebuilt only when a block changes
+    /// (`effective_prompt_dirty`), so a steady prefix costs nothing per
+    /// iteration. An empty result signals "borrow `system_prompt` directly".
     fn refresh_effective_prompt(&mut self) -> Result<(), SkillError> {
         if !self.effective_prompt_dirty {
             return Ok(());
         }
+        // `skill_context` borrows `self.skills`; the borrows below are of other,
+        // disjoint fields, and the render buffer is moved out first, so nothing
+        // aliases when `build_into` writes it back.
         let skill_context = match self.skills.as_mut() {
             Some(skills) => skills.context()?,
             None => "",
         };
-        self.effective_prompt.clear();
-        if self.tool_context.is_some() || !skill_context.is_empty() {
-            self.effective_prompt = assemble_system_prompt(
-                &self.system_prompt,
-                self.tool_context.as_deref(),
-                skill_context,
-            );
+        let mut buffer = std::mem::take(&mut self.effective_prompt);
+
+        let mut builder = ContextBuilder::new();
+        // Inherited scope blocks (Global -> Session) render ahead of the agent's
+        // own; their content is borrowed from the shared `Arc`, not cloned.
+        for block in self.inherited_context.iter() {
+            builder.push(Block::new(block.kind.clone(), block.content.as_ref()));
         }
+        builder.push(Block::new(
+            BlockKind::AgentInstruction,
+            self.system_prompt.as_str(),
+        ));
+        if let Some(tool_context) = self.tool_context.as_deref() {
+            builder.push(Block::new(BlockKind::ToolPolicy, tool_context));
+        }
+        if !skill_context.is_empty() {
+            builder.push(Block::new(BlockKind::ActiveSkills, skill_context));
+        }
+
+        if let Err(error) = builder.build_into(&mut buffer) {
+            // The only build error is a duplicate canonical block; the kinds added
+            // above are distinct, so this is unreachable. Degrade to the raw
+            // instruction rather than propagate a placement bug.
+            tracing::error!(%error, "system-prompt assembly failed; using base instruction");
+            buffer.clear();
+            buffer.push_str(&self.system_prompt);
+        }
+
+        self.effective_prompt = buffer;
         self.effective_prompt_dirty = false;
         Ok(())
     }
 
-    /// The prompt to send this iteration — the cached combined prompt when skills
-    /// contributed content, else the base prompt borrowed with no copy. Assumes
+    /// The prompt to send this iteration — the rendered combined prefix, or the
+    /// base prompt borrowed with no copy when the prefix rendered empty. Assumes
     /// [`refresh_effective_prompt`](Self::refresh_effective_prompt) ran this tick.
     fn effective_prompt(&self) -> &str {
         if self.effective_prompt.is_empty() {
@@ -1178,34 +1215,6 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             &self.effective_prompt
         }
     }
-}
-
-/// Assemble the per-iteration system prompt from its sections, letting
-/// `claw-context` own placement: the Static instruction and tool-policy blocks,
-/// then the Durable active-skills block. Absent sections are omitted.
-fn assemble_system_prompt(
-    instruction: &str,
-    tool_context: Option<&str>,
-    skill_context: &str,
-) -> String {
-    let mut builder =
-        ContextBuilder::new().with(Block::new(BlockKind::AgentInstruction, instruction));
-    if let Some(tool_context) = tool_context {
-        builder = builder.with(Block::new(BlockKind::ToolPolicy, tool_context));
-    }
-    if !skill_context.is_empty() {
-        builder = builder.with(Block::new(BlockKind::ActiveSkills, skill_context));
-    }
-    builder
-        .build()
-        .map(|context| context.into_string())
-        .unwrap_or_else(|error| {
-            // The only build error is a duplicate canonical block; the kinds added
-            // above are distinct, so this branch is unreachable. Degrade to the raw
-            // instruction rather than panic if that invariant is ever broken.
-            tracing::error!(%error, "system-prompt assembly failed; using base instruction");
-            instruction.to_string()
-        })
 }
 
 /// True when `patch` contains an assistant `tool_calls` id with no matching
@@ -1247,6 +1256,7 @@ pub struct BaseAgentBuilder<F: ClawFs + 'static> {
     tools: Option<ToolSet>,
     skills: Option<SkillSet>,
     system_prompt: String,
+    inherited_context: Arc<[Block<'static>]>,
     retry_policy: RetryPolicy,
     tool_block_retries: u32,
     permission_policy: Option<Arc<dyn PermissionPolicy>>,
@@ -1276,6 +1286,17 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
     /// of its tasks. Defaults to empty.
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = system_prompt.into();
+        self
+    }
+
+    /// Inject scope-layered prose blocks from above (Global, then Session) that
+    /// render ahead of the agent's own blocks in the assembled system prefix.
+    ///
+    /// Shared as an `Arc<[Block]>` so several agents can reference one computed
+    /// set for byte-identical prefixes. Defaults to empty — the standalone-agent
+    /// behavior, where only the agent's own blocks are assembled.
+    pub fn with_inherited_context(mut self, blocks: Arc<[Block<'static>]>) -> Self {
+        self.inherited_context = blocks;
         self
     }
 
@@ -1394,12 +1415,13 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
             memory: self.memory,
             tools,
             allowed_tools: None,
-            tail_note: None,
+            reminders: Reminders::new(),
             consecutive_tool_blocks: 0,
             tool_block_retries: self.tool_block_retries,
             skills: self.skills,
             system_prompt: self.system_prompt,
             tool_context,
+            inherited_context: self.inherited_context,
             effective_prompt: String::new(),
             // Build the combined prompt on the first tick.
             effective_prompt_dirty: true,

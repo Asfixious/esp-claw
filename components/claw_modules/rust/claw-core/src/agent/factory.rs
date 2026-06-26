@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
+use claw_context::Block;
 use claw_interface::http::ClawHttp;
 use claw_interface::ClawFs;
 use claw_memory::{ConversationConfig, ConversationDeps};
@@ -51,6 +52,11 @@ pub trait AgentFactory: Send + Sync {
     /// tool to feed user verdicts back to waiting subagents. Subagents pass
     /// `false`.
     ///
+    /// `inherited_context` carries the scope-layered prose blocks injected from
+    /// above (Global -> Session), shared as an `Arc<[Block]>` so every agent in a
+    /// session references one computed set for byte-identical prefixes. Empty for
+    /// a standalone agent.
+    ///
     /// # Errors
     ///
     /// Returns a human-readable error string when `kind` is unknown or the agent
@@ -62,6 +68,7 @@ pub trait AgentFactory: Send + Sync {
         goal: String,
         host: Arc<dyn GraphHost>,
         is_root: bool,
+        inherited_context: Arc<[Block<'static>]>,
     ) -> Result<Box<dyn Agent>, String>;
 }
 
@@ -130,6 +137,7 @@ impl<F: ClawFs + Clone + 'static> AgentFactory for FsAgentFactory<F> {
         goal: String,
         host: Arc<dyn GraphHost>,
         is_root: bool,
+        inherited_context: Arc<[Block<'static>]>,
     ) -> Result<Box<dyn Agent>, String> {
         // The config is pure data; which graph tools attach is decided in
         // `GenericAgent::new` from the manifest's `spawn.enabled`, the host's
@@ -149,6 +157,7 @@ impl<F: ClawFs + Clone + 'static> AgentFactory for FsAgentFactory<F> {
             config,
             Some(host),
             is_root,
+            inherited_context,
         )
         .map_err(|error| format!("building {kind} agent {id}: {error}"))?;
 
@@ -241,6 +250,7 @@ mod tests {
                 "say hi".into(),
                 Arc::new(NoopHost),
                 true,
+                Arc::from([]),
             )
             .expect("agent builds");
 
@@ -266,6 +276,7 @@ mod tests {
             "x".into(),
             Arc::new(NoopHost),
             false,
+            Arc::from([]),
         );
         assert!(result.is_err());
     }

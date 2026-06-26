@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 /// Mutability band — the primary wire-order key. Lower bands render first and
 /// form the cacheable prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Band {
     /// Immutable instructions — the long shared prefix, never busted at runtime.
     Static,
@@ -32,7 +32,7 @@ impl Band {
 
 /// Ownership scope — the secondary wire-order key (broad → narrow) and the
 /// reuse-sharing boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
     Global,
     Session,
@@ -55,9 +55,13 @@ impl Scope {
 }
 
 /// The canonical context blocks, plus a `Custom` escape hatch for in-band
-/// extension. Each variant knows its band, scope, and in-(band,scope) order; the
-/// builder is the sole authority on the resulting wire order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// extension. Each variant knows its band, scope, and in-(band,scope) order;
+/// [`Context`](crate::Context) is the sole authority on the resulting wire order.
+///
+/// Derives `Ord` so it can key the context's block map (uniqueness per kind is
+/// what makes "duplicate block" unrepresentable). Map order is irrelevant — the
+/// render sorts by [`sort_key`](Self::sort_key).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum BlockKind {
     // Band 1 — Static instructions.
@@ -159,21 +163,16 @@ impl BlockKind {
     pub(crate) fn sort_key(&self) -> (u8, u8, u16) {
         (self.band().rank(), self.scope().rank(), self.order())
     }
-
-    /// Whether this is a canonical (non-`Custom`) block. Duplicate canonical
-    /// blocks are a caller error; multiple `Custom` blocks are allowed.
-    pub(crate) fn is_canonical(&self) -> bool {
-        !matches!(self, BlockKind::Custom { .. })
-    }
 }
 
 /// A context block: a placement (`kind`) plus injected `content`. Empty or
-/// whitespace-only content marks the block absent — it renders to zero bytes.
+/// whitespace-only content marks the block absent — it renders to zero bytes and
+/// [`Context::with`](crate::Context::with) drops the key entirely.
 ///
-/// `content` is a [`Cow`] so a block can **borrow** its source (the default for
-/// an agent's per-iteration prose — `system_prompt`, tool policy, skill text)
-/// and avoid a clone, or own it when the source is transient. Inherited/shared
-/// blocks are typically `Block<'static>`.
+/// `content` is a [`Cow`] so callers can pass a borrowed `&str`, an owned
+/// `String`, or a `Cow` without ceremony; [`Context`](crate::Context) copies it
+/// into owned storage on a real change, so a `Block` never has to outlive the
+/// call.
 #[derive(Debug, Clone)]
 pub struct Block<'a> {
     pub kind: BlockKind,
@@ -182,16 +181,11 @@ pub struct Block<'a> {
 
 impl<'a> Block<'a> {
     /// Construct a block from any string-like content (borrowed `&str`, owned
-    /// `String`, or a `Cow`). Borrowed content renders without a copy.
+    /// `String`, or a `Cow`).
     pub fn new(kind: BlockKind, content: impl Into<Cow<'a, str>>) -> Self {
         Self {
             kind,
             content: content.into(),
         }
-    }
-
-    /// Whether this block contributes nothing to the rendered context.
-    pub(crate) fn is_absent(&self) -> bool {
-        self.content.trim().is_empty()
     }
 }

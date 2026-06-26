@@ -50,10 +50,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 quote = "1"
 proc-macro2 = "1"
-# The tool-directory contract validator, kept in lockstep with the runtime
-# `tool_metadata!` macro. `bake`-only (no runtime/permission) keeps this build
-# dependency light.
-claw-tool = { path = "../claw-tool", default-features = false, features = ["bake"] }
+claw-tool = { path = "../claw-tool" }
 
 [dev-dependencies]
 # Host-only fs/http doubles + live transport shared from claw-interface (tests only).

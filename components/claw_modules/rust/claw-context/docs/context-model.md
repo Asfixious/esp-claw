@@ -24,13 +24,14 @@ and `GlobalMemory`. Mutability moved it, not scope.
 ## Realization: the two wire fields
 
 The model above is unchanged; this is only how it maps onto the request the API
-client sends. A request has exactly two wire fields, and `claw-context` is the
-single assembler that produces both (`RequestContext::new(system, history,
-reminders)`):
+client sends. A request has exactly two wire fields, and `Context` is the single
+assembler that produces both (`Context::request(history)` returns a
+`RequestContext` of `system` + the two tail segments):
 
 - **`system` (prefix)** — the cacheable prose `Block`s (Bands 1–2, the durable
-  prefix) rendered into one string via `ContextBuilder::build_into` (a reused,
-  dirty-gated buffer).
+  prefix) declared via `Context::with` and rendered into one string in a reused
+  buffer, re-rendered only when a block actually changes (gated by
+  `Context::version`).
 - **`messages` (tail)** — the Band-3 structured tail, as **two segments kept
   separate** so appending never clones history:
   - the persisted conversation `history` (`ConversationSummary` +

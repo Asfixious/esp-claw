@@ -1,4 +1,4 @@
-//! Demonstrates assembling a context with `claw-context`.
+//! Demonstrates assembling a request with `claw-context`.
 //!
 //! Run with:
 //!
@@ -6,71 +6,41 @@
 //! cargo run -p claw-context --example build_context --target x86_64-unknown-linux-gnu
 //! ```
 //!
-//! The crate owns *placement and rendering*; this example plays the role of the
-//! *content sources* (the "filling"), both inline via [`Block::new`] and through
-//! the [`ContextProvider`] seam. It shows that blocks added in any order always
-//! render in the spec wire order, and that a conversation-mode context omits the
-//! working-mode scaffolding.
+//! The crate owns *placement, change detection, and rendering*; this example
+//! plays the role of the *content sources* (the "filling"). It shows that blocks
+//! declared in any order render in the spec wire order, that a custom block slots
+//! within its band, and that the context only re-renders when a block actually
+//! changes (the `version()` stays put across an identical re-declaration, then
+//! advances when a block is updated).
 
 use std::borrow::Cow;
 
-use claw_context::{Block, BlockKind, BuildError, Context, ContextBuilder, ContextProvider};
+use claw_context::{Band, Block, BlockKind, Context, Scope};
+use serde_json::json;
 
-/// A trivial content source: loads a fixed block kind with fixed text. In a real
-/// system this would read `soul.md`, query memory, summarize history, etc.
-struct StaticSource {
-    kind: BlockKind,
-    text: &'static str,
-}
+fn main() {
+    let mut context = Context::new();
 
-impl ContextProvider for StaticSource {
-    fn block(&self) -> Block<'_> {
-        Block::new(self.kind.clone(), self.text)
-    }
-}
-
-/// Build a conversation-mode context: instructions + dialogue, no task framing.
-fn conversation_context() -> Result<Context, BuildError> {
-    let common = StaticSource {
-        kind: BlockKind::CommonInstruction,
-        text: "You are Claw, a helpful on-device agent. Be concise.",
-    };
-    let agent = StaticSource {
-        kind: BlockKind::AgentInstruction,
-        text: "Role: frontend. Answer the user directly or route to a worker.",
-    };
-
-    // Note the deliberately scrambled insertion order — the builder re-sorts it.
-    ContextBuilder::new()
-        .with(Block::new(
-            BlockKind::OutputContract,
-            "Reply in natural language, one short paragraph.",
-        ))
-        .with(Block::new(BlockKind::CurrentInput, "What can you do?"))
-        .with_provider(&agent)
-        .with_provider(&common)
-        .with(Block::new(
-            BlockKind::ConversationSummary,
-            "Earlier: the user greeted the agent.",
-        ))
-        .build()
-}
-
-/// Build a working-mode context: adds durable memory, an active skill, mode
-/// framing, and a custom retrieved-docs block at the bottom of the durable band.
-fn working_context() -> Result<Context, BuildError> {
+    // A custom retrieved-docs block, placed at the bottom of the agent durable
+    // group (after ModeFraming, order 2).
     let retrieved_docs = Block::new(
         BlockKind::Custom {
-            band: claw_context::Band::Durable,
-            scope: claw_context::Scope::Agent,
-            // Sort after ModeFraming (order 2) within the agent durable group.
+            band: Band::Durable,
+            scope: Scope::Agent,
             order: 3,
             label: Cow::Borrowed("RetrievedDocs"),
         },
         "Doc: the GPIO API exposes claw_gpio_set_level(pin, level).",
     );
 
-    ContextBuilder::new()
+    // Declare the full working-mode context. Insertion order is deliberately
+    // scrambled — the wire order is fixed by BlockKind.
+    context
+        .with(Block::new(
+            BlockKind::OutputContract,
+            "Respond as JSON: {actions, blockers, needs_approval, next_step}.",
+        ))
+        .with(Block::new(BlockKind::CurrentInput, "Make the LED blink."))
         .with(Block::new(
             BlockKind::CommonInstruction,
             "You are Claw, a helpful on-device agent.",
@@ -96,23 +66,34 @@ fn working_context() -> Result<Context, BuildError> {
             BlockKind::RecentContext,
             "tool_result(claw_gpio_set_level): ok",
         ))
-        .with(Block::new(BlockKind::CurrentInput, "Make the LED blink."))
-        .with(Block::new(
-            BlockKind::OutputContract,
-            "Respond as JSON: {actions, blockers, needs_approval, next_step}.",
-        ))
-        .build()
-}
+        // A reminder is the ephemeral tail, never persisted, after the history.
+        .reminder(Some("Only the blink_led skill is permitted this phase."));
 
-fn main() -> Result<(), BuildError> {
-    let conversation = conversation_context()?;
+    let history = json!([{ "role": "user", "content": "Make the LED blink." }]);
+
+    let version_before = context.version();
+    let request = context.request(&history);
+    println!("===== system prefix (version {version_before}) =====\n{}\n", request.system());
+    println!("===== reminders (ephemeral tail) =====");
+    for reminder in request.reminders() {
+        if let Some(text) = reminder.get("content").and_then(serde_json::Value::as_str) {
+            println!("{text}");
+        }
+    }
+
+    // Re-declaring identical content every tick is a free no-op: the version (and
+    // so the cached prefix) does not move.
+    context.with(Block::new(
+        BlockKind::ActiveSkills,
+        "Skill blink_led: toggle the on-board LED N times.",
+    ));
     println!(
-        "===== conversation-mode context =====\n{}\n",
-        conversation.context()
+        "\nversion after identical re-declaration: {} (unchanged: {})",
+        context.version(),
+        context.version() == version_before
     );
 
-    let working = working_context()?;
-    println!("===== working-mode context =====\n{}", working.context());
-
-    Ok(())
+    // A real change advances the version; the next request re-renders.
+    context.with(Block::new(BlockKind::ActiveSkills, ""));
+    println!("version after unloading the skill: {}", context.version());
 }

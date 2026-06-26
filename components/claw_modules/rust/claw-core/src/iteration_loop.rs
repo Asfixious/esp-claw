@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use claw_tool::{AllowedTools, ApprovalNeeded, CallOutcome, ToolError, ToolGate, ToolInvocation, ToolRunner, ToolSet};
+use claw_tool::{ApprovalNeeded, CallOutcome, ToolError, ToolGate, ToolInvocation, ToolRunner, ToolSet};
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
 
 use claw_utils::TruncatedText;
@@ -90,12 +90,11 @@ pub struct IterationStep<'a> {
     /// Ephemeral trailing messages for this request only (never persisted),
     /// appended after `messages`. Empty when there is nothing to nudge.
     pub reminders: &'a [Value],
+    /// The tool set for this step. It also carries its own soft-hide allow-set
+    /// (see [`ToolSet::set_active_tools`]): the full schema is always sent
+    /// (cache-stable), but a call to a tool the set does not currently allow is
+    /// refused with a tool error rather than invoked — see [`ToolRun::blocked`].
     pub tools: Option<&'a ToolSet>,
-    /// Tools allowed to *execute* this step ("soft-hide" gating). `None` is
-    /// ungated: every tool in `tools` may run. When `Some`, the full `tools`
-    /// schema is still sent (cache-stable), but a call to a tool not in the set
-    /// is refused with a tool error rather than invoked — see [`ToolRun::blocked`].
-    pub allowed_tools: Option<&'a AllowedTools>,
     /// Permission gate consulted before each call after soft-hide passes (`None`
     /// = no permission layer). On `Deny` the call is refused; on `Ask` it is held
     /// for human approval (surfaced via [`ToolRun::approval`]) and not run.
@@ -130,8 +129,8 @@ pub enum CompletedKind {
 pub struct ToolRun {
     pub name: String,
     pub ok: bool,
-    /// True when the call was refused by soft-hide gating (not in the step's
-    /// `allowed_tools`) instead of being invoked. A blocked run is always
+    /// True when the call was refused by soft-hide gating (not in the tool set's
+    /// active allow-set) instead of being invoked. A blocked run is always
     /// `ok == false`; upper layers use this to drive the "retry then fail"
     /// policy without treating it as a normal tool failure.
     pub blocked: bool,
@@ -287,7 +286,7 @@ fn run_one_iteration(loop_: &IterationLoop<'_>, step: IterationStep<'_>) -> Iter
         return Err(err);
     }
 
-    let runner = ToolRunner::new(tools, step.allowed_tools, step.gate);
+    let runner = ToolRunner::new(tools, step.gate);
     match run_tool_calls(
         loop_.interruption,
         &runner,
@@ -479,7 +478,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use claw_tool::{Tool, ToolGroup, ToolHandler, ToolOutput};
+    use claw_tool::{AllowedTools, Tool, ToolGroup, ToolHandler, ToolOutput};
     use claw_api::ToolCall;
     use serde_json::json;
 
@@ -606,12 +605,11 @@ mod tests {
         // dispatch lands and we exercise the "(null)" display + is_error path.
         struct FailingTool;
         impl ToolHandler for FailingTool {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 ""
             }
 
-            fn schema(&self) -> &'static str {
-                // Self-consistent minimal schema: function.name matches name().
+            fn schema(&self) -> &str {
                 r#"{"type":"function","function":{"name":""}}"#
             }
 
@@ -638,7 +636,7 @@ mod tests {
             }],
         };
 
-        let runner = ToolRunner::new(&tools, None, None);
+        let runner = ToolRunner::new(&tools, None);
         let mut not_array = AppendedMessages(Value::Object(Default::default()));
         assert!(matches!(
             run_tool_calls(
@@ -684,10 +682,10 @@ mod tests {
         // A tool that would succeed if invoked; gating must refuse it instead.
         struct OkTool;
         impl ToolHandler for OkTool {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "writer"
             }
-            fn schema(&self) -> &'static str {
+            fn schema(&self) -> &str {
                 r#"{"type":"function","function":{"name":"writer"}}"#
             }
             fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -699,9 +697,9 @@ mod tests {
         }
 
         let interruption = FlagControl::new();
-        let tools =
+        let mut tools =
             ToolSet::from_groups([ToolGroup::new("g", [Tool::new(OkTool)])]).expect("tool set");
-        let allowed = AllowedTools::new(["reader"]); // "writer" is not permitted
+        tools.set_active_tools(AllowedTools::new(["reader"])); // "writer" is not permitted
         let response = LlmResponse {
             text: None,
             reasoning_content: None,
@@ -725,7 +723,7 @@ mod tests {
         )
         .expect("assistant");
 
-        let runner = ToolRunner::new(&tools, Some(&allowed), None);
+        let runner = ToolRunner::new(&tools, None);
         let ToolRoundResult::Completed { runs } = run_tool_calls(
             &interruption,
             &runner,

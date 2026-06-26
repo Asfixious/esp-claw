@@ -129,10 +129,10 @@ mod tests {
     struct DummyTool;
 
     impl ToolHandler for DummyTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "do_thing"
         }
-        fn schema(&self) -> &'static str {
+        fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"do_thing"}}"#
         }
         fn invoke(

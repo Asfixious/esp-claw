@@ -19,6 +19,10 @@
 //! reminder set changes (dirty-gated), so a steady reminder set costs nothing
 //! per iteration. Each reminder renders once as a trailing `user` message
 //! wrapped in a `<system-reminder>` envelope.
+//!
+//! Owned by [`Context`](crate::Context): callers reach it only through
+//! [`Context::reminder`](crate::Context::reminder) and the tail it contributes
+//! to [`Context::request`](crate::Context::request).
 
 use serde_json::{json, Value};
 
@@ -45,19 +49,26 @@ impl Reminders {
         }
     }
 
-    /// Replace all reminders with a single text (the common phase-note case).
-    pub(crate) fn set_single(&mut self, text: String) {
-        self.texts.clear();
-        self.texts.push(text);
-        self.dirty = true;
-    }
-
-    /// Drop all reminders. No-op (and no re-render) when already empty.
-    pub(crate) fn clear(&mut self) {
-        if self.texts.is_empty() {
+    /// Set the tail to a single reminder `text`, or clear it when `None`.
+    ///
+    /// **Dirty-gated:** a no-op (no re-render) when the resulting reminder is
+    /// unchanged from the current one, so callers may re-derive and call this
+    /// every tick (the steady case) at zero cost. Takes `&str` so the caller can
+    /// pass a borrow of the source (e.g. the tool set's cached phase note) without
+    /// owning it; the text is copied only when it actually changed.
+    pub(crate) fn set_single(&mut self, text: Option<&str>) {
+        let unchanged = match (text, self.texts.first()) {
+            (Some(new), Some(current)) => new == current,
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
             return;
         }
         self.texts.clear();
+        if let Some(new) = text {
+            self.texts.push(new.to_string());
+        }
         self.dirty = true;
     }
 
@@ -81,5 +92,53 @@ impl Reminders {
     /// [`refresh`](Self::refresh) earlier this tick so the buffer is current.
     pub(crate) fn as_slice(&self) -> &[Value] {
         &self.rendered
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The rendered content of the single reminder, if any.
+    fn rendered_content(reminders: &Reminders) -> Option<&str> {
+        reminders
+            .as_slice()
+            .first()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+    }
+
+    #[test]
+    fn set_single_renders_one_wrapped_user_message() {
+        let mut reminders = Reminders::new();
+        reminders.set_single(Some("only these tools"));
+        reminders.refresh();
+
+        assert_eq!(reminders.as_slice().len(), 1);
+        assert_eq!(
+            rendered_content(&reminders),
+            Some("<system-reminder>\nonly these tools\n</system-reminder>")
+        );
+    }
+
+    #[test]
+    fn unchanged_text_does_not_redirty() {
+        let mut reminders = Reminders::new();
+        reminders.set_single(Some("note"));
+        reminders.refresh();
+        // Re-deriving the same note is a no-op; the buffer stays as-is.
+        reminders.set_single(Some("note"));
+        assert!(!reminders.dirty);
+    }
+
+    #[test]
+    fn none_clears_the_tail() {
+        let mut reminders = Reminders::new();
+        reminders.set_single(Some("note"));
+        reminders.refresh();
+        reminders.set_single(None);
+        reminders.refresh();
+        assert!(reminders.as_slice().is_empty());
     }
 }

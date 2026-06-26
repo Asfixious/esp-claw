@@ -104,11 +104,11 @@ fn no_tools_with_unsupported_llm_builds_and_runs() {
 struct ClashTool;
 
 impl ToolHandler for ClashTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "end_conversation"
     }
 
-    fn schema(&self) -> &'static str {
+    fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":"end_conversation"}}"#
     }
 

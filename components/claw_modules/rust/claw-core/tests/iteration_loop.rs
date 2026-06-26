@@ -208,10 +208,10 @@ impl ClawHttp for AbortDuringHttp {
 struct EchoTool;
 
 impl ToolHandler for EchoTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "files"
     }
-    fn schema(&self) -> &'static str {
+    fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":"files"}}"#
     }
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -226,10 +226,10 @@ impl ToolHandler for EchoTool {
 struct FailingTool;
 
 impl ToolHandler for FailingTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "files"
     }
-    fn schema(&self) -> &'static str {
+    fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":"files"}}"#
     }
     fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -242,11 +242,10 @@ impl ToolHandler for FailingTool {
 struct SoftFailTool;
 
 impl ToolHandler for SoftFailTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         ""
     }
-    fn schema(&self) -> &'static str {
-        // Self-consistent minimal schema: function.name matches name().
+    fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":""}}"#
     }
     fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -291,7 +290,6 @@ fn run_step(
         messages: ChatMessages(messages),
         reminders: &[],
         tools,
-        allowed_tools: None,
         gate: None,
     };
     IterationLoop {

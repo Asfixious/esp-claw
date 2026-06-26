@@ -141,11 +141,11 @@ pub fn never_called_llm() -> ClawApi {
 pub struct EchoTool;
 
 impl ToolHandler for EchoTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "echo"
     }
 
-    fn schema(&self) -> &'static str {
+    fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":"echo","description":"Echo the arguments back"}}"#
     }
 

@@ -58,24 +58,19 @@ use claw_interface::ClawFs;
 use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
-use crate::agent::reminder::Reminders;
 use crate::agent::tools::{internal_tool_group, ControlSignal, ControlSink};
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
     PreemptedOutcome, SystemPrompt, ToolRun,
 };
-use claw_tool::{AllowedTools, ToolGate, ToolSet, ToolSetError};
-use claw_context::{Block, BlockKind, ContextBuilder, RequestContext};
-use claw_permission::{Action, Grant, GrantStore, PermissionDecision, PermissionPolicy, PermissionRequest};
+use claw_context::{Block, BlockKind, Context};
+use claw_permission::{Grant, PermissionPolicy};
 use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
+use claw_tool::{PermissionGate, ToolBlockVerdict, ToolGate, ToolSet, ToolSetError};
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
 crate::define_prefixed_id!(ApprovalId, "approval-", "approval");
-
-/// Default for [`BaseAgentBuilder::with_tool_block_retries`]: tolerate one
-/// gating-blocked tool round (one self-correction nudge) before failing.
-const DEFAULT_TOOL_BLOCK_RETRIES: u32 = 1;
 
 // ===========================================================================
 // Public command / outcome vocabulary
@@ -270,19 +265,18 @@ impl TickOutcome {
 /// Cause of a terminal [`TickOutcome::Failed`].
 ///
 /// Wraps the lower-level errors a tick can hit: a failed LLM/tool iteration, or a
-/// failure assembling the loaded skills' context before the iteration runs.
+/// tool refused past the soft-hide retry budget. Skill-context assembly no longer
+/// fails a tick — it is published to the [`Context`] on skill load/unload (where
+/// the [`SkillError`] surfaces), and [`Context::request`] is infallible, so the
+/// tick never fails on context assembly.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum AgentRunError {
     /// The LLM/tool iteration itself failed.
     #[error(transparent)]
     Iteration(#[from] IterationLoopError),
-    /// Assembling the skill context failed (e.g. a loaded skill's document could
-    /// not be read).
-    #[error(transparent)]
-    Skill(#[from] SkillError),
     /// The model kept calling a tool that soft-hide gating does not permit this
-    /// phase, past the allowed retry budget (see
-    /// [`BaseAgentBuilder::with_tool_block_retries`]).
+    /// phase, past the allowed retry budget (the toolset-wide policy in
+    /// [`ToolSet::set_block_retries`](claw_tool::ToolSet::set_block_retries)).
     #[error("tool not permitted in the current phase: {name}")]
     ToolNotPermitted {
         /// The name of the refused tool.
@@ -345,58 +339,6 @@ impl InterruptionControl for AgentInterruption {
     }
 }
 
-/// The agent's permission gate: a policy, the acting agent's identity, and the
-/// grant store of human decisions, implementing [`ToolGate`] for the tool runner.
-///
-/// [`decide`](ToolGate::decide) is read-only — it answers from a recorded
-/// [`Grant`] first (so a previously approved/denied action resolves without
-/// asking again, which also prevents an ask/retry loop), then falls back to the
-/// policy. Recording a decision happens separately, on an
-/// [`ApprovalResult`](AgentCommand::ApprovalResult), via
-/// [`record_decision`](Self::record_decision).
-struct PermissionGate {
-    policy: Arc<dyn PermissionPolicy>,
-    agent_id: u64,
-    agent_kind: String,
-    grants: GrantStore,
-}
-
-impl PermissionGate {
-    /// Record a human decision against `signatures` (the actions that were asked
-    /// about), so the matching retried calls resolve directly.
-    fn record_decision(&mut self, signatures: &[String], decision: &ApprovalDecision) {
-        for signature in signatures {
-            match decision {
-                ApprovalDecision::Approved => self.grants.grant(signature.clone()),
-                ApprovalDecision::Rejected(reason) => {
-                    self.grants.deny(signature.clone(), reason.clone())
-                }
-            }
-        }
-    }
-}
-
-impl ToolGate for PermissionGate {
-    fn decide(&self, action: &Action) -> PermissionDecision {
-        // A recorded decision wins over the policy: it both honors the human and
-        // breaks the ask → retry → ask loop.
-        match self.grants.lookup(&action.signature()) {
-            Some(Grant::Granted) => return PermissionDecision::Allow,
-            Some(Grant::Denied(reason)) => {
-                return PermissionDecision::Deny {
-                    reason: reason.clone(),
-                }
-            }
-            None => {}
-        }
-        self.policy.evaluate(&PermissionRequest::new(
-            self.agent_id,
-            &self.agent_kind,
-            action,
-        ))
-    }
-}
-
 // ===========================================================================
 // BaseAgent
 // ===========================================================================
@@ -432,50 +374,30 @@ pub struct BaseAgent<F: ClawFs + 'static> {
     retry_policy: RetryPolicy,
     interruption: AgentInterruption,
     memory: ConversationMemory<F>,
+    /// The agent's tools, including all tool gating. Soft-hide phase gating
+    /// (which tools may run now via [`ToolSet::is_allowed`]) and the
+    /// "retry then fail" block policy ([`ToolSet::record_round`]) both live inside
+    /// the set; the full schema is always sent regardless, so the cached prompt
+    /// prefix stays stable. The agent only reads the set's two prompt surfaces
+    /// (placed via the `context` cache) and acts on the block verdict.
     tools: Option<ToolSet>,
-    /// Tools allowed to execute this phase ("soft-hide" gating). `None` = ungated
-    /// (every tool in `tools` may run). Set per semantic state by an upper layer
-    /// via [`set_active_tools`](Self::set_active_tools); the full `tools` schema
-    /// is always sent regardless, so the cached prompt prefix stays stable.
-    allowed_tools: Option<AllowedTools>,
-    /// Ephemeral per-request reminders appended to the tail of the messages sent
-    /// to the LLM (never persisted). Carries the soft-hide phase note (the
-    /// permitted tools), set from the allow-set by
-    /// [`set_active_tools`](Self::set_active_tools) and dropped by
-    /// [`clear_active_tools`](Self::clear_active_tools). See
-    /// [`Reminders`](crate::agent::reminder::Reminders).
-    reminders: Reminders,
-    /// Count of consecutive tool rounds that had at least one gating-blocked
-    /// call. Reset to 0 by any clean tool round. When it exceeds
-    /// `tool_block_retries`, the task fails with [`AgentRunError::ToolNotPermitted`].
-    consecutive_tool_blocks: u32,
-    /// How many consecutive blocked rounds to tolerate (with a self-correction
-    /// nudge) before failing the task. Default 1.
-    tool_block_retries: u32,
     skills: Option<SkillSet>,
-    /// Agent-level system prompt (its persona/identity), fixed across tasks.
-    system_prompt: String,
-    /// The tool-policy prompt section — every tool's usage prose, produced once
-    /// from the final [`ToolSet`] at build (`None` when no tool carries usage).
-    /// Placed into the assembled prompt by `claw-context`; fixed across tasks.
-    tool_context: Option<String>,
-    /// Scope-layered prose blocks injected from above (Global, then Session),
-    /// shared across agents as an `Arc`. Rendered ahead of the agent's own blocks
-    /// by `claw-context`. Empty by default (the standalone-agent behavior).
-    inherited_context: Arc<[Block<'static>]>,
-    /// Cached assembled prompt (instruction + tool policy + skills context). Empty
-    /// means "nothing to assemble, borrow `system_prompt` directly". Rebuilt only
-    /// when `effective_prompt_dirty`.
-    effective_prompt: String,
-    effective_prompt_dirty: bool,
+    /// The agent's context assembly, owned wholesale by `claw-context`: the
+    /// inherited blocks, the agent instruction, the tool-policy and active-skills
+    /// prose, the cached system prefix, and the ephemeral reminder tail. The agent
+    /// only *declares content* into it when a source changes (the instruction and
+    /// tool policy/reminder at build, the active skills on load/unload) via
+    /// [`Context::with`]; [`Context::request`] renders lazily. Change detection,
+    /// wire ordering, and reminder rendering all live in the context.
+    context: Context,
     /// Open group guard from task start until the first response, so the user turn
     /// and the assistant reply commit as one group (compaction never orphans a
     /// reply with no user turn).
     open_turn: Option<GroupGuard<F>>,
     /// The permission gate consulted per tool call (`None` = no permission layer:
-    /// every call that passes soft-hide runs). Owns the grant store of human
-    /// decisions; mutated when an [`ApprovalResult`](AgentCommand::ApprovalResult)
-    /// resolves a pending ask.
+    /// every call that passes soft-hide runs). A `claw-tool` type owning the
+    /// grant store of human decisions; mutated when an
+    /// [`ApprovalResult`](AgentCommand::ApprovalResult) resolves a pending ask.
     gate: Option<PermissionGate>,
     /// Action signatures awaiting the current human decision — the calls the
     /// permission policy asked about this tick. Recorded into the gate's grant
@@ -524,7 +446,6 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             system_prompt: String::new(),
             inherited_context: Arc::from([]),
             retry_policy: RetryPolicy::default(),
-            tool_block_retries: DEFAULT_TOOL_BLOCK_RETRIES,
             permission_policy: None,
             agent_id: 0,
             agent_kind: String::new(),
@@ -657,14 +578,15 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     /// [`SkillError::NotFound`] if no skill set is configured or the registry has
     /// no such skill.
     pub fn load_skill(&mut self, group: &'static str, id: SkillId) -> Result<(), SkillError> {
-        match self.skills.as_mut() {
-            Some(skills) => {
-                skills.load(group, id)?;
-                self.effective_prompt_dirty = true;
-                Ok(())
-            }
-            None => Err(SkillError::NotFound(id)),
-        }
+        let Some(skills) = self.skills.as_mut() else {
+            return Err(SkillError::NotFound(id));
+        };
+        skills.load(group, id)?;
+        // Declare the reassembled active-skills prose; the context change-detects
+        // and re-renders the prefix on the next request.
+        self.context
+            .with(Block::new(BlockKind::ActiveSkills, skills.context()?));
+        Ok(())
     }
 
     /// Load a whole [`SkillGroup`] into context at runtime. No-op if the agent has
@@ -674,22 +596,28 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     ///
     /// [`SkillError`] if a skill in the group is not in the registry.
     pub fn load_skill_group(&mut self, group: SkillGroup) -> Result<(), SkillError> {
-        match self.skills.as_mut() {
-            Some(skills) => {
-                skills.load_group(group)?;
-                self.effective_prompt_dirty = true;
-                Ok(())
-            }
-            None => Ok(()),
-        }
+        let Some(skills) = self.skills.as_mut() else {
+            return Ok(());
+        };
+        skills.load_group(group)?;
+        self.context
+            .with(Block::new(BlockKind::ActiveSkills, skills.context()?));
+        Ok(())
     }
 
     /// Unload a skill from context at runtime. No-op if absent.
-    pub fn unload_skill(&mut self, id: &SkillId) {
-        if let Some(skills) = self.skills.as_mut() {
-            skills.unload(id);
-            self.effective_prompt_dirty = true;
-        }
+    ///
+    /// # Errors
+    ///
+    /// [`SkillError`] if reassembling the remaining skills' prose fails.
+    pub fn unload_skill(&mut self, id: &SkillId) -> Result<(), SkillError> {
+        let Some(skills) = self.skills.as_mut() else {
+            return Ok(());
+        };
+        skills.unload(id);
+        self.context
+            .with(Block::new(BlockKind::ActiveSkills, skills.context()?));
+        Ok(())
     }
 
     // -- Status -------------------------------------------------------------
@@ -713,70 +641,6 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
     pub fn abort_handle(&self) -> AgentAbortHandle {
         AgentAbortHandle {
             flag: Arc::clone(&self.interruption.flag),
-        }
-    }
-
-    // -- Soft-hide gating (set by an upper / semantic layer) ----------------
-    //
-    // Consumed by the in-crate semantic agents: `ConversationAgent` re-gates on
-    // each phase change via these.
-
-    /// Restrict which tools may *execute* until changed ("soft-hide" gating).
-    ///
-    /// Two coupled effects, from the one allow-set so they cannot desync:
-    /// - **Enforcement:** the full tool schema is still sent every iteration (so
-    ///   the cached prompt prefix never moves), but a call to a tool not in
-    ///   `allowed` is refused at execution time — see
-    ///   [`BaseAgentBuilder::with_tool_block_retries`].
-    /// - **Prevention:** a transient phase note listing the permitted tools is
-    ///   appended to the tail of the next request's messages (the production
-    ///   "system-reminder" pattern), so the model avoids blocked calls up front.
-    ///   The note is never written to memory, keeping the cached prefix intact.
-    ///
-    /// Crate-internal: the in-crate semantic agents set this automatically on
-    /// each semantic state change (including mid-task), so gating tracks the
-    /// FSM. It is not part of the public boundary — external callers drive the
-    /// agent through semantic commands, not by toggling gating directly.
-    ///
-    /// Reserved soft-tools seam: no in-crate driver toggles phase gating today
-    /// (only the gating tests exercise it), so it is `dead_code` until a phased
-    /// agent reattaches; the enforcement path in [`ToolRunner`] stays wired.
-    ///
-    /// [`ToolRunner`]: claw_tool::ToolRunner
-    #[allow(dead_code)]
-    pub(crate) fn set_active_tools(&mut self, allowed: AllowedTools) {
-        self.reminders.set_single(Self::phase_note(&allowed));
-        self.allowed_tools = Some(allowed);
-    }
-
-    /// Remove tool gating: every tool in the set may run again (the default),
-    /// and drop the accompanying phase-note reminder.
-    ///
-    /// Reserved soft-tools seam (see [`set_active_tools`](Self::set_active_tools)).
-    #[allow(dead_code)]
-    pub(crate) fn clear_active_tools(&mut self) {
-        self.allowed_tools = None;
-        self.reminders.clear();
-    }
-
-    /// Build the transient phase note from the allow-set: a single
-    /// "system-reminder" line naming the tools the model may use this phase, so
-    /// its wording stays in lock-step with what enforcement will actually allow.
-    ///
-    /// Reserved soft-tools seam (see [`set_active_tools`](Self::set_active_tools)).
-    #[allow(dead_code)]
-    fn phase_note(allowed: &AllowedTools) -> String {
-        let names = allowed.sorted_names();
-        if names.is_empty() {
-            "[system] No tools are available in the current phase; do not call any \
-             tool."
-                .to_string()
-        } else {
-            format!(
-                "[system] Tools available in the current phase: {}. Other tools \
-                 are temporarily unavailable — do not call them.",
-                names.join(", ")
-            )
         }
     }
 
@@ -813,18 +677,15 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             let iteration_id = self.next_iteration;
             self.next_iteration = IterationId(iteration_id.0.saturating_add(1));
 
-            if let Err(error) = self.refresh_effective_prompt() {
-                self.fail_with(AgentRunError::Skill(error));
-            } else {
-                // Rebuild the ephemeral reminder tail (dirty-gated, reused buffer).
-                self.reminders.refresh();
-                let outcome = self.run_iteration(iteration_id);
-                self.reduce_outcome(outcome);
-                // 3. Internal-tool signals raised during the iteration, folded
-                //    back through the same reducer.
-                self.drain_control_signals();
-                self.drain_inbox();
-            }
+            // Context assembly is owned by `claw-context`: `run_iteration` calls
+            // `Context::request`, which re-renders the prefix only if a block
+            // changed since last tick. Nothing to prepare or degrade here.
+            let outcome = self.run_iteration(iteration_id);
+            self.reduce_outcome(outcome);
+            // 3. Internal-tool signals raised during the iteration, folded
+            //    back through the same reducer.
+            self.drain_control_signals();
+            self.drain_inbox();
         }
 
         // The inbox is now drained; realign the projection with the committed
@@ -837,40 +698,35 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         })
     }
 
-    /// The permission gate to consult this iteration, as a trait object (`None`
-    /// when no permission policy is configured).
-    fn tool_gate(&self) -> Option<&dyn ToolGate> {
-        self.gate.as_ref().map(|gate| gate as &dyn ToolGate)
-    }
-
     /// Run exactly one [`IterationLoop`] round over current context.
     ///
-    /// `claw-context` is the single assembler: it pairs the cached system prefix
-    /// with the message tail's two segments — the persisted history snapshot
-    /// (a cheap `Arc` clone) and the ephemeral [`Reminders`] — into one
-    /// [`RequestContext`]. No request stitching happens anywhere else; reminders
-    /// are never written to memory, so the cached system/history prefix is
-    /// untouched.
-    fn run_iteration(&self, iteration_id: IterationId) -> IterationResult {
+    /// [`Context`] is the single assembler: [`Context::request`] pairs the cached
+    /// system prefix with the message tail's two segments — the persisted history
+    /// snapshot (a cheap `Arc` clone) and the ephemeral reminder tail — into one
+    /// `RequestContext`, re-rendering the prefix only on a real change. No request
+    /// stitching happens anywhere else; reminders are never written to memory, so
+    /// the cached system/history prefix is untouched.
+    fn run_iteration(&mut self, iteration_id: IterationId) -> IterationResult {
         let history = self.memory.messages();
-        let context = RequestContext::new(
-            self.effective_prompt(),
-            history.as_ref(),
-            self.reminders.as_slice(),
-        );
+        // Take the disjoint field borrows first, then borrow `context` mutably for
+        // the (lazily rebuilt) request. `request` takes `&mut self.context`, so the
+        // permission gate must be derived from `self.gate` directly here rather
+        // than through a whole-`&self` helper.
         let iteration_loop = IterationLoop {
             llm: &self.llm,
             interruption: &self.interruption,
             retry: self.retry_policy,
         };
+        let tools = self.tools.as_ref();
+        let gate = self.gate.as_ref().map(|gate| gate as &dyn ToolGate);
+        let context = self.context.request(history.as_ref());
         let step = IterationStep {
             iteration_id,
             system_prompt: SystemPrompt(context.system()),
             messages: ChatMessages(context.history()),
             reminders: context.reminders(),
-            tools: self.tools.as_ref(),
-            allowed_tools: self.allowed_tools.as_ref(),
-            gate: self.tool_gate(),
+            tools,
+            gate,
         };
         iteration_loop.run(step)
     }
@@ -974,7 +830,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
                     self.apply_tool_block_policy(&tools.runs);
                     // A permission `Ask` pauses the agent for a human decision
                     // (unless the round already failed the task via the block
-                    // policy above).
+                    // policy above, which leaves `self.outcome` set).
                     self.maybe_raise_approval(&tools.runs);
                 }
             },
@@ -987,36 +843,26 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         }
     }
 
-    /// Apply the soft-hide "retry then fail" policy after a tool round.
+    /// Apply the tool set's soft-hide "retry then fail" policy after a tool round.
     ///
-    /// A round with any gating-blocked call bumps the consecutive counter (the
-    /// model already received a tool error to self-correct from); once it exceeds
-    /// `tool_block_retries` the task fails. A clean round resets the counter.
+    /// The streak counting and budget are a toolset-wide policy owned by
+    /// [`ToolSet::record_round`] (the model already received a tool error to
+    /// self-correct from for each blocked call). The agent only turns an
+    /// [`Exhausted`](ToolBlockVerdict::Exhausted) verdict into a task failure —
+    /// the set has no concept of a task.
     fn apply_tool_block_policy(&mut self, runs: &[ToolRun]) {
         let blocked: Vec<&str> = runs
             .iter()
             .filter(|run| run.blocked)
             .map(|run| run.name.as_str())
             .collect();
-
-        if blocked.is_empty() {
-            self.consecutive_tool_blocks = 0;
-            return;
+        if !blocked.is_empty() {
+            tracing::warn!(tools = ?blocked, "tool gate blocked");
         }
-
-        self.consecutive_tool_blocks = self.consecutive_tool_blocks.saturating_add(1);
-        tracing::warn!(
-            consecutive = self.consecutive_tool_blocks,
-            budget = self.tool_block_retries,
-            tools = ?blocked,
-            "tool gate blocked"
-        );
-
-        if self.consecutive_tool_blocks > self.tool_block_retries {
-            let name = blocked
-                .first()
-                .map(|name| (*name).to_string())
-                .unwrap_or_default();
+        let Some(tools) = self.tools.as_mut() else {
+            return;
+        };
+        if let ToolBlockVerdict::Exhausted { name } = tools.record_round(&blocked) {
             self.fail_with(AgentRunError::ToolNotPermitted { name });
         }
     }
@@ -1052,10 +898,18 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
 
     /// Record a human decision against the actions that were asked about, so the
     /// retried calls resolve directly. No-op without a permission gate.
+    ///
+    /// The agent's [`ApprovalDecision`] is mapped to the permission-layer
+    /// [`Grant`] the gate stores (`claw-tool`/`claw-permission` know nothing of
+    /// the agent's command vocabulary).
     fn record_grants(&mut self, decision: &ApprovalDecision) {
         let signatures = std::mem::take(&mut self.pending_grant_signatures);
         if let Some(gate) = self.gate.as_mut() {
-            gate.record_decision(&signatures, decision);
+            let grant = match decision {
+                ApprovalDecision::Approved => Grant::Granted,
+                ApprovalDecision::Rejected(reason) => Grant::Denied(reason.clone()),
+            };
+            gate.record_decision(&signatures, &grant);
         }
     }
 
@@ -1149,72 +1003,6 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         id
     }
 
-    // -- Effective prompt cache ---------------------------------------------
-
-    /// Rebuild the cached system-prompt prefix if stale; otherwise a no-op.
-    ///
-    /// `claw-context` is the single assembler and owns placement: it gathers the
-    /// inherited scope blocks (Global/Session, injected from above) and the
-    /// agent's own blocks (its instruction, the tool-policy prose, the active
-    /// skills) and renders them in wire order **into the reused
-    /// `effective_prompt` buffer** (`build_into` clears + rewrites, keeping the
-    /// allocation). The buffer is rebuilt only when a block changes
-    /// (`effective_prompt_dirty`), so a steady prefix costs nothing per
-    /// iteration. An empty result signals "borrow `system_prompt` directly".
-    fn refresh_effective_prompt(&mut self) -> Result<(), SkillError> {
-        if !self.effective_prompt_dirty {
-            return Ok(());
-        }
-        // `skill_context` borrows `self.skills`; the borrows below are of other,
-        // disjoint fields, and the render buffer is moved out first, so nothing
-        // aliases when `build_into` writes it back.
-        let skill_context = match self.skills.as_mut() {
-            Some(skills) => skills.context()?,
-            None => "",
-        };
-        let mut buffer = std::mem::take(&mut self.effective_prompt);
-
-        let mut builder = ContextBuilder::new();
-        // Inherited scope blocks (Global -> Session) render ahead of the agent's
-        // own; their content is borrowed from the shared `Arc`, not cloned.
-        for block in self.inherited_context.iter() {
-            builder.push(Block::new(block.kind.clone(), block.content.as_ref()));
-        }
-        builder.push(Block::new(
-            BlockKind::AgentInstruction,
-            self.system_prompt.as_str(),
-        ));
-        if let Some(tool_context) = self.tool_context.as_deref() {
-            builder.push(Block::new(BlockKind::ToolPolicy, tool_context));
-        }
-        if !skill_context.is_empty() {
-            builder.push(Block::new(BlockKind::ActiveSkills, skill_context));
-        }
-
-        if let Err(error) = builder.build_into(&mut buffer) {
-            // The only build error is a duplicate canonical block; the kinds added
-            // above are distinct, so this is unreachable. Degrade to the raw
-            // instruction rather than propagate a placement bug.
-            tracing::error!(%error, "system-prompt assembly failed; using base instruction");
-            buffer.clear();
-            buffer.push_str(&self.system_prompt);
-        }
-
-        self.effective_prompt = buffer;
-        self.effective_prompt_dirty = false;
-        Ok(())
-    }
-
-    /// The prompt to send this iteration — the rendered combined prefix, or the
-    /// base prompt borrowed with no copy when the prefix rendered empty. Assumes
-    /// [`refresh_effective_prompt`](Self::refresh_effective_prompt) ran this tick.
-    fn effective_prompt(&self) -> &str {
-        if self.effective_prompt.is_empty() {
-            &self.system_prompt
-        } else {
-            &self.effective_prompt
-        }
-    }
 }
 
 /// True when `patch` contains an assistant `tool_calls` id with no matching
@@ -1258,7 +1046,6 @@ pub struct BaseAgentBuilder<F: ClawFs + 'static> {
     system_prompt: String,
     inherited_context: Arc<[Block<'static>]>,
     retry_policy: RetryPolicy,
-    tool_block_retries: u32,
     permission_policy: Option<Arc<dyn PermissionPolicy>>,
     agent_id: u64,
     agent_kind: String,
@@ -1322,31 +1109,6 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
         self
     }
 
-    /// How many consecutive soft-hide-blocked tool rounds to tolerate before the
-    /// task fails with [`AgentRunError::ToolNotPermitted`].
-    ///
-    /// Only relevant once an upper layer gates tools via
-    /// [`BaseAgent::set_active_tools`]. Each blocked round hands the model a tool
-    /// error so it can self-correct; this bounds how many such nudges are given.
-    /// `0` fails on the first blocked call; the default is `1` (one nudge, then
-    /// fail on a second consecutive blocked round). A clean tool round resets the
-    /// counter.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use claw_core::agent::BaseAgent;
-    ///
-    /// let agent = BaseAgent::builder(llm, memory)
-    ///     .with_tool_block_retries(0) // fail immediately on a disallowed tool call
-    ///     .build()?;
-    /// # Ok::<(), claw_core::agent::BaseAgentBuildError>(())
-    /// ```
-    pub fn with_tool_block_retries(mut self, retries: u32) -> Self {
-        self.tool_block_retries = retries;
-        self
-    }
-
     /// Install a permission policy that gates every tool call. Each classified
     /// call is evaluated to `Allow` / `Ask` / `Deny`; `Ask` pauses the agent for a
     /// human decision (reusing the approval flow), and the decision is remembered
@@ -1395,16 +1157,27 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
             None
         };
 
-        // Produce the tool-policy prompt section once from the final tool set (the
-        // assembler places it each iteration). Fixed for the agent's lifetime.
-        let tool_context = tools.as_ref().and_then(ToolSet::tool_context);
+        let gate = self
+            .permission_policy
+            .map(|policy| PermissionGate::new(policy, self.agent_id, self.agent_kind));
 
-        let gate = self.permission_policy.map(|policy| PermissionGate {
-            policy,
-            agent_id: self.agent_id,
-            agent_kind: self.agent_kind,
-            grants: GrantStore::new(),
-        });
+        // Declare every piece of content the context owns up front: the inherited
+        // (Global/Session) blocks, the agent instruction, then the tool set's two
+        // static prompt surfaces. The active-skills prose stays absent until a
+        // skill is loaded at runtime (which declares it). After this the agent
+        // only re-declares a block when its source changes.
+        let mut context = Context::new();
+        for block in self.inherited_context.iter() {
+            context.with(block.clone());
+        }
+        context.with(Block::new(BlockKind::AgentInstruction, self.system_prompt));
+        if let Some(tools) = &tools {
+            context.with(Block::new(
+                BlockKind::ToolPolicy,
+                tools.tool_context().unwrap_or_default(),
+            ));
+            context.reminder(tools.extra_tool_context());
+        }
 
         Ok(BaseAgent {
             llm: self.llm,
@@ -1414,17 +1187,8 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
             },
             memory: self.memory,
             tools,
-            allowed_tools: None,
-            reminders: Reminders::new(),
-            consecutive_tool_blocks: 0,
-            tool_block_retries: self.tool_block_retries,
             skills: self.skills,
-            system_prompt: self.system_prompt,
-            tool_context,
-            inherited_context: self.inherited_context,
-            effective_prompt: String::new(),
-            // Build the combined prompt on the first tick.
-            effective_prompt_dirty: true,
+            context,
             open_turn: None,
             gate,
             pending_grant_signatures: Vec::new(),
@@ -1689,10 +1453,10 @@ mod gating_tests {
     struct EchoTool;
 
     impl ToolHandler for EchoTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "echo"
         }
-        fn schema(&self) -> &'static str {
+        fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"echo","description":"Echo"}}"#
         }
         fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -1707,10 +1471,10 @@ mod gating_tests {
     struct WriterTool;
 
     impl ToolHandler for WriterTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "writer"
         }
-        fn schema(&self) -> &'static str {
+        fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"writer","description":"Write"}}"#
         }
         fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
@@ -1866,8 +1630,8 @@ mod gating_tests {
             ]),
             AgentId(1),
         );
-        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
-        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+        let tools = caller_tools().with_active_tools(AllowedTools::new(["end_conversation"]));
+        let mut agent = builder.with_tools(tools).build().expect("build");
 
         agent.run("go");
         assert_eq!(run_to_completion(&mut agent), "done");
@@ -1898,8 +1662,8 @@ mod gating_tests {
             ]),
             AgentId(1),
         );
-        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
-        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+        let tools = caller_tools().with_active_tools(AllowedTools::new(["end_conversation"]));
+        let mut agent = builder.with_tools(tools).build().expect("build");
 
         agent.run("go");
         // First block: nudged, still working.
@@ -1928,9 +1692,9 @@ mod gating_tests {
             ]),
             AgentId(1),
         );
-        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
         // echo is permitted (the clean round); writer is not.
-        agent.set_active_tools(AllowedTools::new(["echo", "end_conversation"]));
+        let tools = caller_tools().with_active_tools(AllowedTools::new(["echo", "end_conversation"]));
+        let mut agent = builder.with_tools(tools).build().expect("build");
 
         agent.run("go");
         assert_eq!(run_to_completion(&mut agent), "done");
@@ -1943,12 +1707,11 @@ mod gating_tests {
             scripted_llm(vec![body_tool_call("t1", "writer", "{}")]),
             AgentId(1),
         );
-        let mut agent = builder
-            .with_tools(caller_tools())
-            .with_tool_block_retries(0)
-            .build()
-            .expect("build");
-        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
+        // The block budget is a toolset-wide policy, configured on the set.
+        let tools = caller_tools()
+            .with_active_tools(AllowedTools::new(["end_conversation"]))
+            .with_block_retries(0);
+        let mut agent = builder.with_tools(tools).build().expect("build");
 
         agent.run("go");
         match agent.tick() {
@@ -1989,12 +1752,14 @@ mod gating_tests {
         ]);
         let llm = build_llm(Arc::clone(&http) as Arc<dyn ClawHttp>);
         let (builder, view) = builder_with_view(llm, AgentId(1));
-        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
 
-        // Gate (which also sets the phase note), then immediately ungate before
-        // running — clearing must drop both the allow-set and the note.
-        agent.set_active_tools(AllowedTools::new(["end_conversation"]));
-        agent.clear_active_tools();
+        // Gate the set (which also arms the phase note), then immediately ungate
+        // before building — clearing must drop both the allow-set and the note,
+        // so the agent assembles no phase note.
+        let mut tools = caller_tools();
+        tools.set_active_tools(AllowedTools::new(["end_conversation"]));
+        tools.clear_active_tools();
+        let mut agent = builder.with_tools(tools).build().expect("build");
 
         agent.run("go");
         assert_eq!(run_to_completion(&mut agent), "done");
@@ -2024,9 +1789,9 @@ mod gating_tests {
         let http = CapturingHttp::new(vec![body_plain_text("hi there")]);
         let llm = build_llm(Arc::clone(&http) as Arc<dyn ClawHttp>);
         let (builder, view) = builder_with_view(llm, AgentId(1));
-        let mut agent = builder.with_tools(caller_tools()).build().expect("build");
-        // Gating sets the note as a side effect; no separate note API.
-        agent.set_active_tools(AllowedTools::new(["echo", "end_conversation"]));
+        // Gating the set arms the note; the agent only places it each tick.
+        let tools = caller_tools().with_active_tools(AllowedTools::new(["echo", "end_conversation"]));
+        let mut agent = builder.with_tools(tools).build().expect("build");
 
         agent.run("hello");
         assert_eq!(run_to_completion(&mut agent), "hi there");

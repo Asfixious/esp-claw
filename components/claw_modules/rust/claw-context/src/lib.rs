@@ -1,41 +1,44 @@
-//! `claw-context` — the agent context builder.
+//! `claw-context` — the agent's context assembler.
 //!
-//! This crate owns **placement and rendering**, never **content**. It assembles
-//! the prompt string handed to the LLM each iteration by ordering injected
-//! blocks into the mutability-graded wire layout (see `docs/context-model.md`),
-//! dropping absent blocks, and rendering a single string. What each block
-//! *contains* — instructions, persona, memory, retrieved knowledge — is supplied
-//! by callers, not by this crate.
+//! This crate owns **placement, change detection, and rendering**, never
+//! **content**. A [`Context`] holds one block per [`BlockKind`], caches the
+//! rendered system prefix, and pairs it with the message tail (history plus
+//! ephemeral reminders) into a [`RequestContext`] for the LLM client. What each
+//! block *contains* — instructions, persona, memory, retrieved knowledge — is
+//! supplied by callers.
+//!
+//! # Model
+//!
+//! Declare blocks with [`Context::with`]; it is incremental and safe — a kind you
+//! do not declare keeps its last value, empty content removes a kind, and
+//! re-declaring identical content is a free no-op. Call [`Context::with`] every
+//! tick for anything that might change (so the context is never stale without
+//! betting that you "remembered" to push), and read with [`Context::request`],
+//! which re-renders only when a block actually changed.
 //!
 //! # Example
 //!
 //! ```
-//! use claw_context::{Block, BlockKind, ContextBuilder};
+//! use claw_context::{Block, BlockKind, Context};
+//! use serde_json::json;
 //!
-//! // Blocks may be added in any order; the builder is the sole authority on
-//! // wire order (band, then scope, then in-band order).
-//! let context = ContextBuilder::new()
+//! let mut context = Context::new();
+//! // Blocks may be declared in any order; the wire order is fixed by BlockKind.
+//! context
 //!     .with(Block::new(BlockKind::CurrentInput, "What's the weather?"))
-//!     .with(Block::new(BlockKind::CommonInstruction, "You are a helpful agent."))
-//!     .build()
-//!     .expect("no duplicate canonical blocks");
+//!     .with(Block::new(BlockKind::AgentInstruction, "You are a helpful agent."));
 //!
-//! // Feed directly to the LLM.
-//! let prompt: &str = context.context();
-//! assert_eq!(prompt, "You are a helpful agent.\n\nWhat's the weather?");
+//! let history = json!([]);
+//! let request = context.request(&history);
+//! assert_eq!(
+//!     request.system(),
+//!     "You are a helpful agent.\n\nWhat's the weather?"
+//! );
 //! ```
 
 mod block;
-mod builder;
+mod context;
+mod reminder;
 
 pub use block::{Band, Block, BlockKind, Scope};
-pub use builder::{BuildError, Context, ContextBuilder, RequestContext};
-
-/// The seam for filling blocks. Content sources (instruction loaders, memory
-/// providers, summarizers, …) implement this outside the crate; the builder
-/// consumes them via [`ContextBuilder::with_provider`].
-pub trait ContextProvider {
-    /// Produce this provider's block (placement + content). The block may borrow
-    /// from `self`, so it must not outlive the provider.
-    fn block(&self) -> Block<'_>;
-}
+pub use context::{Context, RequestContext};

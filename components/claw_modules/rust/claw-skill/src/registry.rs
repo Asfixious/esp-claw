@@ -2,16 +2,23 @@
 //!
 //! [`FsSkillRegistry`] scans one or more skills roots over an injected
 //! [`ClawFs`]: one directory per skill, each holding a `SKILL.md`. The catalog
-//! (metadata) is built once by reading only each file's front-matter head; full
+//! (metadata) is read by parsing only each file's front-matter head; full
 //! documents are read lazily, on demand, when a skill is placed in context.
 //!
 //! Skill ids are unique across every scanned root — the same id in two roots is
 //! a hard [`SkillError::DuplicateId`], not a silent override.
 //!
+//! The catalog is **mutable at runtime**: [`reload`](FsSkillRegistry::reload)
+//! re-scans the roots and atomically swaps in a fresh [`CatalogSnapshot`].
+//! Because the live state sits behind a lock, the read API hands out a cheap
+//! `Arc<CatalogSnapshot>` *snapshot* rather than a borrow — a borrow could not
+//! escape the lock guard, and a snapshot lets a concurrent reload proceed
+//! without disturbing readers already holding an older view.
+//!
 //! [`SkillSet`]: crate::SkillSet
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use claw_interface::ClawFs;
 
@@ -24,6 +31,38 @@ use super::skill::{parse_front_matter, strip_front_matter, SkillError, SkillId, 
 /// this window is treated as malformed.
 const METADATA_PREFIX_BYTES: u64 = 2048;
 
+/// An immutable, point-in-time view of a registry's catalog.
+///
+/// Handed out (inside an [`Arc`]) by [`SkillRegistry::catalog`] so readers get a
+/// consistent snapshot that a concurrent [`reload`](FsSkillRegistry::reload)
+/// cannot mutate underneath them: a reload swaps in a *new* snapshot, leaving
+/// any already-handed-out `Arc` untouched. Holds everything the read path needs
+/// — the catalog rows plus the id → root map used to locate a document.
+#[derive(Debug, Default)]
+pub struct CatalogSnapshot {
+    entries: Vec<SkillMetadata>,
+    /// The root each skill id was found under, so a document read can rebuild
+    /// its path.
+    root_by_id: HashMap<SkillId, String>,
+}
+
+impl CatalogSnapshot {
+    /// The catalog rows (id + description), sorted by id.
+    pub fn entries(&self) -> &[SkillMetadata] {
+        &self.entries
+    }
+
+    /// Look up one catalog entry by id, or `None` if there is no such skill.
+    pub fn get(&self, id: &SkillId) -> Option<&SkillMetadata> {
+        self.entries.iter().find(|entry| entry.id() == id)
+    }
+
+    /// The root directory `id` was found under, if any.
+    fn root_of(&self, id: &SkillId) -> Option<&str> {
+        self.root_by_id.get(id).map(String::as_str)
+    }
+}
+
 /// The catalog + document source the agent's [`SkillSet`] reads from.
 ///
 /// An inbound port: the catalog (cheap metadata) is held in memory, while full
@@ -32,8 +71,12 @@ const METADATA_PREFIX_BYTES: u64 = 2048;
 ///
 /// [`SkillSet`]: crate::SkillSet
 pub trait SkillRegistry: Send + Sync {
-    /// The full catalog, borrowed. Cheap, in-memory metadata only.
-    fn catalog(&self) -> &[SkillMetadata];
+    /// A consistent snapshot of the catalog, shared via [`Arc`].
+    ///
+    /// Cheap to call (an `Arc` clone): the returned snapshot is immutable, so a
+    /// concurrent [`reload`](FsSkillRegistry::reload) replaces the live snapshot
+    /// without disturbing a caller still reading this one.
+    fn catalog(&self) -> Arc<CatalogSnapshot>;
 
     /// Append one skill's document body (front-matter stripped) to `out`.
     ///
@@ -67,19 +110,25 @@ pub trait SkillRegistry: Send + Sync {
     }
 
     /// Look up one catalog entry by id, or `None` if there is no such skill.
-    fn metadata(&self, id: &SkillId) -> Option<&SkillMetadata> {
-        self.catalog().iter().find(|entry| entry.id() == id)
+    ///
+    /// Returns an owned [`SkillMetadata`]: the live catalog sits behind a lock,
+    /// so a borrow could not outlive the snapshot it was read from.
+    fn metadata(&self, id: &SkillId) -> Option<SkillMetadata> {
+        self.catalog().get(id).cloned()
     }
 }
 
 /// A [`SkillRegistry`] backed by one or more [`ClawFs`] skills directories.
+///
+/// The scanned catalog lives behind an `RwLock<Arc<…>>` so it can be replaced at
+/// runtime by [`reload`](Self::reload) — even while shared as an
+/// `Arc<dyn SkillRegistry>` — without handing out a borrow that would outlive a
+/// reload. `fs` and `roots` are fixed at construction and need no locking.
 pub struct FsSkillRegistry {
     fs: Arc<dyn ClawFs>,
     roots: Vec<String>,
-    catalog: Vec<SkillMetadata>,
-    /// The root each skill id was found under, so a document read can rebuild
-    /// its path.
-    root_by_id: HashMap<SkillId, String>,
+    /// The live catalog snapshot, swapped atomically on [`reload`](Self::reload).
+    snapshot: RwLock<Arc<CatalogSnapshot>>,
 }
 
 impl FsSkillRegistry {
@@ -113,34 +162,43 @@ impl FsSkillRegistry {
         roots: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, SkillError> {
         let roots: Vec<String> = roots.into_iter().map(Into::into).collect();
-        let (catalog, root_by_id) = Self::scan_catalog(fs.as_ref(), &roots)?;
+        let snapshot = Self::scan_catalog(fs.as_ref(), &roots)?;
         Ok(Self {
             fs,
             roots,
-            catalog,
-            root_by_id,
+            snapshot: RwLock::new(Arc::new(snapshot)),
         })
     }
 
-    /// Re-scan every root, replacing the catalog (e.g. after skills are added or
-    /// removed on disk).
+    /// Re-scan every root and atomically swap in a fresh catalog (e.g. after
+    /// skills are added or removed on disk).
+    ///
+    /// The new snapshot is built fully before the swap, so the live state is
+    /// only replaced on success; on error the previous catalog stays in place.
+    /// Readers holding an `Arc` from an earlier [`catalog`](SkillRegistry::catalog)
+    /// keep seeing their (now older) view until they fetch again.
+    ///
+    /// Takes `&self`: the catalog lives behind a lock, so a shared
+    /// `Arc<dyn SkillRegistry>` can be reloaded without exclusive access.
     ///
     /// # Errors
     ///
     /// Same as [`scan_roots`](Self::scan_roots).
-    pub fn reload(&mut self) -> Result<(), SkillError> {
-        let (catalog, root_by_id) = Self::scan_catalog(self.fs.as_ref(), &self.roots)?;
-        self.catalog = catalog;
-        self.root_by_id = root_by_id;
+    pub fn reload(&self) -> Result<(), SkillError> {
+        let snapshot = Self::scan_catalog(self.fs.as_ref(), &self.roots)?;
+        // Recover from a poisoned lock: a prior writer panic doesn't corrupt the
+        // `Arc`, and we're about to overwrite it wholesale anyway.
+        let mut guard = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Arc::new(snapshot);
         Ok(())
     }
 
-    /// Build the catalog and id→root map by scanning every root once.
-    fn scan_catalog(
-        fs: &dyn ClawFs,
-        roots: &[String],
-    ) -> Result<(Vec<SkillMetadata>, HashMap<SkillId, String>), SkillError> {
-        let mut catalog = Vec::new();
+    /// Build a [`CatalogSnapshot`] by scanning every root once.
+    fn scan_catalog(fs: &dyn ClawFs, roots: &[String]) -> Result<CatalogSnapshot, SkillError> {
+        let mut entries = Vec::new();
         let mut root_by_id: HashMap<SkillId, String> = HashMap::new();
         for root in roots {
             let names = fs
@@ -158,23 +216,31 @@ impl FsSkillRegistry {
                 let head = read_head(fs, &id, &path)?;
                 let metadata = parse_front_matter(id.clone(), &head)?;
                 root_by_id.insert(id, root.clone());
-                catalog.push(metadata);
+                entries.push(metadata);
             }
         }
-        catalog.sort_by(|a, b| a.id().cmp(b.id()));
-        Ok((catalog, root_by_id))
+        entries.sort_by(|a, b| a.id().cmp(b.id()));
+        Ok(CatalogSnapshot {
+            entries,
+            root_by_id,
+        })
     }
 }
 
 impl SkillRegistry for FsSkillRegistry {
-    fn catalog(&self) -> &[SkillMetadata] {
-        &self.catalog
+    fn catalog(&self) -> Arc<CatalogSnapshot> {
+        // Poisoning only means a writer panicked mid-swap; the data is still a
+        // valid `Arc`, so recover it rather than propagating the panic.
+        self.snapshot
+            .read()
+            .map(|guard| Arc::clone(&guard))
+            .unwrap_or_else(|poisoned| Arc::clone(&poisoned.into_inner()))
     }
 
     fn write_document(&self, id: &SkillId, out: &mut String) -> Result<(), SkillError> {
-        let root = self
-            .root_by_id
-            .get(id)
+        let snapshot = self.catalog();
+        let root = snapshot
+            .root_of(id)
             .ok_or_else(|| SkillError::NotFound(id.clone()))?;
         let path = skill_document_path(root, id.as_str());
         let bytes = self

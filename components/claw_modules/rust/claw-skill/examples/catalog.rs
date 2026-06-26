@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = FsSkillRegistry::scan(Arc::new(fs), "skills")?;
 
     println!("== structured catalog ==");
-    for metadata in registry.catalog() {
+    for metadata in registry.catalog().entries() {
         println!("{:<14} {}", metadata.id().as_str(), metadata.description());
     }
 

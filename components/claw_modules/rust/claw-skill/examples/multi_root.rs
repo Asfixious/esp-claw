@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let registry = FsSkillRegistry::scan_roots(Arc::new(fs), ["system", "data"])?;
     println!("== merged catalog from system + data ==");
-    for metadata in registry.catalog() {
+    for metadata in registry.catalog().entries() {
         println!("{:<8} {}", metadata.id().as_str(), metadata.description());
     }
 

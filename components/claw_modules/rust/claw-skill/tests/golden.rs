@@ -57,6 +57,7 @@ fn registry() -> FsSkillRegistry {
 fn catalog_json(registry: &FsSkillRegistry) -> String {
     let entries: Vec<_> = registry
         .catalog()
+        .entries()
         .iter()
         .map(|metadata| {
             json!({
@@ -101,7 +102,7 @@ fn assert_golden(path: &Path, actual: &str, label: &str) {
 fn catalog_matches_golden() {
     let registry = registry();
     assert!(
-        !registry.catalog().is_empty(),
+        !registry.catalog().entries().is_empty(),
         "no skills scanned from tests/data/skills"
     );
     assert_golden(
@@ -114,7 +115,7 @@ fn catalog_matches_golden() {
 #[test]
 fn documents_match_golden() {
     let registry = registry();
-    for metadata in registry.catalog() {
+    for metadata in registry.catalog().entries() {
         let id = metadata.id();
         let document = registry.document(id).expect("read skill document");
         assert!(
@@ -135,6 +136,7 @@ fn skill_set_loads_unloads_and_caches() {
     // Pick the first fixture skill dynamically rather than hard-coding an id.
     let first = shared
         .catalog()
+        .entries()
         .first()
         .expect("at least one fixture skill")
         .id()

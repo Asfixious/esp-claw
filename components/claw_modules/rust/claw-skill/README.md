@@ -36,8 +36,9 @@ Re-exported from the crate root:
 |------|------|
 | `SkillId` | A skill's identity (its directory name). `Cow<'static, str>`-backed, so a build-baked id (`from_static`, `const`) and a runtime id (`new`) share one type and compare equal by content. |
 | `SkillMetadata` | A cheap catalog row: `id()` + `description()`, no document body. |
-| `SkillRegistry` | Trait: the catalog + document source. `catalog()`, `write_document()`, `document()`, `metadata()`. |
-| `FsSkillRegistry` | `SkillRegistry` backed by one or more `ClawFs` skills roots: `scan()`, `scan_roots()`, `reload()`. |
+| `SkillRegistry` | Trait: the catalog + document source. `catalog()` (returns a shared `Arc<CatalogSnapshot>`), `write_document()`, `document()`, `metadata()`. |
+| `CatalogSnapshot` | An immutable point-in-time view of the catalog: `entries()` + `get()`. Handed out via `Arc` so a concurrent `reload()` can't mutate a reader's view. |
+| `FsSkillRegistry` | `SkillRegistry` backed by one or more `ClawFs` skills roots: `scan()`, `scan_roots()`, `reload()` (re-scans and atomically swaps in a fresh snapshot, on `&self`). |
 | `SkillSet` | An agent's loaded skills + two dirty-cached, borrowed prompt fragments: `catalog()` (the available-skills menu) and `context()` (the loaded bodies). Mutable at runtime: `load()`, `load_group()`, `unload()`. |
 | `SkillGroup` | A named bundle of skill ids to load together. The name tags provenance in the assembled context. |
 | `SkillError` | Failure enum: `ScanFailed`, `DuplicateId`, `ReadFailed`, `InvalidUtf8`, `MissingOpeningFence`, `MissingClosingFence`, `InvalidJson`, `NotFound`. |
@@ -50,9 +51,10 @@ Re-exported from the crate root:
 - **Allocation-frugal context.** `SkillRegistry::write_document` appends a
   body straight into a caller-owned buffer, and `SkillSet` reuses one buffer
   across rebuilds — no `String` per document per rebuild.
-- **Dirty-cached fragments.** `catalog()` is built once (the registry is
-  immutable for a set); `context()` is rebuilt only when the loaded set
-  changes, so steady-state reads are O(1) and hand back a borrowed `&str`.
+- **Dirty-cached fragments.** `catalog()` is cached and keyed on the registry's
+  current snapshot identity (a `reload()` invalidates it); `context()` is rebuilt
+  only when the loaded set changes, so steady-state reads are O(1) and hand back a
+  borrowed `&str`.
 
 ## Usage
 

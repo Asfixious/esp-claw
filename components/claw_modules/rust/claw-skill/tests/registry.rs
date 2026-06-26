@@ -38,8 +38,9 @@ fn two_skill_fs() -> Arc<MemFs> {
 #[test]
 fn scan_builds_catalog_sorted_by_id() {
     let registry = FsSkillRegistry::scan(two_skill_fs(), "skills").unwrap();
-    let ids: Vec<&str> = registry
-        .catalog()
+    let catalog = registry.catalog();
+    let ids: Vec<&str> = catalog
+        .entries()
         .iter()
         .map(|metadata| metadata.id().as_str())
         .collect();
@@ -111,6 +112,41 @@ fn skill_set_context_loads_unloads_and_caches() {
 
     set.unload(&SkillId::new("alpha"));
     assert!(set.context().unwrap().is_empty());
+}
+
+#[test]
+fn reload_picks_up_a_newly_added_skill() {
+    let fs = two_skill_fs();
+    let registry = FsSkillRegistry::scan(fs.clone(), "skills").unwrap();
+    assert_eq!(registry.catalog().entries().len(), 2);
+
+    fs.write_atomic("skills/gamma/SKILL.md", &skill_md("Gamma skill", "# Gamma"))
+        .unwrap();
+    // The pre-reload snapshot is unchanged; reload swaps in a fresh one.
+    assert_eq!(registry.catalog().entries().len(), 2);
+    registry.reload().unwrap();
+
+    let catalog = registry.catalog();
+    let ids: Vec<&str> = catalog
+        .entries()
+        .iter()
+        .map(|metadata| metadata.id().as_str())
+        .collect();
+    assert_eq!(ids, ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn skill_set_catalog_reflects_registry_reload() {
+    let fs = two_skill_fs();
+    let registry: Arc<FsSkillRegistry> = Arc::new(FsSkillRegistry::scan(fs.clone(), "skills").unwrap());
+    let mut set = SkillSet::new(registry.clone());
+    assert!(!set.catalog().contains("gamma"));
+
+    fs.write_atomic("skills/gamma/SKILL.md", &skill_md("Gamma skill", "# Gamma"))
+        .unwrap();
+    registry.reload().unwrap();
+    // The cache is keyed on snapshot identity, so the reload invalidates it.
+    assert!(set.catalog().contains("- gamma: Gamma skill"));
 }
 
 #[test]

@@ -9,13 +9,14 @@
 //! A `SkillSet` is **mutable**: skills load and unload at runtime without
 //! restarting the agent. Both fragments are **dirty-cached** — reads when
 //! nothing changed are O(1) and hand back a borrowed `&str`. The catalog cache
-//! is built once (the registry is immutable for this set); the context cache is
-//! rebuilt whenever the loaded set changes.
+//! is keyed on the registry's current [`CatalogSnapshot`] identity, so a
+//! [`reload`](crate::FsSkillRegistry::reload) that swaps in a new snapshot
+//! invalidates it; the context cache is rebuilt whenever the loaded set changes.
 
 use std::sync::Arc;
 
-use super::registry::SkillRegistry;
-use super::skill::{SkillError, SkillId, SkillMetadata};
+use super::registry::{CatalogSnapshot, SkillRegistry};
+use super::skill::{SkillError, SkillId};
 
 /// A named bundle of skills to load together (parallels `ToolGroup`).
 pub struct SkillGroup {
@@ -48,8 +49,9 @@ struct Loaded {
 pub struct SkillSet {
     registry: Arc<dyn SkillRegistry>,
     loaded: Vec<Loaded>,
-    /// Rendered available-skills menu; built once on first read.
-    catalog_cache: Option<String>,
+    /// Rendered available-skills menu, paired with the snapshot it was rendered
+    /// from so a registry reload (new snapshot identity) invalidates it.
+    catalog_cache: Option<(Arc<CatalogSnapshot>, String)>,
     /// Assembled context for the loaded skills; valid only when `!dirty`.
     context_cache: String,
     dirty: bool,
@@ -114,15 +116,26 @@ impl SkillSet {
     }
 
     /// The available-skills menu (every catalog entry as `- <id>: <description>`),
-    /// borrowed from a cache built on first read.
+    /// borrowed from a cache.
     ///
-    /// `&mut self` only so the cache can be filled in place; the content depends
-    /// solely on the (immutable) registry, so it never goes stale here.
+    /// `&mut self` so the cache can be filled in place. The cache is keyed on the
+    /// registry's current snapshot identity: a [`reload`](crate::FsSkillRegistry::reload)
+    /// swaps in a new [`CatalogSnapshot`], which the [`Arc::ptr_eq`] check below
+    /// detects, triggering a re-render.
     pub fn catalog(&mut self) -> &str {
-        if self.catalog_cache.is_none() {
-            self.catalog_cache = Some(render_catalog(self.registry.catalog()));
+        let snapshot = self.registry.catalog();
+        let fresh = self
+            .catalog_cache
+            .as_ref()
+            .is_some_and(|(cached, _)| Arc::ptr_eq(cached, &snapshot));
+        if !fresh {
+            let rendered = render_catalog(&snapshot);
+            self.catalog_cache = Some((snapshot, rendered));
         }
-        self.catalog_cache.as_deref().unwrap_or_default()
+        self.catalog_cache
+            .as_ref()
+            .map(|(_, rendered)| rendered.as_str())
+            .unwrap_or_default()
     }
 
     /// The assembled context for the loaded skills, rebuilt only if stale.
@@ -171,9 +184,9 @@ impl SkillSet {
 }
 
 /// Render the catalog as a one-line-per-skill menu for the prompt.
-fn render_catalog(catalog: &[SkillMetadata]) -> String {
+fn render_catalog(snapshot: &CatalogSnapshot) -> String {
     let mut out = String::from("Available skills:\n");
-    for metadata in catalog {
+    for metadata in snapshot.entries() {
         out.push_str("- ");
         out.push_str(metadata.id().as_str());
         out.push_str(": ");

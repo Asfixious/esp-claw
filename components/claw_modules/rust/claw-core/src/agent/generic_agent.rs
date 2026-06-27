@@ -82,11 +82,6 @@ impl<F: ClawFs + 'static> GenericAgent<F> {
         let memory_view = memory.clone();
 
         let mut tool_set = ToolSet::new(config.tools)?;
-        // The soft-hide "retry then fail" budget is a toolset-wide policy, so it
-        // lives on the set itself (survives the built-in group merge below).
-        if let Some(retries) = config.tool_block_retries {
-            tool_set.set_block_retries(retries);
-        }
         // Graph-affecting tools need a back-channel; without one (standalone agent)
         // the agent simply has no spawn/approval-routing tools.
         if let Some(host) = host {
@@ -107,6 +102,10 @@ impl<F: ClawFs + 'static> GenericAgent<F> {
             .with_tools(tool_set)
             .with_inherited_context(inherited_context)
             .with_retry_policy(config.retry_policy);
+        // The soft-hide "retry then fail" budget is the agent's BlockPolicy.
+        if let Some(retries) = config.tool_block_retries {
+            base_builder = base_builder.with_block_retries(retries);
+        }
         if let Some(skills) = config.skills {
             base_builder = base_builder.with_skills(skills);
         }

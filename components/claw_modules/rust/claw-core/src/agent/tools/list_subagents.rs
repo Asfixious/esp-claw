@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
+use claw_tool::{tool_metadata, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 use serde_json::Value;
 
 use crate::agent::graph::AgentContext;

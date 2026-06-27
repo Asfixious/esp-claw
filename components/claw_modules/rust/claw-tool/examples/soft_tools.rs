@@ -8,7 +8,7 @@
 //! ```
 
 use claw_tool::{
-    AllowedTools, Tool, ToolBlockVerdict, ToolError, ToolHandler, ToolInvocation, ToolInvokeError,
+    AllowedTools, BlockPolicy, Tool, ToolBlockVerdict, ToolHandler, ToolInvocation, ToolInvokeError,
     ToolOutput, ToolSet,
 };
 
@@ -70,10 +70,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Retry-then-fail: the model ignores the restriction and keeps calling the
     // blocked tool. After the budget (here: 1 nudge) the round is `Exhausted`.
-    set.set_block_retries(1);
+    // The streak counter is a separate `BlockPolicy` the agent owns (not the
+    // tool catalog), so the cached wire surfaces above stay immutable.
+    let mut block_policy = BlockPolicy::new(1);
     println!("== retry-then-fail (block_retries = 1) ==");
     for round in 1..=3 {
-        let verdict = set.record_round(&["write_file"]);
+        let verdict = block_policy.record_round(&["write_file"]);
         println!("round {round}: model called blocked write_file -> {verdict:?}");
         if let ToolBlockVerdict::Exhausted { name } = verdict {
             println!("  budget exhausted on \"{name}\"; the agent should end the task");

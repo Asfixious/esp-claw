@@ -6,7 +6,7 @@
 //! guessing a kind and learning by rejection — and unlike baking the catalog into
 //! `spawn_subagent`'s schema, it costs nothing in the always-sent prompt prefix.
 
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
+use claw_tool::{tool_metadata, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
 use crate::agent::graph::SpawnPolicy;
 

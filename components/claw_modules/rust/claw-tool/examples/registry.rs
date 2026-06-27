@@ -7,7 +7,7 @@
 //! cargo run --example registry --target x86_64-unknown-linux-gnu
 //! ```
 
-use claw_tool::{Tool, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRegistry};
+use claw_tool::{Tool, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRegistry};
 
 /// A trivial demo tool. A real tool bakes its `name`/`schema`/`usage` from
 /// `resources/tools/<name>/` via the `tool_metadata!` macro; here we build them

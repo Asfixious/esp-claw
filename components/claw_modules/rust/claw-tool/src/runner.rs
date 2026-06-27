@@ -14,11 +14,14 @@
 //! hint surfaced via [`is_concurrent`](ToolRunner::is_concurrent) — is the seam a
 //! future async runner grows into: side-effect-free `concurrent` calls awaited
 //! together, serializing ones run in order. Keeping that decision *here* means the
-//! caller does not change when concurrency lands.
+//! caller does not change when concurrency lands. The per-call retry budget
+//! (`invoke_with_retries`) is the other half of that seam. See the workspace
+//! `ROADMAP.md` ("Async, fair-scheduling tool runner") for the planned backoff,
+//! preemption, and fair-scheduling work.
 
 use claw_permission::{Action, PermissionDecision};
 
-use crate::handler::{ToolError, ToolInvocation, ToolInvokeError, ToolOutput, ToolRetryCount};
+use crate::handler::{ToolError, ToolInvocation, ToolInvokeError, ToolOutput};
 use crate::set::ToolSet;
 
 /// The permission seam the runner consults before executing a classified call.
@@ -95,21 +98,21 @@ impl<'a> ToolRunner<'a> {
 
     /// Gate `call` and, if permitted, execute it.
     ///
-    /// # Errors
-    ///
-    /// Propagates [`ToolError`] from dispatch (e.g. an unknown tool or a tool that
-    /// errored). Refusals (soft-hide / permission deny / ask) are *not* errors —
-    /// they come back as a [`CallOutcome`] the model can react to.
-    pub fn run_one(&self, call: &ToolInvocation<'_>) -> Result<CallOutcome, ToolError> {
+    /// Infallible: every path — soft-hide block, permission deny / ask, a tool
+    /// error, an unknown tool, or a clean run — produces a [`CallOutcome`] the
+    /// caller turns into a matched tool message. Tool-layer failures are handed
+    /// back as `ok = false` content the model can self-correct from, never as an
+    /// error that aborts the iteration.
+    pub fn run_one(&self, call: &ToolInvocation<'_>) -> CallOutcome {
         // 1. Soft-hide gating: the schema superset reached the model, but a tool
         //    the set does not currently allow must not run this phase.
         if !self.tools.is_allowed(call.name) {
-            return Ok(CallOutcome {
+            return CallOutcome {
                 content: blocked_tool_message(call.name),
                 ok: false,
                 blocked: true,
                 approval: None,
-            });
+            };
         }
 
         // 2. Permission gating: classify the call and ask the policy. An unknown
@@ -119,10 +122,10 @@ impl<'a> ToolRunner<'a> {
             match gate.decide(&action) {
                 PermissionDecision::Allow => {}
                 PermissionDecision::Deny { reason } => {
-                    return Ok(CallOutcome::ran(denied_tool_message(call.name, &reason), false));
+                    return CallOutcome::ran(denied_tool_message(call.name, &reason), false);
                 }
                 PermissionDecision::Ask { reason } => {
-                    return Ok(CallOutcome {
+                    return CallOutcome {
                         content: ask_tool_message(call.name),
                         ok: false,
                         blocked: false,
@@ -130,38 +133,37 @@ impl<'a> ToolRunner<'a> {
                             summary: reason,
                             signature: action.signature(),
                         }),
-                    });
+                    };
                 }
             }
         }
 
         // 3. Execute — optional per-call automatic re-invocation when the handler
         // returns a non-empty [`ToolRetryCount`]; otherwise surface a tool message.
-        let ToolOutput { output, ok } = match invoke_with_retries(self.tools, call) {
-            Ok(output) => output,
-            Err((error, _)) => return Ok(invoke_failure_to_outcome(call, error)),
-        };
-        Ok(CallOutcome::ran(output, ok))
+        match invoke_with_retries(self.tools, call) {
+            Ok(ToolOutput { output, ok }) => CallOutcome::ran(output, ok),
+            Err(error) => invoke_failure_to_outcome(call, error),
+        }
     }
 }
 
 /// Invoke `call`, re-running the same invocation when the handler supplies a
-/// [`ToolRetryCount`]. Intermediate failures are not surfaced to the model.
+/// [`ToolRetryCount`]. Intermediate failures are not surfaced to the model; the
+/// final failure is reduced to its [`ToolError`] (the budget is spent).
 fn invoke_with_retries(
     tools: &ToolSet,
     call: &ToolInvocation<'_>,
-) -> Result<ToolOutput, ToolInvokeError> {
+) -> Result<ToolOutput, ToolError> {
     let mut extra_attempts = 0u32;
     loop {
         match tools.invoke(call) {
             Ok(output) => return Ok(output),
-            Err((error, retry_budget)) => {
-                let max_extra = retry_budget.get();
-                if extra_attempts < max_extra {
+            Err(ToolInvokeError { error, retries }) => {
+                if extra_attempts < retries.get() {
                     extra_attempts = extra_attempts.saturating_add(1);
                     continue;
                 }
-                return Err((error, ToolRetryCount::none()));
+                return Err(error);
             }
         }
     }
@@ -216,7 +218,7 @@ fn display_name(name: &str) -> &str {
 mod tests {
     use super::*;
     use crate::handler::{
-        Tool, ToolHandler, ToolInvokeError, ToolOutput, tool_invoke_err_with_retries,
+        Tool, ToolHandler, ToolInvokeError, ToolOutput, ToolRetryCount, tool_invoke_err_with_retries,
     };
     use crate::set::{AllowedTools, ToolGroup};
     use claw_permission::{Action, RiskClass};
@@ -267,7 +269,7 @@ mod tests {
         let tools = tools();
         let gate = FixedGate(PermissionDecision::Allow);
         let runner = ToolRunner::new(&tools, Some(&gate));
-        let outcome = runner.run_one(&call()).unwrap();
+        let outcome = runner.run_one(&call());
         assert_eq!(outcome.content, "ran");
         assert!(outcome.ok);
         assert!(outcome.approval.is_none());
@@ -280,7 +282,7 @@ mod tests {
             reason: "no".into(),
         });
         let runner = ToolRunner::new(&tools, Some(&gate));
-        let outcome = runner.run_one(&call()).unwrap();
+        let outcome = runner.run_one(&call());
         assert!(!outcome.ok);
         assert!(outcome.approval.is_none());
         assert!(outcome.content.contains("denied by policy"));
@@ -293,7 +295,7 @@ mod tests {
             reason: "confirm".into(),
         });
         let runner = ToolRunner::new(&tools, Some(&gate));
-        let outcome = runner.run_one(&call()).unwrap();
+        let outcome = runner.run_one(&call());
         assert!(!outcome.ok);
         let approval = outcome.approval.expect("approval needed");
         assert_eq!(approval.summary, "confirm");
@@ -307,7 +309,7 @@ mod tests {
         // Even an Allow gate never runs: soft-hide refuses first.
         let gate = FixedGate(PermissionDecision::Allow);
         let runner = ToolRunner::new(&tools, Some(&gate));
-        let outcome = runner.run_one(&call()).unwrap();
+        let outcome = runner.run_one(&call());
         assert!(outcome.blocked);
         assert!(!outcome.ok);
     }
@@ -316,7 +318,7 @@ mod tests {
     fn no_gate_runs_normally() {
         let tools = tools();
         let runner = ToolRunner::new(&tools, None);
-        let outcome = runner.run_one(&call()).unwrap();
+        let outcome = runner.run_one(&call());
         assert_eq!(outcome.content, "ran");
         assert!(outcome.ok);
     }
@@ -350,13 +352,11 @@ mod tests {
         }
         let tools = ToolSet::new([Tool::new(NeedsNameTool)]).unwrap();
         let runner = ToolRunner::new(&tools, None);
-        let outcome = runner
-            .run_one(&ToolInvocation {
-                id: Some("t1"),
-                name: "needs_name",
-                arguments_json: "{}",
-            })
-            .unwrap();
+        let outcome = runner.run_one(&ToolInvocation {
+            id: Some("t1"),
+            name: "needs_name",
+            arguments_json: "{}",
+        });
         assert!(!outcome.ok);
         assert!(outcome.content.contains("schema validation"));
     }
@@ -395,13 +395,11 @@ mod tests {
         })])
         .unwrap();
         let runner = ToolRunner::new(&tools, None);
-        let outcome = runner
-            .run_one(&ToolInvocation {
-                id: Some("t1"),
-                name: "flaky",
-                arguments_json: "{}",
-            })
-            .unwrap();
+        let outcome = runner.run_one(&ToolInvocation {
+            id: Some("t1"),
+            name: "flaky",
+            arguments_json: "{}",
+        });
         assert!(outcome.ok);
         assert_eq!(outcome.content, "ok after retry");
     }

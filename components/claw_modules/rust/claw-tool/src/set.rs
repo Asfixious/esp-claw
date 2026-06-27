@@ -46,11 +46,6 @@ impl ToolGroup {
 /// Group label for tools registered without an explicit [`ToolGroup`].
 pub const DEFAULT_TOOL_GROUP: &str = "default";
 
-/// Consecutive gating-blocked tool rounds tolerated before
-/// [`record_round`](ToolSet::record_round) reports [`ToolBlockVerdict::Exhausted`].
-/// One round buys the model a single self-correction nudge.
-pub const DEFAULT_BLOCK_RETRIES: u32 = 1;
-
 /// One tool plus its group identity, as stored for dispatch.
 struct Entry {
     tool: Tool,
@@ -121,34 +116,6 @@ pub struct ToolSet {
     /// The dynamic phase note rendered from `active`, or `None` when ungated.
     /// Rebuilt whenever `active` changes.
     extra_context: Option<String>,
-    /// How many consecutive gating-blocked rounds to tolerate (each with a
-    /// self-correction nudge) before [`record_round`](Self::record_round) reports
-    /// [`ToolBlockVerdict::Exhausted`]. See [`set_block_retries`](Self::set_block_retries).
-    block_retries: u32,
-    /// Count of consecutive rounds that had at least one gating-blocked call.
-    /// Reset to 0 by any clean round; compared against `block_retries`.
-    consecutive_blocks: u32,
-}
-
-/// The verdict [`ToolSet::record_round`] returns after a tool round, driving the
-/// soft-hide "retry then fail" policy.
-///
-/// The set counts consecutive rounds with a gating-blocked call (the model
-/// already received a tool error to self-correct from); once that streak exceeds
-/// the tolerated budget the round is [`Exhausted`](Self::Exhausted) and the
-/// caller (the agent) should end the task. A clean round resets the streak and
-/// yields [`Continue`](Self::Continue).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolBlockVerdict {
-    /// Keep iterating: the round was clean, or the blocked streak is still within
-    /// the retry budget.
-    Continue,
-    /// The blocked streak exceeded the budget. `name` is one offending tool, for
-    /// the caller's failure report.
-    Exhausted {
-        /// A tool that was blocked this round.
-        name: String,
-    },
 }
 
 /// Dev-time consistency check for a tool's schema, run when a [`ToolSet`] is
@@ -229,31 +196,28 @@ impl ToolSet {
                 insert_tool(&mut by_name, tool, group.name)?;
             }
         }
+        Ok(Self::from_entries(by_name))
+    }
+
+    /// An empty set — no tools, no schemas. The infallible base other groups are
+    /// merged onto with [`extend_with_group`](Self::extend_with_group).
+    pub fn empty() -> Self {
+        Self::from_entries(HashMap::new())
+    }
+
+    /// Build a set from a populated dispatch map and render its static caches.
+    /// The single constructor [`from_groups`](Self::from_groups) and
+    /// [`empty`](Self::empty) share, so field defaults live in one place.
+    fn from_entries(by_name: HashMap<String, Entry>) -> Self {
         let mut set = Self {
             by_name,
             schemas_json: None,
             tool_context: None,
             active: None,
             extra_context: None,
-            block_retries: DEFAULT_BLOCK_RETRIES,
-            consecutive_blocks: 0,
         };
         set.rebuild_static_caches();
-        Ok(set)
-    }
-
-    /// An empty set — no tools, no schemas. The infallible base other groups are
-    /// merged onto with [`extend_with_group`](Self::extend_with_group).
-    pub fn empty() -> Self {
-        Self {
-            by_name: HashMap::new(),
-            schemas_json: None,
-            tool_context: None,
-            active: None,
-            extra_context: None,
-            block_retries: DEFAULT_BLOCK_RETRIES,
-            consecutive_blocks: 0,
-        }
+        set
     }
 
     /// Merge another [`ToolGroup`] into this set, re-checking the flat-unique-name
@@ -408,51 +372,6 @@ impl ToolSet {
     /// Rendered once when the active set changes; this is a free borrow of the cache.
     pub fn extra_tool_context(&self) -> Option<&str> {
         self.extra_context.as_deref()
-    }
-
-    // -- Soft-hide "retry then fail" policy ---------------------------------
-
-    /// Set how many consecutive gating-blocked rounds to tolerate before
-    /// [`record_round`](Self::record_round) reports
-    /// [`ToolBlockVerdict::Exhausted`]. `0` fails on the first blocked round.
-    ///
-    /// This is a **toolset-wide** policy (the soft-hide allow-set is per-set), not
-    /// per-tool: any round with a blocked call bumps one shared streak. Defaults
-    /// to [`DEFAULT_BLOCK_RETRIES`].
-    pub fn set_block_retries(&mut self, retries: u32) {
-        self.block_retries = retries;
-    }
-
-    /// Builder form of [`set_block_retries`](Self::set_block_retries).
-    #[must_use]
-    pub fn with_block_retries(mut self, retries: u32) -> Self {
-        self.set_block_retries(retries);
-        self
-    }
-
-    /// Account for one completed tool round and report whether soft-hide gating
-    /// has now blocked too many rounds in a row.
-    ///
-    /// `blocked` is the names of the calls the round refused via soft-hide (empty
-    /// for a clean round). A clean round resets the streak; a blocked round bumps
-    /// it and, once it exceeds [`block_retries`](Self::set_block_retries), returns
-    /// [`Exhausted`](ToolBlockVerdict::Exhausted) naming one offender so the agent
-    /// can end the task. The model already received a tool error for each blocked
-    /// call, so an `Exhausted` verdict means it ignored the restriction past the
-    /// budget.
-    pub fn record_round(&mut self, blocked: &[&str]) -> ToolBlockVerdict {
-        let Some(first) = blocked.first() else {
-            self.consecutive_blocks = 0;
-            return ToolBlockVerdict::Continue;
-        };
-        self.consecutive_blocks = self.consecutive_blocks.saturating_add(1);
-        if self.consecutive_blocks > self.block_retries {
-            ToolBlockVerdict::Exhausted {
-                name: (*first).to_string(),
-            }
-        } else {
-            ToolBlockVerdict::Continue
-        }
     }
 
     /// Classify `call` into a permission [`Action`] via its tool, or `None` when
@@ -700,41 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn clean_round_keeps_continuing_and_resets_the_streak() {
-        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
-        assert_eq!(set.record_round(&["read"]), ToolBlockVerdict::Continue);
-        // A clean round clears the streak so the next block starts over.
-        assert_eq!(set.record_round(&[]), ToolBlockVerdict::Continue);
-        assert_eq!(set.record_round(&["read"]), ToolBlockVerdict::Continue);
-    }
-
-    #[test]
-    fn streak_past_the_budget_is_exhausted() {
-        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
-        set.set_block_retries(1);
-        // First blocked round is tolerated (one nudge); the second exhausts it.
-        assert_eq!(set.record_round(&["read"]), ToolBlockVerdict::Continue);
-        assert_eq!(
-            set.record_round(&["read"]),
-            ToolBlockVerdict::Exhausted {
-                name: "read".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn zero_retries_exhausts_on_the_first_block() {
-        let mut set = ToolSet::new([Tool::new(UsageTool::new("read", None))]).unwrap();
-        set.set_block_retries(0);
-        assert_eq!(
-            set.record_round(&["read"]),
-            ToolBlockVerdict::Exhausted {
-                name: "read".to_string()
-            }
-        );
-    }
-
-    #[test]
     fn invoke_rejects_arguments_that_fail_schema_validation() {
         const SCHEMA: &str = r#"{
             "type": "function",
@@ -770,9 +654,7 @@ mod tests {
                 arguments_json: "{}",
             })
             .unwrap_err();
-        assert!(matches!(
-            error,
-            (ToolError::InvalidArguments(_), retries) if retries.is_none()
-        ));
+        assert!(matches!(error.error, ToolError::InvalidArguments(_)));
+        assert!(error.retries.is_none());
     }
 }

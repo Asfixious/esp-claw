@@ -67,7 +67,10 @@ use crate::iteration_loop::{
 use claw_context::{Block, BlockKind, Context};
 use claw_permission::{Grant, PermissionPolicy};
 use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
-use claw_tool::{PermissionGate, ToolBlockVerdict, ToolGate, ToolSet, ToolSetError};
+use claw_tool::{
+    BlockPolicy, PermissionGate, ToolBlockVerdict, ToolGate, ToolSet, ToolSetError,
+    DEFAULT_BLOCK_RETRIES,
+};
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
 crate::define_prefixed_id!(ApprovalId, "approval-", "approval");
@@ -275,8 +278,8 @@ pub enum AgentRunError {
     #[error(transparent)]
     Iteration(#[from] IterationLoopError),
     /// The model kept calling a tool that soft-hide gating does not permit this
-    /// phase, past the allowed retry budget (the toolset-wide policy in
-    /// [`ToolSet::set_block_retries`](claw_tool::ToolSet::set_block_retries)).
+    /// phase, past the allowed retry budget (the agent's
+    /// [`BlockPolicy`](claw_tool::BlockPolicy)).
     #[error("tool not permitted in the current phase: {name}")]
     ToolNotPermitted {
         /// The name of the refused tool.
@@ -374,13 +377,16 @@ pub struct BaseAgent<F: ClawFs + 'static> {
     retry_policy: RetryPolicy,
     interruption: AgentInterruption,
     memory: ConversationMemory<F>,
-    /// The agent's tools, including all tool gating. Soft-hide phase gating
-    /// (which tools may run now via [`ToolSet::is_allowed`]) and the
-    /// "retry then fail" block policy ([`ToolSet::record_round`]) both live inside
-    /// the set; the full schema is always sent regardless, so the cached prompt
-    /// prefix stays stable. The agent only reads the set's two prompt surfaces
-    /// (placed via the `context` cache) and acts on the block verdict.
+    /// The agent's tools, including soft-hide phase gating (which tools may run
+    /// now via [`ToolSet::is_allowed`]). The full schema is always sent
+    /// regardless, so the cached prompt prefix stays stable. The agent only reads
+    /// the set's two prompt surfaces (placed via the `context` cache).
     tools: Option<ToolSet>,
+    /// The soft-hide "retry then fail" streak counter. Kept beside the tool set
+    /// (not inside it) because it is conversation state, while [`ToolSet`] owns the
+    /// immutable catalog and the once-rendered, cached wire surfaces. Fed each tool
+    /// round by [`apply_tool_block_policy`](Self::apply_tool_block_policy).
+    block_policy: BlockPolicy,
     skills: Option<SkillSet>,
     /// The agent's context assembly, owned wholesale by `claw-context`: the
     /// inherited blocks, the agent instruction, the tool-policy and active-skills
@@ -449,6 +455,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
             permission_policy: None,
             agent_id: 0,
             agent_kind: String::new(),
+            block_retries: DEFAULT_BLOCK_RETRIES,
         }
     }
 
@@ -843,13 +850,12 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         }
     }
 
-    /// Apply the tool set's soft-hide "retry then fail" policy after a tool round.
+    /// Apply the soft-hide "retry then fail" policy after a tool round.
     ///
-    /// The streak counting and budget are a toolset-wide policy owned by
-    /// [`ToolSet::record_round`] (the model already received a tool error to
-    /// self-correct from for each blocked call). The agent only turns an
-    /// [`Exhausted`](ToolBlockVerdict::Exhausted) verdict into a task failure —
-    /// the set has no concept of a task.
+    /// The streak counting and budget live in the agent's [`BlockPolicy`] (the
+    /// model already received a tool error to self-correct from for each blocked
+    /// call). The agent turns an [`Exhausted`](ToolBlockVerdict::Exhausted) verdict
+    /// into a task failure — the policy has no concept of a task.
     fn apply_tool_block_policy(&mut self, runs: &[ToolRun]) {
         let blocked: Vec<&str> = runs
             .iter()
@@ -859,10 +865,7 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         if !blocked.is_empty() {
             tracing::warn!(tools = ?blocked, "tool gate blocked");
         }
-        let Some(tools) = self.tools.as_mut() else {
-            return;
-        };
-        if let ToolBlockVerdict::Exhausted { name } = tools.record_round(&blocked) {
+        if let ToolBlockVerdict::Exhausted { name } = self.block_policy.record_round(&blocked) {
             self.fail_with(AgentRunError::ToolNotPermitted { name });
         }
     }
@@ -1049,6 +1052,7 @@ pub struct BaseAgentBuilder<F: ClawFs + 'static> {
     permission_policy: Option<Arc<dyn PermissionPolicy>>,
     agent_id: u64,
     agent_kind: String,
+    block_retries: u32,
 }
 
 impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
@@ -1058,6 +1062,16 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
     /// (`end_conversation`) is merged on at [`build`](Self::build).
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// Set how many consecutive soft-hide-blocked tool rounds to tolerate before
+    /// the agent fails the task with
+    /// [`ToolNotPermitted`](AgentRunError::ToolNotPermitted). Each tolerated round
+    /// is one self-correction nudge to the model; `0` fails on the first blocked
+    /// round. Defaults to [`DEFAULT_BLOCK_RETRIES`](claw_tool::DEFAULT_BLOCK_RETRIES).
+    pub fn with_block_retries(mut self, retries: u32) -> Self {
+        self.block_retries = retries;
         self
     }
 
@@ -1187,6 +1201,7 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
             },
             memory: self.memory,
             tools,
+            block_policy: BlockPolicy::new(self.block_retries),
             skills: self.skills,
             context,
             open_turn: None,
@@ -1440,8 +1455,7 @@ mod gating_tests {
 
     use crate::agent::{AgentId, AgentRunError, BaseAgent, BaseAgentBuilder, TickOutcome};
     use claw_tool::{
-        AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput,
-        ToolSet,
+        AllowedTools, Tool, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolSet,
     };
 
     // HTTP doubles (ScriptedHttp / CapturingHttp, httpmock feature) and the
@@ -1708,11 +1722,13 @@ mod gating_tests {
             scripted_llm(vec![body_tool_call("t1", "writer", "{}")]),
             AgentId(1),
         );
-        // The block budget is a toolset-wide policy, configured on the set.
-        let tools = caller_tools()
-            .with_active_tools(AllowedTools::new(["end_conversation"]))
-            .with_block_retries(0);
-        let mut agent = builder.with_tools(tools).build().expect("build");
+        // The block budget is the agent's BlockPolicy, configured on the builder.
+        let tools = caller_tools().with_active_tools(AllowedTools::new(["end_conversation"]));
+        let mut agent = builder
+            .with_tools(tools)
+            .with_block_retries(0)
+            .build()
+            .expect("build");
 
         agent.run("go");
         match agent.tick() {

@@ -154,7 +154,7 @@ pub enum ToolRegistryError {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::handler::{ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
+    use crate::handler::{ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
     struct DummyTool {
         tool_name: String,

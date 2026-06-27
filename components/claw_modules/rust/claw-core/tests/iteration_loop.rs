@@ -12,7 +12,7 @@ use claw_core::iteration_loop::{
     SystemPrompt, ToolsOutcome,
 };
 use claw_core::{
-    IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRetryCount,
+    IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput,
     ToolSet,
 };
 use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
@@ -234,7 +234,7 @@ impl ToolHandler for FailingTool {
         r#"{"type":"function","function":{"name":"files"}}"#
     }
     fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
-        Err((ToolError::NotFound("files".into()), ToolRetryCount::none()))
+        Err(ToolError::NotFound("files".into()).into())
     }
 }
 

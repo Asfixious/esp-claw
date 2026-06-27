@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use claw_tool::{ApprovalNeeded, CallOutcome, ToolError, ToolGate, ToolInvocation, ToolRunner, ToolSet};
+use claw_tool::{ApprovalNeeded, CallOutcome, ToolGate, ToolInvocation, ToolRunner, ToolSet};
 use claw_api::{ChatError, ChatRequest, ClawApi, ClawApiError, LlmResponse, RetryPolicy};
 
 use claw_utils::TruncatedText;
@@ -32,8 +32,6 @@ pub enum IterationLoopError {
     MissingTools,
     #[error(transparent)]
     Chat(#[from] ChatError),
-    #[error(transparent)]
-    Tool(#[from] ToolError),
 }
 
 /// Checkpoint where preemption was detected. The iteration is terminal at this point.
@@ -412,14 +410,11 @@ fn run_tool_calls(
             ok,
             blocked,
             approval,
-        } = match runner.run_one(&ToolInvocation {
+        } = runner.run_one(&ToolInvocation {
             id: Some(&tc.id),
             name: &tc.name,
             arguments_json: &tc.arguments_json,
-        }) {
-            Ok(outcome) => outcome,
-            Err(err) => return ToolRoundResult::Failed(IterationLoopError::Tool(err)),
-        };
+        });
         // Tool output is free-form text -> message slot; keep ok/blocked as fields.
         tracing::info!(ok, blocked, "{}", TruncatedText::new(&content));
 

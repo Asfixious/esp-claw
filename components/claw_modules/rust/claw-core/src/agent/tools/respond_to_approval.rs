@@ -132,9 +132,7 @@ mod tests {
                 arguments_json: r#"{"agent":"agent-1","verdict":"maybe"}"#,
             })
             .unwrap_err();
-        assert!(matches!(
-            error,
-            (ToolError::InvokeRejected(_), retries) if retries.is_none()
-        ));
+        assert!(matches!(error.error, ToolError::InvokeRejected(_)));
+        assert!(error.retries.is_none());
     }
 }

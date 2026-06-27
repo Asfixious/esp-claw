@@ -4,9 +4,7 @@
 use std::sync::Arc;
 
 use claw_permission::{Action, RiskClass};
-use claw_tool::{
-    tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, tool_invoke_err,
-};
+use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
 use crate::agent::kind::AgentKind;
 use crate::agent::graph::{AgentContext, SpawnPolicy, TerminationPolicy};
@@ -272,20 +270,18 @@ mod tests {
             name: "spawn_subagent",
             arguments_json: r#"{"kind":"worker","goal":"x"}"#,
         });
-        assert!(matches!(
-            missing_name,
-            Err((ToolError::InvalidArguments(_), retries)) if retries.is_none()
-        ));
+        let missing_name = missing_name.unwrap_err();
+        assert!(matches!(missing_name.error, ToolError::InvalidArguments(_)));
+        assert!(missing_name.retries.is_none());
 
         let empty_name = set.invoke(&ToolInvocation {
             id: Some("t2"),
             name: "spawn_subagent",
             arguments_json: r#"{"kind":"worker","name":"","goal":"x"}"#,
         });
-        assert!(matches!(
-            empty_name,
-            Err((ToolError::InvalidArguments(_), retries)) if retries.is_none()
-        ));
+        let empty_name = empty_name.unwrap_err();
+        assert!(matches!(empty_name.error, ToolError::InvalidArguments(_)));
+        assert!(empty_name.retries.is_none());
 
         assert!(host.effects.lock().unwrap().is_empty());
     }
@@ -307,10 +303,8 @@ mod tests {
                 arguments_json: r#"{"kind":"worker","name":"   ","goal":"x"}"#,
             })
             .unwrap_err();
-        assert!(matches!(
-            error,
-            (ToolError::InvokeRejected(_), retries) if retries.is_none()
-        ));
+        assert!(matches!(error.error, ToolError::InvokeRejected(_)));
+        assert!(error.retries.is_none());
         assert!(host.effects.lock().unwrap().is_empty());
     }
 

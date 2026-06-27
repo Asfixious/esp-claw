@@ -13,7 +13,7 @@
 
 use claw_permission::{Action, PermissionDecision, RiskClass};
 use claw_tool::{
-    Tool, ToolError, ToolGate, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRunner,
+    Tool, ToolGate, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRunner,
     ToolSet,
 };
 
@@ -91,11 +91,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runner = ToolRunner::new(&tools, Some(&gate));
 
     // Safe tool: allowed, runs.
-    let outcome = runner.run_one(&call("read_file"))?;
+    let outcome = runner.run_one(&call("read_file"));
     println!("read_file  -> ok={} content={:?}", outcome.ok, outcome.content);
 
     // High-risk tool: the gate asks for approval; the tool does NOT run.
-    let outcome = runner.run_one(&call("write_file"))?;
+    let outcome = runner.run_one(&call("write_file"));
     match outcome.approval {
         Some(approval) => println!(
             "write_file -> approval needed: summary={:?} signature={:?}",

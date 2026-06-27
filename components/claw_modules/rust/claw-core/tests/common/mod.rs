@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, TickOutcome};
-use claw_core::{ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
+use claw_core::{ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 use claw_interface::{
     CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp, StdThread,
 };

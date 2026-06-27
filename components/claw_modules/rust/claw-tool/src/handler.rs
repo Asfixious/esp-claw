@@ -42,6 +42,13 @@ pub enum ToolError {
 ///
 /// Use [`none`](Self::none) for no automatic retry, or [`extra`](Self::extra) with
 /// how many **additional** invocations to allow after the first failure.
+///
+/// # Roadmap
+///
+/// Today the retry budget is honored by a synchronous, immediate re-invoke loop
+/// (no backoff, no preemption between attempts). It is the seam the planned
+/// async, fair-scheduling tool runner grows into — see the workspace ROADMAP
+/// (`components/claw_modules/rust/ROADMAP.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ToolRetryCount(Option<NonZeroU32>);
 
@@ -59,11 +66,6 @@ impl ToolRetryCount {
         Self(NonZeroU32::new(extra_attempts))
     }
 
-    /// Wrap a compile-time non-zero count (e.g. from `NonZeroU32::new(n).unwrap()` in tests).
-    pub const fn from_nonzero(count: NonZeroU32) -> Self {
-        Self(Some(count))
-    }
-
     pub fn is_none(self) -> bool {
         self.0.is_none()
     }
@@ -74,19 +76,35 @@ impl ToolRetryCount {
     }
 }
 
-/// Failure from [`ToolHandler::invoke`] / [`ToolSet::invoke`]: the error plus an
-/// optional per-call automatic retry budget. An empty [`ToolRetryCount`] means
-/// surface the error to the model immediately.
-pub type ToolInvokeError = (ToolError, ToolRetryCount);
+/// A failed tool invocation: the [`ToolError`] plus a per-call automatic retry
+/// budget. An empty [`retries`](Self::retries) budget means surface the error to
+/// the model immediately; a non-empty one lets [`ToolRunner`](crate::ToolRunner)
+/// re-invoke the same call before giving up.
+///
+/// Most handlers never construct this directly — returning a [`ToolError`] uses
+/// the [`From`] impl (no retry). Reach for [`tool_invoke_err_with_retries`] only
+/// for a transient failure worth an automatic re-invoke.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("{error}")]
+pub struct ToolInvokeError {
+    /// What went wrong.
+    #[source]
+    pub error: ToolError,
+    /// How many times the runtime may re-invoke the same call before surfacing it.
+    pub retries: ToolRetryCount,
+}
 
 /// An immediate failure with no automatic re-invocation.
 pub fn tool_invoke_err(error: ToolError) -> ToolInvokeError {
-    (error, ToolRetryCount::none())
+    ToolInvokeError {
+        error,
+        retries: ToolRetryCount::none(),
+    }
 }
 
 /// A failure paired with an explicit automatic retry budget.
 pub fn tool_invoke_err_with_retries(error: ToolError, retries: ToolRetryCount) -> ToolInvokeError {
-    (error, retries)
+    ToolInvokeError { error, retries }
 }
 
 impl From<ToolError> for ToolInvokeError {
@@ -96,11 +114,6 @@ impl From<ToolError> for ToolInvokeError {
 }
 
 impl ToolError {
-    /// Pair this error with an automatic retry budget for the same `tool_call`.
-    pub fn with_retries(self, retries: ToolRetryCount) -> ToolInvokeError {
-        (self, retries)
-    }
-
     /// Build an [`InvokeRejected`] for dynamic validation inside `invoke`.
     pub fn invoke_rejected(message: impl Into<String>) -> Self {
         Self::InvokeRejected(message.into())
@@ -115,8 +128,8 @@ impl ToolError {
             tool_name
         };
         match self {
-            Self::NotFound(name) => format!(
-                "Tool \"{name}\" is not registered and was not executed."
+            Self::NotFound(_) => format!(
+                "Tool \"{display}\" is not registered and was not executed."
             ),
             Self::InvalidArgumentsJson(details) => format!(
                 "Tool \"{display}\" arguments are not valid JSON: {details}. \

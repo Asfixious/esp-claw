@@ -20,6 +20,9 @@
 //!   permission [`ToolGate`], and dispatch — shaped for future async concurrency,
 //!   with [`PermissionGate`] (in [`gate`]) the policy-backed `ToolGate` the agent
 //!   installs.
+//! - **block policy** ([`block`]): [`BlockPolicy`], the soft-hide "retry then
+//!   fail" streak counter. It is *conversation state* the agent owns, kept out of
+//!   [`ToolSet`] (which holds only the immutable catalog and cached wire bytes).
 //!
 //! The on-disk contract those layers rely on (`resources/tools/<name>/` holds
 //! exactly `schema.json` + `usage.md`, and the directory name equals the schema's
@@ -29,6 +32,7 @@
 
 pub mod bake;
 
+mod block;
 mod gate;
 mod handler;
 mod registry;
@@ -36,11 +40,9 @@ mod runner;
 mod set;
 mod validate;
 
+pub use block::{BlockPolicy, ToolBlockVerdict, DEFAULT_BLOCK_RETRIES};
 pub use gate::PermissionGate;
 pub use handler::{Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolInvokeError, ToolRetryCount, tool_invoke_err, tool_invoke_err_with_retries};
 pub use registry::ToolRegistry;
 pub use runner::{ApprovalNeeded, CallOutcome, ToolGate, ToolRunner};
-pub use set::{
-    AllowedTools, ToolBlockVerdict, ToolGroup, ToolSet, ToolSetError, DEFAULT_BLOCK_RETRIES,
-    DEFAULT_TOOL_GROUP,
-};
+pub use set::{AllowedTools, ToolGroup, ToolSet, ToolSetError, DEFAULT_TOOL_GROUP};

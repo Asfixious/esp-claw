@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::agent::kind::AgentKind;
 use crate::agent::base_agent::AgentId;
+use crate::agent::manifest::{AgentManifest, MANIFESTS};
 
 /// What becomes of a subagent once it yields a result.
 ///
@@ -65,6 +66,12 @@ pub enum GraphEffect {
         id: AgentId,
         /// Which kind (role/template) of agent to create.
         kind: AgentKind,
+        /// Optional human/model-facing name for the child, assigned by the
+        /// spawner. Purely a label for supervision (shown by `list_subagents` /
+        /// `watch_subagent`); it does not identify the agent — `delete_subagent`
+        /// and every other operation still key on [`AgentId`]. `None` when the
+        /// spawner did not name it.
+        name: Option<String>,
         /// The goal handed to the child.
         goal: String,
         /// What becomes of the child once it yields (one-shot vs. persistent).
@@ -125,6 +132,9 @@ pub struct AgentSnapshot {
     pub id: AgentId,
     /// Its kind (role/template).
     pub kind: AgentKind,
+    /// Its spawner-assigned name, or `None` if unnamed. A supervision label only
+    /// — operations key on [`id`](Self::id), never this.
+    pub name: Option<String>,
     /// Its creator, or `None` for a session root.
     pub parent: Option<AgentId>,
     /// Distance from the root (root = 0).
@@ -179,11 +189,13 @@ impl AgentContext {
         Self { id, host }
     }
 
-    /// Request a child of `kind` for `goal` with lifecycle `termination`; returns
-    /// the id assigned to the child (allocated now, built after the tick).
+    /// Request a child of `kind` for `goal` with lifecycle `termination` and an
+    /// optional `name`; returns the id assigned to the child (allocated now, built
+    /// after the tick).
     pub(crate) fn spawn(
         &self,
         kind: AgentKind,
+        name: Option<String>,
         goal: String,
         termination: TerminationPolicy,
     ) -> AgentId {
@@ -193,6 +205,7 @@ impl AgentContext {
             GraphEffect::Spawn {
                 id: child,
                 kind,
+                name,
                 goal,
                 termination,
             },
@@ -313,6 +326,31 @@ impl SpawnPolicy {
         }
     }
 
+    /// The spawnable kinds paired with their model-facing descriptions, resolved
+    /// against the baked manifests. This is what the `spawn_subagent` tool shows
+    /// the model so it knows *what it may spawn* up front, instead of guessing a
+    /// kind and learning by rejection.
+    ///
+    /// [`Any`](Self::Any) expands to every baked kind; [`Only`](Self::Only) keeps
+    /// the allow-set but drops any entry without a baked manifest — such a kind
+    /// could never be materialized anyway, so listing it would only invite a spawn
+    /// that is silently dropped at build time.
+    pub(crate) fn catalog(&self) -> Vec<(AgentKind, &'static str)> {
+        match self {
+            SpawnPolicy::Any => MANIFESTS
+                .iter()
+                .map(|manifest| (manifest.kind.clone(), manifest.description))
+                .collect(),
+            SpawnPolicy::Only(kinds) => kinds
+                .iter()
+                .filter_map(|kind| {
+                    AgentManifest::for_kind(kind.as_str())
+                        .map(|manifest| (kind.clone(), manifest.description))
+                })
+                .collect(),
+        }
+    }
+
     /// A short, model-facing description of what is permitted, for the rejection
     /// message handed back when a disallowed kind is requested.
     pub(crate) fn describe(&self) -> String {
@@ -366,6 +404,7 @@ pub(crate) mod test_support {
         AgentSnapshot {
             id: AgentId(id),
             kind: AgentKind::new("worker"),
+            name: None,
             parent: parent.map(AgentId),
             depth,
             termination: TerminationPolicy::Manual,

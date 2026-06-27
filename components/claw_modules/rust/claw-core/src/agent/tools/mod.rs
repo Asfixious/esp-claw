@@ -27,6 +27,7 @@
 
 mod delete_subagent;
 mod end_conversation;
+mod list_spawnable_agents;
 mod list_subagents;
 mod respond_to_approval;
 mod spawn_subagent;
@@ -43,6 +44,7 @@ use crate::agent::graph::{AgentContext, AgentSnapshot, SpawnPolicy};
 
 use delete_subagent::DeleteSubagentTool;
 use end_conversation::EndConversationTool;
+use list_spawnable_agents::ListSpawnableAgentsTool;
 use list_subagents::ListSubagentsTool;
 use respond_to_approval::RespondToApprovalTool;
 use spawn_subagent::SpawnSubagentTool;
@@ -119,6 +121,7 @@ fn snapshot_json(snapshot: &AgentSnapshot) -> Value {
     serde_json::json!({
         "agent": snapshot.id.to_string(),
         "kind": snapshot.kind.as_str(),
+        "name": snapshot.name,
         "parent": snapshot.parent.map(|parent| parent.to_string()),
         "depth": snapshot.depth,
         "status": snapshot.status.as_str(),
@@ -133,8 +136,9 @@ pub(crate) fn internal_tool_group(sink: ControlSink) -> ToolGroup {
     ToolGroup::new(INTERNAL_TOOL_GROUP, [Tool::new(EndConversationTool::new(sink))])
 }
 
-/// Build the subagent-management tool group, all routed through `context`
-/// (parented to / scoped by the context's agent):
+/// Build the subagent-management tool group, all scoped by the context's agent
+/// (or, for `list_spawnable_agents`, by that agent's spawn `policy`):
+/// - `list_spawnable_agents` — the menu of kinds this agent may spawn;
 /// - `spawn_subagent` — create a child (restricted to `policy`'s allowed kinds);
 /// - `list_subagents` — enumerate this agent's subtree;
 /// - `watch_subagent` — snapshot one descendant;
@@ -143,6 +147,7 @@ pub(crate) fn subagent_tool_group(context: Arc<AgentContext>, policy: SpawnPolic
     ToolGroup::new(
         SUBAGENT_TOOL_GROUP,
         [
+            Tool::new(ListSpawnableAgentsTool::new(policy.clone())),
             Tool::new(SpawnSubagentTool::new(Arc::clone(&context), policy)),
             Tool::new(ListSubagentsTool::new(Arc::clone(&context))),
             Tool::new(WatchSubagentTool::new(Arc::clone(&context))),

@@ -136,6 +136,9 @@ struct NodeMeta {
     depth: u16,
     /// This node's kind (role/template).
     kind: AgentKind,
+    /// The spawner-assigned name, or `None` if unnamed (always `None` for a root).
+    /// A supervision label only — the node is identified by its [`AgentId`].
+    name: Option<String>,
     /// What becomes of this node once it yields (one-shot vs. persistent). A root
     /// is never auto-removed (its result surfaces to the user), so its policy is
     /// irrelevant.
@@ -331,6 +334,7 @@ impl OrchestratorInstance {
                         parent: None,
                         depth: 0,
                         kind,
+                        name: None,
                         // A root surfaces its result to the user and persists for
                         // the next message; it is never auto-removed.
                         termination: TerminationPolicy::AutoOnIdle,
@@ -500,9 +504,10 @@ impl OrchestratorInstance {
                 GraphEffect::Spawn {
                     id,
                     kind,
+                    name,
                     goal,
                     termination,
-                } => self.materialize_spawn(requester, id, kind, goal, termination),
+                } => self.materialize_spawn(requester, id, kind, name, goal, termination),
                 GraphEffect::ResolveApproval {
                     target,
                     verdict,
@@ -563,6 +568,7 @@ impl OrchestratorInstance {
                 AgentSnapshot {
                     id,
                     kind: meta.kind.clone(),
+                    name: meta.name.clone(),
                     parent: meta.parent,
                     depth: meta.depth,
                     termination: meta.termination,
@@ -579,6 +585,7 @@ impl OrchestratorInstance {
         parent: AgentId,
         id: AgentId,
         kind: AgentKind,
+        name: Option<String>,
         goal: String,
         termination: TerminationPolicy,
     ) {
@@ -608,6 +615,7 @@ impl OrchestratorInstance {
                         parent: Some(parent),
                         depth,
                         kind,
+                        name,
                         termination,
                     },
                 );
@@ -845,7 +853,7 @@ mod tests {
                 Some(Step::Work) => TickOutcome::Working,
                 Some(Step::Spawn(goal, termination)) => {
                     self.context
-                        .spawn(AgentKind::new(TEST_KIND), goal, termination);
+                        .spawn(AgentKind::new(TEST_KIND), None, goal, termination);
                     TickOutcome::Working
                 }
                 Some(Step::AwaitApproval(summary)) => TickOutcome::AwaitingApproval {

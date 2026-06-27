@@ -8,7 +8,11 @@
       "properties": {
         "kind": {
           "type": "string",
-          "description": "Which kind of agent to spawn (the role best suited to the goal, e.g. \"worker\")."
+          "description": "Which kind of agent to spawn (the role best suited to the goal, e.g. \"worker\"). Call list_spawnable_agents to see the kinds you may spawn."
+        },
+        "name": {
+          "type": "string",
+          "description": "Required short name for this subagent, shown by list_subagents/watch_subagent so you can tell several subagents of the same kind apart. It is a label only — delete_subagent and everything else still use the returned agent id."
         },
         "goal": {
           "type": "string",
@@ -20,7 +24,7 @@
           "description": "Lifecycle policy. 'auto' (default): one-shot — the subagent is removed as soon as it returns its result. 'manual': persistent — after returning its result the subagent stays alive and idle so you can watch it, give it more work, or delete it with delete_subagent."
         }
       },
-      "required": ["kind", "goal"]
+      "required": ["kind", "name", "goal"]
     }
   }
 }

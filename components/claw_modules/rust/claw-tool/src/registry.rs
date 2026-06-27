@@ -154,7 +154,7 @@ pub enum ToolRegistryError {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::handler::{ToolError, ToolHandler, ToolInvocation, ToolOutput};
+    use crate::handler::{ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
     struct DummyTool {
         tool_name: String,
@@ -179,7 +179,7 @@ mod tests {
         fn schema(&self) -> &str {
             &self.tool_schema
         }
-        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
             Ok(ToolOutput {
                 output: format!("ran:{}", self.tool_name),
                 ok: true,

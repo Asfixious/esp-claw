@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use claw_permission::{Action, RiskClass};
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_tool::{
+    tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, tool_invoke_err,
+};
 
 use crate::agent::kind::AgentKind;
 use crate::agent::graph::{AgentContext, SpawnPolicy, TerminationPolicy};
@@ -12,17 +14,30 @@ use crate::agent::manifest::AgentManifest;
 
 use super::string_argument;
 
+/// Read one string argument and reject values that are empty after trimming.
+/// Schema covers presence and `minLength`; this catches whitespace-only strings.
+fn non_blank_argument(arguments_json: &str, key: &str) -> Result<String, ToolError> {
+    let raw = string_argument(arguments_json, key)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::invoke_rejected(format!(
+            "spawn_subagent '{key}' must not be blank"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Parse the `spawn_subagent` tool's `termination` argument; empty defaults to
 /// [`AutoOnIdle`](TerminationPolicy::AutoOnIdle).
 ///
 /// # Errors
 ///
-/// [`ToolError::InvokeFailed`] for any value other than `auto` / `manual`.
+/// [`ToolError::InvokeRejected`] for any value other than `auto` / `manual`.
 fn parse_termination(raw: &str) -> Result<TerminationPolicy, ToolError> {
     match raw.trim() {
         "" | "auto" => Ok(TerminationPolicy::AutoOnIdle),
         "manual" => Ok(TerminationPolicy::Manual),
-        other => Err(ToolError::InvokeFailed(format!(
+        other => Err(ToolError::invoke_rejected(format!(
             "spawn_subagent 'termination' must be one of auto|manual, got '{other}'"
         ))),
     }
@@ -53,14 +68,8 @@ impl ToolHandler for SpawnSubagentTool {
         Action::new("spawn_subagent", RiskClass::Moderate)
     }
 
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
-        let kind = string_argument(call.arguments_json, "kind")?;
-        if kind.trim().is_empty() {
-            return Err(ToolError::InvokeFailed(
-                "spawn_subagent requires a non-empty 'kind'".to_string(),
-            ));
-        }
-        let kind = AgentKind::new(kind);
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
+        let kind = AgentKind::new(non_blank_argument(call.arguments_json, "kind")?);
 
         // Enforce the manifest's `allowed_kinds`. A disallowed kind is refused with
         // a matched tool error (`ok = false`, like soft-hide gating) so the model
@@ -108,19 +117,8 @@ impl ToolHandler for SpawnSubagentTool {
             });
         }
 
-        // A name is required: it is the supervision label shown by list/watch so
-        // the model can tell its subagents apart. Operations still key on the
-        // returned id, never the name.
-        let name = string_argument(call.arguments_json, "name")?;
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(ToolError::InvokeFailed(
-                "spawn_subagent requires a non-empty 'name'".to_string(),
-            ));
-        }
-        let name = name.to_string();
-
-        let goal = string_argument(call.arguments_json, "goal")?;
+        let name = non_blank_argument(call.arguments_json, "name")?;
+        let goal = non_blank_argument(call.arguments_json, "goal")?;
         // Optional lifecycle policy: default one-shot (`auto`); `manual` keeps the
         // child alive and idle after it yields so this agent can supervise it.
         let termination = parse_termination(&string_argument(call.arguments_json, "termination")?)?;
@@ -144,6 +142,7 @@ mod tests {
     use crate::agent::base_agent::AgentId;
     use crate::agent::graph::test_support::{context_for, spawned_kinds, RecordingHost};
     use crate::agent::graph::{GraphEffect, GraphHost};
+    use claw_tool::ToolSet;
 
     fn spawn_tool(host: Arc<RecordingHost>, policy: SpawnPolicy) -> claw_tool::Tool {
         let context = context_for(host as Arc<dyn GraphHost>, AgentId(1));
@@ -163,7 +162,7 @@ mod tests {
         );
         assert!(matches!(
             parse_termination("forever"),
-            Err(ToolError::InvokeFailed(_))
+            Err(ToolError::InvokeRejected(_))
         ));
     }
 
@@ -179,7 +178,7 @@ mod tests {
             .invoke(&ToolInvocation {
                 id: Some("t1"),
                 name: "spawn_subagent",
-                arguments_json: r#"{"kind":"researcher","goal":"x"}"#,
+                arguments_json: r#"{"kind":"researcher","name":"r","goal":"x"}"#,
             })
             .unwrap();
 
@@ -260,33 +259,58 @@ mod tests {
     }
 
     #[test]
-    fn spawn_requires_a_non_empty_name() {
+    fn spawn_requires_name_via_schema_validation() {
         let host = Arc::new(RecordingHost::default());
-        let tool = spawn_tool(
-            Arc::clone(&host),
-            SpawnPolicy::Only(vec![AgentKind::new("worker")]),
-        );
+        let context = context_for(Arc::clone(&host) as Arc<dyn GraphHost>, AgentId(1));
+        let set = ToolSet::from_groups([
+            subagent_tool_group(context, SpawnPolicy::Only(vec![AgentKind::new("worker")])),
+        ])
+        .unwrap();
 
-        // Missing name -> hard tool error, nothing emitted.
+        let missing_name = set.invoke(&ToolInvocation {
+            id: Some("t1"),
+            name: "spawn_subagent",
+            arguments_json: r#"{"kind":"worker","goal":"x"}"#,
+        });
         assert!(matches!(
-            tool.invoke(&ToolInvocation {
+            missing_name,
+            Err((ToolError::InvalidArguments(_), retries)) if retries.is_none()
+        ));
+
+        let empty_name = set.invoke(&ToolInvocation {
+            id: Some("t2"),
+            name: "spawn_subagent",
+            arguments_json: r#"{"kind":"worker","name":"","goal":"x"}"#,
+        });
+        assert!(matches!(
+            empty_name,
+            Err((ToolError::InvalidArguments(_), retries)) if retries.is_none()
+        ));
+
+        assert!(host.effects.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_rejects_whitespace_only_name_after_trim() {
+        let host = Arc::new(RecordingHost::default());
+        let context = context_for(Arc::clone(&host) as Arc<dyn GraphHost>, AgentId(1));
+        let set = ToolSet::from_groups([
+            subagent_tool_group(context, SpawnPolicy::Only(vec![AgentKind::new("worker")])),
+        ])
+        .unwrap();
+
+        // Schema `minLength` accepts whitespace; invoke trims and rejects blank.
+        let error = set
+            .invoke(&ToolInvocation {
                 id: Some("t1"),
                 name: "spawn_subagent",
-                arguments_json: r#"{"kind":"worker","goal":"x"}"#,
-            }),
-            Err(ToolError::InvokeFailed(_))
-        ));
-
-        // Whitespace-only name is also rejected.
-        assert!(matches!(
-            tool.invoke(&ToolInvocation {
-                id: Some("t2"),
-                name: "spawn_subagent",
                 arguments_json: r#"{"kind":"worker","name":"   ","goal":"x"}"#,
-            }),
-            Err(ToolError::InvokeFailed(_))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            (ToolError::InvokeRejected(_), retries) if retries.is_none()
         ));
-
         assert!(host.effects.lock().unwrap().is_empty());
     }
 
@@ -301,7 +325,7 @@ mod tests {
             .invoke(&ToolInvocation {
                 id: Some("t1"),
                 name: "spawn_subagent",
-                arguments_json: r#"{"kind":"ghost","goal":"x"}"#,
+                arguments_json: r#"{"kind":"ghost","name":"g","goal":"x"}"#,
             })
             .unwrap();
 

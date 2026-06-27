@@ -9,10 +9,11 @@ use claw_api::{ClawApi, ClawApiConfig, RetryPolicy};
 use claw_core::iteration_loop::{
     AppendedMessages, ChatMessages, CompletedKind, InterruptionControl, IterationCheckpoint,
     IterationLoop, IterationLoopError, IterationOutcome, IterationResult, IterationStep,
-    SystemPrompt,
+    SystemPrompt, ToolsOutcome,
 };
 use claw_core::{
-    IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
+    IterationId, Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRetryCount,
+    ToolSet,
 };
 use claw_interface::http::{ClawHttp, HttpError, HttpJsonRequest, HttpResponse};
 use claw_interface::RealHttp;
@@ -214,7 +215,7 @@ impl ToolHandler for EchoTool {
     fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":"files"}}"#
     }
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: format!("{}:{}", call.name, call.arguments_json),
             ok: true,
@@ -232,8 +233,8 @@ impl ToolHandler for FailingTool {
     fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":"files"}}"#
     }
-    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
-        Err(ToolError::NotFound("files".into()))
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
+        Err((ToolError::NotFound("files".into()), ToolRetryCount::none()))
     }
 }
 
@@ -248,7 +249,7 @@ impl ToolHandler for SoftFailTool {
     fn schema(&self) -> &str {
         r#"{"type":"function","function":{"name":""}}"#
     }
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: format!("soft-fail:{}:{}", call.name, call.arguments_json),
             ok: false,
@@ -493,7 +494,7 @@ fn run_records_soft_failing_tool_with_null_name() {
 }
 
 #[test]
-fn run_propagates_capability_errors() {
+fn run_recovers_from_invoke_errors_as_tool_message() {
     let llm = test_llm(vec![TOOL_CALL_BODY]);
     let control = MockControl::new();
     let failing = tool_set(FailingTool);
@@ -508,10 +509,25 @@ fn run_propagates_capability_errors() {
         "system",
     );
 
-    assert!(matches!(
-        result,
-        Err(IterationLoopError::Tool(claw_core::ToolError::NotFound(_)))
-    ));
+    let outcome = result.expect("invoke errors become tool messages");
+    match outcome {
+        IterationOutcome::Completed(completed) => {
+            let ToolsOutcome { appended, runs } = match completed.kind {
+                CompletedKind::Tools(tools) => tools,
+                other => panic!("expected Tools, got {other:?}"),
+            };
+            assert_eq!(runs.len(), 1);
+            assert!(!runs[0].ok);
+            let messages = appended.0.as_array().expect("messages array");
+            assert_eq!(messages.len(), 2);
+            assert!(messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not registered"));
+            assert_eq!(messages[1]["is_error"], true);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
 }
 
 #[test]

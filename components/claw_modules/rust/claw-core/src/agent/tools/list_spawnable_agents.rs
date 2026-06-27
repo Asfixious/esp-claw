@@ -6,7 +6,7 @@
 //! guessing a kind and learning by rejection — and unlike baking the catalog into
 //! `spawn_subagent`'s schema, it costs nothing in the always-sent prompt prefix.
 
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
 use crate::agent::graph::SpawnPolicy;
 
@@ -31,7 +31,7 @@ impl ToolHandler for ListSpawnableAgentsTool {
         true
     }
 
-    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         let kinds: Vec<serde_json::Value> = self
             .policy
             .catalog()

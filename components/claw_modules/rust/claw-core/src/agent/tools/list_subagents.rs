@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 use serde_json::Value;
 
 use crate::agent::graph::AgentContext;
@@ -29,7 +29,7 @@ impl ToolHandler for ListSubagentsTool {
         true
     }
 
-    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         let subagents: Vec<Value> = self
             .context
             .list_subagents()

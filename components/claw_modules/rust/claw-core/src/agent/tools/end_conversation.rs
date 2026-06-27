@@ -1,6 +1,6 @@
 //! `end_conversation(final_message)` — the agent ends the task on its own terms.
 
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
 use super::{push, string_argument, ControlSignal, ControlSink};
 
@@ -20,7 +20,7 @@ impl EndConversationTool {
 impl ToolHandler for EndConversationTool {
     tool_metadata!("end_conversation");
 
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         let final_message = string_argument(call.arguments_json, "final_message")?;
         push(&self.sink, ControlSignal::EndConversation { final_message });
         Ok(ToolOutput {
@@ -82,6 +82,9 @@ mod tests {
                 arguments_json: "{not json",
             })
             .unwrap_err();
-        assert!(matches!(error, ToolError::InvokeFailed(_)));
+        assert!(matches!(
+            error,
+            (ToolError::InvalidArgumentsJson(_), retries) if retries.is_none()
+        ));
     }
 }

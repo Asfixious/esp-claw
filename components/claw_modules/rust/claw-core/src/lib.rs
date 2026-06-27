@@ -37,7 +37,8 @@ pub use claw_skill::{
 // The tool framework moved to the standalone `claw-tool` crate; re-exported here
 // so `claw_core::Tool*` stays the stable surface for existing callers.
 pub use claw_tool::{
-    AllowedTools, Tool, ToolError, ToolGate, ToolGroup, ToolHandler, ToolInvocation, ToolOutput,
+    AllowedTools, Tool, ToolError, ToolGate, ToolGroup, ToolHandler, ToolInvocation, ToolInvokeError,
+    ToolOutput, ToolRetryCount, tool_invoke_err, tool_invoke_err_with_retries,
     ToolSet, ToolSetError, DEFAULT_TOOL_GROUP,
 };
 // The permission layer authoring surface — re-exported so callers can build the

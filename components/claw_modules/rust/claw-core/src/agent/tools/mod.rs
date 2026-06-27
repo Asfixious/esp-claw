@@ -91,14 +91,14 @@ fn push(sink: &ControlSink, signal: ControlSignal) {
 ///
 /// # Errors
 ///
-/// [`ToolError::InvokeFailed`] if the arguments are present but not valid JSON —
+/// [`ToolError::InvalidArgumentsJson`] if the arguments are present but not valid JSON —
 /// a malformed call is surfaced, not swallowed.
 pub(crate) fn string_argument(arguments_json: &str, key: &str) -> Result<String, ToolError> {
     if arguments_json.trim().is_empty() {
         return Ok(String::new());
     }
     let value: Value = serde_json::from_str(arguments_json).map_err(|error| {
-        ToolError::InvokeFailed(format!("invalid tool arguments JSON: {error}"))
+        ToolError::InvalidArgumentsJson(format!("invalid tool arguments JSON: {error}"))
     })?;
     Ok(value
         .get(key)

@@ -34,9 +34,10 @@ mod handler;
 mod registry;
 mod runner;
 mod set;
+mod validate;
 
 pub use gate::PermissionGate;
-pub use handler::{Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+pub use handler::{Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolInvokeError, ToolRetryCount, tool_invoke_err, tool_invoke_err_with_retries};
 pub use registry::ToolRegistry;
 pub use runner::{ApprovalNeeded, CallOutcome, ToolGate, ToolRunner};
 pub use set::{

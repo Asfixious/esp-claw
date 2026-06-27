@@ -6,7 +6,7 @@
 mod common;
 
 use claw_core::agent::{AgentId, BaseAgentBuildError, TickOutcome};
-use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolOutput, ToolSet};
+use claw_core::{Tool, ToolError, ToolGroup, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolSet};
 use common::{
     agent_builder, body_echo_call, body_end_conversation, body_plain_text, capturing_llm,
     run_to_completion, scripted_llm, scripted_llm_no_tools, test_output_dir,
@@ -112,7 +112,7 @@ impl ToolHandler for ClashTool {
         r#"{"type":"function","function":{"name":"end_conversation"}}"#
     }
 
-    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: String::new(),
             ok: true,

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use claw_api::{ClawApi, ClawApiConfig};
 use claw_core::agent::{AgentId, BaseAgent, BaseAgentBuilder, TickOutcome};
-use claw_core::{ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_core::{ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 use claw_interface::{
     CapturingHttp, ClawHttp, DiskFs, FailingHttp, NeverHttp, ScriptStep, ScriptedHttp, StdThread,
 };
@@ -149,7 +149,7 @@ impl ToolHandler for EchoTool {
         r#"{"type":"function","function":{"name":"echo","description":"Echo the arguments back"}}"#
     }
 
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: format!("echo:{}", call.arguments_json),
             ok: true,

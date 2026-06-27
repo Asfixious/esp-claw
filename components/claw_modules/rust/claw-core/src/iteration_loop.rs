@@ -478,7 +478,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use claw_tool::{AllowedTools, Tool, ToolGroup, ToolHandler, ToolOutput};
+    use claw_tool::{AllowedTools, Tool, ToolGroup, ToolHandler, ToolInvokeError, ToolOutput};
     use claw_api::ToolCall;
     use serde_json::json;
 
@@ -613,7 +613,7 @@ mod tests {
                 r#"{"type":"function","function":{"name":""}}"#
             }
 
-            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
                 Ok(ToolOutput {
                     output: "done".into(),
                     ok: false,
@@ -688,7 +688,7 @@ mod tests {
             fn schema(&self) -> &str {
                 r#"{"type":"function","function":{"name":"writer"}}"#
             }
-            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
                 Ok(ToolOutput {
                     output: "wrote".into(),
                     ok: true,

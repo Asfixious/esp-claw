@@ -1440,7 +1440,8 @@ mod gating_tests {
 
     use crate::agent::{AgentId, AgentRunError, BaseAgent, BaseAgentBuilder, TickOutcome};
     use claw_tool::{
-        AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolSet,
+        AllowedTools, Tool, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput,
+        ToolSet,
     };
 
     // HTTP doubles (ScriptedHttp / CapturingHttp, httpmock feature) and the
@@ -1459,7 +1460,7 @@ mod gating_tests {
         fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"echo","description":"Echo"}}"#
         }
-        fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
             Ok(ToolOutput {
                 output: format!("echo:{}", call.arguments_json),
                 ok: true,
@@ -1477,7 +1478,7 @@ mod gating_tests {
         fn schema(&self) -> &str {
             r#"{"type":"function","function":{"name":"writer","description":"Write"}}"#
         }
-        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
             Ok(ToolOutput {
                 output: "wrote".into(),
                 ok: true,

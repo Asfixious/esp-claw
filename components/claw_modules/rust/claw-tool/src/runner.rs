@@ -18,7 +18,7 @@
 
 use claw_permission::{Action, PermissionDecision};
 
-use crate::handler::{ToolError, ToolInvocation, ToolOutput};
+use crate::handler::{ToolError, ToolInvocation, ToolInvokeError, ToolOutput, ToolRetryCount};
 use crate::set::ToolSet;
 
 /// The permission seam the runner consults before executing a classified call.
@@ -135,10 +135,40 @@ impl<'a> ToolRunner<'a> {
             }
         }
 
-        // 3. Execute.
-        let ToolOutput { output, ok } = self.tools.invoke(call)?;
+        // 3. Execute — optional per-call automatic re-invocation when the handler
+        // returns a non-empty [`ToolRetryCount`]; otherwise surface a tool message.
+        let ToolOutput { output, ok } = match invoke_with_retries(self.tools, call) {
+            Ok(output) => output,
+            Err((error, _)) => return Ok(invoke_failure_to_outcome(call, error)),
+        };
         Ok(CallOutcome::ran(output, ok))
     }
+}
+
+/// Invoke `call`, re-running the same invocation when the handler supplies a
+/// [`ToolRetryCount`]. Intermediate failures are not surfaced to the model.
+fn invoke_with_retries(
+    tools: &ToolSet,
+    call: &ToolInvocation<'_>,
+) -> Result<ToolOutput, ToolInvokeError> {
+    let mut extra_attempts = 0u32;
+    loop {
+        match tools.invoke(call) {
+            Ok(output) => return Ok(output),
+            Err((error, retry_budget)) => {
+                let max_extra = retry_budget.get();
+                if extra_attempts < max_extra {
+                    extra_attempts = extra_attempts.saturating_add(1);
+                    continue;
+                }
+                return Err((error, ToolRetryCount::none()));
+            }
+        }
+    }
+}
+
+fn invoke_failure_to_outcome(call: &ToolInvocation<'_>, error: ToolError) -> CallOutcome {
+    CallOutcome::ran(error.model_message(call.name), false)
 }
 
 /// Content handed to the model when soft-hide gating refuses a call. Worded so
@@ -185,7 +215,9 @@ fn display_name(name: &str) -> &str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::handler::{Tool, ToolHandler, ToolOutput};
+    use crate::handler::{
+        Tool, ToolHandler, ToolInvokeError, ToolOutput, tool_invoke_err_with_retries,
+    };
     use crate::set::{AllowedTools, ToolGroup};
     use claw_permission::{Action, RiskClass};
 
@@ -202,7 +234,7 @@ mod tests {
         fn classify(&self, _call: &ToolInvocation<'_>) -> Action {
             Action::new("risky", RiskClass::High)
         }
-        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+        fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
             Ok(ToolOutput {
                 output: "ran".into(),
                 ok: true,
@@ -287,5 +319,90 @@ mod tests {
         let outcome = runner.run_one(&call()).unwrap();
         assert_eq!(outcome.content, "ran");
         assert!(outcome.ok);
+    }
+
+    #[test]
+    fn schema_validation_failure_becomes_recoverable_tool_message() {
+        struct NeedsNameTool;
+        impl ToolHandler for NeedsNameTool {
+            fn name(&self) -> &str {
+                "needs_name"
+            }
+            fn schema(&self) -> &str {
+                r#"{
+                    "type": "function",
+                    "function": {
+                        "name": "needs_name",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" } },
+                            "required": ["name"]
+                        }
+                    }
+                }"#
+            }
+            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
+                Ok(ToolOutput {
+                    output: "ran".into(),
+                    ok: true,
+                })
+            }
+        }
+        let tools = ToolSet::new([Tool::new(NeedsNameTool)]).unwrap();
+        let runner = ToolRunner::new(&tools, None);
+        let outcome = runner
+            .run_one(&ToolInvocation {
+                id: Some("t1"),
+                name: "needs_name",
+                arguments_json: "{}",
+            })
+            .unwrap();
+        assert!(!outcome.ok);
+        assert!(outcome.content.contains("schema validation"));
+    }
+
+    #[test]
+    fn per_call_retry_reinvokes_before_surfacing_error() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct FlakyTool {
+            calls: AtomicU32,
+        }
+        impl ToolHandler for FlakyTool {
+            fn name(&self) -> &str {
+                "flaky"
+            }
+            fn schema(&self) -> &str {
+                r#"{"type":"function","function":{"name":"flaky","parameters":{"type":"object","properties":{}}}}"#
+            }
+            fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
+                if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(tool_invoke_err_with_retries(
+                        ToolError::invoke_rejected("transient"),
+                        ToolRetryCount::extra(1),
+                    ))
+                } else {
+                    Ok(ToolOutput {
+                        output: "ok after retry".into(),
+                        ok: true,
+                    })
+                }
+            }
+        }
+
+        let tools = ToolSet::new([Tool::new(FlakyTool {
+            calls: AtomicU32::new(0),
+        })])
+        .unwrap();
+        let runner = ToolRunner::new(&tools, None);
+        let outcome = runner
+            .run_one(&ToolInvocation {
+                id: Some("t1"),
+                name: "flaky",
+                arguments_json: "{}",
+            })
+            .unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.content, "ok after retry");
     }
 }

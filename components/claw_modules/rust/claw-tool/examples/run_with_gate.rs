@@ -13,7 +13,8 @@
 
 use claw_permission::{Action, PermissionDecision, RiskClass};
 use claw_tool::{
-    Tool, ToolError, ToolGate, ToolHandler, ToolInvocation, ToolOutput, ToolRunner, ToolSet,
+    Tool, ToolError, ToolGate, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRunner,
+    ToolSet,
 };
 
 /// A demo tool that classifies a "write" verb as risky so the permission path is
@@ -50,7 +51,7 @@ impl ToolHandler for DemoTool {
         Action::new(self.name.clone(), risk)
     }
 
-    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: format!("{} ran", self.name),
             ok: true,

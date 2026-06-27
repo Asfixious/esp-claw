@@ -8,14 +8,17 @@
       "properties": {
         "kind": {
           "type": "string",
+          "minLength": 1,
           "description": "Which kind of agent to spawn (the role best suited to the goal, e.g. \"worker\"). Call list_spawnable_agents to see the kinds you may spawn."
         },
         "name": {
           "type": "string",
+          "minLength": 1,
           "description": "Required short name for this subagent, shown by list_subagents/watch_subagent so you can tell several subagents of the same kind apart. It is a label only — delete_subagent and everything else still use the returned agent id."
         },
         "goal": {
           "type": "string",
+          "minLength": 1,
           "description": "The goal to delegate to the subagent."
         },
         "termination": {

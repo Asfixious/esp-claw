@@ -7,7 +7,7 @@
 //! cargo run --example registry --target x86_64-unknown-linux-gnu
 //! ```
 
-use claw_tool::{Tool, ToolError, ToolHandler, ToolInvocation, ToolOutput, ToolRegistry};
+use claw_tool::{Tool, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, ToolRegistry};
 
 /// A trivial demo tool. A real tool bakes its `name`/`schema`/`usage` from
 /// `resources/tools/<name>/` via the `tool_metadata!` macro; here we build them
@@ -36,7 +36,7 @@ impl ToolHandler for DemoTool {
         &self.schema
     }
 
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: format!("{} echoed: {}", self.name, call.arguments_json),
             ok: true,

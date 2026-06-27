@@ -8,8 +8,8 @@
 //! ```
 
 use claw_tool::{
-    AllowedTools, Tool, ToolBlockVerdict, ToolError, ToolHandler, ToolInvocation, ToolOutput,
-    ToolSet,
+    AllowedTools, Tool, ToolBlockVerdict, ToolError, ToolHandler, ToolInvocation, ToolInvokeError,
+    ToolOutput, ToolSet,
 };
 
 /// A demo tool carrying soft-tools `usage` prose for the `tool_context` block.
@@ -42,7 +42,7 @@ impl ToolHandler for DemoTool {
         self.usage.as_deref()
     }
 
-    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         Ok(ToolOutput {
             output: format!("{} ran", self.name),
             ok: true,

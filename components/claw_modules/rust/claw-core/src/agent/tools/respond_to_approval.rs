@@ -13,7 +13,9 @@
 use std::sync::Arc;
 
 use claw_permission::{Action, RiskClass};
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_tool::{
+    tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, tool_invoke_err,
+};
 
 use crate::agent::base_agent::AgentId;
 use crate::agent::graph::{AgentContext, ApprovalVerdict};
@@ -43,10 +45,12 @@ impl ToolHandler for RespondToApprovalTool {
         }
     }
 
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         let agent = string_argument(call.arguments_json, "agent")?;
         let target = AgentId::from_wire(agent.trim()).map_err(|error| {
-            ToolError::InvokeFailed(format!("invalid agent id '{agent}': {error}"))
+            tool_invoke_err(ToolError::invoke_rejected(format!(
+                "invalid agent id '{agent}': {error}"
+            )))
         })?;
 
         let verdict_raw = string_argument(call.arguments_json, "verdict")?;
@@ -55,9 +59,9 @@ impl ToolHandler for RespondToApprovalTool {
             "no" => ApprovalVerdict::No,
             "other" => ApprovalVerdict::Other,
             other => {
-                return Err(ToolError::InvokeFailed(format!(
+                return Err(tool_invoke_err(ToolError::invoke_rejected(format!(
                     "respond_to_approval 'verdict' must be one of yes|no|other, got '{other}'"
-                )))
+                ))))
             }
         };
 
@@ -128,6 +132,9 @@ mod tests {
                 arguments_json: r#"{"agent":"agent-1","verdict":"maybe"}"#,
             })
             .unwrap_err();
-        assert!(matches!(error, ToolError::InvokeFailed(_)));
+        assert!(matches!(
+            error,
+            (ToolError::InvokeRejected(_), retries) if retries.is_none()
+        ));
     }
 }

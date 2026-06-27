@@ -138,7 +138,7 @@ mod tests {
         fn invoke(
             &self,
             _call: &ToolInvocation<'_>,
-        ) -> Result<ToolOutput, claw_tool::ToolError> {
+        ) -> Result<ToolOutput, claw_tool::ToolInvokeError> {
             Ok(ToolOutput {
                 output: "ok".into(),
                 ok: true,

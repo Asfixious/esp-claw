@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use claw_permission::{Action, RiskClass};
-use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolOutput};
+use claw_tool::{tool_metadata, ToolError, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput, tool_invoke_err};
 
 use crate::agent::base_agent::AgentId;
 use crate::agent::graph::AgentContext;
@@ -34,10 +34,12 @@ impl ToolHandler for DeleteSubagentTool {
         }
     }
 
-    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
+    fn invoke(&self, call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
         let agent = string_argument(call.arguments_json, "agent")?;
         let target = AgentId::from_wire(agent.trim()).map_err(|error| {
-            ToolError::InvokeFailed(format!("invalid agent id '{agent}': {error}"))
+            tool_invoke_err(ToolError::invoke_rejected(format!(
+                "invalid agent id '{agent}': {error}"
+            )))
         })?;
         // Authorize against the same subtree view watch uses, so the refusal is
         // immediate (the instance re-checks before actually removing).

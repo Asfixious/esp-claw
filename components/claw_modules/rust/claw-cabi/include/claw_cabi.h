@@ -12,8 +12,9 @@
  *
  *  claw-cabi is the single OUTBOUND C ABI (Rust -> C) for the agent/capability
  *  stack. To C, the only concept is a "capability": one descriptor, one
- *  register call. The internal Tool/Channel/lifecycle-only split is inferred
- *  from which callback the caller fills in (see claw_capability_t).
+ *  register call. The internal Tool/Channel/lifecycle-only split is a tagged
+ *  union selected by `role` (see claw_capability_t), mirroring the Rust
+ *  `CapabilityRole` enum so the mutually exclusive arms are structural.
  * ============================================================================
  */
 #pragma once
@@ -98,26 +99,45 @@ typedef claw_capability_result_t (*claw_capability_send_callback_t)(const char *
                                                                     void *user_context);
 
 /* ------------------------------------------------------------------------- */
-/* Capability descriptor — role inferred from which callback is set.         */
+/* Capability descriptor — a tagged union over the mutually exclusive role.  */
 /* ------------------------------------------------------------------------- */
 
+/* Which arm of the role union is live. Mirrors the Rust `CapabilityRole`. */
+typedef enum {
+    CLAW_CAPABILITY_ROLE_NONE = 0,   /* lifecycle-only service; no payload     */
+    CLAW_CAPABILITY_ROLE_TOOL,       /* model-callable tool                    */
+    CLAW_CAPABILITY_ROLE_CHANNEL,    /* message channel                        */
+} claw_capability_role_t;
+
+/* TOOL payload: both fields required. */
+typedef struct {
+    const char *schema_json;
+    claw_capability_execute_callback_t execute;
+} claw_capability_tool_t;
+
+/* CHANNEL payload. */
+typedef struct {
+    claw_capability_send_callback_t send;
+} claw_capability_channel_t;
+
 /*
- * Fill EXACTLY one of:
- *  - execute + schema_json  -> internal Tool role
- *  - send                   -> internal Channel role
- *  - neither (lifecycle only, at least one hook set) -> internal "no role"
- * Setting both execute and send, or execute without schema_json, or doing
- * nothing at all, is CLAW_CAPABILITY_INVALID_ARGUMENT.
+ * `role` selects the live union arm and is validated against it:
+ *  - ROLE_TOOL    -> role_data.tool.{execute, schema_json} required
+ *  - ROLE_CHANNEL -> role_data.channel.send required
+ *  - ROLE_NONE    -> no payload; lifecycle MUST have at least one hook set
+ * Any violation (incl. an empty `id`) is CLAW_CAPABILITY_INVALID_ARGUMENT.
+ * Setting "both Tool and Channel" is structurally impossible — the arms share
+ * storage and only the one named by `role` is read.
  */
 typedef struct {
     const char *id;                  /* required, unique                       */
     const char *description;         /* nullable                               */
-
-    const char *schema_json;         /* required iff `execute` is set          */
-    claw_capability_execute_callback_t execute;  /* set => Tool role           */
-    claw_capability_send_callback_t send;        /* set => Channel role        */
-
-    claw_capability_lifecycle_t lifecycle;  /* optional; hooks may individually be NULL */
+    claw_capability_role_t role;     /* selects the union arm below            */
+    union {
+        claw_capability_tool_t    tool;     /* role == CLAW_CAPABILITY_ROLE_TOOL    */
+        claw_capability_channel_t channel;  /* role == CLAW_CAPABILITY_ROLE_CHANNEL */
+    } role_data;                     /* unused when role == CLAW_CAPABILITY_ROLE_NONE */
+    claw_capability_lifecycle_t lifecycle;  /* orthogonal; hooks may individually be NULL */
     void *user_context;              /* passed to every callback above         */
 } claw_capability_t;
 

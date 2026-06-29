@@ -1,0 +1,40 @@
+[package]
+name = "claw-cabi"
+authors = ["Finn(Ziheng) Sheng"]
+version = "0.1.0"
+edition = "2021"
+description = "The single outbound C ABI (Rust -> C) for the agent/capability stack: C registers capabilities and pushes inbound messages; everything else stays Rust-side"
+
+[lib]
+# staticlib: linked into the firmware image as the C ABI.
+# rlib: lets the Rust entry point / host tests link the in-crate bridge that
+# wires the populated Registry into the agent runtime (plain Rust, not ABI).
+name = "claw_cabi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The adapter whose Registry C populates. claw-cabi is the *only* place that
+# turns those Rust types into a C ABI.
+claw-capability = { path = "../claw-capability" }
+# The agent runtime + channel ingress sink the bridge feeds the Registry into
+# (re-exports the claw-core types: Orchestrator, ChannelIngressSink,
+# InboundMessage, AgentResolver).
+claw-agent = { path = "../claw-agent" }
+
+[lints.rust]
+# THE ONE EXCEPTION in the workspace: this crate is the FFI boundary, so it must
+# be allowed to contain `unsafe` / `#[no_mangle] extern "C"`. Every other crate
+# keeps `unsafe_code = "forbid"`.
+unsafe_code = "allow"
+
+[lints.clippy]
+# Panics still must not cross the FFI boundary: a panic is caught and mapped to
+# CLAW_CAPABILITY_FAILED, never unwound into C.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+arithmetic_side_effects = "deny"

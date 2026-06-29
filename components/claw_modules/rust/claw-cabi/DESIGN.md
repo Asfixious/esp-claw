@@ -43,9 +43,11 @@ direction and stay where they are. This crate is strictly outbound (Rust→C).
    owned Rust-side; handles are passed to C purely as a registration target and
    an inbound port.
 2. **C sees only "capability".** No `tool` / `channel` vocabulary crosses the
-   ABI. There is one descriptor `claw_capability_t`. The internal role (Tool /
-   Channel / lifecycle-only) is **inferred** from which callback the caller
-   filled in (see §4).
+   ABI as a separate concept. There is one descriptor `claw_capability_t` whose
+   role (Tool / Channel / lifecycle-only) is a **tagged union** selected by a
+   `role` discriminant — a faithful structural mirror of the Rust
+   `CapabilityRole` enum, so the arms are mutually exclusive by construction
+   (see §4).
 3. **`Result`-shaped returns.** The two registration functions return
    `claw_capability_result_t` = either `OK` (no payload) or an **error kind + message**
    (see §3).
@@ -127,7 +129,14 @@ in C and there is no "forgot to free" leak risk anywhere.
 
 ---
 
-## 4. Capability descriptor — one concept, inferred role
+## 4. Capability descriptor — a tagged union over the role
+
+The internal `CapabilityRole` enum (`Tool` / `Channel` / `None`) is mirrored
+**structurally** as a C tagged union: a `role` discriminant + a union of the
+mutually exclusive payloads. "Both Tool and Channel" is therefore impossible to
+express (the arms share storage), instead of being a runtime-rejected mistake.
+`lifecycle` and `user_context` are orthogonal common fields and stay outside the
+union — matching the Rust `Capability { id, description, role, lifecycle }`.
 
 ```c
 typedef claw_capability_result_t (*claw_capability_lifecycle_callback_t)(void* user_context);
@@ -142,30 +151,40 @@ typedef claw_capability_result_t (*claw_capability_send_callback_t)(
     const char* channel, const char* chat_id, const char* text,
     const char* reply_to_message_id /* nullable */, void* user_context);
 
+typedef enum {
+  CLAW_CAPABILITY_ROLE_NONE = 0,   // lifecycle-only service; no payload
+  CLAW_CAPABILITY_ROLE_TOOL,       // model-callable tool
+  CLAW_CAPABILITY_ROLE_CHANNEL,    // message channel
+} claw_capability_role_t;
+
+typedef struct { const char* schema_json; claw_capability_execute_callback_t execute; } claw_capability_tool_t;
+typedef struct { claw_capability_send_callback_t send; } claw_capability_channel_t;
+
 typedef struct {
-  const char* id;
-  const char* description;                       // nullable
-  // Exactly one of {execute, send} is set; both => INVALID_ARGUMENT.
-  const char*                        schema_json; // required iff execute is set
-  claw_capability_execute_callback_t execute;     //   set => internal Tool role
-  claw_capability_send_callback_t    send;        //   set => internal Channel role
-  // Neither => internal "no role"; then lifecycle MUST be non-empty.
-  claw_capability_lifecycle_t        lifecycle;   // optional; the four hooks may each be NULL
-  void* user_context;                            // passed to every callback above
+  const char*            id;          // required, unique
+  const char*            description; // nullable
+  claw_capability_role_t role;        // selects the live union arm
+  union {
+    claw_capability_tool_t    tool;     // role == ROLE_TOOL
+    claw_capability_channel_t channel;  // role == ROLE_CHANNEL
+  } role_data;                          // unused when role == ROLE_NONE
+  claw_capability_lifecycle_t lifecycle; // orthogonal; the four hooks may each be NULL
+  void* user_context;                    // passed to every callback above
 } claw_capability_t;
 ```
 
-**Role inference & validation** (all violations → `INVALID_ARGUMENT`):
+The Rust side defines this as a `#[repr(C)]` struct with a `#[repr(C)]` union +
+the `role` tag; reading the union is `unsafe` (allowed only in this crate) and
+gated on `role`.
 
-| `execute` | `send` | lifecycle | → internal role |
-|-----------|--------|-----------|-----------------|
-| set + `schema_json` | unset | any | `Tool` |
-| unset | set | any (usually a gateway) | `Channel` |
-| unset | unset | at least one hook | `None` (lifecycle-only) |
-| set | set | — | **INVALID_ARGUMENT** |
-| set, no `schema_json` | — | — | **INVALID_ARGUMENT** |
-| unset | unset | all NULL | **INVALID_ARGUMENT** (does nothing) |
-| empty `id` | — | — | **INVALID_ARGUMENT** |
+**Validation** (all violations → `INVALID_ARGUMENT`):
+
+| `role` | required payload | else |
+|--------|------------------|------|
+| `ROLE_TOOL` | `role_data.tool.execute` **and** `.schema_json` non-NULL | INVALID_ARGUMENT |
+| `ROLE_CHANNEL` | `role_data.channel.send` non-NULL | INVALID_ARGUMENT |
+| `ROLE_NONE` | at least one `lifecycle` hook set | INVALID_ARGUMENT (does nothing) |
+| any | non-empty `id` | INVALID_ARGUMENT |
 
 **Tool output buffer.** Rust passes a buffer of a named capacity
 `CLAW_CAPABILITY_TOOL_OUTPUT_CAPACITY`; the C `execute` writes its result there,
@@ -317,7 +336,10 @@ descriptors carrying `id` / `description` / schema / `execute` (+ optional
 **Mechanical churn (touches all 16, low-risk, scriptable):**
 
 - Drop dead descriptor fields `.name` / `.family` / `.kind` / `.cap_flags`.
-- Rename `.input_schema_json` → `.schema_json`.
+- Set `.role` and move the role payload under `.role_data`: a tool sets
+  `.role = ROLE_TOOL` with `.role_data.tool.execute` + `.role_data.tool.schema_json`
+  (renamed from `.input_schema_json`); a channel sets `.role = ROLE_CHANNEL` with
+  `.role_data.channel.send`.
 - **`execute` signature** (the bulk): `esp_err_t fn(input_json, ctx, output,
   output_size)` → `claw_capability_result_t fn(arguments_json, output_buffer,
   output_capacity, *output_length, *output_success, user_context)`. Each tool

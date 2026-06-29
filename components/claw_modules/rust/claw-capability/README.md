@@ -1,86 +1,72 @@
 # claw-capability
 
-Capability registry and dispatch for the ESP-Claw agent framework, Rust-first.
+The **capability adapter** for the ESP-Claw agent framework.
 
-A *capability* is a model-callable action (files, Lua, web search, IM, …). This
-crate is the registration + dispatch layer for them: it owns capability
-descriptors and metadata, capability groups, the lifecycle state machine, global
-and per-session LLM visibility, the dispatch path, and the LLM tool-list /
-catalog renderers. It is a pure-Rust reimplementation of the C `claw_cap`
-subsystem; the C function pointers become a handler trait, and all state lives
-on an instance `Registry` (replacing the C `s_runtime` global).
+A *capability* is the single outward-facing vocabulary callers speak. Internally
+there is no such thing: a capability decomposes into a **role** plus an
+orthogonal, optional **lifecycle**.
 
-## How it works
+- **Role** — what the capability exposes when used:
+  - `Tool` — a model-callable tool. It *is* a [`claw_tool::Tool`]; this crate adds
+    no dispatch, schema, or visibility logic of its own.
+  - `Channel` — a message transport (outbound egress; inbound via its lifecycle task).
+  - `None` — no invocation surface; the capability exists only for its lifecycle.
+- **Lifecycle** — optional resource management, available to *any* role (a `Tool`
+  may own a runtime, a `Channel` owns its transport, a lifecycle-only capability
+  is an MCP server toggled by enable/disable). Two paired phases run as
+  `init → (start → stop)* → deinit`: the one-time `init`/`deinit` pair brackets
+  the per-activation `start`/`stop` pair.
 
-Capabilities are registered as **descriptors** (optionally bundled into
-**groups**), the registry is **started**, and each call is **gated** by
-lifecycle state and LLM visibility before it reaches the handler. Capabilities
-the registry does not own can fall through to an optional `RegistryBackend` —
-the seam to the legacy C registry during migration.
+This crate is an **adapter and classifier**, not a runtime. It owns capability
+identity and the lifecycle state machine, and hands out the internal
+representations — `claw_tool::Tool`s and `ChannelAdapter`s — that the rest of the
+stack consumes. It holds **no** tool dispatch, schema rendering, LLM visibility,
+or session logic: *which* tools an agent sees, and *when*, is decided by
+`claw-core` (composing per-agent `ToolSet`s with skills / soft-hide), never
+re-entering this layer.
 
 ## Public API
 
-Re-exported from the crate root:
-
 | Item | Role |
 |------|------|
-| `Registry` | The owning instance: registration, lifecycle (`start_all` / `stop_all`, group enable/disable), visibility, `invoke` dispatch, listing, and the `build_llm_tools_json` / `build_catalog` renderers. |
-| `RegistryBackend` | Fallback seam for capabilities the registry doesn't own (e.g. the C registry during migration). |
-| `CapabilityDescriptor` | One capability's metadata + handler. `new(name, kind, handler)`, `with_flags(..)`. |
-| `CapabilityKind` / `CapabilityFlags` | What a capability does, and its behavior flags (e.g. `CALLABLE_BY_LLM`, `ROOT_AGENT_ONLY`, `EMITS_EVENTS`) as a bitset. |
-| `CapabilityState` | Lifecycle state (`Registered`, `Started`, …) with string labels. |
-| `CapabilityHandler` | The trait a capability implements: `execute(input_json, context) -> CapabilityInvokeResult`. |
-| `CapabilityInvoker` / `CapabilityInvokeResult` | The dispatch trait and its result (`output`, `ok`). |
-| `CapabilityContext` / `CapabilityCaller` | Per-call context (request/session ids) and who initiated the call (`Agent`, …). |
-| `CapabilityGroup` / `GroupHooks` / `GroupInfo` | A registrable group of capabilities, its lifecycle hooks, and a summary view. |
-| `DescriptorRuntimeInfo` / `DescriptorSnapshot` | Runtime state and listable snapshots of registered descriptors. |
-| `CapabilityError` | Dispatch / lifecycle failure. |
+| `Registry` | Owns capability identity + lifecycle: `register` / `register_group`, `start_all` / `stop_all`, `enable_group` / `disable_group`, `unregister[_group]`, plus role-based access (`tools`, `channels`) and state queries. |
+| `Capability` / `CapabilityRole` | One capability (id, description, role, optional lifecycle) and its role (`Tool` / `Channel` / `None`). |
+| `CapabilityGroup` | A registrable bundle of capabilities with an optional **shared** lifecycle (e.g. one runtime backing several tools). |
+| `Lifecycle` | The orthogonal hooks on any capability or group: the one-time `init`/`deinit` pair and the per-activation `start`/`stop` pair (`init → (start → stop)* → deinit`). |
+| `CapabilityState` | Lifecycle state: `Registered` / `Started` / `Disabled`. |
+| `ChannelAdapter` / `OutboundMessage` | The outbound side of a message channel. |
+| `CapabilityError` | Registration / lifecycle failure. |
 
 ## Example
 
 ```rust
 use std::sync::Arc;
 
-use claw_capability::{
-    CapabilityCaller, CapabilityContext, CapabilityDescriptor, CapabilityFlags,
-    CapabilityHandler, CapabilityInvokeResult, CapabilityError, Registry,
-};
+use claw_capability::{Capability, Registry};
+use claw_tool::{Tool, ToolHandler, ToolInvocation, ToolInvokeError, ToolOutput};
 
-struct Echo;
-impl CapabilityHandler for Echo {
-    fn execute(
-        &self,
-        input_json: &str,
-        _context: &CapabilityContext,
-    ) -> Result<CapabilityInvokeResult, CapabilityError> {
-        Ok(CapabilityInvokeResult { output: input_json.to_string(), ok: true })
+struct Clock;
+impl ToolHandler for Clock {
+    fn name(&self) -> &str { "get_time" }
+    fn schema(&self) -> &str { r#"{"type":"function","function":{"name":"get_time"}}"# }
+    fn invoke(&self, _call: &ToolInvocation<'_>) -> Result<ToolOutput, ToolInvokeError> {
+        Ok(ToolOutput { output: "now".into(), ok: true })
     }
 }
 
-let registry = Registry::new(None);
+let registry = Registry::new();
 registry
-    .register(
-        CapabilityDescriptor::new("echo", "echo", Arc::new(Echo))
-            .with_flags(CapabilityFlags::CALLABLE_BY_LLM),
-    )
-    .expect("register echo");
+    .register(Capability::tool(Tool::new(Clock)).with_description("Current time"))
+    .expect("register clock");
 registry.start_all().expect("start");
 
-let context = CapabilityContext { caller: CapabilityCaller::Agent, ..Default::default() };
-let result = registry.invoke("echo", r#"{"hello":"world"}"#, &context).expect("invoke");
-assert!(result.ok);
-```
-
-A fuller, runnable walkthrough — descriptors, groups, lifecycle gating, LLM
-visibility, and a `RegistryBackend` fallthrough — is in `examples/`:
-
-```bash
-cargo run --example capability_dispatch -p claw-capability --target x86_64-unknown-linux-gnu
+// `claw-core` assembles these into a per-agent ToolSet.
+assert_eq!(registry.tools().len(), 1);
 ```
 
 ## Where it fits
 
-A pure-Rust core crate depending only on `thiserror` and `serde_json`. It bundles
-into the firmware's `claw_rt` staticlib and is fully host-testable. Concrete C
-capability descriptors are adapted into this registry at the `claw_capi`
-boundary; the registry itself stays free of FFI.
+A pure-Rust core crate depending on `claw-tool` (for the `Tool` role) and
+`thiserror`. It is fully host-testable and stays free of any platform or
+transport details — those are injected through the `Lifecycle` and
+`ChannelAdapter` traits.

@@ -1,0 +1,36 @@
+[package]
+name = "claw-agent"
+authors = ["Finn(Ziheng) Sheng"]
+version = "0.1.0"
+edition = "2021"
+description = "Concise agent API over the orchestrator: build an agent system, open a chat, send a message, get replies"
+
+[lib]
+name = "claw_agent"
+path = "src/lib.rs"
+
+# A minimal REPL that drives the whole agent system through the public API
+# (`AgentSystem` -> `Chat::send`) against a live LLM with on-disk memory.
+[[bin]]
+name = "claw-agent-chat"
+path = "src/bin/claw-agent-chat.rs"
+
+[dependencies]
+claw-core = { path = "../claw-core" }
+claw-api = { path = "../claw-api" }
+# `compactor-stub` provides the never-compacts `NoopCompactor` used by the
+# host `on_disk` convenience constructor.
+claw-memory = { path = "../claw-memory", features = ["compactor-stub"] }
+# Host dependency-injection backends: real disk fs, blocking reqwest transport,
+# and std-thread memory pool spawner. This crate is a host-facing dev/test tool
+# (like `cli`), so these host-only features are always on.
+claw-interface = { path = "../claw-interface", features = ["diskfs", "realhttp", "stdthread"] }
+thiserror = "2"
+# Used by the `claw-agent-chat` bin to load `claw-core/.env.local`.
+dotenvy = "0.15"
+
+[dev-dependencies]
+# In-memory fs + scripted HTTP doubles so the end-to-end tests run hermetically
+# (no network, no API key) entirely through the public API.
+claw-interface = { path = "../claw-interface", features = ["memfs", "httpmock"] }
+serde_json = "1"

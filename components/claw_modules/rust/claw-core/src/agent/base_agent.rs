@@ -59,6 +59,7 @@ use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
 use crate::agent::tools::{internal_tool_group, skill_tool_group, ControlSignal, ControlSink};
+use crate::memory::{AgentEvent, Memory};
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,

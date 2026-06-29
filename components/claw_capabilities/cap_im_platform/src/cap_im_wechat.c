@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "cap_im_wechat.h"
+#include "claw_utils_string.h"
 
 #include <ctype.h>
 #include <inttypes.h>
@@ -306,6 +307,30 @@ static int cap_im_wechat_int_value(cJSON *item, int fallback)
     return fallback;
 }
 
+static bool cap_im_wechat_json_has_success_code(cJSON *root)
+{
+    cJSON *item = NULL;
+
+    if (!cJSON_IsObject(root)) {
+        return false;
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "ret");
+    if (cJSON_IsNumber(item) && item->valueint != 0) {
+        return false;
+    }
+    item = cJSON_GetObjectItemCaseSensitive(root, "errcode");
+    if (cJSON_IsNumber(item) && item->valueint != 0) {
+        return false;
+    }
+    item = cJSON_GetObjectItemCaseSensitive(root, "code");
+    if (cJSON_IsNumber(item) && item->valueint != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 static int64_t cap_im_wechat_int64_value(cJSON *item, int64_t fallback)
 {
     if (cJSON_IsNumber(item)) {
@@ -571,6 +596,9 @@ static esp_err_t cap_im_wechat_http_request(const char *url,
     config.user_data = response;
     config.buffer_size = 1024;
     config.buffer_size_tx = 2048;
+#ifdef CONFIG_HTTP_REUSE_ENABLE
+    config.keep_alive_enable = true;
+#endif
 
     client = esp_http_client_init(&config);
     if (!client) {
@@ -1610,6 +1638,7 @@ static void cap_im_wechat_poll_task(void *arg)
 static esp_err_t cap_im_wechat_send_message_json(cJSON *msg_root)
 {
     cJSON *root = NULL;
+    cJSON *resp_root = NULL;
     cap_im_wechat_http_resp_t response = {0};
     esp_err_t err;
 
@@ -1636,8 +1665,23 @@ static esp_err_t cap_im_wechat_send_message_json(cJSON *msg_root)
 
     err = cap_im_wechat_api_post("ilink/bot/sendmessage", root, 15000, &response);
     cJSON_Delete(root);
+    if (err != ESP_OK) {
+        cap_im_wechat_resp_cleanup(&response);
+        return err;
+    }
+
+    if (response.buf && response.buf[0]) {
+        resp_root = cJSON_Parse(response.buf);
+        if (!resp_root || !cap_im_wechat_json_has_success_code(resp_root)) {
+            ESP_LOGW(TAG, "wechat sendmessage returned error body=%s", response.buf);
+            cJSON_Delete(resp_root);
+            cap_im_wechat_resp_cleanup(&response);
+            return ESP_FAIL;
+        }
+        cJSON_Delete(resp_root);
+    }
     cap_im_wechat_resp_cleanup(&response);
-    return err;
+    return ESP_OK;
 }
 
 static void cap_im_wechat_build_client_id(char *buf, size_t buf_size)
@@ -2453,7 +2497,10 @@ esp_err_t cap_im_wechat_send_text(const char *chat_id, const char *text)
         esp_err_t err;
 
         if (chunk_len > CAP_IM_WECHAT_MAX_MSG_LEN) {
-            chunk_len = CAP_IM_WECHAT_MAX_MSG_LEN;
+            chunk_len = claw_utils_utf8_prefix_len(text + offset, CAP_IM_WECHAT_MAX_MSG_LEN);
+            if (chunk_len == 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
         }
 
         chunk = calloc(1, chunk_len + 1);

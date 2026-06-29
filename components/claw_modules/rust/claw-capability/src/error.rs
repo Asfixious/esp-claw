@@ -1,40 +1,26 @@
-//! Capability-layer errors (no `esp_err_t` in this crate).
+//! Capability-layer errors.
 
-/// Failure outcome of capability registration, lifecycle, and dispatch.
+/// Failure outcome of capability registration and lifecycle.
 ///
-/// This is the pure-Rust replacement for the `esp_err_t` codes returned by the
-/// C capability layer; the future `claw_capi` boundary maps between the two:
+/// `Failed(_)` is the only stringly variant, reserved for the pluggable boundary
+/// the registry cannot classify: a [`Lifecycle`](crate::Lifecycle) /
+/// [`ChannelAdapter`](crate::ChannelAdapter) hook reporting its own failure.
 ///
-/// - `InvalidArg`    <-> `ESP_ERR_INVALID_ARG`
-/// - `NotFound`      <-> `ESP_ERR_NOT_FOUND`
-/// - `AlreadyExists` <-> `ESP_ERR_INVALID_STATE` (id/name conflict on register)
-/// - `InvalidState`  <-> `ESP_ERR_INVALID_STATE` (transition while draining/unloading)
-/// - `NotAvailable`  <-> `ESP_ERR_INVALID_STATE` (descriptor not Registered/Started)
-/// - `NotVisible`    <-> `ESP_ERR_INVALID_STATE` (not exposed to the LLM)
-/// - `NotSupported`  <-> `ESP_ERR_NOT_SUPPORTED`
-/// - `Timeout`       <-> `ESP_ERR_TIMEOUT` (drain timed out)
-/// - `Failed`        <-> generic `ESP_FAIL` / handler failure
-///
-/// A *handler* failure that should still be shown to the model is carried as
-/// `CapabilityInvokeResult { ok: false, .. }`, not as a `CapabilityError`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+/// Tool *invocation* failures are **not** modeled here: a capability with the
+/// [`Tool`](crate::CapabilityRole::Tool) role is a [`claw_tool::Tool`], so its
+/// argument/handler errors are [`claw_tool::ToolInvokeError`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CapabilityError {
     #[error("invalid argument")]
     InvalidArg,
-    #[error("capability not found")]
+    #[error("capability or group not found")]
     NotFound,
     #[error("capability or group already exists")]
     AlreadyExists,
     #[error("invalid state for this operation")]
     InvalidState,
-    #[error("capability not available")]
-    NotAvailable,
-    #[error("capability not exposed to the LLM")]
-    NotVisible,
-    #[error("operation not supported")]
-    NotSupported,
-    #[error("operation timed out")]
-    Timeout,
-    #[error("operation failed")]
-    Failed,
+    /// A `Lifecycle` or `ChannelAdapter` hook reported its own failure. The
+    /// registry forwards the message unchanged; it does not interpret it.
+    #[error("capability operation failed: {0}")]
+    Failed(String),
 }

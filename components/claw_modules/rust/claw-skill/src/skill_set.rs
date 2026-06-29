@@ -74,6 +74,14 @@ impl SkillSet {
         self.loaded.is_empty()
     }
 
+    /// A handle to the catalog source this set reads from (a cheap `Arc` clone).
+    ///
+    /// Lets a runtime skill tool validate an id and render the available-skills
+    /// menu against the same registry without taking a borrow on the set.
+    pub fn registry(&self) -> Arc<dyn SkillRegistry> {
+        Arc::clone(&self.registry)
+    }
+
     /// Load one skill under `group`. No-op if already loaded.
     ///
     /// # Errors

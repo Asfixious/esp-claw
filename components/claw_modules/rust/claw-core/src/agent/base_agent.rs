@@ -58,7 +58,7 @@ use claw_interface::ClawFs;
 use claw_memory::{ConversationMemory, GroupGuard};
 use serde_json::{json, Value};
 
-use crate::agent::tools::{internal_tool_group, ControlSignal, ControlSink};
+use crate::agent::tools::{internal_tool_group, skill_tool_group, ControlSignal, ControlSink};
 use crate::iteration_loop::{
     ChatMessages, CompletedKind, CompletedOutcome, InterruptionControl, IterationId, IterationLoop,
     IterationLoopError, IterationOutcome, IterationResult, IterationStep, PlainTextOutcome,
@@ -66,7 +66,7 @@ use crate::iteration_loop::{
 };
 use claw_context::{Block, BlockKind, Context};
 use claw_permission::{Grant, PermissionPolicy};
-use claw_skill::{SkillError, SkillGroup, SkillId, SkillSet};
+use claw_skill::SkillSet;
 use claw_tool::{
     BlockPolicy, PermissionGate, ToolBlockVerdict, ToolGate, ToolSet, ToolSetError,
     DEFAULT_BLOCK_RETRIES,
@@ -74,6 +74,10 @@ use claw_tool::{
 
 crate::define_prefixed_id!(AgentId, "agent-", "agent");
 crate::define_prefixed_id!(ApprovalId, "approval-", "approval");
+
+/// Provenance group recorded for a skill the model loaded at runtime via the
+/// `load_skill` tool (shown in the active-skills context block as the source).
+const MODEL_SKILL_GROUP: &str = "model";
 
 // ===========================================================================
 // Public command / outcome vocabulary
@@ -269,9 +273,10 @@ impl TickOutcome {
 ///
 /// Wraps the lower-level errors a tick can hit: a failed LLM/tool iteration, or a
 /// tool refused past the soft-hide retry budget. Skill-context assembly no longer
-/// fails a tick — it is published to the [`Context`] on skill load/unload (where
-/// the [`SkillError`] surfaces), and [`Context::request`] is infallible, so the
-/// tick never fails on context assembly.
+/// fails a tick — it is rebuilt when a `load_skill` / `unload_skill` control
+/// signal is reduced (a [`SkillError`](claw_skill::SkillError) there is logged,
+/// not surfaced), and [`Context::request`] is infallible, so the tick never fails
+/// on context assembly.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum AgentRunError {
     /// The LLM/tool iteration itself failed.
@@ -576,61 +581,18 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
         self.send_command(AgentCommand::ApprovalResult { id, decision })
     }
 
-    // -- Skills (agent config, not conversation drive) ----------------------
-
-    /// Load one skill into context at runtime (no restart).
-    ///
-    /// # Errors
-    ///
-    /// [`SkillError::NotFound`] if no skill set is configured or the registry has
-    /// no such skill.
-    pub fn load_skill(&mut self, group: &'static str, id: SkillId) -> Result<(), SkillError> {
-        let Some(skills) = self.skills.as_mut() else {
-            return Err(SkillError::NotFound(id));
-        };
-        skills.load(group, id)?;
-        // Declare the reassembled active-skills prose; the context change-detects
-        // and re-renders the prefix on the next request.
-        self.context
-            .with(Block::new(BlockKind::ActiveSkills, skills.context()?));
-        Ok(())
-    }
-
-    /// Load a whole [`SkillGroup`] into context at runtime. No-op if the agent has
-    /// no skill set configured.
-    ///
-    /// # Errors
-    ///
-    /// [`SkillError`] if a skill in the group is not in the registry.
-    pub fn load_skill_group(&mut self, group: SkillGroup) -> Result<(), SkillError> {
-        let Some(skills) = self.skills.as_mut() else {
-            return Ok(());
-        };
-        skills.load_group(group)?;
-        self.context
-            .with(Block::new(BlockKind::ActiveSkills, skills.context()?));
-        Ok(())
-    }
-
-    /// Unload a skill from context at runtime. No-op if absent.
-    ///
-    /// # Errors
-    ///
-    /// [`SkillError`] if reassembling the remaining skills' prose fails.
-    pub fn unload_skill(&mut self, id: &SkillId) -> Result<(), SkillError> {
-        let Some(skills) = self.skills.as_mut() else {
-            return Ok(());
-        };
-        skills.unload(id);
-        self.context
-            .with(Block::new(BlockKind::ActiveSkills, skills.context()?));
-        Ok(())
-    }
-
     // -- Status -------------------------------------------------------------
 
+    /// The agent's current lifecycle state.
+    ///
+    /// The primary observability surface: callers branch on this instead of a
+    /// grab-bag of `is_*` predicates. See [`AgentState`] for the states.
+    pub fn state(&self) -> AgentState {
+        self.lifecycle
+    }
+
     /// True while a task is actively iterating (not idle, paused, or awaiting
-    /// approval).
+    /// approval). A thin convenience over [`state`](Self::state).
     pub fn is_running(&self) -> bool {
         self.lifecycle == AgentState::Running
     }
@@ -811,6 +773,43 @@ impl<F: ClawFs + 'static> BaseAgent<F> {
                 self.lifecycle = AgentState::Idle;
                 self.outcome = Some(TickOutcome::Ended { final_message });
             }
+            Inbound::Control(ControlSignal::LoadSkill { id }) => {
+                // `load_skill` already validated the id against the registry; a
+                // failure here can only be a registry reload race, which is
+                // non-fatal (the skill is simply not added).
+                if let Some(skills) = self.skills.as_mut() {
+                    if let Err(error) = skills.load(MODEL_SKILL_GROUP, id) {
+                        tracing::warn!(%error, "load_skill control signal failed");
+                    }
+                }
+                self.refresh_active_skills();
+            }
+            Inbound::Control(ControlSignal::UnloadSkill { id }) => {
+                if let Some(skills) = self.skills.as_mut() {
+                    skills.unload(&id);
+                }
+                self.refresh_active_skills();
+            }
+        }
+    }
+
+    /// Re-render the active-skills context block from the current loaded set.
+    ///
+    /// Non-fatal: skills are auxiliary prompt context, and the reducer has no
+    /// channel to surface a [`SkillError`](claw_skill::SkillError), so a
+    /// reassembly failure is logged and
+    /// the previous block is left in place (the next load/unload retries).
+    fn refresh_active_skills(&mut self) {
+        let Some(skills) = self.skills.as_mut() else {
+            return;
+        };
+        match skills.context() {
+            Ok(rendered) => {
+                let rendered = rendered.to_string();
+                self.context
+                    .with(Block::new(BlockKind::ActiveSkills, rendered));
+            }
+            Err(error) => tracing::warn!(%error, "rebuilding active-skills context failed"),
         }
     }
 
@@ -1075,9 +1074,10 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
         self
     }
 
-    /// Set the agent's skills. The [`SkillSet`] stays mutable after build so
-    /// skills can be loaded/unloaded at runtime via [`BaseAgent::load_skill`] /
-    /// [`BaseAgent::unload_skill`].
+    /// Set the agent's skills. The [`SkillSet`] stays mutable after build so the
+    /// model can load/unload skills at runtime through the `load_skill` /
+    /// `unload_skill` tools (merged on at [`build`](Self::build) when a set is
+    /// configured).
     pub fn with_skills(mut self, skills: SkillSet) -> Self {
         self.skills = Some(skills);
         self
@@ -1148,7 +1148,9 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
     /// Finish configuration and produce a runnable [`BaseAgent`].
     ///
     /// The built-in tool group is merged onto the caller's tools when the LLM
-    /// supports tool calls.
+    /// supports tool calls; the skill-management group (`list_skills` /
+    /// `load_skill` / `unload_skill`) is also merged when a [`SkillSet`] is
+    /// configured.
     ///
     /// # Errors
     ///
@@ -1163,6 +1165,11 @@ impl<F: ClawFs + 'static> BaseAgentBuilder<F> {
         let tools = if supports_tools {
             let mut tools = self.tools.unwrap_or_else(ToolSet::empty);
             tools.extend_with_group(internal_tool_group(Arc::clone(&control)))?;
+            // Skill management is model-callable only when a skill set is
+            // configured: the tools read its registry to list/validate ids.
+            if let Some(skills) = &self.skills {
+                tools.extend_with_group(skill_tool_group(Arc::clone(&control), skills.registry()))?;
+            }
             Some(tools)
         } else {
             if self.tools.is_some() {
@@ -1713,6 +1720,40 @@ mod gating_tests {
 
         agent.run("go");
         assert_eq!(run_to_completion(&mut agent), "done");
+    }
+
+    /// A model-issued `load_skill` tool call lands the skill's body in the
+    /// system prompt of the *next* LLM request (the control signal is reduced
+    /// before the following iteration builds its context).
+    #[test]
+    fn load_skill_tool_injects_skill_body_into_context() {
+        use crate::agent::tools::test_support::skill_registry;
+        use claw_skill::SkillSet;
+
+        let http = CapturingHttp::new(vec![
+            body_tool_call("s1", "load_skill", r#"{"skill":"alpha"}"#),
+            body_plain_text("done"),
+        ]);
+        let (builder, _view) = builder_with_view(build_llm(http.clone()), AgentId(1));
+        let registry = skill_registry(&[("alpha", "Alpha skill")]);
+        let mut agent = builder
+            .with_skills(SkillSet::new(registry))
+            .build()
+            .expect("build");
+
+        agent.run("go");
+        assert_eq!(run_to_completion(&mut agent), "done");
+
+        let bodies = http.captured_bodies();
+        assert!(bodies.len() >= 2, "expected at least two LLM requests");
+        assert!(
+            !bodies[0].to_string().contains("Body for alpha."),
+            "skill body present before it was loaded"
+        );
+        assert!(
+            bodies[1].to_string().contains("Body for alpha."),
+            "loaded skill body missing from the next request"
+        );
     }
 
     /// `0` retries fails on the very first disallowed call.

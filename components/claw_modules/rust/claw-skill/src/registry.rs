@@ -81,8 +81,9 @@ pub trait SkillRegistry: Send + Sync {
     /// Append one skill's document body (front-matter stripped) to `out`.
     ///
     /// The allocation-frugal primitive: the body is pushed straight into the
-    /// caller's buffer, so a [`SkillSet`] can reuse one buffer across rebuilds
-    /// instead of allocating (and freeing) a fresh `String` per document.
+    /// caller's buffer, so a [`SkillSet`](crate::SkillSet) can reuse one buffer
+    /// across rebuilds instead of allocating (and freeing) a fresh `String` per
+    /// document.
     ///
     /// # Errors
     ///
@@ -115,6 +116,22 @@ pub trait SkillRegistry: Send + Sync {
     /// so a borrow could not outlive the snapshot it was read from.
     fn metadata(&self, id: &SkillId) -> Option<SkillMetadata> {
         self.catalog().get(id).cloned()
+    }
+
+    /// Re-scan the catalog source and atomically swap in a fresh view, so skills
+    /// added to (or removed from) the source since construction become visible.
+    ///
+    /// Default: a no-op, for sources whose catalog is immutable (a static or
+    /// in-memory registry has nothing to re-scan). The filesystem-backed
+    /// [`FsSkillRegistry`] overrides this to re-scan its roots.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined. [`FsSkillRegistry`] returns the same errors as
+    /// [`scan_roots`](FsSkillRegistry::scan_roots); on error the previous catalog
+    /// is left in place.
+    fn reload(&self) -> Result<(), SkillError> {
+        Ok(())
     }
 }
 
@@ -168,32 +185,6 @@ impl FsSkillRegistry {
             roots,
             snapshot: RwLock::new(Arc::new(snapshot)),
         })
-    }
-
-    /// Re-scan every root and atomically swap in a fresh catalog (e.g. after
-    /// skills are added or removed on disk).
-    ///
-    /// The new snapshot is built fully before the swap, so the live state is
-    /// only replaced on success; on error the previous catalog stays in place.
-    /// Readers holding an `Arc` from an earlier [`catalog`](SkillRegistry::catalog)
-    /// keep seeing their (now older) view until they fetch again.
-    ///
-    /// Takes `&self`: the catalog lives behind a lock, so a shared
-    /// `Arc<dyn SkillRegistry>` can be reloaded without exclusive access.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`scan_roots`](Self::scan_roots).
-    pub fn reload(&self) -> Result<(), SkillError> {
-        let snapshot = Self::scan_catalog(self.fs.as_ref(), &self.roots)?;
-        // Recover from a poisoned lock: a prior writer panic doesn't corrupt the
-        // `Arc`, and we're about to overwrite it wholesale anyway.
-        let mut guard = self
-            .snapshot
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Arc::new(snapshot);
-        Ok(())
     }
 
     /// Build a [`CatalogSnapshot`] by scanning every root once.
@@ -251,6 +242,32 @@ impl SkillRegistry for FsSkillRegistry {
         // body slice is then copied straight into the caller's buffer.
         let text = String::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8(id.clone()))?;
         out.push_str(strip_front_matter(id, &text)?);
+        Ok(())
+    }
+
+    /// Re-scan every root and atomically swap in a fresh catalog (e.g. after
+    /// skills are added or removed on disk).
+    ///
+    /// The new snapshot is built fully before the swap, so the live state is
+    /// only replaced on success; on error the previous catalog stays in place.
+    /// Readers holding an `Arc` from an earlier [`catalog`](SkillRegistry::catalog)
+    /// keep seeing their (now older) view until they fetch again.
+    ///
+    /// Takes `&self`: the catalog lives behind a lock, so a shared
+    /// `Arc<dyn SkillRegistry>` can be reloaded without exclusive access.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`scan_roots`](Self::scan_roots).
+    fn reload(&self) -> Result<(), SkillError> {
+        let snapshot = Self::scan_catalog(self.fs.as_ref(), &self.roots)?;
+        // Recover from a poisoned lock: a prior writer panic doesn't corrupt the
+        // `Arc`, and we're about to overwrite it wholesale anyway.
+        let mut guard = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Arc::new(snapshot);
         Ok(())
     }
 }

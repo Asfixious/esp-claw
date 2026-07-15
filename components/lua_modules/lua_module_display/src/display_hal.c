@@ -8,36 +8,29 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include "display_arbiter.h"
+#include "display_service.h"
 #include "display_dirty.h"
 #include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
-#include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_painter_font.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#if CONFIG_SOC_LCD_RGB_SUPPORTED
-#include "esp_lcd_panel_rgb.h"
-#endif
-#if CONFIG_SOC_MIPI_DSI_SUPPORTED
-#include "esp_lcd_mipi_dsi.h"
-#endif
 
 static const char *TAG = "display_hal";
 
 #define DISPLAY_HAL_FRAMEBUFFER_COUNT_MAX 2
-#define DISPLAY_HAL_FLUSH_TIMEOUT_MS      2000
 #define DISPLAY_HAL_PI                    3.14159265358979323846f
-
 typedef struct {
     SemaphoreHandle_t lock;
+    display_service_session_handle_t session;
     esp_lcd_panel_handle_t panel;
     esp_lcd_panel_io_handle_t io;
     display_hal_panel_if_t panel_if;
-    bool display_callbacks_registered;
+    display_hal_pixel_format_t pixel_format;
+    size_t bytes_per_pixel;
     bool clip_enabled;
     int clip_x;
     int clip_y;
@@ -46,42 +39,44 @@ typedef struct {
     int width;
     int height;
     size_t framebuffer_bytes;
-    uint16_t *framebuffers[DISPLAY_HAL_FRAMEBUFFER_COUNT_MAX];
+    uint8_t *framebuffers[DISPLAY_HAL_FRAMEBUFFER_COUNT_MAX];
     uint8_t framebuffer_count;
     uint8_t draw_framebuffer_index;
     uint8_t visible_framebuffer_index;
-    int8_t pending_framebuffer_index;
     bool frame_active;
-    bool flush_in_flight;
     bool framebuffer_initialized;
     display_dirty_rect_t dirty;
-    SemaphoreHandle_t display_flush_done;
-    uint16_t *submit_swap_buffer;
+    uint8_t *submit_swap_buffer;
     size_t submit_swap_buffer_pixels;
 } display_hal_state_t;
 
 static display_hal_state_t s_state;
 
+size_t display_hal_pixel_format_bytes(display_hal_pixel_format_t format)
+{
+    switch (format) {
+    case DISPLAY_HAL_PIXEL_FORMAT_RGB565:
+        return 2;
+    case DISPLAY_HAL_PIXEL_FORMAT_RGB888:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+display_hal_pixel_format_t display_hal_get_pixel_format(void)
+{
+    /* No lock needed: the value is stable between create/destroy calls and readers
+       tolerate the default when the HAL has not been created yet. */
+    return s_state.pixel_format;
+}
+
 static void display_hal_clear_clip_locked(void);
-static esp_err_t display_hal_clear_display_callbacks_locked(void);
-static bool display_hal_flush_done_isr(esp_lcd_panel_io_handle_t panel_io,
-                                       esp_lcd_panel_io_event_data_t *edata,
-                                       void *user_ctx);
-#if CONFIG_SOC_LCD_RGB_SUPPORTED
-static bool display_hal_flush_done_rgb_isr(esp_lcd_panel_handle_t panel,
-                                           const esp_lcd_rgb_panel_event_data_t *edata,
-                                           void *user_ctx);
-#endif
-#if CONFIG_SOC_MIPI_DSI_SUPPORTED
-static bool display_hal_flush_done_dpi_isr(esp_lcd_panel_handle_t panel,
-                                           esp_lcd_dpi_panel_event_data_t *edata,
-                                           void *user_ctx);
-#endif
-static esp_err_t display_hal_register_display_callbacks_locked(void);
-static esp_err_t display_hal_wait_flush_done_locked(TickType_t timeout_ticks);
 static bool display_hal_clip_rect_to_screen_locked(int *x, int *y, int *width, int *height);
 
-static esp_err_t display_hal_checked_rgb565_bytes(int width, int height, size_t *out_bytes)
+static esp_err_t display_hal_checked_framebuffer_bytes(int width, int height,
+                                                       size_t bytes_per_pixel,
+                                                       size_t *out_bytes)
 {
     size_t pixels;
 
@@ -89,28 +84,126 @@ static esp_err_t display_hal_checked_rgb565_bytes(int width, int height, size_t 
         return ESP_ERR_INVALID_ARG;
     }
     *out_bytes = 0;
-    if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / (size_t)height) {
-        ESP_LOGE(TAG, "invalid display size: %dx%d", width, height);
+    if (width <= 0 || height <= 0 || bytes_per_pixel == 0 ||
+            (size_t)width > SIZE_MAX / (size_t)height) {
+        ESP_LOGE(TAG, "invalid display size: %dx%d (bpp=%u)",
+                 width, height, (unsigned)bytes_per_pixel);
         return ESP_ERR_INVALID_SIZE;
     }
     pixels = (size_t)width * (size_t)height;
-    if (pixels > SIZE_MAX / sizeof(uint16_t)) {
-        ESP_LOGE(TAG, "display framebuffer size overflow: %dx%d", width, height);
+    if (pixels > SIZE_MAX / bytes_per_pixel) {
+        ESP_LOGE(TAG, "display framebuffer size overflow: %dx%d bpp=%u",
+                 width, height, (unsigned)bytes_per_pixel);
         return ESP_ERR_INVALID_SIZE;
     }
-    *out_bytes = pixels * sizeof(uint16_t);
+    *out_bytes = pixels * bytes_per_pixel;
     return ESP_OK;
 }
 
-static bool display_hal_panel_requires_swap(void)
+/* bswap16 is meaningful only for RGB565: SPI LCD controllers expect the pixel
+   in big-endian byte order, and this HAL keeps the framebuffer in native
+   little-endian. RGB888 input is converted to native BGR when pixels enter
+   the framebuffer or direct-submit buffer. */
+static bool display_hal_pixels_need_swap(display_hal_pixel_format_t pixel_format, display_hal_panel_if_t panel_if)
 {
-    return s_state.panel_if == DISPLAY_HAL_PANEL_IF_IO;
+    return pixel_format == DISPLAY_HAL_PIXEL_FORMAT_RGB565 && panel_if == DISPLAY_HAL_PANEL_IF_IO;
 }
 
-static void display_hal_bswap16_into(uint16_t *dst, const uint16_t *src, size_t pixel_count)
+static void display_hal_bswap16_into(uint8_t *dst, const uint8_t *src, size_t pixel_count)
+{
+    const uint16_t *src16 = (const uint16_t *)src;
+    uint16_t *dst16 = (uint16_t *)dst;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        dst16[i] = __builtin_bswap16(src16[i]);
+    }
+}
+
+static inline uint32_t display_hal_rgb888_read(const uint8_t *pixel)
+{
+    return ((uint32_t)pixel[0] << 16) | ((uint32_t)pixel[1] << 8) | (uint32_t)pixel[2];
+}
+
+static inline void display_hal_rgb888_write(uint8_t *pixel, uint8_t r, uint8_t g, uint8_t b)
+{
+    pixel[0] = b;
+    pixel[1] = g;
+    pixel[2] = r;
+}
+
+static inline void display_hal_rgb888_write_value(uint8_t *pixel, uint32_t rgb)
+{
+    pixel[0] = (uint8_t)((rgb >> 16) & 0xFF);
+    pixel[1] = (uint8_t)((rgb >> 8) & 0xFF);
+    pixel[2] = (uint8_t)(rgb & 0xFF);
+}
+
+static void display_hal_copy_rgb888_to_native(uint8_t *dst, const uint8_t *src, size_t pixel_count)
 {
     for (size_t i = 0; i < pixel_count; ++i) {
-        dst[i] = __builtin_bswap16(src[i]);
+        const uint8_t *s = src + i * 3;
+        uint8_t *d = dst + i * 3;
+        uint8_t r = s[0];
+        uint8_t g = s[1];
+        uint8_t b = s[2];
+        d[0] = b;
+        d[1] = g;
+        d[2] = r;
+    }
+}
+
+static inline uint8_t *display_hal_pixel_ptr(uint8_t *fb, int x, int y)
+{
+    return fb + ((size_t)y * (size_t)s_state.width + (size_t)x) * s_state.bytes_per_pixel;
+}
+
+static inline const uint8_t *display_hal_src_pixel_ptr(const uint8_t *buf, int src_width,
+                                                       int x, int y, size_t bpp)
+{
+    return buf + ((size_t)y * (size_t)src_width + (size_t)x) * bpp;
+}
+
+static void display_hal_pixel_blend(uint8_t *pixel, display_color_t color)
+{
+    if (s_state.pixel_format == DISPLAY_HAL_PIXEL_FORMAT_RGB565) {
+        uint16_t value = (uint16_t)(pixel[0] | ((uint16_t)pixel[1] << 8));
+        value = display_color_blend_rgb565(value, color);
+        pixel[0] = (uint8_t)(value & 0xFF);
+        pixel[1] = (uint8_t)((value >> 8) & 0xFF);
+    } else {
+        uint32_t dst = display_hal_rgb888_read(pixel);
+        uint32_t out = display_color_blend_rgb888(dst, color);
+        display_hal_rgb888_write_value(pixel, out);
+    }
+}
+
+static void display_hal_fill_row(uint8_t *row, display_color_t color, int count, bool blend)
+{
+    if (count <= 0) {
+        return;
+    }
+    if (s_state.pixel_format == DISPLAY_HAL_PIXEL_FORMAT_RGB565) {
+        uint16_t *dst = (uint16_t *)row;
+        if (blend) {
+            for (int i = 0; i < count; ++i) {
+                dst[i] = display_color_blend_rgb565(dst[i], color);
+            }
+        } else {
+            uint16_t value = display_color_to_rgb565(color);
+            for (int i = 0; i < count; ++i) {
+                dst[i] = value;
+            }
+        }
+    } else {
+        if (blend) {
+            for (int i = 0; i < count; ++i) {
+                display_hal_pixel_blend(row + (size_t)i * 3, color);
+            }
+        } else {
+            for (int i = 0; i < count; ++i) {
+                uint8_t *p = row + (size_t)i * 3;
+                display_hal_rgb888_write(p, color.r, color.g, color.b);
+            }
+        }
     }
 }
 
@@ -151,36 +244,45 @@ static esp_err_t display_hal_ensure_display_locked(void)
     return display_hal_require_created_locked();
 }
 
-esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
+esp_err_t display_hal_create(display_service_session_handle_t session,
+                             esp_lcd_panel_handle_t panel_handle,
                              esp_lcd_panel_io_handle_t io_handle,
                              display_hal_panel_if_t panel_if,
+                             display_hal_pixel_format_t pixel_format,
                              int lcd_width,
                              int lcd_height)
 {
     esp_err_t ret = display_hal_lock();
+    size_t bytes_per_pixel = display_hal_pixel_format_bytes(pixel_format);
 
     if (ret != ESP_OK) {
         return ret;
     }
 
     ESP_GOTO_ON_FALSE(panel_handle != NULL, ESP_ERR_INVALID_ARG, fail, TAG, "panel handle missing");
+    ESP_GOTO_ON_FALSE(display_service_session_is_valid(session), ESP_ERR_INVALID_ARG, fail, TAG, "invalid display session");
     ESP_GOTO_ON_FALSE(panel_if >= DISPLAY_HAL_PANEL_IF_IO &&
                       panel_if <= DISPLAY_HAL_PANEL_IF_MIPI_DSI,
                       ESP_ERR_INVALID_ARG, fail, TAG, "invalid panel interface");
+    ESP_GOTO_ON_FALSE(bytes_per_pixel != 0, ESP_ERR_INVALID_ARG, fail, TAG,
+                      "unsupported pixel format: %d", (int)pixel_format);
     if (panel_if == DISPLAY_HAL_PANEL_IF_IO) {
         ESP_GOTO_ON_FALSE(io_handle != NULL, ESP_ERR_INVALID_ARG, fail, TAG, "io handle missing");
     }
     ESP_GOTO_ON_FALSE(lcd_width > 0 && lcd_height > 0, ESP_ERR_INVALID_ARG,
                       fail, TAG, "invalid lcd size");
 
+    /* pixel_format is part of the identity for the no-op reinit check: switching
+       formats must reallocate framebuffers and the swap buffer at the new bpp. */
+    bool swap_needed = display_hal_pixels_need_swap(pixel_format, panel_if);
     if (s_state.panel == panel_handle &&
             s_state.io == io_handle &&
             s_state.panel_if == panel_if &&
+            s_state.pixel_format == pixel_format &&
+            s_state.session == session &&
             s_state.width == lcd_width &&
             s_state.height == lcd_height &&
-            s_state.display_flush_done != NULL &&
-            s_state.display_callbacks_registered &&
-            (!display_hal_panel_requires_swap() || s_state.submit_swap_buffer != NULL)) {
+            (!swap_needed || s_state.submit_swap_buffer != NULL)) {
         ESP_LOGD(TAG, "display_hal_create: already initialized with matching params, no-op");
         ret = ESP_OK;
         goto fail;
@@ -193,43 +295,31 @@ esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
         s_state.submit_swap_buffer = NULL;
         s_state.submit_swap_buffer_pixels = 0;
     }
-    if (s_state.display_callbacks_registered) {
-        ESP_LOGW(TAG, "display_hal_create: clearing leftover display callbacks");
-        (void)display_hal_clear_display_callbacks_locked();
-    }
-
     s_state.panel = panel_handle;
+    s_state.session = session;
     s_state.io = io_handle;
     s_state.panel_if = panel_if;
+    s_state.pixel_format = pixel_format;
+    s_state.bytes_per_pixel = bytes_per_pixel;
     s_state.width = lcd_width;
     s_state.height = lcd_height;
-    ESP_GOTO_ON_ERROR(display_hal_checked_rgb565_bytes(lcd_width, lcd_height, &s_state.framebuffer_bytes),
+    ESP_GOTO_ON_ERROR(display_hal_checked_framebuffer_bytes(lcd_width, lcd_height,
+                                                            bytes_per_pixel,
+                                                            &s_state.framebuffer_bytes),
                       fail, TAG, "invalid framebuffer size");
     s_state.framebuffer_count = 0;
     s_state.draw_framebuffer_index = 0;
     s_state.visible_framebuffer_index = 0;
-    s_state.pending_framebuffer_index = -1;
     s_state.frame_active = false;
-    s_state.flush_in_flight = false;
     s_state.framebuffer_initialized = false;
     display_dirty_clear(&s_state.dirty);
-    if (display_hal_panel_requires_swap()) {
+    if (display_hal_pixels_need_swap(s_state.pixel_format, s_state.panel_if)) {
         size_t swap_bytes = s_state.framebuffer_bytes;
         s_state.submit_swap_buffer = heap_caps_aligned_alloc(16, swap_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         ESP_GOTO_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_NO_MEM, fail, TAG, "alloc submit swap buffer failed");
         s_state.submit_swap_buffer_pixels = (size_t)lcd_width * (size_t)lcd_height;
     }
     display_hal_clear_clip_locked();
-
-    if (!s_state.display_flush_done) {
-        s_state.display_flush_done = xSemaphoreCreateBinary();
-        ESP_GOTO_ON_FALSE(s_state.display_flush_done != NULL, ESP_ERR_NO_MEM, fail, TAG,
-                          "create flush semaphore failed");
-    }
-    if (!s_state.display_callbacks_registered) {
-        ESP_GOTO_ON_ERROR(display_hal_register_display_callbacks_locked(),
-                          fail, TAG, "register flush callback failed");
-    }
 
 fail:
     if (ret != ESP_OK) {
@@ -244,47 +334,29 @@ fail:
 esp_err_t display_hal_destroy(void)
 {
     esp_err_t ret = display_hal_lock();
-    SemaphoreHandle_t flush_done_to_delete = NULL;
 
     if (ret != ESP_OK) {
         return ret;
-    }
-
-    if (s_state.flush_in_flight) {
-        ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
-        if (ret != ESP_OK) {
-            display_hal_unlock();
-            return ret;
-        }
-    }
-
-    if (s_state.display_callbacks_registered) {
-        ret = display_hal_clear_display_callbacks_locked();
-        if (ret != ESP_OK) {
-            display_hal_unlock();
-            return ret;
-        }
     }
 
     for (size_t i = 0; i < DISPLAY_HAL_FRAMEBUFFER_COUNT_MAX; ++i) {
         heap_caps_free(s_state.framebuffers[i]);
         s_state.framebuffers[i] = NULL;
     }
-    flush_done_to_delete = s_state.display_flush_done;
 
     s_state.panel = NULL;
+    s_state.session = NULL;
     s_state.io = NULL;
     s_state.panel_if = DISPLAY_HAL_PANEL_IF_IO;
-    s_state.display_callbacks_registered = false;
+    s_state.pixel_format = DISPLAY_HAL_PIXEL_FORMAT_RGB565;
+    s_state.bytes_per_pixel = 0;
     s_state.width = 0;
     s_state.height = 0;
     s_state.framebuffer_bytes = 0;
     s_state.framebuffer_count = 0;
     s_state.draw_framebuffer_index = 0;
     s_state.visible_framebuffer_index = 0;
-    s_state.pending_framebuffer_index = -1;
     s_state.frame_active = false;
-    s_state.flush_in_flight = false;
     s_state.framebuffer_initialized = false;
     display_dirty_clear(&s_state.dirty);
     s_state.clip_enabled = false;
@@ -295,13 +367,9 @@ esp_err_t display_hal_destroy(void)
     heap_caps_free(s_state.submit_swap_buffer);
     s_state.submit_swap_buffer = NULL;
     s_state.submit_swap_buffer_pixels = 0;
-    s_state.display_flush_done = NULL;
 
     /* Keep the HAL mutex alive across destroy/create cycles so concurrent callers cannot block on or acquire a deleted semaphore. */
     display_hal_unlock();
-    if (flush_done_to_delete) {
-        vSemaphoreDelete(flush_done_to_delete);
-    }
     return ESP_OK;
 }
 
@@ -314,98 +382,7 @@ static void display_hal_clear_clip_locked(void)
     s_state.clip_height = s_state.height;
 }
 
-static esp_err_t display_hal_clear_display_callbacks_locked(void)
-{
-    esp_err_t ret = ESP_OK;
-
-    switch (s_state.panel_if) {
-    case DISPLAY_HAL_PANEL_IF_MIPI_DSI:
-#if CONFIG_SOC_MIPI_DSI_SUPPORTED
-    {
-        const esp_lcd_dpi_panel_event_callbacks_t callbacks = {0};
-        ret = esp_lcd_dpi_panel_register_event_callbacks(s_state.panel, &callbacks, NULL);
-        break;
-    }
-#else
-        ret = ESP_ERR_NOT_SUPPORTED;
-        break;
-#endif
-    case DISPLAY_HAL_PANEL_IF_RGB:
-#if CONFIG_SOC_LCD_RGB_SUPPORTED
-    {
-        const esp_lcd_rgb_panel_event_callbacks_t callbacks = {0};
-        ret = esp_lcd_rgb_panel_register_event_callbacks(s_state.panel, &callbacks, NULL);
-        break;
-    }
-#else
-        ret = ESP_ERR_NOT_SUPPORTED;
-        break;
-#endif
-    case DISPLAY_HAL_PANEL_IF_IO:
-    default: {
-        const esp_lcd_panel_io_callbacks_t callbacks = {0};
-        if (!s_state.io) {
-            s_state.display_callbacks_registered = false;
-            return ESP_OK;
-        }
-        ret = esp_lcd_panel_io_register_event_callbacks(s_state.io, &callbacks, NULL);
-        break;
-    }
-    }
-
-    ESP_RETURN_ON_ERROR(ret, TAG, "clear flush callback failed");
-    s_state.display_callbacks_registered = false;
-    return ESP_OK;
-}
-
-static esp_err_t display_hal_register_display_callbacks_locked(void)
-{
-    esp_err_t ret = ESP_OK;
-
-    switch (s_state.panel_if) {
-    case DISPLAY_HAL_PANEL_IF_MIPI_DSI:
-#if CONFIG_SOC_MIPI_DSI_SUPPORTED
-    {
-        const esp_lcd_dpi_panel_event_callbacks_t callbacks = {
-            .on_color_trans_done = display_hal_flush_done_dpi_isr,
-        };
-        ret = esp_lcd_dpi_panel_register_event_callbacks(s_state.panel, &callbacks, NULL);
-        break;
-    }
-#else
-        ret = ESP_ERR_NOT_SUPPORTED;
-        break;
-#endif
-    case DISPLAY_HAL_PANEL_IF_RGB:
-#if CONFIG_SOC_LCD_RGB_SUPPORTED
-    {
-        const esp_lcd_rgb_panel_event_callbacks_t callbacks = {
-            .on_color_trans_done = display_hal_flush_done_rgb_isr,
-        };
-        ret = esp_lcd_rgb_panel_register_event_callbacks(s_state.panel, &callbacks, NULL);
-        break;
-    }
-#else
-        ret = ESP_ERR_NOT_SUPPORTED;
-        break;
-#endif
-    case DISPLAY_HAL_PANEL_IF_IO:
-    default: {
-        const esp_lcd_panel_io_callbacks_t callbacks = {
-            .on_color_trans_done = display_hal_flush_done_isr,
-        };
-        ESP_RETURN_ON_FALSE(s_state.io != NULL, ESP_ERR_INVALID_STATE, TAG, "io handle missing");
-        ret = esp_lcd_panel_io_register_event_callbacks(s_state.io, &callbacks, NULL);
-        break;
-    }
-    }
-
-    ESP_RETURN_ON_ERROR(ret, TAG, "register flush callback failed");
-    s_state.display_callbacks_registered = true;
-    return ESP_OK;
-}
-
-static uint16_t *display_hal_get_draw_framebuffer_locked(void)
+static uint8_t *display_hal_get_draw_framebuffer_locked(void)
 {
     if (s_state.framebuffer_count == 0) {
         return NULL;
@@ -413,7 +390,7 @@ static uint16_t *display_hal_get_draw_framebuffer_locked(void)
     return s_state.framebuffers[s_state.draw_framebuffer_index];
 }
 
-static uint16_t *display_hal_get_visible_framebuffer_locked(void)
+static uint8_t *display_hal_get_visible_framebuffer_locked(void)
 {
     if (s_state.framebuffer_count == 0) {
         return NULL;
@@ -448,7 +425,6 @@ static esp_err_t display_hal_ensure_framebuffer_locked(void)
     s_state.framebuffer_count = 1;
     s_state.draw_framebuffer_index = 0;
     s_state.visible_framebuffer_index = 0;
-    s_state.pending_framebuffer_index = -1;
 
     if (display_hal_alloc_framebuffer_locked(1) == ESP_OK) {
         s_state.framebuffer_count = 2;
@@ -458,7 +434,7 @@ static esp_err_t display_hal_ensure_framebuffer_locked(void)
     return ESP_OK;
 }
 
-static void display_hal_fill_framebuffer_locked(uint16_t *framebuffer, display_color_t color)
+static void display_hal_fill_framebuffer_locked(uint8_t *framebuffer, display_color_t color)
 {
     if (!framebuffer) {
         return;
@@ -466,19 +442,11 @@ static void display_hal_fill_framebuffer_locked(uint16_t *framebuffer, display_c
     if (display_color_is_transparent(color)) {
         return;
     }
-    size_t pixels = (size_t)s_state.width * (size_t)s_state.height;
-    if (display_color_is_opaque(color)) {
-        uint16_t panel_color = display_color_to_rgb565(color);
-        for (size_t i = 0; i < pixels; ++i) {
-            framebuffer[i] = panel_color;
-        }
-        return;
-    }
 
-    /* Alpha clear blends over the current framebuffer contents. */
-    for (size_t i = 0; i < pixels; ++i) {
-        framebuffer[i] = display_color_blend_rgb565(framebuffer[i], color);
-    }
+    /* fill_row handles both formats and opaque/alpha paths; treating the whole
+       framebuffer as a single wide row keeps it a single dispatch. */
+    int pixels = s_state.width * s_state.height;
+    display_hal_fill_row(framebuffer, color, pixels, !display_color_is_opaque(color));
 }
 
 static bool display_hal_get_clip_bounds_locked(int *left, int *top, int *right, int *bottom)
@@ -681,116 +649,44 @@ static bool display_hal_angle_in_arc(float angle_deg, float start_deg, float end
     return angle >= start || angle <= end;
 }
 
-static IRAM_ATTR bool display_hal_flush_done_isr(esp_lcd_panel_io_handle_t panel_io,
-                                                 esp_lcd_panel_io_event_data_t *edata,
-                                                 void *user_ctx)
-{
-    BaseType_t high_task_woken = pdFALSE;
-
-    (void)panel_io;
-    (void)edata;
-    (void)user_ctx;
-
-    if (s_state.display_flush_done) {
-        xSemaphoreGiveFromISR(s_state.display_flush_done, &high_task_woken);
-    }
-
-    return high_task_woken == pdTRUE;
-}
-
-#if CONFIG_SOC_LCD_RGB_SUPPORTED
-static IRAM_ATTR bool display_hal_flush_done_rgb_isr(esp_lcd_panel_handle_t panel,
-                                                     const esp_lcd_rgb_panel_event_data_t *edata,
-                                                     void *user_ctx)
-{
-    (void)panel;
-    (void)edata;
-    (void)user_ctx;
-    return display_hal_flush_done_isr(NULL, NULL, NULL);
-}
-#endif
-
-#if CONFIG_SOC_MIPI_DSI_SUPPORTED
-static IRAM_ATTR bool display_hal_flush_done_dpi_isr(esp_lcd_panel_handle_t panel,
-                                                     esp_lcd_dpi_panel_event_data_t *edata,
-                                                     void *user_ctx)
-{
-    (void)panel;
-    (void)edata;
-    (void)user_ctx;
-    return display_hal_flush_done_isr(NULL, NULL, NULL);
-}
-#endif
-
-static esp_err_t display_hal_wait_flush_done_locked(TickType_t timeout_ticks)
-{
-    if (!s_state.flush_in_flight) {
-        return ESP_OK;
-    }
-    ESP_RETURN_ON_FALSE(s_state.display_flush_done != NULL, ESP_ERR_INVALID_STATE, TAG,
-                        "flush semaphore missing");
-
-    if (xSemaphoreTake(s_state.display_flush_done, timeout_ticks) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    s_state.flush_in_flight = false;
-    if (s_state.pending_framebuffer_index >= 0) {
-        s_state.visible_framebuffer_index = (uint8_t)s_state.pending_framebuffer_index;
-        s_state.pending_framebuffer_index = -1;
-    }
-    return ESP_OK;
-}
-
+/*
+ * All submissions go through the active display_service raw session with wait=true.
+ * The service (via the LVGL adapter) blocks until the panel has consumed the
+ * caller's buffer, so the caller can rotate framebuffers or reuse memory as
+ * soon as this function returns. There is no async flush state to track.
+ */
 static esp_err_t display_hal_submit_bitmap_locked(int x_start, int y_start,
                                                   int x_end, int y_end,
-                                                  const uint16_t *pixels,
-                                                  int pending_framebuffer_index,
-                                                  bool wait_for_done)
+                                                  const void *pixels,
+                                                  int pending_framebuffer_index)
 {
-    const uint16_t *submit_pixels = pixels;
-    size_t pixel_count = 0;
-    uint16_t *swap_buffer = NULL;
-    esp_err_t ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
+    const void *submit_pixels = pixels;
+    esp_err_t ret;
+
+    if (display_hal_pixels_need_swap(s_state.pixel_format, s_state.panel_if)) {
+        size_t pixel_count = (size_t)(x_end - x_start) * (size_t)(y_end - y_start);
+        ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_INVALID_STATE, TAG, "submit swap buffer missing");
+        display_hal_bswap16_into(s_state.submit_swap_buffer, (const uint8_t *)pixels, pixel_count);
+        submit_pixels = s_state.submit_swap_buffer;
+    }
+
+    ESP_RETURN_ON_FALSE(s_state.session != NULL, ESP_ERR_INVALID_STATE, TAG, "display session missing");
+    ret = display_service_session_raw_blit(s_state.session, &(display_service_raw_blit_t) {
+        .x_start = x_start,
+        .y_start = y_start,
+        .x_end = x_end,
+        .y_end = y_end,
+        .frame_buffer = submit_pixels,
+        .wait = true,
+    });
     if (ret != ESP_OK) {
         return ret;
     }
 
-    if (s_state.display_flush_done) {
-        while (xSemaphoreTake(s_state.display_flush_done, 0) == pdTRUE) {
-        }
+    if (pending_framebuffer_index >= 0) {
+        s_state.visible_framebuffer_index = (uint8_t)pending_framebuffer_index;
     }
-
-    if (!display_arbiter_is_owner(DISPLAY_ARBITER_OWNER_LUA)) {
-        s_state.flush_in_flight = false;
-        if (pending_framebuffer_index >= 0) {
-            s_state.visible_framebuffer_index = (uint8_t)pending_framebuffer_index;
-            s_state.pending_framebuffer_index = -1;
-        }
-        return ESP_OK;
-    }
-
-    if (display_hal_panel_requires_swap()) {
-        pixel_count = (size_t)(x_end - x_start) * (size_t)(y_end - y_start);
-        ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_INVALID_STATE, TAG,
-                            "submit swap buffer missing");
-        swap_buffer = s_state.submit_swap_buffer;
-        display_hal_bswap16_into(swap_buffer, pixels, pixel_count);
-        submit_pixels = swap_buffer;
-    }
-
-    ret = esp_lcd_panel_draw_bitmap(s_state.panel, x_start, y_start, x_end, y_end, submit_pixels);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    s_state.flush_in_flight = true;
-    s_state.pending_framebuffer_index = (int8_t)pending_framebuffer_index;
-
-    if (wait_for_done) {
-        ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
-    }
-    return ret;
+    return ESP_OK;
 }
 
 static const esp_painter_basic_font_t *display_hal_get_font(uint8_t font_size)
@@ -896,8 +792,8 @@ static void display_hal_measure_text_raw(const char *text, const esp_painter_bas
 
 static esp_err_t display_hal_fill_rect_locked(int x, int y, int width, int height, display_color_t color)
 {
-    uint16_t *framebuffer = display_hal_get_draw_framebuffer_locked();
-    uint16_t color565 = display_color_to_rgb565(color);
+    uint8_t *framebuffer = display_hal_get_draw_framebuffer_locked();
+    bool blend = !display_color_is_opaque(color);
 
     if (display_color_is_transparent(color)) {
         return ESP_OK;
@@ -908,34 +804,27 @@ static esp_err_t display_hal_fill_rect_locked(int x, int y, int width, int heigh
     }
 
     if (s_state.frame_active && framebuffer) {
-        if (s_state.flush_in_flight &&
-            s_state.pending_framebuffer_index == (int8_t)s_state.draw_framebuffer_index) {
-            ESP_RETURN_ON_ERROR(
-                display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS)),
-                TAG, "wait flush failed");
-        }
         for (int row = 0; row < height; ++row) {
-            uint16_t *dst = framebuffer + ((size_t)(y + row) * s_state.width) + x;
-            for (int col = 0; col < width; ++col) {
-                dst[col] = display_color_is_opaque(color) ? color565 : display_color_blend_rgb565(dst[col], color);
-            }
+            uint8_t *dst = display_hal_pixel_ptr(framebuffer, x, y + row);
+            display_hal_fill_row(dst, color, width, blend);
         }
         display_dirty_mark(&s_state.dirty, x, y, width, height);
         return ESP_OK;
     }
 
-    if (!display_color_is_opaque(color)) {
+    if (blend) {
         ESP_LOGE(TAG, "alpha drawing requires an active framebuffer");
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint16_t *line = malloc((size_t)width * sizeof(uint16_t));
+    /* No active framebuffer: build a single opaque scanline once and stream it
+       into the panel row by row via draw_bitmap. */
+    size_t line_bytes = (size_t)width * s_state.bytes_per_pixel;
+    uint8_t *line = malloc(line_bytes);
     ESP_RETURN_ON_FALSE(line != NULL, ESP_ERR_NO_MEM, TAG, "line alloc failed");
-    for (int i = 0; i < width; ++i) {
-        line[i] = color565;
-    }
+    display_hal_fill_row(line, color, width, false);
     for (int row = 0; row < height; ++row) {
-        esp_err_t ret = display_hal_submit_bitmap_locked(x, y + row, x + width, y + row + 1, line, -1, true);
+        esp_err_t ret = display_hal_submit_bitmap_locked(x, y + row, x + width, y + row + 1, line, -1);
         if (ret != ESP_OK) {
             free(line);
             return ret;
@@ -1018,15 +907,32 @@ static esp_err_t display_hal_draw_rect_locked(int x, int y, int width, int heigh
     return display_hal_draw_vline_locked(x + width - 1, y + 1, height - 2, color);
 }
 
+static esp_err_t display_hal_check_src_format_locked(display_hal_pixel_format_t src_format)
+{
+    if (src_format != s_state.pixel_format) {
+        ESP_LOGE(TAG, "bitmap src format %d does not match panel format %d",
+                 (int)src_format, (int)s_state.pixel_format);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t display_hal_draw_bitmap_crop_locked(int x, int y,
                                                      int src_x, int src_y,
                                                      int w, int h,
                                                      int src_width, int src_height,
-                                                     const uint16_t *pixels)
+                                                     const void *pixels,
+                                                     display_hal_pixel_format_t src_format,
+                                                     bool src_native)
 {
+    size_t src_bpp = 0;
+    const uint8_t *src_bytes = (const uint8_t *)pixels;
+
     if (!pixels || src_width <= 0 || src_height <= 0 || w <= 0 || h <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    ESP_RETURN_ON_ERROR(display_hal_check_src_format_locked(src_format), TAG, "src format check failed");
+    src_bpp = s_state.bytes_per_pixel;
 
     if (src_x < 0) {
         x -= src_x;
@@ -1052,45 +958,65 @@ static esp_err_t display_hal_draw_bitmap_crop_locked(int x, int y,
         return ESP_OK;
     }
 
-    uint16_t *framebuffer = display_hal_get_draw_framebuffer_locked();
+    uint8_t *framebuffer = display_hal_get_draw_framebuffer_locked();
     if (s_state.frame_active && framebuffer) {
-        if (s_state.flush_in_flight &&
-            s_state.pending_framebuffer_index == (int8_t)s_state.draw_framebuffer_index) {
-            ESP_RETURN_ON_ERROR(
-                display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS)),
-                TAG, "wait flush failed");
-        }
         for (int row = 0; row < h; ++row) {
-            const uint16_t *src = pixels + ((size_t)(src_y + row) * src_width) + src_x;
-            uint16_t *dst = framebuffer + ((size_t)(y + row) * s_state.width) + x;
-            memcpy(dst, src, (size_t)w * sizeof(uint16_t));
+            const uint8_t *src = display_hal_src_pixel_ptr(src_bytes, src_width,
+                                                           src_x, src_y + row, src_bpp);
+            uint8_t *dst = display_hal_pixel_ptr(framebuffer, x, y + row);
+            if (src_format == DISPLAY_HAL_PIXEL_FORMAT_RGB888 && !src_native) {
+                display_hal_copy_rgb888_to_native(dst, src, (size_t)w);
+            } else {
+                memcpy(dst, src, (size_t)w * src_bpp);
+            }
         }
         display_dirty_mark(&s_state.dirty, x, y, w, h);
         return ESP_OK;
     }
 
+    if (src_format == DISPLAY_HAL_PIXEL_FORMAT_RGB888 && !src_native) {
+        size_t row_bytes = (size_t)w * src_bpp;
+        uint8_t *row_buf = malloc(row_bytes);
+        ESP_RETURN_ON_FALSE(row_buf != NULL, ESP_ERR_NO_MEM, TAG, "native row order buffer alloc failed");
+        for (int row = 0; row < h; ++row) {
+            const uint8_t *row_ptr = display_hal_src_pixel_ptr(src_bytes, src_width, src_x, src_y + row, src_bpp);
+            display_hal_copy_rgb888_to_native(row_buf, row_ptr, (size_t)w);
+            esp_err_t ret = display_hal_submit_bitmap_locked(x, y + row, x + w, y + row + 1, row_buf, -1);
+            if (ret != ESP_OK) {
+                free(row_buf);
+                return ret;
+            }
+        }
+        free(row_buf);
+        return ESP_OK;
+    }
+
     if (src_x == 0 && w == src_width) {
-        const uint16_t *start = pixels + ((size_t)src_y * src_width);
-        return display_hal_submit_bitmap_locked(x, y, x + w, y + h, start, -1, true);
+        const uint8_t *start = display_hal_src_pixel_ptr(src_bytes, src_width, 0, src_y, src_bpp);
+        return display_hal_submit_bitmap_locked(x, y, x + w, y + h, start, -1);
     }
 
     for (int row = 0; row < h; ++row) {
-        const uint16_t *row_ptr = pixels + ((size_t)(src_y + row) * src_width) + src_x;
+        const uint8_t *row_ptr = display_hal_src_pixel_ptr(src_bytes, src_width,
+                                                           src_x, src_y + row, src_bpp);
         ESP_RETURN_ON_ERROR(
-            display_hal_submit_bitmap_locked(x, y + row, x + w, y + row + 1, row_ptr, -1, true),
+            display_hal_submit_bitmap_locked(x, y + row, x + w, y + row + 1, row_ptr, -1),
             TAG, "submit bitmap row failed");
     }
     return ESP_OK;
 }
 
-static esp_err_t display_hal_draw_bitmap_locked(int x, int y, int w, int h, const uint16_t *pixels)
+static esp_err_t display_hal_draw_bitmap_locked(int x, int y, int w, int h,
+                                                const void *pixels,
+                                                display_hal_pixel_format_t src_format,
+                                                bool src_native)
 {
-    return display_hal_draw_bitmap_crop_locked(x, y, 0, 0, w, h, w, h, pixels);
+    return display_hal_draw_bitmap_crop_locked(x, y, 0, 0, w, h, w, h, pixels, src_format, src_native);
 }
 
 static esp_err_t display_hal_present_full_locked(void)
 {
-    uint16_t *framebuffer = display_hal_get_draw_framebuffer_locked();
+    uint8_t *framebuffer = display_hal_get_draw_framebuffer_locked();
 
     if (!framebuffer || !s_state.frame_active) {
         return ESP_ERR_INVALID_STATE;
@@ -1099,14 +1025,14 @@ static esp_err_t display_hal_present_full_locked(void)
     ESP_RETURN_ON_ERROR(
         display_hal_submit_bitmap_locked(
             0, 0, s_state.width, s_state.height,
-            framebuffer, (int)s_state.draw_framebuffer_index, false),
+            framebuffer, (int)s_state.draw_framebuffer_index),
         TAG, "present failed");
 
     if (s_state.framebuffer_count > 1) {
-        uint16_t *prev_draw_fb = framebuffer;
+        uint8_t *prev_draw_fb = framebuffer;
         s_state.draw_framebuffer_index = (uint8_t)((s_state.draw_framebuffer_index + 1) %
                                                    s_state.framebuffer_count);
-        uint16_t *new_draw_fb = display_hal_get_draw_framebuffer_locked();
+        uint8_t *new_draw_fb = display_hal_get_draw_framebuffer_locked();
         if (new_draw_fb && new_draw_fb != prev_draw_fb) {
             memcpy(new_draw_fb, prev_draw_fb, s_state.framebuffer_bytes);
         }
@@ -1117,8 +1043,8 @@ static esp_err_t display_hal_present_full_locked(void)
 
 static esp_err_t display_hal_present_rect_locked(int x, int y, int width, int height)
 {
-    uint16_t *draw_fb = display_hal_get_draw_framebuffer_locked();
-    uint16_t *visible_fb = display_hal_get_visible_framebuffer_locked();
+    uint8_t *draw_fb = display_hal_get_draw_framebuffer_locked();
+    uint8_t *visible_fb = display_hal_get_visible_framebuffer_locked();
 
     if (!draw_fb || !s_state.frame_active) {
         return ESP_ERR_INVALID_STATE;
@@ -1126,32 +1052,28 @@ static esp_err_t display_hal_present_rect_locked(int x, int y, int width, int he
     if (!display_hal_clip_rect_to_screen_locked(&x, &y, &width, &height)) {
         return ESP_OK;
     }
-    if (s_state.flush_in_flight) {
-        ESP_RETURN_ON_ERROR(
-            display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS)),
-            TAG, "wait flush failed");
-    }
 
+    size_t row_bytes = (size_t)width * s_state.bytes_per_pixel;
     if (width == s_state.width) {
-        const uint16_t *start = draw_fb + ((size_t)y * s_state.width);
+        const uint8_t *start = display_hal_pixel_ptr(draw_fb, 0, y);
         ESP_RETURN_ON_ERROR(
-            display_hal_submit_bitmap_locked(x, y, x + width, y + height, start, -1, true),
+            display_hal_submit_bitmap_locked(x, y, x + width, y + height, start, -1),
             TAG, "present rect failed");
     } else {
         for (int row = 0; row < height; ++row) {
-            const uint16_t *row_ptr = draw_fb + ((size_t)(y + row) * s_state.width) + x;
+            const uint8_t *row_ptr = display_hal_pixel_ptr(draw_fb, x, y + row);
             ESP_RETURN_ON_ERROR(
                 display_hal_submit_bitmap_locked(
-                    x, y + row, x + width, y + row + 1, row_ptr, -1, true),
+                    x, y + row, x + width, y + row + 1, row_ptr, -1),
                 TAG, "present rect row failed");
         }
     }
 
     if (visible_fb && visible_fb != draw_fb) {
         for (int row = 0; row < height; ++row) {
-            const uint16_t *src = draw_fb + ((size_t)(y + row) * s_state.width) + x;
-            uint16_t *dst = visible_fb + ((size_t)(y + row) * s_state.width) + x;
-            memcpy(dst, src, (size_t)width * sizeof(uint16_t));
+            const uint8_t *src = display_hal_pixel_ptr(draw_fb, x, y + row);
+            uint8_t *dst = display_hal_pixel_ptr(visible_fb, x, y + row);
+            memcpy(dst, src, row_bytes);
         }
     }
     return ESP_OK;
@@ -1201,24 +1123,37 @@ static void display_hal_sort_vertices_by_y(int *x1, int *y1, int *x2, int *y2, i
     }
 }
 
-static esp_err_t display_hal_scale_rgb565(const uint16_t *src, int src_w, int src_h,
-                                          int dst_w, int dst_h, uint16_t **dst_out)
+static esp_err_t display_hal_scale_pixels(const void *src, int src_w, int src_h,
+                                          int dst_w, int dst_h, size_t bpp, void **dst_out)
 {
-    uint16_t *dst = NULL;
-
-    if (!src || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || !dst_out) {
+    if (!src || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+            !dst_out || bpp == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    dst = malloc((size_t)dst_w * (size_t)dst_h * sizeof(uint16_t));
+    size_t dst_bytes = (size_t)dst_w * (size_t)dst_h * bpp;
+    uint8_t *dst = malloc(dst_bytes);
     ESP_RETURN_ON_FALSE(dst != NULL, ESP_ERR_NO_MEM, TAG, "scale buffer alloc failed");
 
-    for (int y = 0; y < dst_h; ++y) {
-        int src_y = (y * src_h) / dst_h;
-        const uint16_t *src_row = src + ((size_t)src_y * src_w);
-        uint16_t *dst_row = dst + ((size_t)y * dst_w);
-        for (int x = 0; x < dst_w; ++x) {
-            int src_x = (x * src_w) / dst_w;
-            dst_row[x] = src_row[src_x];
+    const uint8_t *src_bytes = (const uint8_t *)src;
+    if (bpp == 2) {
+        for (int y = 0; y < dst_h; ++y) {
+            int src_y = (y * src_h) / dst_h;
+            const uint16_t *src_row = (const uint16_t *)(src_bytes + (size_t)src_y * src_w * 2);
+            uint16_t *dst_row = (uint16_t *)(dst + (size_t)y * dst_w * 2);
+            for (int x = 0; x < dst_w; ++x) {
+                int src_x = (x * src_w) / dst_w;
+                dst_row[x] = src_row[src_x];
+            }
+        }
+    } else {
+        for (int y = 0; y < dst_h; ++y) {
+            int src_y = (y * src_h) / dst_h;
+            const uint8_t *src_row = src_bytes + (size_t)src_y * src_w * bpp;
+            uint8_t *dst_row = dst + (size_t)y * dst_w * bpp;
+            for (int x = 0; x < dst_w; ++x) {
+                int src_x = (x * src_w) / dst_w;
+                memcpy(dst_row + (size_t)x * bpp, src_row + (size_t)src_x * bpp, bpp);
+            }
         }
     }
 
@@ -1239,8 +1174,8 @@ int display_hal_height(void)
 esp_err_t display_hal_begin_frame(bool clear, display_color_t color)
 {
     esp_err_t ret = display_hal_lock();
-    uint16_t *draw_fb = NULL;
-    uint16_t *visible_fb = NULL;
+    uint8_t *draw_fb = NULL;
+    uint8_t *visible_fb = NULL;
 
     if (ret != ESP_OK) {
         return ret;
@@ -1249,10 +1184,6 @@ esp_err_t display_hal_begin_frame(bool clear, display_color_t color)
     ret = display_hal_ensure_display_locked();
     if (ret == ESP_OK) {
         ret = display_hal_ensure_framebuffer_locked();
-    }
-    if (ret == ESP_OK && s_state.flush_in_flight &&
-        (!clear || s_state.pending_framebuffer_index == (int8_t)s_state.draw_framebuffer_index)) {
-        ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
     }
     if (ret == ESP_OK) {
         s_state.frame_active = true;
@@ -1315,9 +1246,6 @@ esp_err_t display_hal_end_frame(void)
     if (ret != ESP_OK) {
         return ret;
     }
-    if (s_state.flush_in_flight) {
-        ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
-    }
     if (display_dirty_is_valid(&s_state.dirty)) {
         ESP_LOGD(TAG, "ending frame with unpresented dirty rect");
     }
@@ -1357,7 +1285,8 @@ esp_err_t display_hal_get_animation_info(display_hal_animation_info_t *info)
         info->framebuffer_count = s_state.framebuffer_count;
         info->double_buffered = s_state.framebuffer_count > 1;
         info->frame_active = s_state.frame_active;
-        info->flush_in_flight = s_state.flush_in_flight;
+        /* All submits are synchronous; there is never an in-flight flush. */
+        info->flush_in_flight = false;
     }
     display_hal_unlock();
     return ret;
@@ -2136,7 +2065,9 @@ esp_err_t display_hal_draw_text_aligned(int x, int y, int width, int height,
     return display_hal_draw_text(draw_x, draw_y, text, font_size, text_color, has_bg, bg_color);
 }
 
-esp_err_t display_hal_draw_bitmap(int x, int y, int w, int h, const uint16_t *pixels)
+esp_err_t display_hal_draw_bitmap(int x, int y, int w, int h,
+                                  const void *pixels,
+                                  display_hal_pixel_format_t src_format)
 {
     esp_err_t ret = display_hal_lock();
 
@@ -2147,7 +2078,26 @@ esp_err_t display_hal_draw_bitmap(int x, int y, int w, int h, const uint16_t *pi
         ret = display_hal_ensure_display_locked();
     }
     if (ret == ESP_OK) {
-        ret = display_hal_draw_bitmap_locked(x, y, w, h, pixels);
+        ret = display_hal_draw_bitmap_locked(x, y, w, h, pixels, src_format, false);
+    }
+    display_hal_unlock();
+    return ret;
+}
+
+esp_err_t display_hal_draw_bitmap_native(int x, int y, int w, int h,
+                                         const void *pixels,
+                                         display_hal_pixel_format_t src_format)
+{
+    esp_err_t ret = display_hal_lock();
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (ret == ESP_OK) {
+        ret = display_hal_ensure_display_locked();
+    }
+    if (ret == ESP_OK) {
+        ret = display_hal_draw_bitmap_locked(x, y, w, h, pixels, src_format, true);
     }
     display_hal_unlock();
     return ret;
@@ -2157,7 +2107,8 @@ esp_err_t display_hal_draw_bitmap_crop(int x, int y,
                                        int src_x, int src_y,
                                        int w, int h,
                                        int src_width, int src_height,
-                                       const uint16_t *pixels)
+                                       const void *pixels,
+                                       display_hal_pixel_format_t src_format)
 {
     esp_err_t ret = display_hal_lock();
 
@@ -2168,28 +2119,83 @@ esp_err_t display_hal_draw_bitmap_crop(int x, int y,
         ret = display_hal_ensure_display_locked();
     }
     if (ret == ESP_OK) {
-        ret = display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h, src_width, src_height, pixels);
+        ret = display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h,
+                                                  src_width, src_height, pixels, src_format, false);
+    }
+    display_hal_unlock();
+    return ret;
+}
+
+esp_err_t display_hal_draw_bitmap_crop_native(int x, int y,
+                                              int src_x, int src_y,
+                                              int w, int h,
+                                              int src_width, int src_height,
+                                              const void *pixels,
+                                              display_hal_pixel_format_t src_format)
+{
+    esp_err_t ret = display_hal_lock();
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (ret == ESP_OK) {
+        ret = display_hal_ensure_display_locked();
+    }
+    if (ret == ESP_OK) {
+        ret = display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h,
+                                                  src_width, src_height, pixels, src_format, true);
     }
     display_hal_unlock();
     return ret;
 }
 
 esp_err_t display_hal_draw_bitmap_scaled(int x, int y,
-                                         const uint16_t *pixels,
+                                         const void *pixels,
                                          int src_width, int src_height,
                                          int scale_w, int scale_h,
+                                         display_hal_pixel_format_t src_format,
                                          int *out_w, int *out_h)
 {
-    uint16_t *scaled = NULL;
+    void *scaled = NULL;
     esp_err_t ret = ESP_OK;
+    size_t bpp = display_hal_pixel_format_bytes(src_format);
 
-    if (!pixels || src_width <= 0 || src_height <= 0 || scale_w <= 0 || scale_h <= 0) {
+    if (!pixels || src_width <= 0 || src_height <= 0 || scale_w <= 0 || scale_h <= 0 || bpp == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    ret = display_hal_scale_rgb565(pixels, src_width, src_height, scale_w, scale_h, &scaled);
+    ret = display_hal_scale_pixels(pixels, src_width, src_height, scale_w, scale_h, bpp, &scaled);
     if (ret == ESP_OK) {
-        ret = display_hal_draw_bitmap(x, y, scale_w, scale_h, scaled);
+        ret = display_hal_draw_bitmap(x, y, scale_w, scale_h, scaled, src_format);
+    }
+    if (out_w) {
+        *out_w = scale_w;
+    }
+    if (out_h) {
+        *out_h = scale_h;
+    }
+    free(scaled);
+    return ret;
+}
+
+esp_err_t display_hal_draw_bitmap_scaled_native(int x, int y,
+                                                const void *pixels,
+                                                int src_width, int src_height,
+                                                int scale_w, int scale_h,
+                                                display_hal_pixel_format_t src_format,
+                                                int *out_w, int *out_h)
+{
+    void *scaled = NULL;
+    esp_err_t ret = ESP_OK;
+    size_t bpp = display_hal_pixel_format_bytes(src_format);
+
+    if (!pixels || src_width <= 0 || src_height <= 0 || scale_w <= 0 || scale_h <= 0 || bpp == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = display_hal_scale_pixels(pixels, src_width, src_height, scale_w, scale_h, bpp, &scaled);
+    if (ret == ESP_OK) {
+        ret = display_hal_draw_bitmap_native(x, y, scale_w, scale_h, scaled, src_format);
     }
     if (out_w) {
         *out_w = scale_w;

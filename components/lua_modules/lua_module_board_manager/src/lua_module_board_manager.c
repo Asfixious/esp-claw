@@ -14,6 +14,8 @@
 #define LUA_BM_DISPLAY_PANEL_IF_IO        0
 #define LUA_BM_DISPLAY_PANEL_IF_RGB       1
 #define LUA_BM_DISPLAY_PANEL_IF_MIPI_DSI  2
+#define LUA_BM_DISPLAY_PIXEL_FORMAT_RGB565 0
+#define LUA_BM_DISPLAY_PIXEL_FORMAT_RGB888 1
 
 /** Push nil + error message string, return 2. Convenience for error paths. */
 static int push_err(lua_State *L, esp_err_t err, const char *msg)
@@ -171,7 +173,7 @@ static int lua_bm_get_device_config_handle(lua_State *L)
 
 /* --------------------------------------------------------------------------
  * board_manager.get_display_lcd_params(name)
- *   -> panel_handle, io_handle, lcd_width, lcd_height, panel_if | nil, errmsg
+ *   -> panel_handle, io_handle, lcd_width, lcd_height, panel_if, pixel_format | nil, errmsg
  * -------------------------------------------------------------------------- */
 static int lua_bm_get_display_lcd_params(lua_State *L)
 {
@@ -209,6 +211,7 @@ static int lua_bm_get_display_lcd_params(lua_State *L)
     }
     const char *sub_type = lcd_cfg->sub_type;
     int panel_if = LUA_BM_DISPLAY_PANEL_IF_IO;
+    int pixel_format = lcd_cfg->bits_per_pixel == 24 ? LUA_BM_DISPLAY_PIXEL_FORMAT_RGB888 : LUA_BM_DISPLAY_PIXEL_FORMAT_RGB565;
 
     if (sub_type != NULL) {
         if (strcmp(sub_type, "dsi") == 0 || strcmp(sub_type, "mipi_dsi") == 0) {
@@ -221,7 +224,8 @@ static int lua_bm_get_display_lcd_params(lua_State *L)
     lua_pushinteger(L, lcd_cfg->lcd_width);
     lua_pushinteger(L, lcd_cfg->lcd_height);
     lua_pushinteger(L, panel_if);
-    return 5;
+    lua_pushinteger(L, pixel_format);
+    return 6;
 #else
     lua_pushnil(L);
     lua_pushstring(L, "display lcd support is disabled");
@@ -477,6 +481,10 @@ int luaopen_board_manager(lua_State *L)
     lua_setfield(L, -2, "PANEL_IF_RGB");
     lua_pushinteger(L, LUA_BM_DISPLAY_PANEL_IF_MIPI_DSI);
     lua_setfield(L, -2, "PANEL_IF_MIPI_DSI");
+    lua_pushinteger(L, LUA_BM_DISPLAY_PIXEL_FORMAT_RGB565);
+    lua_setfield(L, -2, "PIXEL_FORMAT_RGB565");
+    lua_pushinteger(L, LUA_BM_DISPLAY_PIXEL_FORMAT_RGB888);
+    lua_setfield(L, -2, "PIXEL_FORMAT_RGB888");
     return 1;
 }
 

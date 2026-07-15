@@ -13,8 +13,10 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "display_color.h"
+#include "display_service.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -48,14 +50,40 @@ typedef enum {
     DISPLAY_HAL_PANEL_IF_MIPI_DSI,
 } display_hal_panel_if_t;
 
+/**
+ * @brief Framebuffer pixel format.
+ *
+ * Only RGB565 (2 bytes/pixel input as RGB565 little-endian) and RGB888
+ * (3 bytes/pixel input as R,G,B) are supported. RGB565 remains standard RGB
+ * order; RGB888 is stored/submitted in native BGR panel order.
+ */
+typedef enum {
+    DISPLAY_HAL_PIXEL_FORMAT_RGB565 = 0,
+    DISPLAY_HAL_PIXEL_FORMAT_RGB888,
+} display_hal_pixel_format_t;
+
+/**
+ * @brief Number of bytes per pixel for a given format.
+ */
+size_t display_hal_pixel_format_bytes(display_hal_pixel_format_t format);
+
 /* --- Lifecycle --- */
 
-esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
+esp_err_t display_hal_create(display_service_session_handle_t session,
+                             esp_lcd_panel_handle_t panel_handle,
                              esp_lcd_panel_io_handle_t io_handle,
                              display_hal_panel_if_t panel_if,
+                             display_hal_pixel_format_t pixel_format,
                              int lcd_width,
                              int lcd_height);
 esp_err_t display_hal_destroy(void);
+
+/**
+ * @brief Current framebuffer pixel format.
+ *
+ * Returns @c DISPLAY_HAL_PIXEL_FORMAT_RGB565 when the HAL is not yet created.
+ */
+display_hal_pixel_format_t display_hal_get_pixel_format(void);
 
 /* --- Geometry --- */
 
@@ -112,20 +140,47 @@ esp_err_t display_hal_draw_text_aligned(int x, int y, int width, int height,
                                         display_hal_text_align_t align,
                                         display_hal_text_valign_t valign);
 
-/* --- Bitmap --- */
-
-/* pixels: RGB565 little-endian byte order */
-esp_err_t display_hal_draw_bitmap(int x, int y, int w, int h, const uint16_t *pixels);
+/* --- Bitmap ---
+ *
+ * @c pixels points to a tightly packed pixel buffer whose byte layout is
+ * described by @p src_format:
+ *   - DISPLAY_HAL_PIXEL_FORMAT_RGB565: little-endian uint16_t per pixel.
+ *   - DISPLAY_HAL_PIXEL_FORMAT_RGB888: 3 input bytes per pixel in R,G,B order.
+ *
+ * @p src_format must currently match the HAL's active pixel format; a
+ * mismatched call returns ESP_ERR_INVALID_ARG. RGB888 input pixels are
+ * converted to native BGR before they reach the framebuffer or panel.
+ */
+esp_err_t display_hal_draw_bitmap(int x, int y, int w, int h,
+                                  const void *pixels,
+                                  display_hal_pixel_format_t src_format);
+esp_err_t display_hal_draw_bitmap_native(int x, int y, int w, int h,
+                                         const void *pixels,
+                                         display_hal_pixel_format_t src_format);
 esp_err_t display_hal_draw_bitmap_crop(int x, int y,
                                        int src_x, int src_y,
                                        int w, int h,
                                        int src_width, int src_height,
-                                       const uint16_t *pixels);
+                                       const void *pixels,
+                                       display_hal_pixel_format_t src_format);
+esp_err_t display_hal_draw_bitmap_crop_native(int x, int y,
+                                              int src_x, int src_y,
+                                              int w, int h,
+                                              int src_width, int src_height,
+                                              const void *pixels,
+                                              display_hal_pixel_format_t src_format);
 esp_err_t display_hal_draw_bitmap_scaled(int x, int y,
-                                         const uint16_t *pixels,
+                                         const void *pixels,
                                          int src_width, int src_height,
                                          int scale_w, int scale_h,
+                                         display_hal_pixel_format_t src_format,
                                          int *out_w, int *out_h);
+esp_err_t display_hal_draw_bitmap_scaled_native(int x, int y,
+                                                const void *pixels,
+                                                int src_width, int src_height,
+                                                int scale_w, int scale_h,
+                                                display_hal_pixel_format_t src_format,
+                                                int *out_w, int *out_h);
 
 #ifdef __cplusplus
 }

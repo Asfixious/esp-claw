@@ -16,8 +16,6 @@ menu "App Claw Config"
             is enabled, Lua LVGL scripts switch screens inside this runtime
             instead of initializing LVGL directly.
 
-    endchoice
-
     choice APP_CLAW_MEMORY_MODE
         prompt "App Claw memory management mode"
         depends on APP_CLAW_CAP_MEMORY

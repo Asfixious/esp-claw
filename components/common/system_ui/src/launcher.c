@@ -47,6 +47,15 @@ static void system_ui_launcher_set_default_layout(void)
     s_ui.launcher_layout.cols = SYSTEM_UI_LAUNCHER_DEFAULT_COLS;
 }
 
+static void system_ui_launcher_ensure_page_count(void)
+{
+    size_t tiles_per_page = system_ui_launcher_tiles_per_page();
+
+    if (tiles_per_page > 0) {
+        s_ui.launcher_page_count = (s_ui.launcher_app_count + tiles_per_page - 1) / tiles_per_page;
+    }
+}
+
 static esp_err_t system_ui_launcher_read_binary_file(const char *path, uint8_t **out, size_t *out_size)
 {
     struct stat st;
@@ -375,14 +384,12 @@ esp_err_t system_ui_launcher_load_locked(void)
     ret = claw_skill_foreach_catalog_entry(system_ui_launcher_add_skill_entry, NULL);
     if (ret == ESP_ERR_INVALID_STATE) {
         ESP_LOGI(SYSTEM_UI_TAG, "launcher deferred: skill registry not ready");
+        system_ui_launcher_ensure_page_count();
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(ret, SYSTEM_UI_TAG, "load launcher skills failed");
 
-    size_t tiles_per_page = system_ui_launcher_tiles_per_page();
-    if (tiles_per_page > 0) {
-        s_ui.launcher_page_count = (s_ui.launcher_app_count + tiles_per_page - 1) / tiles_per_page;
-    }
+    system_ui_launcher_ensure_page_count();
     ESP_LOGI(SYSTEM_UI_TAG, "loaded %u launcher apps in %u pages",
              (unsigned)s_ui.launcher_app_count, (unsigned)s_ui.launcher_page_count);
     return ESP_OK;
@@ -447,36 +454,6 @@ static void system_ui_launcher_app_event_cb(lv_event_t *event)
     strlcpy(work_event.launcher_action, app->action, sizeof(work_event.launcher_action));
     strlcpy(work_event.launcher_args_json, app->args_json, sizeof(work_event.launcher_args_json));
     (void)system_ui_post_work_event(&work_event, 0);
-}
-
-static esp_err_t system_ui_launcher_create_page_dots(lv_obj_t *tile, size_t page_index)
-{
-    if (s_ui.launcher_page_count == 0) {
-        return ESP_OK;
-    }
-
-    int32_t short_side = system_ui_short_side_from(s_ui.width, s_ui.height);
-    int32_t dot_size = system_ui_clamp_i32(short_side / 46, 5, 8);
-    int32_t dot_gap = system_ui_clamp_i32(short_side / 42, 5, 9);
-    int32_t count = (int32_t)s_ui.launcher_page_count;
-    int32_t total_w = count * dot_size + (count - 1) * dot_gap + dot_size * 2;
-    int32_t start_x = ((int32_t)s_ui.width - total_w) / 2;
-    int32_t y = (int32_t)s_ui.height - system_ui_clamp_i32(short_side / 14, 18, 30);
-
-    for (size_t i = 0; i < s_ui.launcher_page_count; i++) {
-        lv_obj_t *dot = lv_obj_create(tile);
-        ESP_RETURN_ON_FALSE(dot != NULL, ESP_ERR_NO_MEM, SYSTEM_UI_TAG, "create launcher page dot failed");
-        int32_t w = i == page_index ? dot_size * 3 : dot_size;
-        lv_obj_set_size(dot, w, dot_size);
-        lv_obj_set_pos(dot, start_x, y);
-        start_x += w + dot_gap;
-        lv_obj_set_style_radius(dot, 0, 0);
-        lv_obj_set_style_bg_color(dot, system_ui_color(i == page_index ? SYSTEM_UI_COLOR_TEXT : SYSTEM_UI_COLOR_LINE), 0);
-        lv_obj_set_style_bg_opa(dot, i == page_index ? LV_OPA_COVER : LV_OPA_60, 0);
-        lv_obj_set_style_border_width(dot, 0, 0);
-        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
-    }
-    return ESP_OK;
 }
 
 static esp_err_t system_ui_launcher_create_app_card(lv_obj_t *tile,
@@ -593,16 +570,13 @@ static system_ui_launcher_app_t *system_ui_launcher_app_at(size_t index)
 
 static esp_err_t system_ui_launcher_create_page_locked(size_t page_index)
 {
-    lv_dir_t dir = LV_DIR_NONE;
-    if (page_index > 0) {
-        dir |= LV_DIR_LEFT;
-    }
+    lv_dir_t dir = LV_DIR_LEFT;
     if (page_index + 1 < s_ui.launcher_page_count) {
         dir |= LV_DIR_RIGHT;
     }
 
-    /* Launcher pages stay on the main row and remain horizontally pageable under the lock overlay. */
-    lv_obj_t *tile = lv_tileview_add_tile(s_ui.tileview, (uint8_t)page_index, 0, dir);
+    /* Launcher pages share the same row as the clock page and start at column 1. */
+    lv_obj_t *tile = lv_tileview_add_tile(s_ui.tileview, (uint8_t)(page_index + 1), 0, dir);
     ESP_RETURN_ON_FALSE(tile != NULL, ESP_ERR_NO_MEM, SYSTEM_UI_TAG, "create launcher tile failed");
     if (page_index == 0) {
         s_ui.launcher_first_tile = tile;
@@ -634,8 +608,6 @@ static esp_err_t system_ui_launcher_create_page_locked(size_t page_index)
     for (size_t i = 0; app && i < tiles_per_page; i++, app = app->next) {
         ESP_RETURN_ON_ERROR(system_ui_launcher_create_app_card(tile, &grid, i, app), SYSTEM_UI_TAG, "create launcher app card failed");
     }
-    ESP_RETURN_ON_ERROR(system_ui_launcher_create_page_dots(tile, page_index),
-                        SYSTEM_UI_TAG, "create launcher page dots failed");
     return ESP_OK;
 }
 

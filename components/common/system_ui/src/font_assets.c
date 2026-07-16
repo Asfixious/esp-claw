@@ -13,21 +13,6 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-static bool system_ui_path_has_parent_ref(const char *path)
-{
-    const char *p = path;
-
-    while (p && *p) {
-        if ((p[0] == '.' && p[1] == '.' && (p[2] == '\0' || p[2] == '/' || p[2] == '\\')) ||
-                ((p[0] == '/' || p[0] == '\\') && p[1] == '.' && p[2] == '.' &&
-                 (p[3] == '\0' || p[3] == '/' || p[3] == '\\'))) {
-            return true;
-        }
-        p++;
-    }
-    return false;
-}
-
 static const char *system_ui_skip_fs_prefix(const char *path)
 {
     if (!path) {
@@ -48,8 +33,6 @@ static esp_err_t system_ui_to_vfs_path(claw_path_root_t root, const char *path, 
     const char *rel = system_ui_skip_fs_prefix(path);
 
     ESP_RETURN_ON_FALSE(rel && rel[0], ESP_ERR_INVALID_ARG, SYSTEM_UI_TAG, "fs path is empty");
-    ESP_RETURN_ON_FALSE(!system_ui_path_has_parent_ref(rel), ESP_ERR_INVALID_ARG,
-                        SYSTEM_UI_TAG, "fs path escapes data root");
     return claw_paths_join(root, rel, out, out_size);
 }
 
@@ -141,10 +124,6 @@ void system_ui_create_font_locked(const char *font_path, uint32_t font_size)
     }
     if (font_size == 0) {
         font_size = SYSTEM_UI_DEFAULT_FONT_SIZE;
-    }
-    if (system_ui_path_has_parent_ref(font_path)) {
-        ESP_LOGW(SYSTEM_UI_TAG, "ui font path rejected: %s", font_path);
-        return;
     }
 
     written = snprintf(s_ui.font_path, sizeof(s_ui.font_path), "%s", system_ui_skip_fs_prefix(font_path));

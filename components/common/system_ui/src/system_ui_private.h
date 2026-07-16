@@ -136,7 +136,14 @@ typedef enum {
     SYSTEM_UI_WORK_EVENT_JOBS_REFRESH,
     SYSTEM_UI_WORK_EVENT_JOBS_ACTION,
     SYSTEM_UI_WORK_EVENT_NETWORK_STATUS,
+    SYSTEM_UI_WORK_EVENT_APP_EXIT_SWIPE,
 } system_ui_work_event_type_t;
+
+typedef enum {
+    SYSTEM_UI_TOUCH_GESTURE_NONE = 0,
+    SYSTEM_UI_TOUCH_GESTURE_SHOW_JOBS,
+    SYSTEM_UI_TOUCH_GESTURE_EXIT_APP,
+} system_ui_touch_gesture_t;
 
 typedef struct {
     system_ui_work_event_type_t type;
@@ -177,16 +184,10 @@ typedef struct {
     lv_obj_t *home_tile;
     lv_obj_t *tileview;
     lv_obj_t *launcher_first_tile;
-    lv_obj_t *emote_anim;
     lv_obj_t *status_label;
     lv_obj_t *time_label;
     lv_obj_t *date_label;
-    lv_obj_t *lock_hint_label;
     lv_timer_t *home_clock_timer;
-    bool lock_unlocked;
-    bool lock_drag_active;
-    int32_t lock_drag_start_y;
-    int32_t lock_drag_progress;
     lv_obj_t *overlay_root;
     lv_obj_t *overlay_dot;
     lv_timer_t *overlay_timer;
@@ -202,6 +203,8 @@ typedef struct {
     void *jobs_action_user_ctx;
     system_ui_jobs_stop_all_cb_t jobs_stop_all_cb;
     void *jobs_stop_all_user_ctx;
+    system_ui_app_exit_swipe_cb_t app_exit_swipe_cb;
+    void *app_exit_swipe_user_ctx;
     bool jobs_stop_task_running;
     bool jobs_refresh_running;
     bool jobs_refresh_pending;
@@ -222,8 +225,6 @@ typedef struct {
     lv_font_t *clock_font;
     uint8_t *font_data;
     size_t font_data_size;
-    uint8_t *emote_data;
-    size_t emote_data_size;
     uint32_t width;
     uint32_t height;
     SemaphoreHandle_t callback_mutex;
@@ -233,14 +234,11 @@ typedef struct {
     uint32_t generation;
     bool started;
     bool event_task_stop;
-    bool touch_swipe_tracking;
+    system_ui_touch_gesture_t touch_gesture;
     bool jobs_visible;
     bool sta_connected;
-    bool emote_loaded;
-    bool emote_paused_for_display_claim;
     char ap_ssid[64];
     char font_path[SYSTEM_UI_PATH_MAX];
-    char emote_path[SYSTEM_UI_PATH_MAX];
 } system_ui_state_t;
 
 extern system_ui_state_t s_ui;
@@ -263,7 +261,6 @@ static inline void system_ui_apply_clock_font(lv_obj_t *obj)
 
 esp_err_t system_ui_create_home_locked(void);
 void system_ui_home_update_locked(void);
-void system_ui_home_set_emote_paused_locked(bool paused);
 void system_ui_delete_home_locked(void);
 void system_ui_load_screen_locked(lv_obj_t *screen);
 

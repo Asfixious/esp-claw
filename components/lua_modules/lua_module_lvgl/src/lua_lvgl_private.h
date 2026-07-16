@@ -26,6 +26,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lauxlib.h"
+#include "lv_eaf.h"
 #include "lvgl.h"
 
 #ifdef __EMSCRIPTEN__
@@ -114,6 +115,7 @@ typedef enum {
     LUA_LVGL_OBJ_TILE,
     LUA_LVGL_OBJ_WINDOW,
     LUA_LVGL_OBJ_WINDOW_CHILD,
+    LUA_LVGL_OBJ_EAF,
 } lua_lvgl_obj_type_t;
 
 /* Forward declaration so lua_lvgl_event_sub_t can hold a back-pointer to
@@ -379,6 +381,20 @@ int lua_lvgl_window_add_title(lua_State *L);
 int lua_lvgl_window_add_button(lua_State *L);
 int lua_lvgl_window_get_header(lua_State *L);
 int lua_lvgl_window_get_content(lua_State *L);
+int lua_lvgl_eaf_set_src(lua_State *L);
+int lua_lvgl_eaf_set_src_data(lua_State *L);
+int lua_lvgl_eaf_restart(lua_State *L);
+int lua_lvgl_eaf_pause(lua_State *L);
+int lua_lvgl_eaf_resume(lua_State *L);
+int lua_lvgl_eaf_is_loaded(lua_State *L);
+int lua_lvgl_eaf_get_loop_count(lua_State *L);
+int lua_lvgl_eaf_set_loop_count(lua_State *L);
+int lua_lvgl_eaf_get_total_frames(lua_State *L);
+int lua_lvgl_eaf_get_current_frame(lua_State *L);
+int lua_lvgl_eaf_set_frame_delay(lua_State *L);
+int lua_lvgl_eaf_get_frame_delay(lua_State *L);
+int lua_lvgl_eaf_set_loop_enabled(lua_State *L);
+int lua_lvgl_eaf_get_loop_enabled(lua_State *L);
 int lua_lvgl_span_set_text(lua_State *L);
 int lua_lvgl_span_get_text(lua_State *L);
 int lua_lvgl_span_set_style(lua_State *L);
@@ -439,6 +455,7 @@ extern const luaL_Reg lua_lvgl_runtime_funcs[];
 extern const luaL_Reg lua_lvgl_core_widget_funcs[];
 extern const luaL_Reg lua_lvgl_extra_widget_funcs[];
 extern const luaL_Reg lua_lvgl_complex_widget_funcs[];
+extern const luaL_Reg lua_lvgl_eaf_module_funcs[];
 extern const luaL_Reg lua_lvgl_event_module_funcs[];
 extern const luaL_Reg lua_lvgl_indev_module_funcs[];
 extern const luaL_Reg lua_lvgl_demo_module_funcs[];

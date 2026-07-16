@@ -157,14 +157,14 @@ Basic widgets:
 - `lvgl.textarea(parent, { text = "..." })`
 - `lvgl.list(parent, opts)`
 - `lvgl.table(parent, opts)`
-- `lvgl.image(parent, { src = "S:/path.bin" })`
+- `lvgl.image(parent, { src = "<your/path/image.bin>" })`
 - `lvgl.line(parent, { points = {{x=0,y=0}, {x=20,y=20}} })`
 - `lvgl.spinner(parent, { anim_ms = 1000, arc_sweep = 60 })`
 - `lvgl.buttonmatrix(parent, { map = {"1", "2", "\n", "3"}, one_checked = true })`
 - `lvgl.calendar(parent, { today = {2026, 5, 15}, shown = {2026, 5}, highlighted = {{2026, 5, 15}} })`
 - `lvgl.canvas(parent, { w = 80, h = 40, color_format = "rgb565" })`
 - `lvgl.chart(parent, { type = "line", point_count = 10, min = 0, max = 100, update_mode = "shift" })`
-- `lvgl.imagebutton(parent, { src = "S:/path.bin" })`
+- `lvgl.imagebutton(parent, { src = "<your/path/image.bin>" })`
 - `lvgl.led(parent, { color = "#00ff00", brightness = 180, on = true })`
 - `lvgl.menu(parent, opts)`
 - `lvgl.msgbox(parent_or_nil, { title = "...", text = "...", buttons = {"OK"}, close_button = true })`
@@ -173,6 +173,7 @@ Basic widgets:
 - `lvgl.tabview(parent, { tab_bar_position = "top", tab_bar_size = 36 })`
 - `lvgl.tileview(parent, opts)`
 - `lvgl.window(parent, opts)`
+- `lvgl.eaf(parent, { src = "<your/path/anim.eaf>", loop_count = -1 })`
 
 Lua index convention:
 - dropdown/roller selected indexes are 1-based
@@ -217,6 +218,34 @@ label:set_style({ font = font })
 - `font:set_size(px)`
 - `font:is_valid()` -> boolean
 - `font:delete()`
+
+## EAF Animation
+
+EAF playback is exposed as an LVGL object:
+
+```lua
+local anim = lvgl.eaf(scr, {
+    src = "<your/path/idle.eaf>",
+    align = "center",
+    loop_count = -1,
+    frame_delay = 100,
+})
+
+if anim:is_loaded() then
+    anim:pause()
+    anim:resume()
+end
+```
+
+Methods:
+- `anim:set_src(path)`
+- `anim:set_src_data(binary_string)`
+- `anim:restart()`, `anim:pause()`, `anim:resume()`
+- `anim:is_loaded()`
+- `anim:get_total_frames()`, `anim:get_current_frame()`
+- `anim:set_loop_count(n)`, `anim:get_loop_count()`
+- `anim:set_loop_enabled(boolean)`, `anim:get_loop_enabled()`
+- `anim:set_frame_delay(ms)`, `anim:get_frame_delay()`
 
 Font paths must be relative to or under the DATA root. The font file must
 remain available while any LVGL object uses the font.

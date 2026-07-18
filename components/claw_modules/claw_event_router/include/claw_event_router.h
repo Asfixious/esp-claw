@@ -34,7 +34,6 @@ typedef struct {
     uint32_t task_stack_size;
     UBaseType_t task_priority;
     BaseType_t task_core;
-    uint32_t agent_submit_timeout_ms;
     bool default_route_messages_to_agent;
     claw_event_router_outbound_resolver_fn outbound_resolver;
     void *outbound_resolver_user_ctx;

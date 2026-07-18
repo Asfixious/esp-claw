@@ -20,6 +20,7 @@
 #include "claw_cap.h"
 #include "claw_task.h"
 #include "claw_event_publisher.h"
+#include "claw_im_session.h"
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_http_client.h"
@@ -749,12 +750,14 @@ static esp_err_t cap_im_wechat_publish_inbound_text(const char *chat_id,
         return ESP_OK;
     }
 
-    return claw_event_router_publish_message("wechat_gateway",
-                                             "wechat",
-                                             chat_id,
-                                             content,
-                                             sender_id,
-                                             message_id);
+    return claw_im_session_publish_message(
+        "wechat_gateway",
+        "wechat",
+        chat_id,
+        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
+        content,
+        sender_id,
+        message_id);
 }
 
 static esp_err_t cap_im_wechat_publish_attachment_event(const char *chat_id,
@@ -2086,8 +2089,6 @@ static esp_err_t cap_im_wechat_send_message_execute(const char *input_json,
     const char *event_type = NULL;
     cap_im_wechat_stage_send_mode_t stage_mode;
     esp_err_t err;
-
-    (void)ctx;
 
     if (!input_json || !output || output_size == 0) {
         return ESP_ERR_INVALID_ARG;

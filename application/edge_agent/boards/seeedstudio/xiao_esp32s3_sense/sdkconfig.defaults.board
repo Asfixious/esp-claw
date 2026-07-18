@@ -17,8 +17,8 @@ CONFIG_SPIRAM_SPEED_80M=y
 # Put WiFi station / LwIP buffers in PSRAM to free ~50 KB of internal RAM.
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
-# FreeRTOS task stacks tagged CLAW_TASK_STACK_PREFER_PSRAM (claw_core,
-# claw_memory, claw_event_router, cap_system, cap_scheduler, cap_im_*,
+# FreeRTOS task stacks tagged CLAW_TASK_STACK_PREFER_PSRAM (agent runtime,
+# claw_event_router, cap_system, cap_scheduler, cap_im_*,
 # cap_lua, ...) must be allowed to use external memory. OCT PSRAM keeps
 # the stack accessible while flash cache is disabled, so leave the default y.
 # Do NOT set CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n (CoreS3 disables it

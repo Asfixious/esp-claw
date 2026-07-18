@@ -20,6 +20,7 @@
 #include "cJSON.h"
 #include "claw_task.h"
 #include "claw_event_publisher.h"
+#include "claw_im_session.h"
 #include "esp_crt_bundle.h"
 #include "esp_attr.h"
 #include "esp_http_client.h"
@@ -677,12 +678,14 @@ static esp_err_t cap_im_qq_publish_inbound_text(const char *chat_id,
         return ESP_OK;
     }
 
-    return claw_event_router_publish_message("qq_gateway",
-                                             "qq",
-                                             chat_id,
-                                             content,
-                                             sender_id,
-                                             message_id);
+    return claw_im_session_publish_message(
+        "qq_gateway",
+        "qq",
+        chat_id,
+        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
+        content,
+        sender_id,
+        message_id);
 }
 
 static esp_err_t cap_im_qq_publish_attachment_event(const char *chat_id,

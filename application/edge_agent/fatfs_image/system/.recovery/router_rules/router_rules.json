@@ -31,7 +31,7 @@
   },
   {
     "id": "im_session_command",
-    "description": "Handle persistent chat session commands when the user sends /session.",
+    "description": "Handle global numeric AgentSystem session commands when the user sends /session.",
     "enabled": true,
     "consume_on_match": true,
     "ack": "{{event.source_channel}} session command handled",
@@ -45,39 +45,9 @@
     "actions": [
       {
         "type": "call_cap",
-        "cap": "session_command",
+        "cap": "agent",
         "input": {
-          "command": "{{match.remainder}}"
-        }
-      },
-      {
-        "type": "send_message",
-        "input": {
-          "channel": "{{event.source_channel}}",
-          "chat_id": "{{event.chat_id}}"
-        }
-      }
-    ]
-  },
-  {
-    "id": "im_llm_command",
-    "description": "Handle LLM configuration commands when the user sends /llm.",
-    "enabled": true,
-    "consume_on_match": true,
-    "ack": "{{event.source_channel}} LLM command handled",
-    "match": {
-      "event_type": "message",
-      "event_key": "text",
-      "content_type": "text",
-      "text": "/llm",
-      "text_match_rule": "prefix"
-    },
-    "actions": [
-      {
-        "type": "call_cap",
-        "cap": "llm_config_command",
-        "input": {
-          "command": "{{match.remainder}}"
+          "message": "{{event.text}}"
         }
       },
       {
@@ -145,53 +115,7 @@
       {
         "type": "run_agent",
         "input": {
-          "target_channel": "{{event.source_channel}}",
-          "session_policy": "chat"
-        }
-      }
-    ]
-  },
-  {
-    "id": "agent_stage_im_notify",
-    "description": "Deliver agent stage progress messages to the original IM chat.",
-    "enabled": true,
-    "consume_on_match": true,
-    "ack": "{{event.source_channel}} agent stage sent",
-    "match": {
-      "source_cap": "claw_core",
-      "event_type": "agent_stage",
-      "content_type": "text"
-    },
-    "actions": [
-      {
-        "type": "send_message",
-        "input": {
-          "event_type": "{{event.event_type}}",
-          "channel": "{{event.source_channel}}",
-          "chat_id": "{{event.chat_id}}",
-          "message": "{{event.text}}"
-        }
-      }
-    ]
-  },
-  {
-    "id": "agent_out_message_send_message",
-    "description": "Deliver agent output messages to the original IM chat.",
-    "enabled": true,
-    "consume_on_match": true,
-    "ack": "{{event.source_channel}} agent output sent",
-    "match": {
-      "source_cap": "claw_core",
-      "event_type": "out_message",
-      "content_type": "text"
-    },
-    "actions": [
-      {
-        "type": "send_message",
-        "input": {
-          "channel": "{{event.source_channel}}",
-          "chat_id": "{{event.chat_id}}",
-          "message": "{{event.text}}"
+          "target_channel": "{{event.source_channel}}"
         }
       }
     ]

@@ -21,6 +21,7 @@
 #include "claw_cap.h"
 #include "claw_task.h"
 #include "claw_event_publisher.h"
+#include "claw_im_session.h"
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_attr.h"
@@ -965,12 +966,14 @@ static esp_err_t cap_im_feishu_publish_inbound_text(const char *chat_id,
         return ESP_OK;
     }
 
-    return claw_event_router_publish_message("feishu_gateway",
-                                             "feishu",
-                                             chat_id,
-                                             content,
-                                             sender_id,
-                                             message_id);
+    return claw_im_session_publish_message(
+        "feishu_gateway",
+        "feishu",
+        chat_id,
+        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
+        content,
+        sender_id,
+        message_id);
 }
 
 static esp_err_t cap_im_feishu_publish_attachment_event(const char *chat_id,
@@ -2998,8 +3001,6 @@ static esp_err_t cap_im_feishu_send_message_execute(const char *input_json,
     const char *chat_id = NULL;
     const char *message = NULL;
     esp_err_t err;
-
-    (void)ctx;
 
     if (!input_json || !output || output_size == 0) {
         return ESP_ERR_INVALID_ARG;

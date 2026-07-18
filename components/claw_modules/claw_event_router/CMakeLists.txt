@@ -6,8 +6,7 @@ idf_component_register(
         "include"
     REQUIRES
         claw_cap
-        claw_core
-        claw_manager
+        claw_utils
         freertos
         console
 )

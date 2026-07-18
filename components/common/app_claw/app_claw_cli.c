@@ -24,9 +24,6 @@
 #if CONFIG_APP_CLAW_CAP_IM_WECHAT
 #include "cmd_cap_im_wechat.h"
 #endif
-#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
-#include "cmd_cap_llm_inspect.h"
-#endif
 #if CONFIG_APP_CLAW_CAP_LUA
 #include "cmd_cap_lua.h"
 #endif
@@ -36,15 +33,11 @@
 #if CONFIG_APP_CLAW_CAP_SCHEDULER
 #include "cmd_cap_scheduler.h"
 #endif
-#if CONFIG_APP_CLAW_CAP_SKILL_MGR
-#include "cmd_cap_skill.h"
-#endif
 #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
 #include "cmd_cap_web_search.h"
 #endif
+#include "claw_agent.h"
 #include "claw_cap.h"
-#include "claw_agent_mgr.h"
-#include "claw_core.h"
 #include "claw_event_publisher.h"
 #include "claw_event_router.h"
 #include "cJSON.h"
@@ -54,8 +47,61 @@
 static const char *TAG = "app_claw_cli";
 static const size_t CAP_OUTPUT_BUF_SIZE = 1024;
 
-static uint32_t s_next_request_id = 1;
-static char s_current_session_id[64] = "default";
+static uint32_t s_current_session_id;
+static uint32_t s_active_turn_id;
+static uint32_t s_pending_input_request_id;
+static uint32_t *s_cli_session_ids;
+static size_t s_cli_session_count;
+static size_t s_cli_session_capacity;
+
+static bool cli_session_is_owned(uint32_t session_id)
+{
+    for (size_t i = 0; i < s_cli_session_count; i++) {
+        if (s_cli_session_ids[i] == session_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static esp_err_t remember_cli_session(uint32_t session_id)
+{
+    uint32_t *resized;
+    size_t next_capacity;
+
+    if (session_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cli_session_is_owned(session_id)) {
+        return ESP_OK;
+    }
+    if (s_cli_session_count == s_cli_session_capacity) {
+        next_capacity = s_cli_session_capacity == 0 ? 4 : s_cli_session_capacity * 2;
+        if (next_capacity < s_cli_session_capacity ||
+                next_capacity > SIZE_MAX / sizeof(*s_cli_session_ids)) {
+            return ESP_ERR_NO_MEM;
+        }
+        resized = realloc(s_cli_session_ids, next_capacity * sizeof(*s_cli_session_ids));
+        if (!resized) {
+            return ESP_ERR_NO_MEM;
+        }
+        s_cli_session_ids = resized;
+        s_cli_session_capacity = next_capacity;
+    }
+    s_cli_session_ids[s_cli_session_count++] = session_id;
+    return ESP_OK;
+}
+
+static void forget_cli_session(uint32_t session_id)
+{
+    for (size_t i = 0; i < s_cli_session_count; i++) {
+        if (s_cli_session_ids[i] == session_id) {
+            s_cli_session_ids[i] = s_cli_session_ids[s_cli_session_count - 1];
+            s_cli_session_count--;
+            return;
+        }
+    }
+}
 
 static char *join_prompt_args(int argc, char **argv)
 {
@@ -115,56 +161,210 @@ static char *join_args_from(int argc, char **argv, int start_index)
     return prompt;
 }
 
-static int submit_and_print(const char *prompt, const char *session_id)
+typedef enum {
+    CLI_TURN_DONE = 0,
+    CLI_TURN_FAILED = 1,
+    CLI_TURN_INPUT_PENDING = 2,
+} cli_turn_result_t;
+
+static esp_err_t create_ephemeral_session(uint32_t *out_session_id)
 {
-    claw_core_response_t response = {0};
-    uint32_t request_id = 0;
     esp_err_t err;
 
-    if (session_id && session_id[0]) {
-        printf("Submitting request %" PRIu32 " [session=%s]...\n",
-               s_next_request_id,
-               session_id);
-    } else {
-        printf("Submitting request %" PRIu32 " [single-turn]...\n", s_next_request_id);
+    if (!out_session_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    err = claw_agent_session_create(CLAW_AGENT_SESSION_PERSISTENCE_EPHEMERAL,
+                                    out_session_id);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = claw_agent_session_open(*out_session_id);
+    if (err != ESP_OK) {
+        claw_agent_session_delete(*out_session_id);
+        *out_session_id = 0;
+    }
+    return err;
+}
+
+static esp_err_t close_session_stream(uint32_t session_id)
+{
+    esp_err_t err;
+
+    if (session_id == 0) {
+        return ESP_OK;
+    }
+    err = claw_agent_session_close(session_id);
+    if (err != ESP_OK) {
+        return err;
     }
 
-    if (!app_claw_get_core()) {
-        printf("claw_core is not ready\n");
-        return 1;
-    }
+    for (int i = 0; i < 20; i++) {
+        claw_agent_event_t event = {0};
 
-    err = claw_agent_mgr_submit_root_text(prompt,
-                                          session_id,
-                                          CLAW_CORE_REQUEST_FLAG_PUBLISH_STAGE_MESSAGE,
-                                          5000,
-                                          &request_id);
+        err = claw_agent_session_receive(session_id, &event, 250);
+        if (err == ESP_ERR_TIMEOUT) {
+            continue;
+        }
+        if (err != ESP_OK) {
+            return err;
+        }
+        bool closed = event.kind == CLAW_AGENT_EVENT_KIND_CLOSED;
+        claw_agent_event_free(&event);
+        if (closed) {
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t create_cli_session(uint32_t *out_session_id)
+{
+    esp_err_t err = create_ephemeral_session(out_session_id);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = remember_cli_session(*out_session_id);
+    if (err != ESP_OK) {
+        close_session_stream(*out_session_id);
+        claw_agent_session_delete(*out_session_id);
+        *out_session_id = 0;
+    }
+    return err;
+}
+
+static esp_err_t ensure_current_session(void)
+{
+    esp_err_t err;
+
+    if (s_current_session_id != 0) {
+        return ESP_OK;
+    }
+    err = create_cli_session(&s_current_session_id);
+    if (err == ESP_OK) {
+        printf("Created ephemeral session %" PRIu32 "\n", s_current_session_id);
+    }
+    return err;
+}
+
+static cli_turn_result_t receive_and_print(uint32_t session_id, bool track_input)
+{
+    uint32_t target_turn_id = track_input ? s_active_turn_id : 0;
+    bool output_open = false;
+    bool saw_error = false;
+
+    while (true) {
+        claw_agent_event_t event = {0};
+        esp_err_t err = claw_agent_session_receive(session_id, &event, 130000);
+
+        if (err != ESP_OK) {
+            printf("receive failed: %s\n", esp_err_to_name(err));
+            return CLI_TURN_FAILED;
+        }
+
+        switch (event.kind) {
+        case CLAW_AGENT_EVENT_KIND_TURN_STARTED:
+            if (event.data.turn_started.origin == CLAW_AGENT_TURN_ORIGIN_USER &&
+                    target_turn_id == 0) {
+                target_turn_id = event.data.turn_started.turn_id;
+                if (track_input) {
+                    s_active_turn_id = target_turn_id;
+                }
+            }
+            break;
+        case CLAW_AGENT_EVENT_KIND_OUTPUT_DELTA:
+            if (!output_open) {
+                printf("\nassistant> ");
+                output_open = true;
+            }
+            printf("%s", event.data.text_delta.text ? event.data.text_delta.text : "");
+            fflush(stdout);
+            break;
+        case CLAW_AGENT_EVENT_KIND_OUTPUT_END:
+            if (output_open) {
+                printf("\n");
+                output_open = false;
+            }
+            break;
+        case CLAW_AGENT_EVENT_KIND_TOOL_CALL:
+            if (output_open) {
+                printf("\n");
+                output_open = false;
+            }
+            printf("[tool] %s\n",
+                   event.data.tool_call.name ? event.data.tool_call.name : "unknown");
+            break;
+        case CLAW_AGENT_EVENT_KIND_INPUT_REQUESTED:
+            if (output_open) {
+                printf("\n");
+                output_open = false;
+            }
+            printf("input requested id=%" PRIu32 ": %s\n",
+                   event.data.input_requested.request_id,
+                   event.data.input_requested.summary ? event.data.input_requested.summary : "");
+            if (track_input) {
+                s_pending_input_request_id = event.data.input_requested.request_id;
+                printf("Use: respond <answer>\n");
+            }
+            claw_agent_event_free(&event);
+            return CLI_TURN_INPUT_PENDING;
+        case CLAW_AGENT_EVENT_KIND_ERROR:
+            if (output_open) {
+                printf("\n");
+                output_open = false;
+            }
+            printf("error> %s\n", event.data.error.message ? event.data.error.message : "unknown");
+            saw_error = true;
+            break;
+        case CLAW_AGENT_EVENT_KIND_TURN_ENDED:
+            if (target_turn_id != 0 && event.data.turn_ended.turn_id == target_turn_id) {
+                if (output_open) {
+                    printf("\n");
+                }
+                if (track_input) {
+                    s_active_turn_id = 0;
+                    s_pending_input_request_id = 0;
+                }
+                claw_agent_event_free(&event);
+                return saw_error ? CLI_TURN_FAILED : CLI_TURN_DONE;
+            }
+            break;
+        case CLAW_AGENT_EVENT_KIND_CLOSED:
+            if (track_input && s_current_session_id == session_id) {
+                s_current_session_id = 0;
+                s_active_turn_id = 0;
+                s_pending_input_request_id = 0;
+            }
+            claw_agent_event_free(&event);
+            printf("session closed\n");
+            return CLI_TURN_FAILED;
+        default:
+            break;
+        }
+        claw_agent_event_free(&event);
+    }
+}
+
+static cli_turn_result_t submit_and_print(const char *prompt,
+                                          uint32_t session_id,
+                                          bool track_input)
+{
+    esp_err_t err;
+
+    printf("Submitting [session=%" PRIu32 "]...\n", session_id);
+    err = claw_agent_session_submit(session_id, prompt);
     if (err != ESP_OK) {
         printf("submit failed: %s\n", esp_err_to_name(err));
-        return 1;
+        return CLI_TURN_FAILED;
     }
-    s_next_request_id = request_id + 1;
-
-    err = claw_agent_mgr_receive_root_for(request_id, &response, 130000);
-    if (err != ESP_OK) {
-        printf("receive failed: %s\n", esp_err_to_name(err));
-        return 1;
-    }
-
-    if (response.status == CLAW_CORE_RESPONSE_STATUS_OK && response.text) {
-        printf("\nassistant> %s\n\n", response.text);
-    } else {
-        printf("\nerror> %s\n\n",
-               response.error_message ? response.error_message : "unknown error");
-    }
-
-    claw_core_response_free(&response);
-    return 0;
+    return receive_and_print(session_id, track_input);
 }
 
 static int cmd_ask(int argc, char **argv)
 {
     char *prompt = NULL;
+    esp_err_t err;
 
     if (argc < 2) {
         printf("Usage: ask <prompt>\n");
@@ -177,7 +377,14 @@ static int cmd_ask(int argc, char **argv)
         return 1;
     }
 
-    argc = submit_and_print(prompt, s_current_session_id);
+    err = ensure_current_session();
+    if (err != ESP_OK) {
+        printf("session create failed: %s\n", esp_err_to_name(err));
+        free(prompt);
+        return 1;
+    }
+
+    argc = submit_and_print(prompt, s_current_session_id, true) == CLI_TURN_FAILED;
     free(prompt);
     return argc;
 }
@@ -185,6 +392,9 @@ static int cmd_ask(int argc, char **argv)
 static int cmd_ask_once(int argc, char **argv)
 {
     char *prompt = NULL;
+    uint32_t session_id = 0;
+    cli_turn_result_t turn_result;
+    esp_err_t err;
     int rc;
 
     if (argc < 2) {
@@ -198,31 +408,142 @@ static int cmd_ask_once(int argc, char **argv)
         return 1;
     }
 
-    rc = submit_and_print(prompt, NULL);
+    err = create_ephemeral_session(&session_id);
+    if (err != ESP_OK) {
+        printf("session create failed: %s\n", esp_err_to_name(err));
+        free(prompt);
+        return 1;
+    }
+
+    turn_result = submit_and_print(prompt, session_id, false);
+    if (turn_result == CLI_TURN_INPUT_PENDING) {
+        printf("ask_once cannot leave an input request pending; cancelling turn\n");
+        claw_agent_session_cancel(session_id);
+    }
+    rc = turn_result == CLI_TURN_DONE ? 0 : 1;
+    err = close_session_stream(session_id);
+    if (err != ESP_OK) {
+        printf("session close failed: %s\n", esp_err_to_name(err));
+        rc = 1;
+    }
+    err = claw_agent_session_delete(session_id);
+    if (err != ESP_OK) {
+        printf("session delete failed: %s\n", esp_err_to_name(err));
+        rc = 1;
+    }
     free(prompt);
     return rc;
 }
 
+static bool parse_session_id(const char *value, uint32_t *out_session_id)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || !value[0] || !out_session_id) {
+        return false;
+    }
+    parsed = strtoul(value, &end, 10);
+    if (!end || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+        return false;
+    }
+    *out_session_id = (uint32_t)parsed;
+    return true;
+}
+
 static int cmd_session(int argc, char **argv)
 {
+    uint32_t next_session_id = 0;
+    uint32_t previous_session_id = s_current_session_id;
+    bool created_new = false;
+    esp_err_t err;
+
     if (argc == 1) {
-        printf("Current session: %s\n", s_current_session_id);
+        if (s_current_session_id == 0) {
+            printf("Current session: none (next ask creates an ephemeral session)\n");
+        } else {
+            printf("Current session: %" PRIu32 " (ephemeral)\n", s_current_session_id);
+        }
         return 0;
     }
 
     if (argc != 2) {
-        printf("Usage: session [id]\n");
+        printf("Usage: session [new|id]\n");
         return 1;
     }
 
-    if (argv[1][0] == '\0') {
-        printf("session id cannot be empty\n");
+    if (strcmp(argv[1], "new") == 0) {
+        err = create_cli_session(&next_session_id);
+        created_new = err == ESP_OK;
+    } else if (parse_session_id(argv[1], &next_session_id)) {
+        if (next_session_id == previous_session_id) {
+            printf("Current session: %" PRIu32 "\n", s_current_session_id);
+            return 0;
+        }
+        if (!cli_session_is_owned(next_session_id)) {
+            printf("session %" PRIu32 " is not a CLI-created ephemeral session\n",
+                   next_session_id);
+            return 1;
+        }
+        err = claw_agent_session_open(next_session_id);
+    } else {
+        printf("session id must be a non-zero integer or 'new'\n");
+        return 1;
+    }
+    if (err != ESP_OK) {
+        printf("session open failed: %s\n", esp_err_to_name(err));
         return 1;
     }
 
-    strlcpy(s_current_session_id, argv[1], sizeof(s_current_session_id));
-    printf("Switched session to: %s\n", s_current_session_id);
+    if (previous_session_id != 0) {
+        err = close_session_stream(previous_session_id);
+        if (err != ESP_OK) {
+            printf("current session close failed: %s\n", esp_err_to_name(err));
+            close_session_stream(next_session_id);
+            if (created_new) {
+                claw_agent_session_delete(next_session_id);
+                forget_cli_session(next_session_id);
+            }
+            return 1;
+        }
+    }
+
+    s_current_session_id = next_session_id;
+    s_active_turn_id = 0;
+    s_pending_input_request_id = 0;
+    printf("Switched to session: %" PRIu32 "\n", s_current_session_id);
     return 0;
+}
+
+static int cmd_respond(int argc, char **argv)
+{
+    char *response = NULL;
+    esp_err_t err;
+
+    if (argc < 2) {
+        printf("Usage: respond <answer>\n");
+        return 1;
+    }
+    if (s_current_session_id == 0 || s_pending_input_request_id == 0) {
+        printf("No pending input request\n");
+        return 1;
+    }
+
+    response = join_prompt_args(argc, argv);
+    if (!response) {
+        printf("Out of memory\n");
+        return 1;
+    }
+    err = claw_agent_session_respond(s_current_session_id,
+                                     s_pending_input_request_id,
+                                     response);
+    free(response);
+    if (err != ESP_OK) {
+        printf("respond failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    s_pending_input_request_id = 0;
+    return receive_and_print(s_current_session_id, true) == CLI_TURN_FAILED;
 }
 
 static int cmd_cap_list(int argc, char **argv)
@@ -254,16 +575,20 @@ static int cmd_cap_list(int argc, char **argv)
 static int cmd_cap_call(int argc, char **argv)
 {
     char *output = NULL;
+    char session_id[16] = {0};
     esp_err_t err;
     claw_cap_call_context_t ctx = {
         .caller = CLAW_CAP_CALLER_CONSOLE,
-        .session_id = s_current_session_id,
-        .core = app_claw_get_core(),
     };
 
     if (argc < 3) {
         printf("Usage: cap_call <name> <json>\n");
         return 1;
+    }
+
+    if (s_current_session_id != 0) {
+        snprintf(session_id, sizeof(session_id), "%" PRIu32, s_current_session_id);
+        ctx.session_id = session_id;
     }
 
     {
@@ -710,17 +1035,11 @@ static void register_cap_cli_commands(void)
 #if CONFIG_APP_CLAW_CAP_LUA
     register_cap_lua();
 #endif
-#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
-    register_cap_llm_inspect();
-#endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     register_cap_router_mgr();
 #endif
 #if CONFIG_APP_CLAW_CAP_SCHEDULER
     register_cap_scheduler();
-#endif
-#if CONFIG_APP_CLAW_CAP_SKILL_MGR
-    register_cap_skill();
 #endif
 #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
     register_cap_web_search();
@@ -777,10 +1096,19 @@ esp_err_t app_claw_cli_start(void)
     {
         esp_console_cmd_t session_cmd = {
             .command = "session",
-            .help = "Show or switch the current session: session [id]",
+            .help = "Show, create, or switch numeric sessions: session [new|id]",
             .func = cmd_session,
         };
         ESP_ERROR_CHECK(esp_console_cmd_register(&session_cmd));
+    }
+
+    {
+        esp_console_cmd_t respond_cmd = {
+            .command = "respond",
+            .help = "Respond to the current agent input request: respond <answer>",
+            .func = cmd_respond,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&respond_cmd));
     }
 
     {

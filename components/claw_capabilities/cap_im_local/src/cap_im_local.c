@@ -14,6 +14,7 @@
 #include "cJSON.h"
 #include "claw_cap.h"
 #include "claw_event_publisher.h"
+#include "claw_im_session.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -430,12 +431,14 @@ esp_err_t cap_im_local_emit_user_message(const char *channel,
         if (!has_text) {
             return ESP_ERR_INVALID_ARG;
         }
-        return claw_event_router_publish_message("local_gateway",
-                                                 resolved_channel,
-                                                 chat_id,
-                                                 text,
-                                                 resolved_sender_id,
-                                                 resolved_message_id);
+        return claw_im_session_publish_message(
+            "local_gateway",
+            resolved_channel,
+            chat_id,
+            CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
+            text,
+            resolved_sender_id,
+            resolved_message_id);
     }
 
     combined = calloc(1, CAP_IM_LOCAL_EMIT_COMBINED_MAX);
@@ -478,12 +481,14 @@ esp_err_t cap_im_local_emit_user_message(const char *channel,
              combined,
              strlen(combined) > 80 ? "..." : "");
 
-    err = claw_event_router_publish_message("local_gateway",
-                                            resolved_channel,
-                                            chat_id,
-                                            combined,
-                                            resolved_sender_id,
-                                            resolved_message_id);
+    err = claw_im_session_publish_message(
+        "local_gateway",
+        resolved_channel,
+        chat_id,
+        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
+        combined,
+        resolved_sender_id,
+        resolved_message_id);
     free(combined);
     return err;
 }

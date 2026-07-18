@@ -17,10 +17,7 @@
 #include <sys/types.h>
 
 #include "cJSON.h"
-#include "claw_agent_mgr.h"
-#include "claw_core.h"
 #include "claw_event_publisher.h"
-#include "claw_session_mgr.h"
 #include "claw_task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -37,7 +34,6 @@ static const char *TAG = "claw_event_router";
 #define CLAW_EVENT_ROUTER_DEFAULT_QUEUE_LEN          6
 #define CLAW_EVENT_ROUTER_DEFAULT_STACK            8192
 #define CLAW_EVENT_ROUTER_DEFAULT_PRIO               5
-#define CLAW_EVENT_ROUTER_DEFAULT_SUBMIT          1000
 #define CLAW_EVENT_ROUTER_ID_SIZE                  64
 #define CLAW_EVENT_ROUTER_DESC_SIZE               160
 #define CLAW_EVENT_ROUTER_ACK_SIZE                256
@@ -75,7 +71,6 @@ typedef struct {
     SemaphoreHandle_t mutex;
     QueueHandle_t event_queue;
     TaskHandle_t task_handle;
-    uint32_t next_request_id;
     char rules_path[192];
     size_t max_rules;
     size_t max_actions_per_rule;
@@ -112,7 +107,6 @@ static void claw_event_router_init_defaults(claw_event_router_runtime_t *runtime
     runtime->max_rules = CLAW_EVENT_ROUTER_DEFAULT_MAX_RULES;
     runtime->max_actions_per_rule = CLAW_EVENT_ROUTER_DEFAULT_MAX_ACTIONS;
     runtime->cap_output_size = CLAW_EVENT_ROUTER_DEFAULT_OUTPUT_SIZE;
-    runtime->next_request_id = 1000000;
 }
 
 static void claw_event_router_free_runtime(void)
@@ -1267,6 +1261,8 @@ static cJSON *claw_event_router_build_event_context(const claw_event_t *event)
     cJSON_AddStringToObject(event_obj, "message_id", event->message_id);
     cJSON_AddStringToObject(event_obj, "correlation_id", event->correlation_id);
     cJSON_AddStringToObject(event_obj, "content_type", event->content_type);
+    cJSON_AddNumberToObject(event_obj, "session_id", (double)event->session_id);
+    cJSON_AddNumberToObject(event_obj, "request_id", (double)event->request_id);
     cJSON_AddStringToObject(event_obj, "session_policy",
                             claw_event_session_policy_to_string(event->session_policy));
     cJSON_AddNumberToObject(event_obj, "timestamp_ms", (double)event->timestamp_ms);
@@ -1501,29 +1497,6 @@ static cJSON *claw_event_router_render_json(const cJSON *input, const cJSON *ctx
     return cJSON_Duplicate((cJSON *)input, 1);
 }
 
-static esp_err_t claw_event_router_prepare_session_id(const claw_event_t *event,
-                                                              char *buf,
-                                                              size_t buf_size,
-                                                              size_t *out_len)
-{
-    claw_session_build_context_t ctx = {0};
-
-    if (!event || !buf || buf_size == 0 || !out_len) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    ctx.agent_id = 0;
-    ctx.session_policy = event->session_policy;
-    ctx.source_cap = event->source_cap;
-    ctx.event_type = event->event_type;
-    ctx.source_channel = event->source_channel;
-    ctx.chat_id = event->chat_id;
-    ctx.message_id = event->message_id;
-    ctx.event_id = event->event_id;
-
-    return claw_session_mgr_build_session_id(&ctx, buf, buf_size, out_len);
-}
-
 static esp_err_t claw_event_router_default_outbound_resolver(const claw_event_t *event,
                                                              const char *target_channel,
                                                              const char *target_endpoint,
@@ -1660,8 +1633,6 @@ static esp_err_t claw_event_router_execute_cap_action(
     cJSON *rendered_input = NULL;
     char *input_json = NULL;
     char *output = NULL;
-    char session_id[CLAW_SESSION_MGR_ID_SIZE] = {0};
-    size_t session_id_len = 0;
     claw_cap_call_context_t call_ctx = {0};
     esp_err_t err = ESP_OK;
 
@@ -1691,16 +1662,6 @@ static esp_err_t claw_event_router_execute_cap_action(
     call_ctx.chat_id = event->chat_id;
     call_ctx.target_channel = event->target_channel[0] ? event->target_channel : event->source_channel;
     call_ctx.target_chat_id = event->target_endpoint[0] ? event->target_endpoint : event->chat_id;
-    err = claw_event_router_prepare_session_id(event, session_id, sizeof(session_id), &session_id_len);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to build cap action session id: %s", esp_err_to_name(err));
-        free(input_json);
-        free(output);
-        return err;
-    }
-    if (session_id_len > 0) {
-        call_ctx.session_id = session_id;
-    }
     call_ctx.source_cap = "claw_event_router";
     call_ctx.correlation_id = event->correlation_id[0] ? event->correlation_id : event->message_id;
     call_ctx.caller = action->caller;
@@ -1736,6 +1697,98 @@ static esp_err_t claw_event_router_execute_cap_action(
     return err;
 }
 
+static esp_err_t claw_event_router_prepare_agent_input(cJSON *input,
+                                                       const claw_event_t *event)
+{
+    cJSON *session;
+    cJSON *agent_input;
+    cJSON *control;
+    const cJSON *message_item;
+    const cJSON *session_id;
+    const cJSON *request_id;
+    const char *message;
+    const char *session_action;
+    bool uses_event_session = false;
+
+    if (!cJSON_IsObject(input) || !event) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    session = cJSON_GetObjectItemCaseSensitive(input, "session");
+    agent_input = cJSON_GetObjectItemCaseSensitive(input, "input");
+    control = cJSON_GetObjectItemCaseSensitive(input, "control");
+    message_item = cJSON_GetObjectItemCaseSensitive(input, "message");
+    if (message_item && !cJSON_IsString(message_item)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    message = cJSON_GetStringValue(message_item);
+    if (session && !cJSON_IsObject(session)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    session_action = cJSON_GetStringValue(
+        session ? cJSON_GetObjectItemCaseSensitive(session, "action") : NULL);
+    if (session_action) {
+        return (agent_input || control || message) ? ESP_ERR_INVALID_ARG : ESP_OK;
+    }
+    session_id = session ?
+                 cJSON_GetObjectItemCaseSensitive(session, "session_id") : NULL;
+
+    if (!session_id) {
+        if (event->session_id == 0 || message) {
+            return event->session_id == 0 ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_ARG;
+        }
+        if (!session) {
+            session = cJSON_CreateObject();
+            if (!session || !cJSON_AddItemToObject(input, "session", session)) {
+                cJSON_Delete(session);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        if (!cJSON_AddNumberToObject(session,
+                                    "session_id",
+                                    (double)event->session_id)) {
+            return ESP_ERR_NO_MEM;
+        }
+        uses_event_session = true;
+    }
+
+    if (message) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (control) {
+        return agent_input ? ESP_ERR_INVALID_ARG : ESP_OK;
+    }
+    if (!agent_input) {
+        agent_input = cJSON_CreateObject();
+        if (!agent_input || !cJSON_AddItemToObject(input, "input", agent_input)) {
+            cJSON_Delete(agent_input);
+            return ESP_ERR_NO_MEM;
+        }
+    } else if (!cJSON_IsObject(agent_input)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    request_id = cJSON_GetObjectItemCaseSensitive(agent_input, "request_id");
+    if (uses_event_session) {
+        if (request_id) {
+            if (!cJSON_IsNumber(request_id) ||
+                    request_id->valuedouble != (double)event->request_id) {
+                return ESP_ERR_INVALID_ARG;
+            }
+        } else if (event->request_id != 0 &&
+                   !cJSON_AddNumberToObject(agent_input,
+                                           "request_id",
+                                           (double)event->request_id)) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!cJSON_GetObjectItemCaseSensitive(agent_input, "text") &&
+            !cJSON_AddStringToObject(agent_input,
+                                    "text",
+                                    event->text ? event->text : "")) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t claw_event_router_execute_agent_action(
     const claw_event_router_rule_t *rule,
     const claw_event_router_action_t *action,
@@ -1745,13 +1798,18 @@ static esp_err_t claw_event_router_execute_agent_action(
 {
     cJSON *input_root = NULL;
     cJSON *rendered_input = NULL;
-    const char *text = NULL;
+    cJSON *session = NULL;
+    cJSON *session_id_item = NULL;
+    cJSON *input = NULL;
+    cJSON *request_id_item = NULL;
+    char *agent_input_json = NULL;
     const char *target_channel = NULL;
     const char *target_chat_id = NULL;
-    const char *session_policy = NULL;
-    claw_event_t agent_event = {0};
-    claw_agent_mgr_root_input_t agent_input = {0};
-    char submit_output[32] = {0};
+    char target_channel_buf[CLAW_EVENT_ROUTER_FIELD_SIZE] = {0};
+    char target_chat_id_buf[CLAW_EVENT_ROUTER_FIELD_SIZE] = {0};
+    char session_id_buf[16] = {0};
+    claw_cap_call_context_t call_ctx = {0};
+    char *agent_output = NULL;
     esp_err_t err;
 
     input_root = cJSON_Parse(action->input_json);
@@ -1765,46 +1823,82 @@ static esp_err_t claw_event_router_execute_agent_action(
         return ESP_ERR_NO_MEM;
     }
 
-    text = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "text"));
     target_channel = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "target_channel"));
     target_chat_id = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "target_chat_id"));
-    session_policy = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "session_policy"));
+    if (!target_channel || !target_channel[0]) {
+        target_channel = event->target_channel[0] ? event->target_channel : event->source_channel;
+    }
+    if (!target_chat_id || !target_chat_id[0]) {
+        target_chat_id = event->target_endpoint[0] ? event->target_endpoint : event->chat_id;
+    }
+    strlcpy(target_channel_buf, target_channel ? target_channel : "", sizeof(target_channel_buf));
+    strlcpy(target_chat_id_buf, target_chat_id ? target_chat_id : "", sizeof(target_chat_id_buf));
+    cJSON_DeleteItemFromObjectCaseSensitive(rendered_input, "target_channel");
+    cJSON_DeleteItemFromObjectCaseSensitive(rendered_input, "target_chat_id");
+    cJSON_DeleteItemFromObjectCaseSensitive(rendered_input, "session_policy");
 
-    agent_event = *event;
-    if (session_policy && session_policy[0]) {
-        claw_event_router_parse_session_policy(session_policy, &agent_event.session_policy);
+    err = claw_event_router_prepare_agent_input(rendered_input, event);
+    if (err != ESP_OK) {
+        if (result) {
+            result->action_count++;
+            result->failed_actions++;
+            result->last_error = err;
+        }
+        cJSON_Delete(rendered_input);
+        return err;
+    }
+    session = cJSON_GetObjectItemCaseSensitive(rendered_input, "session");
+    session_id_item = cJSON_GetObjectItemCaseSensitive(session, "session_id");
+    if (cJSON_IsNumber(session_id_item) && session_id_item->valuedouble > 0) {
+        snprintf(session_id_buf,
+                 sizeof(session_id_buf),
+                 "%.0f",
+                 session_id_item->valuedouble);
+    }
+    input = cJSON_GetObjectItemCaseSensitive(rendered_input, "input");
+    request_id_item = cJSON_GetObjectItemCaseSensitive(input, "request_id");
+
+    agent_input_json = cJSON_PrintUnformatted(rendered_input);
+    if (!agent_input_json) {
+        cJSON_Delete(rendered_input);
+        return ESP_ERR_NO_MEM;
+    }
+    agent_output = calloc(1, s_runtime->cap_output_size);
+    if (!agent_output) {
+        free(agent_input_json);
+        cJSON_Delete(rendered_input);
+        return ESP_ERR_NO_MEM;
     }
 
-    agent_input.session_policy = agent_event.session_policy;
-    agent_input.flags = CLAW_CORE_REQUEST_FLAG_PUBLISH_OUT_MESSAGE |
-                        CLAW_CORE_REQUEST_FLAG_PUBLISH_STAGE_MESSAGE |
-                        CLAW_CORE_REQUEST_FLAG_SKIP_RESPONSE_QUEUE |
-                        CLAW_CORE_REQUEST_FLAG_USER_INTERRUPT;
-    agent_input.request_id = s_runtime->next_request_id++;
-    agent_input.user_text = (text && text[0]) ? text : (event->text ? event->text : "");
-    agent_input.source_cap = event->source_cap;
-    agent_input.event_type = event->event_type;
-    agent_input.source_channel = event->source_channel;
-    agent_input.source_chat_id = event->chat_id;
-    agent_input.source_sender_id = event->sender_id;
-    agent_input.source_message_id = event->message_id;
-    agent_input.event_id = event->event_id;
-    agent_input.target_channel = (target_channel && target_channel[0]) ? target_channel : event->source_channel;
-    agent_input.target_chat_id = (target_chat_id && target_chat_id[0]) ? target_chat_id : event->chat_id;
-
-    err = claw_agent_mgr_submit_root(&agent_input,
-                                     s_runtime->config.agent_submit_timeout_ms);
+    call_ctx.request_id = cJSON_IsNumber(request_id_item) ?
+                          (uint32_t)request_id_item->valuedouble : 0;
+    call_ctx.session_id = session_id_buf[0] ? session_id_buf : NULL;
+    call_ctx.channel = event->source_channel;
+    call_ctx.chat_id = event->chat_id;
+    call_ctx.target_channel = target_channel_buf;
+    call_ctx.target_chat_id = target_chat_id_buf;
+    call_ctx.source_cap = "claw_event_router";
+    call_ctx.correlation_id = event->correlation_id[0] ? event->correlation_id : event->message_id;
+    call_ctx.caller = CLAW_CAP_CALLER_SYSTEM;
+    err = claw_cap_call("agent",
+                        agent_input_json,
+                        &call_ctx,
+                        agent_output,
+                        s_runtime->cap_output_size);
+    free(agent_input_json);
 
     if (err == ESP_OK) {
-        snprintf(submit_output, sizeof(submit_output), "request_id=%" PRIu32, agent_input.request_id);
         claw_event_router_update_last_output(ctx,
                                              "agent",
-                                             agent_input.target_channel,
-                                             "submitted",
-                                             submit_output);
+                                             target_channel_buf,
+                                             "ok",
+                                             agent_output);
     } else {
-        claw_event_router_update_last_output(ctx, "agent", agent_input.target_channel, "error",
-                                             esp_err_to_name(err));
+        claw_event_router_update_last_output(ctx,
+                                             "agent",
+                                             target_channel_buf,
+                                             "error",
+                                             agent_output[0] ? agent_output : esp_err_to_name(err));
     }
 
     if (result) {
@@ -1819,6 +1913,7 @@ static esp_err_t claw_event_router_execute_agent_action(
         ESP_LOGW(TAG, "Rule %s agent action failed: %s", rule->id, esp_err_to_name(err));
     }
 
+    free(agent_output);
     cJSON_Delete(rendered_input);
     return err;
 }
@@ -2369,9 +2464,6 @@ esp_err_t claw_event_router_start(void)
     priority = s_runtime->config.task_priority ?
                s_runtime->config.task_priority : CLAW_EVENT_ROUTER_DEFAULT_PRIO;
     core = s_runtime->config.task_core;
-    s_runtime->config.agent_submit_timeout_ms = s_runtime->config.agent_submit_timeout_ms ?
-                                                s_runtime->config.agent_submit_timeout_ms :
-                                                CLAW_EVENT_ROUTER_DEFAULT_SUBMIT;
     s_runtime->stop_requested = false;
 
     task_ok = claw_task_create(&(claw_task_config_t){
@@ -2523,6 +2615,16 @@ esp_err_t claw_event_router_publish(const claw_event_t *event)
     return ESP_OK;
 }
 
+static esp_err_t claw_event_router_publish_message_internal(
+    const char *source_cap,
+    const char *channel,
+    const char *chat_id,
+    uint32_t session_id,
+    uint32_t request_id,
+    const char *text,
+    const char *sender_id,
+    const char *message_id);
+
 esp_err_t claw_event_router_publish_message(const char *source_cap,
                                             const char *channel,
                                             const char *chat_id,
@@ -2530,9 +2632,52 @@ esp_err_t claw_event_router_publish_message(const char *source_cap,
                                             const char *sender_id,
                                             const char *message_id)
 {
+    return claw_event_router_publish_message_internal(source_cap,
+                                                      channel,
+                                                      chat_id,
+                                                      0,
+                                                      0,
+                                                      text,
+                                                      sender_id,
+                                                      message_id);
+}
+
+esp_err_t claw_event_router_publish_session_message(const char *source_cap,
+                                                     const char *channel,
+                                                     const char *chat_id,
+                                                     uint32_t session_id,
+                                                     uint32_t request_id,
+                                                     const char *text,
+                                                     const char *sender_id,
+                                                     const char *message_id)
+{
+    if (session_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return claw_event_router_publish_message_internal(source_cap,
+                                                      channel,
+                                                      chat_id,
+                                                      session_id,
+                                                      request_id,
+                                                      text,
+                                                      sender_id,
+                                                      message_id);
+}
+
+static esp_err_t claw_event_router_publish_message_internal(
+    const char *source_cap,
+    const char *channel,
+    const char *chat_id,
+    uint32_t session_id,
+    uint32_t request_id,
+    const char *text,
+    const char *sender_id,
+    const char *message_id)
+{
     claw_event_t event = {0};
 
-    if (!source_cap || !channel || !chat_id || !text) {
+    if (!source_cap || !channel || !chat_id || !text ||
+            (session_id == 0 && request_id != 0)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -2549,6 +2694,8 @@ esp_err_t claw_event_router_publish_message(const char *source_cap,
         strlcpy(event.correlation_id, message_id, sizeof(event.correlation_id));
     }
     event.timestamp_ms = claw_event_router_now_ms();
+    event.session_id = session_id;
+    event.request_id = request_id;
     event.session_policy = CLAW_SESSION_POLICY_CHAT;
     snprintf(event.event_id, sizeof(event.event_id), "msg-%" PRId64, event.timestamp_ms);
     event.text = (char *)text;

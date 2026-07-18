@@ -5,7 +5,7 @@ idf_component_register(
         "include"
     REQUIRES
         claw_cap
-        claw_core
+        claw_utils
         esp_netif
         esp_wifi
     PRIV_REQUIRES

@@ -40,6 +40,7 @@ idf_component_register(
         claw_cap
         claw_utils
         claw_event_router
+        claw_im_session
         esp_http_client
         http_reuse
         esp_event

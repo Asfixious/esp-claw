@@ -468,7 +468,6 @@ static esp_err_t cap_scheduler_publish_entry_locked(cap_scheduler_entry_t *entry
     if (!cap_scheduler_parse_session_policy_local(entry->item.session_policy, &event.session_policy)) {
         event.session_policy = CLAW_SESSION_POLICY_TRIGGER;
     }
-
     entry->status = CAP_SCHEDULER_STATUS_RUNNING;
     publish_err = s_cap_scheduler.config.publish_event(&event);
     err = publish_err;

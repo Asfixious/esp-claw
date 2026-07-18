@@ -6,6 +6,7 @@ idf_component_register(
     REQUIRES
         claw_cap
         claw_event_router
+        claw_im_session
         esp_timer
         freertos
         console

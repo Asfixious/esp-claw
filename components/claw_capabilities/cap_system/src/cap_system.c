@@ -15,8 +15,8 @@
 
 #include "cJSON.h"
 #include "claw_cap.h"
-#include "claw_version.h"
 #include "claw_task.h"
+#include "claw_version.h"
 #include "esp_check.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -459,7 +459,7 @@ static cJSON *cap_system_build_version_json(void)
         return NULL;
     }
 
-    // ESP-Claw comes from claw_core; Edge Agent comes from ESP-IDF PROJECT_VER embedded in esp_app_desc.
+    // ESP-Claw comes from the runtime component; Edge Agent comes from ESP-IDF PROJECT_VER.
     cJSON_AddStringToObject(root, "esp_claw", claw_get_version());
     cJSON_AddStringToObject(root, "esp_claw_git", claw_get_git_version());
     cJSON_AddStringToObject(root, "edge_agent", esp_app_get_description()->version);

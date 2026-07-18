@@ -1,1 +1,5 @@
-dependencies: {}
+dependencies:
+  claw_im_session:
+    path: ../../claw_modules/claw_im_session
+  runtime:
+    path: ../../../framework/runtime

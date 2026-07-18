@@ -9,7 +9,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "claw_core.h"
 #include "esp_err.h"
 #ifdef __cplusplus
 extern "C" {
@@ -58,21 +57,8 @@ typedef struct {
     const char *target_chat_id;
     const char *source_cap;
     const char *correlation_id;
-    claw_core_handle_t core;
     claw_cap_caller_t caller;
 } claw_cap_call_context_t;
-
-typedef struct {
-    uint32_t magic;
-    claw_core_handle_t *core;
-    claw_cap_caller_t caller;
-    const char *agent_id;
-    const char *agent_type;
-    const char *parent_agent_id;
-    const char *parent_session_id;
-} claw_cap_core_call_user_ctx_t;
-
-#define CLAW_CAP_CORE_CALL_USER_CTX_MAGIC 0x43415043U
 
 typedef enum {
     CLAW_CAP_EVENT_ROUTE_PASS = 0,
@@ -155,6 +141,8 @@ bool claw_cap_group_exists(const char *group_id);
 esp_err_t claw_cap_get_group_state(const char *group_id, claw_cap_state_t *state);
 esp_err_t claw_cap_get_descriptor_state(const char *id_or_name,
                                         claw_cap_descriptor_info_t *info);
+bool claw_cap_is_llm_tool_available(const char *id_or_name,
+                                    const claw_cap_call_context_t *ctx);
 const claw_cap_descriptor_t *claw_cap_find(const char *id_or_name);
 claw_cap_list_t claw_cap_list(void);
 claw_cap_group_list_t claw_cap_list_groups(void);
@@ -163,22 +151,10 @@ esp_err_t claw_cap_call(const char *id_or_name,
                         const claw_cap_call_context_t *ctx,
                         char *output,
                         size_t output_size);
-esp_err_t claw_cap_call_from_core(const char *cap_name,
-                                  const char *input_json,
-                                  const claw_core_request_t *request,
-                                  char **out_output,
-                                  void *user_ctx);
 char *claw_cap_build_llm_tools_json(const claw_cap_call_context_t *ctx,
                                     bool wrap_for_responses_api);
 char *claw_cap_build_catalog(void);
 const char *claw_cap_state_to_string(claw_cap_state_t state);
-
-/* Exposes all root-agent LLM-visible tools for one request. */
-extern const claw_core_context_provider_t claw_cap_root_agent_tools_provider;
-/* Exposes sub-agent LLM-visible tools, excluding root-only tools. */
-extern const claw_core_context_provider_t claw_cap_sub_agent_tools_provider;
-/* Compatibility alias for root-agent tools. */
-extern const claw_core_context_provider_t claw_cap_tools_provider;
 
 #ifdef __cplusplus
 }

@@ -21,8 +21,6 @@ extern "C" {
 #define APP_CLAW_PATH_LEN             64
 #define APP_CLAW_FILE_PATH_LEN        96
 
-typedef struct claw_core_state *claw_core_handle_t;
-
 typedef struct {
     char llm_api_key[APP_CLAW_STR_LEN];
     char llm_backend_type[APP_CLAW_SHORT_STR_LEN];
@@ -63,7 +61,6 @@ esp_err_t app_claw_start(const app_claw_config_t *config);
 esp_err_t app_claw_update_config(const app_claw_config_t *config);
 esp_err_t app_claw_get_config(app_claw_config_t *out_config);
 esp_err_t app_claw_apply_config(const app_claw_config_t *config);
-claw_core_handle_t app_claw_get_core(void);
 esp_err_t app_claw_ui_start(void);
 esp_err_t app_claw_set_network_status(bool sta_connected, const char *ap_ssid);
 

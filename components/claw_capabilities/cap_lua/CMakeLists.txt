@@ -9,7 +9,7 @@ idf_component_register(
         "src"
     REQUIRES
         claw_cap
-        claw_core
+        claw_utils
         console
         esp_timer
         freertos

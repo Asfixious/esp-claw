@@ -148,22 +148,29 @@ deltas in one iteration. Output and tool calls are not truncated.
 
 ## C ABI mapping
 
-The C ABI preserves the existing content event numbers and adds explicit end
-kinds:
+The C ABI mirrors every public session event through a tagged payload union:
 
 | Rust event | C event kind |
 |---|---|
-| `Output(Delta(text))` | `CLAW_AGENT_EVENT_KIND_OUTPUT` |
-| `Output(End)` | `CLAW_AGENT_EVENT_KIND_OUTPUT_END` |
-| `Reasoning(Delta(text))` | `CLAW_AGENT_EVENT_KIND_REASONING` |
+| `TurnStarted { turn, origin }` | `CLAW_AGENT_EVENT_KIND_TURN_STARTED` |
+| `InputRequested { request, kind }` | `CLAW_AGENT_EVENT_KIND_INPUT_REQUESTED` |
+| `IterationStarted { iteration }` | `CLAW_AGENT_EVENT_KIND_ITERATION_STARTED` |
+| `Reasoning(Delta(text))` | `CLAW_AGENT_EVENT_KIND_REASONING_DELTA` |
 | `Reasoning(End)` | `CLAW_AGENT_EVENT_KIND_REASONING_END` |
-| `ToolCalls(Delta(call))` | `CLAW_AGENT_EVENT_KIND_TOOLS` |
-| `ToolCalls(End)` | `CLAW_AGENT_EVENT_KIND_TOOLS_END` |
-| `InputRequested { request, PermissionApproval { summary } }` | `CLAW_AGENT_EVENT_KIND_INPUT_REQUESTED` |
+| `Output(Delta(text))` | `CLAW_AGENT_EVENT_KIND_OUTPUT_DELTA` |
+| `Output(End)` | `CLAW_AGENT_EVENT_KIND_OUTPUT_END` |
+| `ToolCalls(Delta(call))` | `CLAW_AGENT_EVENT_KIND_TOOL_CALL` |
+| `ToolCalls(End)` | `CLAW_AGENT_EVENT_KIND_TOOL_CALLS_END` |
+| `IterationEnded` | `CLAW_AGENT_EVENT_KIND_ITERATION_ENDED` |
+| `TurnEnded { turn }` | `CLAW_AGENT_EVENT_KIND_TURN_ENDED` |
+| `Error { message }` | `CLAW_AGENT_EVENT_KIND_ERROR` |
+| `Closed` | `CLAW_AGENT_EVENT_KIND_CLOSED` |
 
-The current C payload for a tool call remains its name; Rust callers receive
-the complete `ToolCall`. For `INPUT_REQUESTED`, `request_id` is non-zero,
-`input_kind` is `PERMISSION_APPROVAL`, and `text` carries the semantic summary;
-the caller replies through `claw_agent_session_respond`. End events have null
-`text` and `error_message`. The C ABI currently skips `TurnStarted`, so
-`TurnOrigin` is exposed by the Rust public API only.
+`TURN_STARTED` includes the turn id, origin, and originating subagent id.
+`TOOL_CALL` carries the complete provider id, name, and JSON arguments.
+`INPUT_REQUESTED` carries its request id, semantic kind, and summary; the
+caller replies through `claw_agent_session_respond`. Owned strings in the
+selected union member are released together through `claw_agent_event_free`.
+`TURN_ENDED` closes only the current turn; a C event pump keeps receiving the
+same session stream until `CLOSED` so detached-subagent turns cannot be lost or
+misattributed to a later user submit.

@@ -11,11 +11,11 @@
 extern "C" {
 #endif
 
-/* Register the agent runtime as a claw_cap group so the event router and other
- * subsystems can invoke it through claw_cap_call. This adapter maps router
- * context to numeric claw_agent sessions, then either starts a turn or answers
- * that session's pending input request. The agent runtime must be initialized/
- * started separately for calls to succeed. */
+/* Register AgentSystem as a system-only claw_cap entry. Normal input must carry
+ * the numeric session selected by the IM layer; raw messages are reserved for
+ * /session commands. Explicit callers may choose one session lifecycle, input,
+ * or control operation. AgentSystem must be initialized and started
+ * separately. */
 esp_err_t cap_agent_register_group(void);
 
 #ifdef __cplusplus

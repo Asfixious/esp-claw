@@ -7,5 +7,6 @@ idf_component_register(
     REQUIRES
         claw_cap
         esp_http_client
+        mbedtls
         console
 )

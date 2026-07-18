@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include <sys/types.h>
 
 #include "cap_router_mgr.h"
+#include "cJSON.h"
 #include "cmd_cap_router_mgr.h"
 #include "claw_cap.h"
 #include "claw_event_router.h"
@@ -33,9 +35,83 @@ static const char *TAG = "event_router_test";
 #define TEST_RULES_PATH            TEST_AUTOMATION_DIR "/rules"
 
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+static char s_agent_input[512];
+static char s_agent_session_id[16];
+static uint32_t s_agent_request_id;
+static unsigned s_agent_call_count;
+static char s_outbound_input[512];
+static char s_outbound_channel[32];
+static char s_outbound_chat_id[64];
+static unsigned s_outbound_call_count;
 
 static const char *s_seed_rules_json =
     "[]\n";
+
+static esp_err_t test_agent_execute(const char *input_json,
+                                    const claw_cap_call_context_t *ctx,
+                                    char *output,
+                                    size_t output_size)
+{
+    strlcpy(s_agent_input, input_json ? input_json : "", sizeof(s_agent_input));
+    strlcpy(s_agent_session_id,
+            ctx && ctx->session_id ? ctx->session_id : "",
+            sizeof(s_agent_session_id));
+    s_agent_request_id = ctx ? ctx->request_id : 0;
+    s_agent_call_count++;
+    if (input_json && strstr(input_json, "/session") != NULL) {
+        strlcpy(output, "Sessions:\n* 12 (current)", output_size);
+    } else {
+        strlcpy(output, "{\"ok\":true}", output_size);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t test_outbound_execute(const char *input_json,
+                                       const claw_cap_call_context_t *ctx,
+                                       char *output,
+                                       size_t output_size)
+{
+    strlcpy(s_outbound_input,
+            input_json ? input_json : "",
+            sizeof(s_outbound_input));
+    strlcpy(s_outbound_channel,
+            ctx && ctx->channel ? ctx->channel : "",
+            sizeof(s_outbound_channel));
+    strlcpy(s_outbound_chat_id,
+            ctx && ctx->chat_id ? ctx->chat_id : "",
+            sizeof(s_outbound_chat_id));
+    s_outbound_call_count++;
+    strlcpy(output, "{\"ok\":true}", output_size);
+    return ESP_OK;
+}
+
+static const claw_cap_descriptor_t s_test_agent_descriptors[] = {
+    {
+        .id = "agent",
+        .name = "agent",
+        .family = "test",
+        .description = "Capture Router agent forwarding.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .input_schema_json = "{\"type\":\"object\"}",
+        .execute = test_agent_execute,
+    },
+    {
+        .id = "test_send_message",
+        .name = "test_send_message",
+        .family = "test",
+        .description = "Capture Router outbound messages.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .input_schema_json = "{\"type\":\"object\"}",
+        .execute = test_outbound_execute,
+    },
+};
+
+static const claw_cap_group_t s_test_agent_group = {
+    .group_id = "test_agent",
+    .descriptors = s_test_agent_descriptors,
+    .descriptor_count = sizeof(s_test_agent_descriptors) /
+                        sizeof(s_test_agent_descriptors[0]),
+};
 
 static esp_err_t init_nvs(void)
 {
@@ -127,6 +203,9 @@ static esp_err_t init_console(void)
     esp_console_register_help_command();
     ESP_RETURN_ON_ERROR(claw_cap_init(), TAG, "Failed to init claw_cap");
     ESP_RETURN_ON_ERROR(cap_router_mgr_register_group(), TAG, "Failed to register router manager cap");
+    ESP_RETURN_ON_ERROR(claw_cap_register_group(&s_test_agent_group),
+                        TAG,
+                        "Failed to register test agent cap");
     ESP_RETURN_ON_ERROR(claw_cap_start_all(), TAG, "Failed to start capabilities");
     register_cap_router_mgr();
     return ESP_OK;
@@ -144,6 +223,11 @@ static esp_err_t init_event_router(void)
     };
 
     ESP_RETURN_ON_ERROR(claw_event_router_init(&config), TAG, "Failed to init event router");
+    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding(
+                            "cli",
+                            "test_send_message"),
+                        TAG,
+                        "Failed to register test outbound binding");
     return claw_event_router_start();
 }
 
@@ -246,13 +330,30 @@ static bool run_cli_and_check(const char *label,
     return passed;
 }
 
-static bool run_agent_without_submit_check(void)
+static bool run_agent_forwarding_check(void)
 {
-    static const char *agent_rule_json =
-        "{\"id\":\"agent_missing_submit\",\"enabled\":true,\"consume_on_match\":true,"
+    static const char *respond_rule_json =
+        "{\"id\":\"agent_respond\",\"enabled\":true,\"consume_on_match\":true,"
         "\"match\":{\"event_type\":\"message\",\"content_type\":\"text\",\"source_cap\":\"test_source\","
-        "\"channel\":\"cli\",\"chat_id\":\"room_agent\",\"text\":\"agent please\"},"
+        "\"channel\":\"cli\",\"chat_id\":\"room_agent\",\"text\":\"respond please\"},"
         "\"actions\":[{\"type\":\"run_agent\"}]}";
+    static const char *submit_rule_json =
+        "{\"id\":\"agent_submit\",\"enabled\":true,\"consume_on_match\":true,"
+        "\"match\":{\"event_type\":\"message\",\"content_type\":\"text\",\"source_cap\":\"test_source\","
+        "\"channel\":\"cli\",\"chat_id\":\"room_agent\",\"text\":\"submit please\"},"
+        "\"actions\":[{\"type\":\"run_agent\",\"input\":{"
+        "\"input\":{\"text\":\"{{event.text}}\"}}}]}";
+    static const char *explicit_rule_json =
+        "{\"id\":\"agent_explicit\",\"enabled\":true,\"consume_on_match\":true,"
+        "\"match\":{\"event_type\":\"message\",\"content_type\":\"text\",\"source_cap\":\"test_source\","
+        "\"channel\":\"cli\",\"chat_id\":\"room_agent\",\"text\":\"explicit please\"},"
+        "\"actions\":[{\"type\":\"run_agent\",\"input\":{"
+        "\"session\":{\"session_id\":44},\"input\":{\"text\":\"{{event.text}}\"}}}]}";
+    static const char *missing_rule_json =
+        "{\"id\":\"agent_missing\",\"enabled\":true,\"consume_on_match\":true,"
+        "\"match\":{\"event_type\":\"message\",\"content_type\":\"text\",\"source_cap\":\"test_source\","
+        "\"channel\":\"cli\",\"chat_id\":\"room_agent\",\"text\":\"missing please\"},"
+        "\"actions\":[{\"type\":\"run_agent\",\"input\":{\"session_policy\":\"chat\"}}]}";
     claw_event_t event = {
         .source_cap = "test_source",
         .event_type = "message",
@@ -262,35 +363,233 @@ static bool run_agent_without_submit_check(void)
         .session_policy = CLAW_SESSION_POLICY_CHAT,
     };
     claw_event_router_result_t result = {0};
+    cJSON *root = NULL;
+    cJSON *session = NULL;
+    cJSON *input = NULL;
+    const char *forwarded_text = NULL;
     esp_err_t err;
-    bool passed;
+    bool passed = true;
 
-    ESP_LOGI(TAG, "[RUN] run_agent_without_submit");
-    err = claw_event_router_add_rule_json(agent_rule_json);
+    ESP_LOGI(TAG, "[RUN] run_agent_forwarding");
+    err = claw_event_router_add_rule_json(respond_rule_json);
+    if (err == ESP_OK) {
+        err = claw_event_router_add_rule_json(submit_rule_json);
+    }
+    if (err == ESP_OK) {
+        err = claw_event_router_add_rule_json(explicit_rule_json);
+    }
+    if (err == ESP_OK) {
+        err = claw_event_router_add_rule_json(missing_rule_json);
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add run_agent rule: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to add run_agent rules: %s", esp_err_to_name(err));
+        (void)claw_event_router_delete_rule("agent_respond");
+        (void)claw_event_router_delete_rule("agent_submit");
+        (void)claw_event_router_delete_rule("agent_explicit");
+        (void)claw_event_router_delete_rule("agent_missing");
         return false;
     }
 
-    event.text = strdup("agent please");
+    event.text = calloc(1, 32);
     if (!event.text) {
-        (void)claw_event_router_delete_rule("agent_missing_submit");
+        (void)claw_event_router_delete_rule("agent_respond");
+        (void)claw_event_router_delete_rule("agent_submit");
+        (void)claw_event_router_delete_rule("agent_explicit");
+        (void)claw_event_router_delete_rule("agent_missing");
         return false;
     }
 
+    memset(s_agent_input, 0, sizeof(s_agent_input));
+    memset(s_agent_session_id, 0, sizeof(s_agent_session_id));
+    s_agent_request_id = 0;
+    s_agent_call_count = 0;
+    event.session_id = 42;
+    event.request_id = 7;
+    strlcpy(event.text, "respond please", 32);
     err = claw_event_router_handle_event(&event, &result);
-    passed = err == ESP_ERR_INVALID_STATE || result.last_error == ESP_ERR_INVALID_STATE;
-    if (!passed) {
+    root = cJSON_Parse(s_agent_input);
+    session = cJSON_GetObjectItemCaseSensitive(root, "session");
+    input = cJSON_GetObjectItemCaseSensitive(root, "input");
+    forwarded_text = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(input, "text"));
+    if (err != ESP_OK ||
+            s_agent_call_count != 1 ||
+            strcmp(s_agent_session_id, "42") != 0 ||
+            s_agent_request_id != 7 ||
+            cJSON_GetNumberValue(
+                cJSON_GetObjectItemCaseSensitive(session, "session_id")) != 42 ||
+            !forwarded_text || strcmp(forwarded_text, "respond please") != 0 ||
+            cJSON_GetNumberValue(
+                cJSON_GetObjectItemCaseSensitive(input, "request_id")) != 7) {
         ESP_LOGE(TAG,
-                 "run_agent without submit returned err=%s last_error=%s failed_actions=%d",
+                 "run_agent respond forwarding returned err=%s input=%s session=%s request=%" PRIu32,
                  esp_err_to_name(err),
-                 esp_err_to_name(result.last_error),
-                 result.failed_actions);
+                 s_agent_input,
+                 s_agent_session_id,
+                 s_agent_request_id);
+        passed = false;
+    }
+    cJSON_Delete(root);
+    root = NULL;
+
+    memset(&result, 0, sizeof(result));
+    event.session_id = 43;
+    event.request_id = 0;
+    strlcpy(event.text, "submit please", 32);
+    err = claw_event_router_handle_event(&event, &result);
+    root = cJSON_Parse(s_agent_input);
+    session = cJSON_GetObjectItemCaseSensitive(root, "session");
+    input = cJSON_GetObjectItemCaseSensitive(root, "input");
+    if (err != ESP_OK ||
+            s_agent_call_count != 2 ||
+            strcmp(s_agent_session_id, "43") != 0 ||
+            s_agent_request_id != 0 ||
+            cJSON_GetNumberValue(
+                cJSON_GetObjectItemCaseSensitive(session, "session_id")) != 43 ||
+            !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(input, "text")) ||
+            strcmp(cJSON_GetStringValue(
+                       cJSON_GetObjectItemCaseSensitive(input, "text")),
+                   "submit please") != 0 ||
+            cJSON_GetObjectItemCaseSensitive(input, "request_id") != NULL) {
+        ESP_LOGE(TAG,
+                 "Router did not preserve submit-vs-respond distinction: err=%s input=%s",
+                 esp_err_to_name(err),
+                 s_agent_input);
+        passed = false;
+    }
+    cJSON_Delete(root);
+    root = NULL;
+
+    memset(&result, 0, sizeof(result));
+    event.session_id = 0;
+    event.request_id = 0;
+    strlcpy(event.text, "explicit please", 32);
+    err = claw_event_router_handle_event(&event, &result);
+    root = cJSON_Parse(s_agent_input);
+    session = cJSON_GetObjectItemCaseSensitive(root, "session");
+    input = cJSON_GetObjectItemCaseSensitive(root, "input");
+    forwarded_text = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(input, "text"));
+    if (err != ESP_OK ||
+            s_agent_call_count != 3 ||
+            strcmp(s_agent_session_id, "44") != 0 ||
+            s_agent_request_id != 0 ||
+            cJSON_GetNumberValue(
+                cJSON_GetObjectItemCaseSensitive(session, "session_id")) != 44 ||
+            !forwarded_text || strcmp(forwarded_text, "explicit please") != 0) {
+        ESP_LOGE(TAG,
+                 "Router did not preserve explicit session input: err=%s calls=%u input=%s",
+                 esp_err_to_name(err),
+                 s_agent_call_count,
+                 s_agent_input);
+        passed = false;
+    }
+    cJSON_Delete(root);
+
+    memset(&result, 0, sizeof(result));
+    strlcpy(event.text, "missing please", 32);
+    err = claw_event_router_handle_event(&event, &result);
+    if ((err != ESP_ERR_INVALID_STATE &&
+            result.last_error != ESP_ERR_INVALID_STATE) ||
+            s_agent_call_count != 3) {
+        ESP_LOGE(TAG,
+                 "Router accepted RUN_AGENT without a session: err=%s calls=%u",
+                 esp_err_to_name(err),
+                 s_agent_call_count);
+        passed = false;
     }
 
     claw_event_free(&event);
-    (void)claw_event_router_delete_rule("agent_missing_submit");
-    ESP_LOGI(TAG, "[%s] run_agent_without_submit", passed ? "PASS" : "FAIL");
+    (void)claw_event_router_delete_rule("agent_respond");
+    (void)claw_event_router_delete_rule("agent_submit");
+    (void)claw_event_router_delete_rule("agent_explicit");
+    (void)claw_event_router_delete_rule("agent_missing");
+    ESP_LOGI(TAG, "[%s] run_agent_forwarding", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool run_session_command_forwarding_check(void)
+{
+    static const char *session_rule_json =
+        "{\"id\":\"session_forward\",\"enabled\":true,\"consume_on_match\":true,"
+        "\"match\":{\"event_type\":\"message\",\"content_type\":\"text\","
+        "\"source_cap\":\"test_source\",\"channel\":\"cli\","
+        "\"chat_id\":\"room_session\",\"text\":\"/session\","
+        "\"text_match_rule\":\"prefix\"},"
+        "\"actions\":[{\"type\":\"call_cap\",\"cap\":\"agent\","
+        "\"input\":{\"message\":\"{{event.text}}\"}},{\"type\":\"send_message\","
+        "\"input\":{\"channel\":\"{{event.source_channel}}\","
+        "\"chat_id\":\"{{event.chat_id}}\"}}]}";
+    claw_event_t event = {
+        .source_cap = "test_source",
+        .event_type = "message",
+        .source_channel = "cli",
+        .chat_id = "room_session",
+        .content_type = "text",
+        .session_policy = CLAW_SESSION_POLICY_CHAT,
+    };
+    claw_event_router_result_t result = {0};
+    cJSON *agent_root = NULL;
+    cJSON *outbound_root = NULL;
+    const char *agent_message;
+    const char *outbound_message;
+    const char *outbound_chat_id;
+    esp_err_t err;
+    bool passed;
+
+    ESP_LOGI(TAG, "[RUN] session_command_forwarding");
+    err = claw_event_router_add_rule_json(session_rule_json);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add session forwarding rule: %s", esp_err_to_name(err));
+        return false;
+    }
+    event.text = strdup("/session switch 12");
+    if (!event.text) {
+        (void)claw_event_router_delete_rule("session_forward");
+        return false;
+    }
+
+    memset(s_agent_input, 0, sizeof(s_agent_input));
+    memset(s_outbound_input, 0, sizeof(s_outbound_input));
+    memset(s_outbound_channel, 0, sizeof(s_outbound_channel));
+    memset(s_outbound_chat_id, 0, sizeof(s_outbound_chat_id));
+    s_agent_call_count = 0;
+    s_outbound_call_count = 0;
+    err = claw_event_router_handle_event(&event, &result);
+    agent_root = cJSON_Parse(s_agent_input);
+    outbound_root = cJSON_Parse(s_outbound_input);
+    agent_message = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(agent_root, "message"));
+    outbound_message = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(outbound_root, "message"));
+    outbound_chat_id = cJSON_GetStringValue(
+        cJSON_GetObjectItemCaseSensitive(outbound_root, "chat_id"));
+    passed = err == ESP_OK &&
+            result.action_count == 2 &&
+            result.failed_actions == 0 &&
+            s_agent_call_count == 1 &&
+            agent_message && strcmp(agent_message, "/session switch 12") == 0 &&
+            s_outbound_call_count == 1 &&
+            strcmp(s_outbound_channel, "cli") == 0 &&
+            strcmp(s_outbound_chat_id, "room_session") == 0 &&
+            outbound_chat_id && strcmp(outbound_chat_id, "room_session") == 0 &&
+            outbound_message &&
+            strcmp(outbound_message, "Sessions:\n* 12 (current)") == 0;
+    if (!passed) {
+        ESP_LOGE(TAG,
+                 "session forwarding failed err=%s actions=%u/%u agent=%s outbound=%s",
+                 esp_err_to_name(err),
+                 (unsigned)result.action_count,
+                 (unsigned)result.failed_actions,
+                 s_agent_input,
+                 s_outbound_input);
+    }
+
+    cJSON_Delete(agent_root);
+    cJSON_Delete(outbound_root);
+    claw_event_free(&event);
+    (void)claw_event_router_delete_rule("session_forward");
+    ESP_LOGI(TAG, "[%s] session_command_forwarding", passed ? "PASS" : "FAIL");
     return passed;
 }
 
@@ -389,7 +688,8 @@ static bool run_smoke_suite(void)
                            NULL,
                            0) && ok;
 
-    ok = run_agent_without_submit_check() && ok;
+    ok = run_agent_forwarding_check() && ok;
+    ok = run_session_command_forwarding_check() && ok;
 
     return ok;
 }

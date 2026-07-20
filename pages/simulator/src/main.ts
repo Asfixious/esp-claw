@@ -91,6 +91,9 @@ async function createLocalSkill(file: File): Promise<LoadedSkill> {
         category: ['ui'],
         tags: ['local'],
       },
+      execution: {
+        entry,
+      },
       simulator: {
         entry,
         files: [entry],

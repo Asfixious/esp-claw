@@ -12,13 +12,17 @@ local FRAME_INTERVAL_MS = 30
 -- Whatever the sensor exposes; image.convert covers any of these on output.
 local CAMERA_OPEN_OPTS = { format = { "JPEG", "RGBP", "YUYV", "UYVY", "YU12" }, width = 320, height = 240, nearest = true, }
 local MOTION_OPTS = {
-    stride = 8,
-    pixel_threshold = 0.2,
-    moving_threshold = 0.02,
+    pixel_diff_threshold = 24,
+    active_pixel_percent = 5,
+    confirm_frames = 2,
+    hold_frames = 3,
+    block_size = 4,
+    block_hit_pixels = 15,
 }
 
 local display_started = false
 local camera_started = false
+local detector = motion.new(MOTION_OPTS)
 
 local function cleanup()
     if display_started then
@@ -34,9 +38,8 @@ end
 
 local function draw_result_overlay(frame_index, remaining_s, detect_result)
     local has_previous = detect_result.has_previous == true
-    local moving_points = detect_result.moving_points or 0
-    local moving_ratio = detect_result.moving_ratio or 0
-    local moved = detect_result.moved == true
+    local active_pixels = detect_result.active_pixels or 0
+    local moved = detect_result.alert_active == true
     local status = moved and "MOTION" or (has_previous and "STILL" or "WARMUP")
     local bg = { r = 24, g = 24, b = 24 }
 
@@ -52,7 +55,7 @@ local function draw_result_overlay(frame_index, remaining_s, detect_result)
         color = "white",
         font_size = 16,
     })
-    display.draw_text(8, 28, string.format("ratio=%.3f points=%d frame=%d left=%ds", moving_ratio, moving_points, frame_index, remaining_s), {
+    display.draw_text(8, 28, string.format("pixels=%d frame=%d left=%ds", active_pixels, frame_index, remaining_s), {
         color = "white",
         font_size = 12,
     })
@@ -101,10 +104,10 @@ local run_ok, run_err = xpcall(function()
         local remaining_s = deadline_s - now_s
         local frame <close> = camera.get_frame(CAPTURE_TIMEOUT_MS)
         local rgb565 <close> = image.convert(frame, image.RGB565)
-        local detect_result = motion.detect(frame, MOTION_OPTS)
+        local detect_result = detector:detect(rgb565)
 
         frames = frames + 1
-        if detect_result.moved == true then
+        if detect_result.alert_active == true then
             moved_frames = moved_frames + 1
         end
 
@@ -119,8 +122,9 @@ local run_ok, run_err = xpcall(function()
         display.end_frame()
 
         if frames == 1 or frames % 15 == 0 then
-            print(string.format("%s frame=%d moved=%s points=%s ratio=%s moved_frames=%d",
-                TAG, frames, tostring(detect_result.moved), tostring(detect_result.moving_points), tostring(detect_result.moving_ratio), moved_frames))
+            print(string.format("%s frame=%d detected=%s alert=%s active_pixels=%s event=%s moved_frames=%d",
+                TAG, frames, tostring(detect_result.detected), tostring(detect_result.alert_active),
+                tostring(detect_result.active_pixels), tostring(detect_result.event), moved_frames))
         end
 
         if FRAME_INTERVAL_MS > 0 then
@@ -142,6 +146,7 @@ local run_ok, run_err = xpcall(function()
 end, debug.traceback)
 
 cleanup()
+detector:close()
 
 if not run_ok then
     error(run_err)

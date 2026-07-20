@@ -5,9 +5,12 @@ local motion = require("motion_detect")
 local TAG = "[motion_detect_test]"
 local CAPTURE_TIMEOUT_MS = 3000
 local MOTION_OPTS = {
-    stride = 8,
-    pixel_threshold = 0.2,
-    moving_threshold = 0.02,
+    pixel_diff_threshold = 24,
+    active_pixel_percent = 5,
+    confirm_frames = 2,
+    hold_frames = 3,
+    block_size = 4,
+    block_hit_pixels = 15,
 }
 
 local function assert_true(value, message)
@@ -17,7 +20,8 @@ local function assert_true(value, message)
 end
 
 local function assert_type(value, expected_type, name)
-    assert_true(type(value) == expected_type, string.format("%s expected %s, got %s", name, expected_type, type(value)))
+    assert_true(type(value) == expected_type,
+        string.format("%s expected %s, got %s", name, expected_type, type(value)))
 end
 
 local function close_camera()
@@ -33,20 +37,11 @@ local function get_frame_or_fail()
     return frame_or_err
 end
 
-local function release_frame(frame)
-    local ok, err = pcall(function()
-        frame:release()
-    end)
-    assert_true(ok, "frame:release failed: " .. tostring(err))
-end
-
 local camera_paths, path_err = board_manager.get_camera_paths()
 if not camera_paths then
     print(TAG .. " SKIP: get_camera_paths failed: " .. tostring(path_err))
     return
 end
-
-print(TAG .. " camera dev_path: " .. tostring(camera_paths.dev_path))
 
 local opened, open_err = pcall(camera.open, camera_paths.dev_path)
 if not opened then
@@ -54,56 +49,49 @@ if not opened then
     return
 end
 
-local info_ok, info_or_err = pcall(camera.info)
-if not info_ok then
-    close_camera()
-    error("camera.info failed: " .. tostring(info_or_err))
-end
+local detector = motion.new(MOTION_OPTS)
+local run_ok, run_err = xpcall(function()
+    local first_result
+    do
+        local first_frame <close> = get_frame_or_fail()
+        first_result = detector:detect(first_frame)
+    end
 
-print(string.format("%s stream: %dx%d format=%s", TAG, info_or_err.width, info_or_err.height, tostring(info_or_err.pixel_format)))
+    assert_type(first_result, "table", "first_result")
+    assert_true(first_result.has_previous == false, "first detect should seed the previous frame")
+    assert_true(first_result.detected == false, "first detect must not report motion")
+    assert_true(first_result.alert_active == false, "first detect must not activate the alert")
+    assert_true(first_result.event == "none", "first detect event must be none")
+    assert_type(first_result.threshold_pixels, "number", "first_result.threshold_pixels")
+    assert_true(first_result.roi_width > 0 and first_result.roi_height > 0, "normalized ROI must be non-empty")
 
-motion.reset()
+    local second_result
+    do
+        local second_frame <close> = get_frame_or_fail()
+        second_result = detector:detect(second_frame)
+    end
+    assert_true(second_result.has_previous == true, "second detect should compare with the previous frame")
+    assert_type(second_result.detected, "boolean", "second_result.detected")
+    assert_type(second_result.alert_active, "boolean", "second_result.alert_active")
+    assert_type(second_result.active_pixels, "number", "second_result.active_pixels")
+    assert_type(second_result.positive_frames, "number", "second_result.positive_frames")
+    assert_type(second_result.hold_frames, "number", "second_result.hold_frames")
+    assert_true(second_result.event == "none" or second_result.event == "activated" or second_result.event == "cleared",
+        "unexpected motion event")
 
-local first_frame = get_frame_or_fail()
-local first_result = motion.detect(first_frame, MOTION_OPTS)
-release_frame(first_frame)
+    detector:reset()
+    local reset_result
+    do
+        local reset_frame <close> = get_frame_or_fail()
+        reset_result = detector:detect(reset_frame)
+    end
+    assert_true(reset_result.has_previous == false, "detect after reset should seed again")
+    print(string.format("%s PASS detected=%s active_pixels=%d alert=%s", TAG,
+        tostring(second_result.detected), second_result.active_pixels, tostring(second_result.alert_active)))
+end, debug.traceback)
 
-assert_type(first_result, "table", "first_result")
-assert_true(first_result.has_previous == false, "first detect should seed previous frame")
-assert_true(first_result.moving_points == nil, "first detect should not compare without previous frame")
-assert_true(first_result.stride == MOTION_OPTS.stride, "first detect stride mismatch")
-assert_true(first_result.pixel_threshold == MOTION_OPTS.pixel_threshold, "first detect pixel_threshold mismatch")
-print(TAG .. " first detect seeded previous frame")
-
-local second_frame = get_frame_or_fail()
-local second_result = motion.detect(second_frame, MOTION_OPTS)
-release_frame(second_frame)
-
-assert_type(second_result, "table", "second_result")
-assert_true(second_result.has_previous == true, "second detect should compare with previous frame")
-assert_type(second_result.moving_points, "number", "second_result.moving_points")
-assert_true(second_result.moving_points >= 0, "moving_points must be non-negative")
-assert_type(second_result.sample_points, "number", "second_result.sample_points")
-assert_true(second_result.sample_points > 0, "sample_points must be positive")
-assert_type(second_result.moving_ratio, "number", "second_result.moving_ratio")
-assert_true(second_result.moving_ratio >= 0 and second_result.moving_ratio <= 1, "moving_ratio must be in [0, 1]")
-assert_true(second_result.stride == MOTION_OPTS.stride, "second detect stride mismatch")
-assert_true(second_result.pixel_threshold == MOTION_OPTS.pixel_threshold, "second detect pixel_threshold mismatch")
-assert_true(second_result.moving_threshold == MOTION_OPTS.moving_threshold, "second detect moving_threshold mismatch")
-assert_type(second_result.moved, "boolean", "second_result.moved")
-print(string.format("%s second detect: moving_points=%d sample_points=%d moving_ratio=%.4f moved=%s",
-    TAG, second_result.moving_points, second_result.sample_points, second_result.moving_ratio, tostring(second_result.moved)))
-
-motion.reset()
-
-local reset_frame = get_frame_or_fail()
-local reset_result = motion.detect(reset_frame, MOTION_OPTS)
-release_frame(reset_frame)
-
-assert_type(reset_result, "table", "reset_result")
-assert_true(reset_result.has_previous == false, "detect after reset should seed previous frame again")
-assert_true(reset_result.moving_points == nil, "detect after reset should not compare without previous frame")
-print(TAG .. " reset behavior verified")
-
+detector:close()
 close_camera()
-print(TAG .. " PASS")
+if not run_ok then
+    error(run_err)
+end

@@ -9,4 +9,9 @@ dependencies:
   espressif/esp-dl:
     version: "~3.3.0"
     rules:
-      - if: "$CONFIG{LUA_MODULE_VISION_ESPDET} == True"
+      - if: "$CONFIG{LUA_MODULE_VISION_ESPDET} == True || $CONFIG{LUA_MODULE_VISION_COLOR_DETECT} == True"
+
+  100312dog/opencv-mobile-prebuilt-newlib:
+    version: "0.2.1"
+    rules:
+      - if: $CONFIG{LUA_MODULE_VISION_COLOR_DETECT} == True

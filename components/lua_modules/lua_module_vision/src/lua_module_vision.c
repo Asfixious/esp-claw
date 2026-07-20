@@ -301,7 +301,7 @@ int luaopen_motion_detect(lua_State *L)
 
 esp_err_t lua_module_vision_register(void)
 {
-#if !CONFIG_LUA_MODULE_VISION_MOTION_DETECT && !CONFIG_LUA_MODULE_VISION_ESPDET
+#if !CONFIG_LUA_MODULE_VISION_MOTION_DETECT && !CONFIG_LUA_MODULE_VISION_ESPDET && !CONFIG_LUA_MODULE_VISION_COLOR_DETECT
     return ESP_OK;
 #else
     static const cap_lua_module_t modules[] = {
@@ -310,6 +310,9 @@ esp_err_t lua_module_vision_register(void)
 #endif
 #if CONFIG_LUA_MODULE_VISION_ESPDET
         {"espdet", luaopen_espdet},
+#endif
+#if CONFIG_LUA_MODULE_VISION_COLOR_DETECT
+        {"color_detect", luaopen_color_detect_dl},
 #endif
     };
     return cap_lua_register_modules(modules, sizeof(modules) / sizeof(modules[0]));

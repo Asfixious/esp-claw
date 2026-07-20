@@ -4,12 +4,22 @@ menu "Lua Vision Module"
     depends on ESP_BOARD_DEV_CAMERA_SUPPORT
 
     config LUA_MODULE_VISION_MOTION_DETECT
-        bool "Enable motion_detect Lua module"
+        bool "Enable vision_motion_detect Lua module"
         default y
         help
-            Build and register the motion_detect Lua submodule. It compares
-            consecutive image.frame objects using RGB565 luma, block filtering,
-            stable alert state, and motion bounding boxes.
+            Build and register the lightweight vision_motion_detect Lua module.
+            This is the legacy vision submodule and does not require ESPDet
+            model runtime support. It is registered under a separate Lua module
+            name so it can coexist with APP_CLAW_LUA_MODULE_MOTION_DETECT, which
+            provides the lcd_ai_detect-style block/box detector as motion_detect.
+
+    config LUA_MODULE_VISION_COLOR_DETECT
+        bool "Enable color_detect Lua module"
+        default y
+        help
+            Build and register the ESP-DL color_detect Lua module for detecting
+            colored blobs in image.frame values using the migrated ColorDetect
+            implementation.
 
     config LUA_MODULE_VISION_ESPDET
         bool "Enable espdet Lua module"

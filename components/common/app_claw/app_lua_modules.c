@@ -110,9 +110,6 @@
 #if CONFIG_APP_CLAW_LUA_MODULE_LVGL
 #include "lua_module_lvgl.h"
 #endif
-#if CONFIG_APP_CLAW_LUA_MODULE_LVGL && CONFIG_APP_CLAW_SYSTEM_UI_ENABLE
-#include "system_ui.h"
-#endif
 #if CONFIG_APP_CLAW_LUA_MODULE_MAGNETOMETER
 #include "lua_module_magnetometer.h"
 #endif
@@ -564,14 +561,6 @@ static esp_err_t app_lua_register_led_strip(const char *fatfs_base_path)
 #endif
 
 #if CONFIG_APP_CLAW_LUA_MODULE_LVGL
-#if CONFIG_APP_CLAW_SYSTEM_UI_ENABLE
-static void app_lua_lvgl_click_feedback_cb(void *user_ctx)
-{
-    (void)user_ctx;
-    system_ui_click_feedback();
-}
-#endif
-
 static esp_err_t app_lua_register_lvgl(const char *fatfs_base_path)
 {
     return lua_module_lvgl_register_with_data_root(fatfs_base_path);

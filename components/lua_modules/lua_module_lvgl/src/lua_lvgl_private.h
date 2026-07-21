@@ -70,6 +70,8 @@ static inline void lua_lvgl_web_tabview_set_tab_text(lv_obj_t *tv, uint32_t inde
 #define LUA_MODULE_LVGL_FS_LETTER 'D'
 #define LUA_MODULE_LVGL_PATH_MAX 256
 #define LUA_LVGL_FONT_MT "lvgl.font"
+#define LUA_MODULE_LVGL_DEFAULT_FONT_PATH "fonts/misans.ttf"
+#define LUA_MODULE_LVGL_DEFAULT_FONT_SIZE 24
 
 typedef enum {
     LUA_LVGL_OBJ_GENERIC = 0,
@@ -221,6 +223,12 @@ typedef struct {
     lua_lvgl_event_sub_t *event_queue_tail;
     lua_lvgl_pending_unref_t *pending_unrefs;
     lua_lvgl_font_record_t *fonts;
+    lv_font_t *default_font;
+    uint8_t *default_font_data;
+    size_t default_font_data_size;
+    uint32_t default_font_size;
+    uint32_t default_font_cache_size;
+    char default_font_path[LUA_MODULE_LVGL_PATH_MAX];
     lv_fs_drv_t fs_drv;
     char data_root[LUA_MODULE_LVGL_PATH_MAX];
     bool fs_registered;
@@ -294,6 +302,9 @@ void lua_lvgl_release_fonts_locked(void);
 lua_lvgl_font_ud_t *lua_lvgl_check_font(lua_State *L, int index);
 lv_font_t *lua_lvgl_validate_font_locked(const lua_lvgl_font_ud_t *ud, const char **out_error);
 void lua_lvgl_apply_font_style_field(lua_State *L, int index, lv_obj_t *obj);
+void lua_lvgl_apply_default_font_locked(lv_obj_t *obj);
+esp_err_t lua_lvgl_create_default_font_locked(const char *font_path, uint32_t font_size, uint32_t cache_size);
+void lua_lvgl_destroy_default_font_locked(void);
 extern const luaL_Reg lua_lvgl_font_module_funcs[];
 
 /* lua_lvgl_layout.c */

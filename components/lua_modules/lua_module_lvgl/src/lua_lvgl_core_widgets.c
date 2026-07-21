@@ -39,6 +39,7 @@ static int lua_lvgl_create_screen(lua_State *L)
         return luaL_error(L, "lvgl runtime is not initialized");
     }
     screen = lv_obj_create(NULL);
+    lua_lvgl_apply_default_font_locked(screen);
     if (!lua_lvgl_push_obj(L, screen, LUA_LVGL_OBJ_SCREEN)) {
         lv_obj_delete(screen);
         lua_lvgl_unlock();

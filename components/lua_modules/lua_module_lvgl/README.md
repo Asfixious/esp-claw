@@ -66,6 +66,9 @@ Common `opts`:
 - `buffer_lines`: draw buffer height in lines, default `40`
 - `tick_ms`: LVGL tick period, default `5`
 - `task_period_ms`: LVGL handler task period, default `10`
+- `font_path`: default runtime font path, default `fonts/misans.ttf`; DATA is tried first, then SYSTEM
+- `font_size`: default runtime font size, default `24`
+- `font_cache_size`: default runtime font glyph cache size, default `LV_TINY_TTF_CACHE_GLYPH_CNT`
 
 Shutdown:
 
@@ -202,8 +205,16 @@ text_color = 0xffffff
 
 ## Runtime TTF Fonts
 
+By default, `lvgl.init()` loads `fonts/misans.ttf` as the runtime font and applies it to the root screen and every screen created with `lvgl.create_screen()`. Set `font_size` per app when a different default text size is needed:
+
+```lua
+lvgl.init(panel_handle, io_handle, width, height, panel_if, {
+    font_size = 22,
+})
+```
+
 When LVGL `tiny_ttf` is enabled, fonts can be loaded from the DATA root at
-runtime:
+runtime for per-object overrides:
 
 ```lua
 local storage = require("storage")

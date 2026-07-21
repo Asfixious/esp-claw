@@ -20,6 +20,7 @@ idf_component_register(
         "src"
     REQUIRES
         cap_lua
+        claw_core
         esp_lcd
         esp_lcd_touch
         esp_timer

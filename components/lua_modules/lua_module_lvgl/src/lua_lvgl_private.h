@@ -70,7 +70,7 @@ static inline void lua_lvgl_web_tabview_set_tab_text(lv_obj_t *tv, uint32_t inde
 #define LUA_MODULE_LVGL_FS_LETTER 'D'
 #define LUA_MODULE_LVGL_PATH_MAX 256
 #define LUA_LVGL_FONT_MT "lvgl.font"
-#define LUA_MODULE_LVGL_DEFAULT_FONT_PATH "fonts/misans.ttf"
+#define LUA_MODULE_LVGL_DEFAULT_FONT_PATH "fonts/NotoSansSC-Regular-sub.ttf"
 #define LUA_MODULE_LVGL_DEFAULT_FONT_SIZE 24
 
 typedef enum {

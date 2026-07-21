@@ -30,7 +30,7 @@ extern "C" {
 #define SYSTEM_UI_TASK_STACK 8192
 #define SYSTEM_UI_TASK_PRIO 5
 #define SYSTEM_UI_STOP_TIMEOUT_MS 5000
-#define SYSTEM_UI_DEFAULT_FONT_PATH "fonts/misans.ttf"
+#define SYSTEM_UI_DEFAULT_FONT_PATH "fonts/NotoSansSC-Regular-sub.ttf"
 #define SYSTEM_UI_DEFAULT_FONT_SIZE 24
 #define SYSTEM_UI_CLOCK_FONT_SIZE 72
 #define SYSTEM_UI_PATH_MAX 256

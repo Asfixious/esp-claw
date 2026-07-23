@@ -10,5 +10,5 @@ idf_component_register(
         claw_im_session
         freertos
         json
-        runtime
+        framework
 )

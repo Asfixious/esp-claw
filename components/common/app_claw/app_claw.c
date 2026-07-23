@@ -306,7 +306,7 @@ esp_err_t app_claw_update_config(const app_claw_config_t *config)
     };
 
     xSemaphoreTake(s_config_lock, portMAX_DELAY);
-    err = claw_agent_link_api(&api_config, CLAW_AGENT_API_USAGE_ROOT_AGENT, true);
+    err = claw_agent_link_api(&api_config, CLAW_AGENT_API_PURPOSE_ROOT_AGENT, true);
     if (err == ESP_OK) {
         s_current_config = *config;
         s_current_config_valid = true;

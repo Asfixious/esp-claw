@@ -8,10 +8,7 @@ subagent-origin turn on the same stream when the root is idle.
 ## Event model
 
 ```rust
-pub enum StreamPart<T> {
-    Delta(T),
-    End,
-}
+use claw_utils::stream::StreamPart;
 
 pub enum SessionEvent {
     TurnStarted { turn: TurnId, origin: TurnOrigin },
@@ -62,7 +59,7 @@ Exactly one `End` is emitted for each content kind, including a kind with no
 deltas. A caller therefore never has to infer that reasoning, output, or tool
 calls ended from the next event or from `IterationEnded`.
 
-The lower-level `LlmDelta` contract has the same monotonic ordering. A tool call
+The lower-level `ChatStreamEvent` contract has the same monotonic ordering. A tool call
 is emitted only after all of its arguments have arrived, so `ToolCalls(Delta)`
 never contains a partial call. The content `End` events are emitted as soon as
 the LLM stream finishes and before tool execution. `IterationEnded` is emitted

@@ -300,11 +300,6 @@ static void system_ui_touch_observer_cb(const display_service_touch_sample_t *sa
     }
 }
 
-static bool system_ui_display_claim_active(void)
-{
-    return display_service_has_exclusive_session();
-}
-
 bool system_ui_system_overlay_allowed(void)
 {
     return display_service_exclusive_allows_system_overlay();

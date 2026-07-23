@@ -104,12 +104,6 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
 #define APP_CLAW_UI_JOBS_OUTPUT_LEN 4096
 #define APP_CLAW_UI_JOB_STOP_WAIT_MS 50
 
-static bool app_claw_bool_is_true(const char *value)
-{
-    return value &&
-           (strcmp(value, "true") == 0 || strcmp(value, "1") == 0 || strcmp(value, "yes") == 0);
-}
-
 #if CONFIG_APP_CLAW_SYSTEM_UI_ENABLE && CONFIG_APP_CLAW_CAP_LUA
 static char *app_claw_split_job_field(char **cursor)
 {
@@ -528,6 +522,13 @@ esp_err_t app_claw_set_network_status(bool sta_connected, const char *ap_ssid)
 }
 
 #if CONFIG_APP_CLAW_CAP_MEMORY
+
+static bool app_claw_bool_is_true(const char *value)
+{
+    return value &&
+           (strcmp(value, "true") == 0 || strcmp(value, "1") == 0 || strcmp(value, "yes") == 0);
+}
+
 static esp_err_t init_memory(const app_claw_config_t *config,
                              const app_claw_storage_paths_t *paths,
                              uint32_t max_tool_iterations)

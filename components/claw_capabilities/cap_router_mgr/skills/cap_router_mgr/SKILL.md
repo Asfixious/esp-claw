@@ -89,7 +89,6 @@ Use this skill to inspect and modify event router rules through the direct calla
 ## Actions
 - Supported `type`:
   - `call_cap`
-  - `run_agent`
   - `run_script`
   - `send_message`
   - `emit_event`
@@ -100,7 +99,8 @@ Use this skill to inspect and modify event router rules through the direct calla
   - `fail_open`
 - Requirements and defaults:
   - `call_cap`: requires `cap` and `input`.
-  - `run_agent`: `input` optional; defaults to `{}`. `text` falls back to event text. `target_channel` and `target_chat_id` fall back to the current event route.
+    Route Agent input through `cap="agent"` with the standard
+    `{"method":"session.input","args":{...}}` RPC envelope.
   - `run_script`: requires `input`; common fields are `path`, `args`, `async`.
   - `send_message`: requires `input`; common fields are `channel`, `chat_id`, `message`. Missing `channel` falls back to target/source channel. Missing `chat_id` falls back to target endpoint/event chat id. Missing `message` falls back to previous action output.
   - `emit_event`: requires `input`; common fields are `event_type`, `source_cap`, `source_channel`, `chat_id`, `message_id`, `content_type`, `text`, `payload_json`, `session_policy`. Defaults: `source_cap=claw_event_router`, `event_type=trigger`, `content_type=trigger`, `payload_json={}`, invalid or missing `session_policy=trigger`.
@@ -170,6 +170,6 @@ Use this skill to inspect and modify event router rules through the direct calla
 
 ```json
 {
-  "rule_json": "{\"id\":\"im_any_message_agent\",\"enabled\":true,\"consume_on_match\":true,\"match\":{\"event_type\":\"message\",\"event_key\":\"text\",\"content_type\":\"text\"},\"actions\":[{\"type\":\"run_agent\",\"input\":{\"target_channel\":\"{{event.source_channel}}\",\"session_policy\":\"chat\"}}]}"
+  "rule_json": "{\"id\":\"im_any_message_agent\",\"enabled\":true,\"consume_on_match\":true,\"match\":{\"event_type\":\"message\",\"event_key\":\"text\",\"content_type\":\"text\"},\"actions\":[{\"type\":\"call_cap\",\"cap\":\"agent\",\"input\":{\"method\":\"session.input\",\"args\":{\"text\":\"{{event.text}}\"}}}]}"
 }
 ```

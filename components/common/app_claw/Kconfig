@@ -85,6 +85,13 @@ menu "App Claw Config"
                 Enable the Lua capability and keep app_claw's direct dependency
                 on cap_lua.
 
+        config APP_CLAW_CAP_LLM_INSPECT
+            bool "Enable LLM image inspection capability"
+            default y
+            help
+                Enable standalone local-image inference and keep app_claw's
+                direct dependency on cap_llm_inspect.
+
         config APP_CLAW_CAP_MCP_CLIENT
             bool "Enable MCP client capability"
             default y

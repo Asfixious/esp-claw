@@ -35,6 +35,7 @@ typedef struct {
     UBaseType_t task_priority;
     BaseType_t task_core;
     bool default_route_messages_to_agent;
+    bool default_route_agent_output_to_channel;
     claw_event_router_outbound_resolver_fn outbound_resolver;
     void *outbound_resolver_user_ctx;
 } claw_event_router_config_t;
@@ -53,11 +54,10 @@ typedef struct {
 
 typedef enum {
     CLAW_EVENT_ROUTER_ACTION_CALL_CAP = 0,
-    CLAW_EVENT_ROUTER_ACTION_RUN_AGENT = 1,
-    CLAW_EVENT_ROUTER_ACTION_RUN_SCRIPT = 2,
-    CLAW_EVENT_ROUTER_ACTION_SEND_MESSAGE = 3,
-    CLAW_EVENT_ROUTER_ACTION_EMIT_EVENT = 4,
-    CLAW_EVENT_ROUTER_ACTION_DROP = 5,
+    CLAW_EVENT_ROUTER_ACTION_RUN_SCRIPT = 1,
+    CLAW_EVENT_ROUTER_ACTION_SEND_MESSAGE = 2,
+    CLAW_EVENT_ROUTER_ACTION_EMIT_EVENT = 3,
+    CLAW_EVENT_ROUTER_ACTION_DROP = 4,
 } claw_event_router_action_kind_t;
 
 typedef enum {

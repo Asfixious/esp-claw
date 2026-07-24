@@ -7,6 +7,7 @@
 
 #include "app_lua_modules.h"
 
+#include <errno.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -33,6 +34,9 @@
 #endif
 #if CONFIG_APP_CLAW_CAP_LUA
 #include "cap_lua.h"
+#endif
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+#include "cap_llm_inspect.h"
 #endif
 #if CONFIG_APP_CLAW_CAP_MCP_CLIENT
 #include "cap_mcp_client.h"
@@ -81,6 +85,9 @@ static size_t s_external_group_count;
 static size_t s_external_group_capacity;
 static app_capability_group_info_t *s_group_infos;
 static size_t s_group_info_capacity;
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+static bool s_llm_inspect_prepared;
+#endif
 
 static bool app_cap_groups_config_empty(const char *value)
 {
@@ -492,6 +499,78 @@ static esp_err_t app_cap_register_lua(const app_claw_config_t *config,
 }
 #endif
 
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+static esp_err_t app_cap_parse_positive_number(const char *value,
+                                               size_t max_value,
+                                               size_t *out_value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!out_value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_value = 0;
+    if (!value || !value[0]) {
+        return ESP_OK;
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' ||
+            parsed == 0 || parsed > max_value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_value = (size_t)parsed;
+    return ESP_OK;
+}
+
+static esp_err_t app_cap_prepare_llm_inspect(const app_claw_config_t *config,
+                                             const app_claw_storage_paths_t *paths)
+{
+    cap_llm_inspect_config_t inspect_config = {
+        .api_key = config->llm_api_key,
+        .backend_type = config->llm_backend_type,
+        .model = config->llm_model,
+        .base_url = config->llm_base_url,
+        .auth_type = config->llm_auth_type,
+        .max_tokens_field = config->llm_max_tokens_field,
+        .supports_vision = strcmp(config->llm_supports_vision, "true") == 0,
+        .image_remote_url_only = strcmp(config->llm_image_remote_url_only, "true") == 0,
+    };
+    size_t parsed_value = 0;
+
+    (void)paths;
+    ESP_RETURN_ON_ERROR(app_cap_parse_positive_number(config->llm_timeout_ms,
+                                                      UINT32_MAX,
+                                                      &parsed_value),
+                        TAG, "Invalid LLM timeout for image inspection");
+    inspect_config.timeout_ms = (uint32_t)parsed_value;
+    ESP_RETURN_ON_ERROR(app_cap_parse_positive_number(config->llm_max_tokens,
+                                                      UINT32_MAX,
+                                                      &parsed_value),
+                        TAG, "Invalid LLM max tokens for image inspection");
+    inspect_config.max_tokens = (uint32_t)parsed_value;
+    ESP_RETURN_ON_ERROR(app_cap_parse_positive_number(config->llm_default_image_max_bytes,
+                                                      SIZE_MAX,
+                                                      &inspect_config.image_max_bytes),
+                        TAG, "Invalid image size limit for image inspection");
+
+    ESP_RETURN_ON_ERROR(cap_llm_inspect_configure(&inspect_config),
+                        TAG, "Failed to configure image inspection");
+    s_llm_inspect_prepared = true;
+    return ESP_OK;
+}
+
+static esp_err_t app_cap_register_llm_inspect(const app_claw_config_t *config,
+                                              const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    (void)paths;
+    return cap_llm_inspect_register_group();
+}
+#endif
+
 #if CONFIG_APP_CLAW_CAP_MCP_CLIENT
 static esp_err_t app_cap_register_mcp_client(const app_claw_config_t *config,
                                              const app_claw_storage_paths_t *paths)
@@ -595,6 +674,9 @@ static const app_capability_group_entry_t s_capability_group_entries[] = {
 #if CONFIG_APP_CLAW_CAP_LUA
     { "cap_lua", "Lua", "Register Lua cap", true, app_cap_prepare_lua, app_cap_register_lua },
 #endif
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+    { "cap_llm_inspect", "LLM Inspect", "Register LLM inspect cap", true, app_cap_prepare_llm_inspect, app_cap_register_llm_inspect },
+#endif
 #if CONFIG_APP_CLAW_CAP_MCP_CLIENT
     { "cap_mcp_client", "MCP Client", "Register MCP client cap", false, NULL, app_cap_register_mcp_client },
 #endif
@@ -636,6 +718,9 @@ static const app_capability_group_info_t s_capability_group_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_CAP_LUA
     { "cap_lua", "Lua", true },
+#endif
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+    { "cap_llm_inspect", "LLM Inspect", true },
 #endif
 #if CONFIG_APP_CLAW_CAP_MCP_CLIENT
     { "cap_mcp_client", "MCP Client", false },
@@ -808,5 +893,18 @@ esp_err_t app_capabilities_get_compiled_groups(const app_capability_group_info_t
 
     *groups = s_group_infos;
     *count = total_count;
+    return ESP_OK;
+}
+
+esp_err_t app_capabilities_update_config(const app_claw_config_t *config)
+{
+    if (!config) {
+        return ESP_ERR_INVALID_ARG;
+    }
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+    if (s_llm_inspect_prepared) {
+        return app_cap_prepare_llm_inspect(config, NULL);
+    }
+#endif
     return ESP_OK;
 }

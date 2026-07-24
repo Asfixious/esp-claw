@@ -44,6 +44,7 @@ typedef struct {
 esp_err_t app_capabilities_register_external_group(const app_capability_external_group_t *group);
 esp_err_t app_capabilities_init(const app_claw_config_t *config,
                                 const app_claw_storage_paths_t *paths);
+esp_err_t app_capabilities_update_config(const app_claw_config_t *config);
 esp_err_t app_capabilities_get_compiled_groups(const app_capability_group_info_t **groups,
                                                size_t *count);
 

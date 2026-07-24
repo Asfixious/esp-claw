@@ -11,11 +11,11 @@
 extern "C" {
 #endif
 
-/* Register AgentSystem as a system-only claw_cap entry. Normal input must carry
- * the numeric session selected by the IM layer; raw messages are reserved for
- * /session commands. Explicit callers may choose one session lifecycle, input,
- * or control operation. AgentSystem must be initialized and started
- * separately. */
+/* Register the system-only `agent` RPC capability. Requests use the strict
+ * {"method":"...","args":{...}} envelope; Session/request IDs may come from
+ * args or claw_cap_call_context_t. Opened Session streams are translated to
+ * Event Router events by cap_agent. AgentSystem lifecycle remains
+ * application-owned and must be initialized and started separately. */
 esp_err_t cap_agent_register_group(void);
 
 #ifdef __cplusplus

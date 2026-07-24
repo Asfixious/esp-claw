@@ -9,6 +9,8 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "cJSON.h"
+#include "claw_cap.h"
 #include "claw_event_publisher.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -20,6 +22,7 @@ static const char *TAG = "claw_im_session";
 #define CLAW_IM_SESSION_CURSOR_CAPACITY 32
 #define CLAW_IM_SESSION_CHANNEL_SIZE    32
 #define CLAW_IM_SESSION_CHAT_ID_SIZE    96
+#define CLAW_IM_SESSION_RPC_OUTPUT_SIZE 256
 
 typedef struct {
     bool occupied;
@@ -128,6 +131,114 @@ static bool claw_im_session_is_command(const char *text)
            *text == '\r' || *text == '\f' || *text == '\v';
 }
 
+static esp_err_t claw_im_session_call_agent(const char *method,
+                                            cJSON *args,
+                                            cJSON **out_response)
+{
+    cJSON *request = NULL;
+    cJSON *response = NULL;
+    char *input_json = NULL;
+    char *output = NULL;
+    claw_cap_call_context_t ctx = {
+        .source_cap = "claw_im_session",
+        .caller = CLAW_CAP_CALLER_SYSTEM,
+    };
+    esp_err_t err;
+
+    if (!method || !args) {
+        cJSON_Delete(args);
+        return ESP_ERR_INVALID_ARG;
+    }
+    request = cJSON_CreateObject();
+    if (!request ||
+            !cJSON_AddStringToObject(request, "method", method) ||
+            !cJSON_AddItemToObject(request, "args", args)) {
+        cJSON_Delete(request);
+        cJSON_Delete(args);
+        return ESP_ERR_NO_MEM;
+    }
+    args = NULL;
+    input_json = cJSON_PrintUnformatted(request);
+    cJSON_Delete(request);
+    if (!input_json) {
+        return ESP_ERR_NO_MEM;
+    }
+    output = calloc(1, CLAW_IM_SESSION_RPC_OUTPUT_SIZE);
+    if (!output) {
+        free(input_json);
+        return ESP_ERR_NO_MEM;
+    }
+    err = claw_cap_call("agent",
+                        input_json,
+                        &ctx,
+                        output,
+                        CLAW_IM_SESSION_RPC_OUTPUT_SIZE);
+    free(input_json);
+    if (err == ESP_OK && out_response) {
+        response = cJSON_Parse(output);
+        if (!cJSON_IsObject(response)) {
+            cJSON_Delete(response);
+            err = ESP_ERR_INVALID_RESPONSE;
+        } else {
+            *out_response = response;
+        }
+    }
+    free(output);
+    return err;
+}
+
+static esp_err_t claw_im_session_agent_create(
+    claw_agent_session_persistence_t persistence,
+    uint32_t *out_session_id)
+{
+    cJSON *args = cJSON_CreateObject();
+    cJSON *response = NULL;
+    const cJSON *result;
+    const cJSON *session_id;
+    esp_err_t err;
+
+    if (!out_session_id || !args ||
+            !cJSON_AddStringToObject(
+                args,
+                "persistence",
+                persistence == CLAW_AGENT_SESSION_PERSISTENCE_EPHEMERAL ?
+                "ephemeral" : "persistent")) {
+        cJSON_Delete(args);
+        return ESP_ERR_NO_MEM;
+    }
+    err = claw_im_session_call_agent("session.create", args, &response);
+    if (err != ESP_OK) {
+        return err;
+    }
+    result = cJSON_GetObjectItemCaseSensitive(response, "result");
+    session_id = cJSON_GetObjectItemCaseSensitive(result, "session_id");
+    if (!cJSON_IsNumber(session_id) ||
+            session_id->valuedouble < 1.0 ||
+            session_id->valuedouble > (double)UINT32_MAX ||
+            (double)(uint32_t)session_id->valuedouble != session_id->valuedouble) {
+        cJSON_Delete(response);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    *out_session_id = (uint32_t)session_id->valuedouble;
+    cJSON_Delete(response);
+    return ESP_OK;
+}
+
+static esp_err_t claw_im_session_agent_id_call(const char *method,
+                                               uint32_t session_id)
+{
+    cJSON *args = cJSON_CreateObject();
+
+    if (!args ||
+            !cJSON_AddNumberToObject(args,
+                                    "session_id",
+                                    (double)session_id)) {
+        cJSON_Delete(args);
+        return ESP_ERR_NO_MEM;
+    }
+    return claw_im_session_call_agent(method, args, NULL);
+}
+
 esp_err_t claw_im_session_publish_message(
     const char *source_cap,
     const char *channel,
@@ -233,14 +344,16 @@ esp_err_t claw_im_session_prepare_input(
             claw_im_session_unlock();
             return ESP_ERR_NO_MEM;
         }
-        err = claw_agent_session_create(persistence, &session_id);
+        err = claw_im_session_agent_create(persistence, &session_id);
         if (err != ESP_OK) {
             claw_im_session_unlock();
             return err;
         }
-        err = claw_agent_session_open(session_id);
+        err = claw_im_session_agent_id_call("session.open", session_id);
         if (err != ESP_OK) {
-            esp_err_t cleanup_err = claw_agent_session_delete(session_id);
+            esp_err_t cleanup_err = claw_im_session_agent_id_call(
+                "session.delete",
+                session_id);
 
             if (cleanup_err != ESP_OK) {
                 ESP_LOGW(TAG,
@@ -266,7 +379,7 @@ esp_err_t claw_im_session_prepare_input(
                  channel,
                  chat_id);
     } else if (!cursor->open) {
-        err = claw_agent_session_open(cursor->session_id);
+        err = claw_im_session_agent_id_call("session.open", cursor->session_id);
         if (err != ESP_OK) {
             claw_im_session_unlock();
             return err;

@@ -4,7 +4,9 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
+        claw_cap
         claw_event_router
         freertos
         framework
+        json
 )

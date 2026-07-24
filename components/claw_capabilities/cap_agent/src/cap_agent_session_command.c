@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "cap_agent_reply.h"
+#include "cap_agent_event.h"
 #include "claw_agent.h"
 #include "claw_im_session.h"
 #include "esp_log.h"
@@ -300,19 +300,19 @@ static esp_err_t cap_agent_session_select_open(
     bool opened_here = false;
     esp_err_t err;
 
-    if (!cap_agent_reply_is_attached(session_id)) {
+    if (!cap_agent_event_is_attached(session_id)) {
         err = claw_agent_session_open(session_id);
         if (err == ESP_OK) {
             opened_here = true;
         } else if (err == ESP_ERR_INVALID_STATE) {
-            if (!cap_agent_reply_is_attached(session_id)) {
+            if (!cap_agent_event_is_attached(session_id)) {
                 /* IM may have opened the stream while publishing the inbound
                  * event. Only adopt that stream when the IM map proves it is
                  * ours; otherwise another C API consumer owns receive(). */
                 if (!claw_im_session_is_managed(session_id)) {
                     return err;
                 }
-                err = cap_agent_reply_ensure(session_id);
+                err = cap_agent_event_attach(session_id);
                 if (err != ESP_OK) {
                     return err;
                 }
@@ -322,7 +322,7 @@ static esp_err_t cap_agent_session_select_open(
         }
     }
     if (opened_here) {
-        err = cap_agent_reply_ensure(session_id);
+        err = cap_agent_event_attach(session_id);
         if (err != ESP_OK) {
             (void)claw_agent_session_close(session_id);
             return err;

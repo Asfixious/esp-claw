@@ -47,7 +47,10 @@
         "type": "call_cap",
         "cap": "agent",
         "input": {
-          "message": "{{event.text}}"
+          "method": "session.command",
+          "args": {
+            "text": "{{event.text}}"
+          }
         }
       },
       {
@@ -101,6 +104,25 @@
     ]
   },
   {
+    "id": "agent_out_message",
+    "description": "Send completed Agent output to the outbound channel bound by the originating IM route.",
+    "enabled": true,
+    "consume_on_match": true,
+    "ack": "agent output sent",
+    "match": {
+      "source_cap": "agent",
+      "event_type": "out_message"
+    },
+    "actions": [
+      {
+        "type": "send_message",
+        "input": {
+          "message": "{{event.text}}"
+        }
+      }
+    ]
+  },
+  {
     "id": "im_any_message_agent",
     "description": "Route IM text messages to the agent.",
     "enabled": true,
@@ -113,9 +135,13 @@
     },
     "actions": [
       {
-        "type": "run_agent",
+        "type": "call_cap",
+        "cap": "agent",
         "input": {
-          "target_channel": "{{event.source_channel}}"
+          "method": "session.input",
+          "args": {
+            "text": "{{event.text}}"
+          }
         }
       }
     ]

@@ -27,6 +27,9 @@
 #if CONFIG_APP_CLAW_CAP_LUA
 #include "cmd_cap_lua.h"
 #endif
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+#include "cmd_cap_llm_inspect.h"
+#endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
 #include "cmd_cap_router_mgr.h"
 #endif
@@ -302,7 +305,7 @@ static cli_turn_result_t receive_and_print(uint32_t session_id, bool track_input
             }
             printf("input requested id=%" PRIu32 ": %s\n",
                    event.data.input_requested.request_id,
-                   event.data.input_requested.summary ? event.data.input_requested.summary : "");
+                   event.data.input_requested.reason ? event.data.input_requested.reason : "");
             if (track_input) {
                 s_pending_input_request_id = event.data.input_requested.request_id;
                 printf("Use: respond <answer>\n");
@@ -1034,6 +1037,9 @@ static void register_cap_cli_commands(void)
 #endif
 #if CONFIG_APP_CLAW_CAP_LUA
     register_cap_lua();
+#endif
+#if CONFIG_APP_CLAW_CAP_LLM_INSPECT
+    register_cap_llm_inspect();
 #endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     register_cap_router_mgr();

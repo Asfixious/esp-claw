@@ -1,13 +1,15 @@
 idf_component_register(
     SRCS
         "src/cap_agent.c"
-        "src/cap_agent_reply.c"
+        "src/cap_agent_event.c"
         "src/cap_agent_session_command.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         claw_cap
+        claw_event_router
         claw_im_session
+        esp_timer
         freertos
         json
         framework

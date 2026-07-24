@@ -1,11 +1,16 @@
 idf_component_register(
     SRCS
         "src/cap_llm_inspect.c"
+        "src/cap_llm_inspect_http.c"
+        "src/cap_llm_inspect_media.c"
+        "src/cap_llm_inspect_providers.c"
+        "src/cap_llm_inspect_runtime.c"
         "src/cmd_cap_llm_inspect.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         claw_cap
-        claw_core
         console
+        esp_http_client
+        mbedtls
 )

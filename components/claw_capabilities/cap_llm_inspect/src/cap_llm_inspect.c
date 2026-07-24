@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "cap_llm_inspect.h"
+#include "cap_llm_inspect_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,20 +12,101 @@
 
 #include "cJSON.h"
 #include "claw_cap.h"
-#include "claw_core_llm.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static const char *CAP_LLM_INSPECT_SYSTEM_PROMPT =
     "You analyze local image files for the ESP32 claw. "
     "Describe visible content plainly and briefly. "
     "If the image is unclear, say what is uncertain instead of guessing.";
+static const char *TAG = "cap_llm_inspect";
+
+static SemaphoreHandle_t s_runtime_lock;
+static portMUX_TYPE s_runtime_lock_init_mux = portMUX_INITIALIZER_UNLOCKED;
+static cap_llm_inspect_runtime_handle_t s_runtime;
+
+static bool string_is_empty(const char *value)
+{
+    return !value || value[0] == '\0';
+}
+
+static bool config_is_unbound(const cap_llm_inspect_config_t *config)
+{
+    return string_is_empty(config->api_key) &&
+           string_is_empty(config->backend_type) &&
+           string_is_empty(config->model) &&
+           string_is_empty(config->base_url);
+}
+
+static esp_err_t ensure_runtime_lock(void)
+{
+    SemaphoreHandle_t new_lock = NULL;
+
+    if (s_runtime_lock) {
+        return ESP_OK;
+    }
+
+    new_lock = xSemaphoreCreateMutex();
+    if (!new_lock) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    portENTER_CRITICAL(&s_runtime_lock_init_mux);
+    if (!s_runtime_lock) {
+        s_runtime_lock = new_lock;
+        new_lock = NULL;
+    }
+    portEXIT_CRITICAL(&s_runtime_lock_init_mux);
+    if (new_lock) {
+        vSemaphoreDelete(new_lock);
+    }
+    return ESP_OK;
+}
+
+esp_err_t cap_llm_inspect_configure(const cap_llm_inspect_config_t *config)
+{
+    cap_llm_inspect_runtime_handle_t replacement = NULL;
+    cap_llm_inspect_runtime_handle_t previous = NULL;
+    char *error_message = NULL;
+    esp_err_t err;
+
+    if (!config) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!config_is_unbound(config)) {
+        err = cap_llm_inspect_runtime_create(config, &replacement, &error_message);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to configure image inference: %s",
+                     error_message ? error_message : esp_err_to_name(err));
+            free(error_message);
+            return err;
+        }
+    }
+
+    err = ensure_runtime_lock();
+    if (err != ESP_OK) {
+        cap_llm_inspect_runtime_delete(replacement);
+        return err;
+    }
+
+    xSemaphoreTake(s_runtime_lock, portMAX_DELAY);
+    previous = s_runtime;
+    s_runtime = replacement;
+    xSemaphoreGive(s_runtime_lock);
+    cap_llm_inspect_runtime_delete(previous);
+
+    ESP_LOGI(TAG, "Standalone image inference %s",
+             replacement ? "configured" : "left unconfigured");
+    return ESP_OK;
+}
 
 static esp_err_t cap_llm_inspect_execute(const char *input_json,
                                          const claw_cap_call_context_t *ctx,
                                          char *output,
                                          size_t output_size)
 {
-    claw_media_asset_t asset = {0};
-    claw_llm_media_request_t request = {0};
     cJSON *root = NULL;
     cJSON *path_json = NULL;
     cJSON *prompt_json = NULL;
@@ -35,10 +117,7 @@ static esp_err_t cap_llm_inspect_execute(const char *input_json,
     if (!input_json || !output || output_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!ctx || !ctx->core) {
-        snprintf(output, output_size, "Error: claw_core is not ready");
-        return ESP_ERR_INVALID_STATE;
-    }
+    (void)ctx;
 
     root = cJSON_Parse(input_json);
     if (!root) {
@@ -55,13 +134,26 @@ static esp_err_t cap_llm_inspect_execute(const char *input_json,
         return ESP_ERR_INVALID_ARG;
     }
 
-    asset.kind = CLAW_MEDIA_ASSET_KIND_LOCAL_PATH;
-    asset.path = path_json->valuestring;
-    request.system_prompt = CAP_LLM_INSPECT_SYSTEM_PROMPT;
-    request.user_prompt = prompt_json->valuestring;
-    request.media = &asset;
-    request.media_count = 1;
-    err = claw_core_llm_infer_media(ctx->core, &request, &analysis, &error_message);
+    err = ensure_runtime_lock();
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: image inference lock unavailable");
+        return err;
+    }
+
+    xSemaphoreTake(s_runtime_lock, portMAX_DELAY);
+    if (!s_runtime) {
+        err = ESP_ERR_INVALID_STATE;
+        error_message = strdup("LLM image inference is not configured");
+    } else {
+        err = cap_llm_inspect_runtime_infer_image(s_runtime,
+                                                  path_json->valuestring,
+                                                  CAP_LLM_INSPECT_SYSTEM_PROMPT,
+                                                  prompt_json->valuestring,
+                                                  &analysis,
+                                                  &error_message);
+    }
+    xSemaphoreGive(s_runtime_lock);
     cJSON_Delete(root);
     if (err != ESP_OK) {
         snprintf(output,

@@ -190,6 +190,7 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
         .task_priority = 5,
         .task_core = tskNO_AFFINITY,
         .default_route_messages_to_agent = false,
+        .default_route_agent_output_to_channel = false,
     };
 #endif
     if (!config) {
@@ -200,6 +201,7 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
 
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     router_config.default_route_messages_to_agent = true;
+    router_config.default_route_agent_output_to_channel = true;
     router_config.rules_path = paths.router_rules_path;
 #endif
 
@@ -292,6 +294,8 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
 esp_err_t app_claw_update_config(const app_claw_config_t *config)
 {
     claw_agent_api_config_t api_config;
+    app_claw_config_t previous_config;
+    bool had_previous_config = false;
     esp_err_t err;
 
     if (!config) {
@@ -306,10 +310,24 @@ esp_err_t app_claw_update_config(const app_claw_config_t *config)
     };
 
     xSemaphoreTake(s_config_lock, portMAX_DELAY);
-    err = claw_agent_link_api(&api_config, CLAW_AGENT_API_PURPOSE_ROOT_AGENT, true);
+    if (s_current_config_valid) {
+        previous_config = s_current_config;
+        had_previous_config = true;
+    }
+    err = app_capabilities_update_config(config);
+    if (err == ESP_OK) {
+        err = claw_agent_link_api(&api_config, CLAW_AGENT_API_PURPOSE_ROOT_AGENT, true);
+    }
     if (err == ESP_OK) {
         s_current_config = *config;
         s_current_config_valid = true;
+    } else if (had_previous_config) {
+        esp_err_t rollback_err = app_capabilities_update_config(&previous_config);
+
+        if (rollback_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore capability configuration: %s",
+                     esp_err_to_name(rollback_err));
+        }
     }
     xSemaphoreGive(s_config_lock);
     return err;

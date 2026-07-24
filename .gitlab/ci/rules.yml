@@ -22,6 +22,9 @@
 .patterns-components_common: &patterns-components_common
 - "components/common/**/*"
 
+.patterns-framework: &patterns-framework
+  - "framework/**/*"
+
 # application folder, in the alphabetic order
 .patterns-application_mcp_server_point: &patterns-application_mcp_server_point
   - "application/mcp_server_point/**/*"
@@ -86,6 +89,8 @@
       changes: *patterns-components_lua_modules
     - <<: *if-mr
       changes: *patterns-components_common
+    - <<: *if-mr
+      changes: *patterns-framework
     - <<: *if-mr
       changes: *patterns-application_edge_agent
     - <<: *if-mr

@@ -19,7 +19,25 @@ import LinkToSource from '@/components/LinkToSource.astro';
 1. **准备 ESP-IDF 环境**
 
    {/* 链接有意指向 v6.0 文档：v6.0 的安装教程比 v5.x 文档更加详细，安装步骤具有向下兼容性，实际安装的 IDF 版本为 v5.5.4 */}
-   参考 [ESP-IDF 安装指南](https://docs.espressif.com/projects/esp-idf/zh_CN/v6.0/esp32s3/get-started/index.html#get-started-set-up-tools)，安装 ESP-IDF v5.5.4，并激活 ESP-IDF 环境。
+   参考 [ESP-IDF 安装指南](https://docs.espressif.com/projects/esp-idf/zh_CN/v6.0/esp32s3/get-started/index.html#get-started-set-up-tools) 安装 ESP-IDF v5.5.4。暂时不要激活 ESP-IDF 环境；按下方顺序激活可确保优先使用 ESP-IDF 的 C 编译器。
+
+   固件构建包含使用 Rust 编写的 ESP32-S3 核心。安装 [Rust toolchain](https://www.rust-lang.org/tools/install)，再安装 Espressif Rust toolchain：
+
+   ```bash
+   rustup toolchain install stable
+   cargo install espup --locked
+   espup install
+   ```
+
+   在 Linux 和 macOS 上，每次打开新的终端后都需要加载 `espup` 生成的环境变量：
+
+   ```bash
+   . "$HOME/export-esp.sh"
+   ```
+
+   Windows 会自动配置这些环境变量，无需执行上述命令。
+
+   最后激活 ESP-IDF 环境。必须在加载 `espup` 环境后执行此步骤，确保构建使用 ESP-IDF v5.5.4 所需的 C 编译器。
 
    激活 IDF 环境后，安装 ESP Board Manager 包：
    ```bash

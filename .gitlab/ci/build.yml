@@ -71,6 +71,17 @@ build_application_edge_agent:
   extends:
     - .build_examples_template
     - .rules:build:application_edge_agent
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends build-essential curl pkg-config
+    - |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable
+    - export PATH="${HOME}/.cargo/bin:${PATH}"
+    - cargo install espup --locked
+    - espup install
+    - . "${HOME}/export-esp.sh"
+    - . "${IDF_PATH}/export.sh"
   variables:
     EXAMPLE_DIR: application/edge_agent
   parallel:

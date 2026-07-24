@@ -51,12 +51,12 @@ This walkthrough uses sample app `application/edge_agent`, covering entry <LinkT
 <LinkToSource relativePath="components/common/app_claw/app_claw.c" /> initializes the Agent stack in order, then launches the Console REPL.
 
 <Steps>
-1. **Init Session Manager and Event Router**
+1. **Init Event Router and capabilities**
 
-    Call `cap_session_mgr_set_session_root_dir` to set the session manager root, then
-    `claw_event_router_init` loads the automation file (demo: `/fatfs/router_rules/router_rules.json`),
-    sets timeouts talking to `claw_core`, and `default_route_messages_to_agent` (`true` when LLM settings are complete).
-    The `run_agent` action uses asynchronous submission; Agent responses are published back to the Event Router as `out_message` events.
+    `claw_event_router_init` loads `/fatfs/router_rules/router_rules.json`; `app_capabilities_init`
+    then registers and starts the enabled C capabilities, including the system-only `agent` RPC adapter.
+    Both unmatched-message-to-Agent and unmatched-Agent-output-to-channel fallbacks are enabled.
+    Agent input is `call_cap("agent", method + args)`; Session output returns as `out_message` events.
 
 2. **Init scheduler**
 

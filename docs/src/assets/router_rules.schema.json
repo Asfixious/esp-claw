@@ -89,7 +89,6 @@
               "type": "string",
               "enum": [
                 "call_cap",
-                "run_agent",
                 "run_script",
                 "send_message",
                 "emit_event",
@@ -140,31 +139,6 @@
                       "channel": { "type": "string" },
                       "chat_id": { "type": "string" },
                       "message": { "type": "string" }
-                    }
-                  }
-                }
-              }
-            },
-            {
-              "if": { "properties": { "type": { "const": "run_agent" } } },
-              "then": {
-                "properties": {
-                  "input": {
-                    "type": "object",
-                    "properties": {
-                      "text": { "type": "string" },
-                      "target_channel": { "type": "string" },
-                      "target_chat_id": { "type": "string" },
-                      "session_policy": {
-                        "type": "string",
-                        "enum": [
-                          "chat",
-                          "trigger",
-                          "global",
-                          "ephemeral",
-                          "nosave"
-                        ]
-                      }
                     }
                   }
                 }

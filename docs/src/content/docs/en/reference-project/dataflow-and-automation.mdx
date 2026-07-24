@@ -36,8 +36,7 @@ The **order** of rules in `router_rules.json` is evaluation order. Each rule typ
 - `actions`: action list, for example:
     | Action | Typical use |
     |--------------|----------|
-    | `call_cap` | Run a capability without the LLM |
-    | `run_agent` | Asynchronously submit to `claw_core`; Agent response is published back via `out_message` event |
+    | `call_cap` | Run a capability, including the `agent` RPC endpoint |
     | `run_script` | Run a Lua script |
     | `send_message` | Send IM via outbound binding |
     | `emit_event` | Emit a new Event back into `claw_event_router` |
@@ -75,7 +74,7 @@ The **order** of rules in `router_rules.json` is evaluation order. Each rule typ
 
 Matched text templates include `{{match.text}}`, `{{match.rule}}`, and `{{match.remainder}}`.
 
-`edge_agent` ships a starter `router_rules.json` for basic IM flows. See <LinkToSource relativePath="application/edge_agent/fatfs_image/router_rules/router_rules.json" />.
+`edge_agent` ships a recovery `router_rules.json` for basic IM flows. See <LinkToSource relativePath="application/edge_agent/fatfs_image/system/.recovery/router_rules/router_rules.json" />.
 
 Full syntax is captured in the JSON Schema.
 
@@ -90,6 +89,25 @@ Full syntax is captured in the JSON Schema.
 
     **Run `auto reload` after changes.**
 </Aside>
+
+## Route text to Agent
+
+Agent input is an ordinary capability call; there is no Agent-specific Router action:
+
+```json
+{
+  "type": "call_cap",
+  "cap": "agent",
+  "input": {
+    "method": "session.input",
+    "args": {
+      "text": "{{event.text}}"
+    }
+  }
+}
+```
+
+The incoming event's numeric `session_id` and optional `request_id` are forwarded through the call context. `session.input` submits a new turn when `request_id` is zero and responds to `INPUT_REQUESTED` otherwise.
 
 ## Event Router workflow
 
@@ -125,7 +143,7 @@ fallback_check: {
   label: "No rule matched &&\ndefault_route_messages_to_agent &&\nevent_type = \"message\"?"
   shape: diamond
 }
-run_default: "Default Agent\n(run_agent)"
+run_default: "Default Agent\n(call_cap agent)"
 done: "Done"
 
 queue -> guard: "dequeue"
@@ -145,7 +163,7 @@ fallback_check -> done: "no"
 
 ## `out_message` Event and Outbound Messages
 
-When the `run_agent` action is triggered, the Agent's response is not returned synchronously. Instead, it is published back to the Event Router as an asynchronous event of type `out_message`.
+Agent input uses `call_cap` with `cap="agent"`, `method="session.input"`, and `args.text`. `cap_agent` accepts the input synchronously, exclusively consumes the Session stream, coalesces output deltas, and publishes one asynchronous `out_message` event at output end.
 
 To send the Agent's response to an IM channel, you need to configure a routing rule for `out_message`, for example:
 
@@ -154,16 +172,13 @@ To send the Agent's response to an IM channel, you need to configure a routing r
   "id": "agent_out_message_send_message",
   "consume_on_match": true,
   "match": {
-    "source_cap": "claw_core",
-    "event_type": "out_message",
-    "content_type": "text"
+    "source_cap": "agent",
+    "event_type": "out_message"
   },
   "actions": [
     {
       "type": "send_message",
       "input": {
-        "channel": "{{event.source_channel}}",
-        "chat_id": "{{event.chat_id}}",
         "message": "{{event.text}}"
       }
     }
@@ -171,40 +186,39 @@ To send the Agent's response to an IM channel, you need to configure a routing r
 }
 ```
 
-The `channel` / `chat_id` fields usually come from `target_channel` / `target_chat_id` passed when triggering `run_agent`.
+When `channel` / `chat_id` are omitted, `send_message` uses the route that `cap_agent` bound when the corresponding Session input was accepted.
 
 ## Agent-request cancellation and queue cleanup
 
-After a `run_agent` action is submitted to `claw_core`, a `request_id` is allocated and recorded for later cancellation or tracking.
+Agent execution and Router queue entries have separate cancellation surfaces.
 
 Accordingly, the framework offers two cancellation layers (C APIs):
 
-- `claw_core_cancel_request(request_id)`: cancel the currently executing (in-flight) Agent request.
+- `claw_cap_call("agent", {"method":"session.interrupt"|"session.cancel",...})`: interrupt or cancel a numeric Agent Session.
 - `claw_event_router_cancel_event(event_id)`: mark and skip one pending Event in the queue.
 - `claw_event_router_purge_queue(event_type_filter, source_cap_filter, &out_cancelled)`: batch-mark and skip pending queue Events (optional filters by event type and source cap).
 
 <Aside type="note">
 
 - These APIs only affect objects that have not finished processing; completed requests/Events are not rolled back.
-  - `claw_core_cancel_request(0)` means "cancel any current in-flight request"; when a concrete `request_id` is provided, only that request is matched.
+  - Agent cancellation targets a numeric Session; `request_id` is reserved for responding to `INPUT_REQUESTED`.
   - Event Router cancellation means "skip pending queue items", and does not affect actions already in execution.
 </Aside>
 
 ## `agent_stage` Event and Execution Progress Notifications
 
-Besides the final `out_message`, `claw_core` can also publish `agent_stage` events during multi-round tool calling, which can be used to push staged tool-call progress information.
+Besides the final `out_message`, `cap_agent` publishes `agent_stage` events for tool calls observed on the Session stream.
 
 The `agent_stage` event structure is:
-- `source_cap`: `claw_core`
+- `source_cap`: `agent`
 - `event_type`: `agent_stage`
 - `event.text`: staged information during tool calls
 
-To auto-publish `agent_stage` events, adjust this menuconfig option: <kbd>(Top)</kbd> → <kbd>Component config</kbd> → <kbd>ESP-Claw Core</kbd> → <kbd>Agent stage notification verbosity</kbd>
-- With <kbd>Verbose</kbd>, `claw_core` publishes `agent_stage` events to Event Router on turns that contain tool calls.
-- With <kbd>Simple</kbd>, `agent_stage` events are not published at the routing layer.
+`cap_agent` emits one `agent_stage/tool_call` event for each complete tool call received from `claw_agent.h`.
+Reasoning and token deltas are not queued through Event Router; output deltas are coalesced until `OUTPUT_END`.
 
 `agent_stage` events can be routed to channels such as IM to provide real-time progress updates.
-For example, `edge_agent` includes rule `agent_stage_im_notify` in <LinkToSource relativePath="application/edge_agent/fatfs_image/router_rules/router_rules.json" />. When Verbose is enabled and this rule matches, it sends `{{event.text}}` from `agent_stage` back to the source IM conversation.
+For example, a rule may match `source_cap=agent,event_type=agent_stage` and send `{{event.text}}` back to the source IM conversation.
 
 ## Scheduled Dispatch
 

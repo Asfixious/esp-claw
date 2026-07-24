@@ -1,6 +1,6 @@
 ---
 title: cap_llm_inspect — 图像分析
-description: LLM 交互代表：在工具执行中嵌套发起 LLM 多模态推理。
+description: 不依赖 Agent 运行时的独立本地图像推理能力。
 ---
 
 import LinkToSource from '@/components/LinkToSource.astro';
@@ -10,12 +10,12 @@ import { Aside } from '@astrojs/starlight/components';
 
 ## 定位
 
-`cap_llm_inspect` 是**与 LLM 产生交互**的代表实现。它展示了一种特殊模式：一个 Capability 在被 LLM 调用执行时，会反过来**再次发起 LLM 推理**（嵌套 LLM 调用），用于分析本地图像文件。
+`cap_llm_inspect` 通过**由 Capability 自己持有的独立推理客户端**分析本地图像。它不依赖 `claw_core`，也不进入 Agent 请求循环。
 
-这种模式适用于需要 LLM 能力作为子任务的场景，例如：
-- 图像理解（本模块）
-- 文本摘要
-- 代码解释
+它刻意只保留最小范围：
+- 读取一个受支持的本地图像
+- 发送一次图像与提示词请求
+- 返回提供者的文本结果
 
 ## 工具接口
 
@@ -48,13 +48,13 @@ inspect -> send: "结果文本"
 send -> user: "回复"
 ```
 
-## 核心实现：嵌套 LLM 推理
+## 核心实现：独立图像推理
 
-`cap_llm_inspect` 的实现极为简洁（约 110 行），核心逻辑：
+Capability 只拥有图像预处理、提供者请求和 HTTP 响应，核心逻辑：
 
 ```c
 static const char *CAP_LLM_INSPECT_SYSTEM_PROMPT =
-    "You analyze local image files for the ESP-Claw. "
+    "You analyze local image files for the ESP32 claw. "
     "Describe visible content plainly and briefly. "
     "If the image is unclear, say what is uncertain instead of guessing.";
 
@@ -62,23 +62,24 @@ static esp_err_t cap_llm_inspect_execute(const char *input_json,
                                           const claw_cap_call_context_t *ctx,
                                           char *output, size_t output_size)
 {
-    // 1. 解析 path 和 prompt
-    claw_media_asset_t asset = {
-        .kind = CLAW_MEDIA_ASSET_KIND_LOCAL_PATH,
-        .path = path_json->valuestring,
-    };
-
-    // 2. 构造多模态请求（独立 system prompt + 用户 prompt + 图像）
-    claw_llm_media_request_t request = {
-        .system_prompt = CAP_LLM_INSPECT_SYSTEM_PROMPT,
-        .user_prompt   = prompt_json->valuestring,
-        .media         = &asset,
-        .media_count   = 1,
-    };
-
-    // 3. 嵌套调用 LLM，结果写入 output
+    // 此处之前已解析并校验 path 和 prompt。
     char *analysis = NULL;
-    err = claw_core_llm_infer_media(&request, &analysis, &error_message);
+    char *error_message = NULL;
+
+    xSemaphoreTake(s_runtime_lock, portMAX_DELAY);
+    if (!s_runtime) {
+        err = ESP_ERR_INVALID_STATE;
+        error_message = strdup("LLM image inference is not configured");
+    } else {
+        err = cap_llm_inspect_runtime_infer_image(
+            s_runtime,
+            path_json->valuestring,
+            CAP_LLM_INSPECT_SYSTEM_PROMPT,
+            prompt_json->valuestring,
+            &analysis,
+            &error_message);
+    }
+    xSemaphoreGive(s_runtime_lock);
     snprintf(output, output_size, "%s", analysis);
     free(analysis);
 }
@@ -86,10 +87,10 @@ static esp_err_t cap_llm_inspect_execute(const char *input_json,
 
 ### 与普通 LLM 对话的区别
 
-`claw_core_llm_infer_media` 是一次**独立的 LLM 调用**，与正在处理用户请求的 Agent 对话完全隔离：
+`cap_llm_inspect` 的私有运行时与正在处理用户请求的 Agent 对话完全隔离：
 
 - 使用专属的 `system_prompt`（专注于图像描述，不携带对话历史）
-- 不消耗当前 session 的 token 配额
+- 不读取或持久化当前 session 上下文
 - 不触发 `cap_skill` 的工具可见性管理
 - 支持图像作为输入（依赖底层 LLM 提供者的多模态能力）
 
@@ -117,19 +118,19 @@ if (err != ESP_OK) {
 
 2. **路径确认原则**：描述中明确要求 "Confirm the path first"——LLM 在调用前应先通过 `cap_files` 的 `list_dir` 确认文件存在，避免因路径错误浪费 LLM 调用
 
-3. **无状态**：`cap_llm_inspect` 不持有任何状态，每次调用都是独立的推理任务
+3. **无 session 状态**：只保留复制后的提供者配置，每次图像请求彼此独立
 
 4. **关注点分离**：IM 附件下载由 `cap_im_platform` 负责，路径管理由 `cap_files` 负责，分析逻辑集中在 `cap_llm_inspect`
 
-## 扩展思路
+## 刻意限制的范围
 
-基于同样的模式，可以实现：
+Capability 明确不包含：
 
-- `inspect_audio`：分析音频文件（需 LLM 支持音频输入）
-- `summarize_document`：对文本文件进行摘要（调用文本推理接口）
-- `classify_image`：使用专用 system prompt 对图像分类
+- 音频或文档处理
+- Agent 历史、工具循环或上下文持久化
+- 流式响应、重试或通用提供者框架
 
 <Aside type="tip">
-  **何时使用嵌套 LLM vs. 直接处理？**
-  若任务本身需要语义理解（图像内容描述、自然语言判断），嵌套 LLM 是最简洁的方案。若任务是确定性的（文件操作、数值计算），应避免嵌套 LLM 以降低延迟和成本。
+  **为什么保持最小范围？**
+  `inspect_image` 只需要一个本地图像和一个语义结果；额外的 Agent 运行时功能只会增加耦合，不能帮助它完成任务。
 </Aside>

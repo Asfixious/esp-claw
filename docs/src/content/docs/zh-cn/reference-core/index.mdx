@@ -16,7 +16,7 @@ import LinkToSource from '@/components/LinkToSource.astro';
 |------|--------|
 | [claw_core](./claw-core) | 维护请求队列与后台任务，组装 system / messages / tools 上下文，驱动大语言模型多轮与工具调用，并通过回调写回会话历史、调用 `claw_cap`。 |
 | [claw_cap](./claw-cap) | 能力注册表：按 group 管理描述符、生命周期、大语言模型可见分组，统一执行入口，并向 `claw_core` 提供 tools JSON。 |
-| [claw_event_router](./claw-event-router) | 统一事件入口：规则匹配、`call_cap` / `run_agent` / `run_script` / `send_message` 等动作链；`run_agent` 异步提交至 `claw_core`，响应通过 `out_message` 事件发布。事件类型定义见 `claw_event.h`，发布 API 见 `claw_event_publisher.h`。 |
+| [claw_event_router](./claw-event-router) | 统一事件入口：规则匹配与 `call_cap` / `run_script` / `send_message` 动作链。Agent 输入使用 `call_cap("agent", method + args)`；`cap_agent` 将 Session 输出发布为 `out_message`。事件类型定义见 `claw_event.h`，发布 API 见 `claw_event_publisher.h`。 |
 | [claw_memory](./claw-memory) | 会话历史与长期记忆文件的读写，并作为 `claw_core` 的 context provider。 |
 | [claw_skill](./claw-skill) | Skills 目录、`SKILL.md` 元数据渲染、按 session 的激活状态持久化，以及向模型注入 Skills 目录清单。已激活 Skill 文档通过 `activate_skill` 工具返回值注入会话历史。 |
 

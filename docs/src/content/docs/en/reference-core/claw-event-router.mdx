@@ -21,34 +21,33 @@ At minimum, include `claw_event_publisher.h` if you only need to publish events 
 
 ## Responsibilities
 
-`claw_event_router` ingests structured `claw_event_t` events, matches them against `router_rules.json` (or rules added/removed at runtime), and runs a chain of actions (e.g. call a capability, run Lua, invoke the Agent, send a message, emit another event).
+`claw_event_router` ingests structured `claw_event_t` events, matches them against `router_rules.json` (or rules added/removed at runtime), and runs a chain of actions (for example call a capability, run Lua, send a message, or emit another event).
 
 For the end-to-end flow and full `router_rules.json` syntax, see [Dataflow and automation](@lang/reference-project/dataflow-and-automation).
 <LinkCard title="Dataflow and automation" href="@lang/reference-project/dataflow-and-automation" description="Full router_rules.json syntax, Event Router workflow, and Console commands" />
 
 ## Event Sources
 
-Capabilities (especially IM gateways, MCP, etc.) call `claw_event_router_publish_message` or `claw_event_router_publish_trigger` at appropriate times. `claw_core` also publishes Agent responses as `out_message` events when the `CLAW_CORE_REQUEST_FLAG_PUBLISH_OUT_MESSAGE` flag is set;
-when `Verbose` stage notifications are enabled, it also emits `agent_stage` events during inference (see [Dataflow and automation](@lang/reference-project/dataflow-and-automation#agent_stage-event-and-execution-progress-notifications)).
+Capabilities (especially IM gateways, MCP, etc.) call `claw_event_router_publish_message` or `claw_event_router_publish_trigger` at appropriate times. `cap_agent` exclusively consumes each opened `claw_agent.h` Session stream and publishes completed Agent responses as `out_message` events;
+tool calls are translated to `agent_stage` events (see [Dataflow and automation](@lang/reference-project/dataflow-and-automation#agent_stage-event-and-execution-progress-notifications)).
 
 The router processes the queue asynchronously so heavy work does not run on CPU-heavy callback stacks.
 
-## Interaction with claw_core
+## Interaction with cap_agent
 
-The `run_agent` action submits the request asynchronously to `claw_core` and returns immediately (status `queued`) without waiting for the Agent's response. Once inference is complete, `claw_core` publishes the response back to the Event Router as an `out_message` event via `claw_event_router_publish`. Rules then decide how to handle it (usually via `send_message` to an IM channel).
+Agent input uses the ordinary `call_cap` action with `cap: "agent"` and the RPC envelope `{"method":"session.input","args":{"text":"..."}}`. Event Router forwards the event's Session, request, route, and correlation fields through `claw_cap_call_context_t`. `cap_agent` accepts the input immediately, then publishes complete output back as `source_cap=agent,event_type=out_message`.
 
 Common fields in `claw_event_router_config_t`:
 
-- `core_submit_timeout_ms`: upper bound for the router thread waiting to submit a request to the `claw_core` queue.
 - `default_route_messages_to_agent`: whether certain messages are routed to the Agent when no rule matches.
-- `session_builder`: optional callback to override the default `claw_event_build_session_id` logic.
+- `default_route_agent_output_to_channel`: whether unmatched Agent `out_message` events use the outbound binding for their route.
 - `outbound_resolver`: optional callback to resolve the `target_channel` to a capability name before checking the binding table.
 
-In `edge_agent`, `default_route_messages_to_agent` depends on whether the LLM is fully configured: if the LLM API is not set up correctly, it will be `false`.
+In `edge_agent`, both default routes are enabled. Explicit matching rules still take priority over either fallback.
 
-<Aside type="caution" title="When the LLM is not configured, claw_core does not start">
-  If any of the LLM API key, backend_type, or model is empty, `edge_agent` skips `claw_core_init` and `claw_core_start`, so the inference core never starts.
-  Then `run_agent`, `ask`, image inspect, and other core-dependent features stay unavailable until the LLM settings are filled in and the device reboots. The Event Router, automation rules, local capabilities, and the Console REPL still work.
+<Aside type="caution" title="Agent input still requires a linked LLM API">
+  `edge_agent` initializes and starts AgentSystem even when its initial API fields are empty.
+  Session input remains unavailable until a valid API binding is linked. Event Router, automation rules, local capabilities, and the Console REPL remain available.
 </Aside>
 
 ## Queue cancellation and purge

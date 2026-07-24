@@ -36,8 +36,7 @@ Event 是 ESP-Claw 框架中的消息载体，包含了 Event ID、来源、目�
 - `actions`: 规则的动作列表，例如：
     | 动作类型 | 典型用途 |
     |--------------|----------|
-    | `call_cap` | 不经过大语言模型，直接执行某个能力 |
-    | `run_agent` | 异步提交消息至 `claw_core`，Agent 响应通过 `out_message` 事件发布回 Event Router |
+    | `call_cap` | 执行某个 Capability，包括 `agent` RPC 入口 |
     | `run_script` | 运行 Lua 脚本 |
     | `send_message` | 发送 IM 消息至出站绑定的目标 |
     | `emit_event` | 生成新的事件并传递给 `claw_event_router` |
@@ -75,7 +74,7 @@ Event 是 ESP-Claw 框架中的消息载体，包含了 Event ID、来源、目�
 
 命中文本相关模板包括 `{{match.text}}`、`{{match.rule}}`、`{{match.remainder}}`。
 
-`edge_agent` 自带简单的 `router_rules.json`，可以处理 IM 消息收发等基础任务。见 <LinkToSource relativePath="application/edge_agent/fatfs_image/router_rules/router_rules.json" />。
+`edge_agent` 自带用于处理 IM 消息收发等基础任务的 recovery `router_rules.json`。见 <LinkToSource relativePath="application/edge_agent/fatfs_image/system/.recovery/router_rules/router_rules.json" />。
 
 `router_rules.json` 的详细语法定义可见 JSON Schema。
 
@@ -90,6 +89,25 @@ Event 是 ESP-Claw 框架中的消息载体，包含了 Event ID、来源、目�
 
     **修改后，需要执行 `auto reload` 命令使修改生效。**
 </Aside>
+
+## 将文本路由给 Agent
+
+Agent 输入是普通 Capability 调用，不存在 Agent 专用 Router action：
+
+```json
+{
+  "type": "call_cap",
+  "cap": "agent",
+  "input": {
+    "method": "session.input",
+    "args": {
+      "text": "{{event.text}}"
+    }
+  }
+}
+```
+
+入站事件的 numeric `session_id` 与可选 `request_id` 通过 call context 传递。`request_id` 为零时 `session.input` 提交新 turn，否则回答 `INPUT_REQUESTED`。
 
 ## Event Router 的工作流程
 
@@ -125,7 +143,7 @@ fallback_check: {
   label: "未命中任何规则 &&\ndefault_route_messages_to_agent &&\nevent_type = \"message\"?"
   shape: diamond
 }
-run_default: "提交给默认 Agent\n（run_agent）"
+run_default: "提交给默认 Agent\n（call_cap agent）"
 done: "处理完成"
 
 queue -> guard: "取出 Event"
@@ -145,7 +163,7 @@ fallback_check -> done: "否"
 
 ## `out_message` 事件与出站消息
 
-当 Event Router 的 `run_agent` 动作被触发后，Agent 的响应不会同步返回，而是以 `out_message` 类型的事件异步发布回 Event Router。
+Agent 输入使用 `call_cap`，指定 `cap="agent"`、`method="session.input"` 与 `args.text`。`cap_agent` 同步接收输入、独占消费 Session stream、聚合 output delta，并在 output end 时异步发布一条 `out_message` 事件。
 
 如需将 Agent 响应发送到 IM 通道，需要为 `out_message` 配置对应的路由规则，例如：
 
@@ -154,16 +172,13 @@ fallback_check -> done: "否"
   "id": "agent_out_message_send_message",
   "consume_on_match": true,
   "match": {
-    "source_cap": "claw_core",
-    "event_type": "out_message",
-    "content_type": "text"
+    "source_cap": "agent",
+    "event_type": "out_message"
   },
   "actions": [
     {
       "type": "send_message",
       "input": {
-        "channel": "{{event.source_channel}}",
-        "chat_id": "{{event.chat_id}}",
         "message": "{{event.text}}"
       }
     }
@@ -171,40 +186,39 @@ fallback_check -> done: "否"
 }
 ```
 
-其中 `channel` / `chat_id` 通常来自触发 `run_agent` 时传入的 `target_channel` / `target_chat_id`。
+省略 `channel` / `chat_id` 时，`send_message` 使用 `cap_agent` 在对应 Session 输入被接受时绑定的路由。
 
 ## 推理任务取消与清理
 
-`run_agent` 动作提交到 `claw_core` 后会分配并记录 `request_id`，用于后续取消或追踪。
+Agent 执行与 Router 队列项使用彼此独立的取消接口。
 
 对应地，框架提供了两层“取消”能力（C API）：
 
-- `claw_core_cancel_request(request_id)`：取消当前正在执行（in-flight）的 Agent 请求。
+- `claw_cap_call("agent", {"method":"session.interrupt"|"session.cancel",...})`：中断或取消 numeric Agent Session。
 - `claw_event_router_cancel_event(event_id)`：标记并跳过队列中尚未处理的单个 Event。
 - `claw_event_router_purge_queue(event_type_filter, source_cap_filter, &out_cancelled)`：批量标记并跳过队列中的待处理 Event（可按事件类型、来源 cap 过滤）。
 
 <Aside type="note">
 
 - 这些接口只对“还没完成处理”的对象生效；已处理完成的请求/Event 不会被回滚。
-  - `claw_core_cancel_request(0)` 表示“取消任意当前 in-flight 请求”；传具体 `request_id` 时只匹配该请求。
+  - Agent 取消以 numeric Session 为目标；`request_id` 保留用于回答 `INPUT_REQUESTED`。
   - Event Router 的取消是“跳过队列中的待处理项”，不影响已进入执行阶段的动作。
 </Aside>
 
 ## `agent_stage` 事件与执行过程通知
 
-除最终结果对应的 `out_message` 外，`claw_core` 还可以在 Agent 多轮工具调用过程中发布 `agent_stage` 事件，可用于推送工具调用的阶段性信息。
+除最终结果对应的 `out_message` 外，`cap_agent` 还会为 Session stream 中的工具调用发布 `agent_stage` 事件。
 
 `agent_stage` 事件的结构为：
-- `source_cap`：`claw_core`
+- `source_cap`：`agent`
 - `event_type`：`agent_stage`
 - `event.text`：工具调用过程中的阶段性信息
 
-如需自动发出 `agent_stage` 事件，需调整 menuconfig 中的配置：<kbd>(Top)</kbd> → <kbd>Component config</kbd> → <kbd>ESP-Claw Core</kbd> → <kbd>Agent stage notification verbosity</kbd>
-- 选择 <kbd>Verbose</kbd> 时，`claw_core` 会在每轮存在工具调用时向 Event Router 发布 `agent_stage` 事件；
-- 选择 <kbd>Simple</kbd> 时，不在路由层发布 `agent_stage` 事件。
+`cap_agent` 对从 `claw_agent.h` 收到的每个完整 Tool Call 发布一条 `agent_stage/tool_call`。
+reasoning 与 token delta 不进入 Event Router 队列；output delta 聚合至 `OUTPUT_END`。
 
 `agent_stage` 事件可以被路由到 IM 等通道，以实时向用户反馈「工作进度」。
-例如 `edge_agent` 默认的 <LinkToSource relativePath="application/edge_agent/fatfs_image/router_rules/router_rules.json" /> 中定义了规则 `agent_stage_im_notify`，在启用 Verbose 且命中该规则时，会把 `agent_stage` 的 `{{event.text}}` 发回来源 IM 会话。
+例如规则可以匹配 `source_cap=agent,event_type=agent_stage`，再将 `{{event.text}}` 发回来源 IM 会话。
 
 ## 定时调度
 

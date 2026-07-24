@@ -1,6 +1,6 @@
 ---
 title: cap_llm_inspect — image analysis
-description: LLM-interaction reference capability—nested multimodal LLM calls from tool execution.
+description: Standalone local-image inference without depending on the Agent runtime.
 ---
 
 import LinkToSource from '@/components/LinkToSource.astro';
@@ -10,12 +10,12 @@ Source: <LinkToSource relativePath="components/claw_capabilities/cap_llm_inspect
 
 ## Role
 
-`cap_llm_inspect` is the **LLM-interaction reference** capability. It demonstrates a special pattern: while executing a tool for the LLM, it **starts another LLM inference** (nested call) to analyze a local image file.
+`cap_llm_inspect` analyzes a local image through a **standalone inference client owned by the capability**. It does not depend on `claw_core` or enter the Agent request loop.
 
-Useful subtasks include:
-- Image understanding (this module)
-- Text summarization
-- Code explanation
+Its scope is deliberately narrow:
+- Read one supported local image
+- Send one image-and-prompt request
+- Return the provider's text response
 
 ## Tool surface
 
@@ -48,13 +48,13 @@ inspect -> send: "result text"
 send -> user: "reply"
 ```
 
-## Core idea: nested LLM inference
+## Core idea: standalone image inference
 
-The implementation is small (~110 lines). Core flow:
+The capability owns only image preparation, the provider request, and the HTTP response. Core flow:
 
 ```c
 static const char *CAP_LLM_INSPECT_SYSTEM_PROMPT =
-    "You analyze local image files for the ESP-Claw. "
+    "You analyze local image files for the ESP32 claw. "
     "Describe visible content plainly and briefly. "
     "If the image is unclear, say what is uncertain instead of guessing.";
 
@@ -62,23 +62,24 @@ static esp_err_t cap_llm_inspect_execute(const char *input_json,
                                           const claw_cap_call_context_t *ctx,
                                           char *output, size_t output_size)
 {
-    // 1. Parse path and prompt
-    claw_media_asset_t asset = {
-        .kind = CLAW_MEDIA_ASSET_KIND_LOCAL_PATH,
-        .path = path_json->valuestring,
-    };
-
-    // 2. Build multimodal request (dedicated system prompt + user prompt + image)
-    claw_llm_media_request_t request = {
-        .system_prompt = CAP_LLM_INSPECT_SYSTEM_PROMPT,
-        .user_prompt   = prompt_json->valuestring,
-        .media         = &asset,
-        .media_count   = 1,
-    };
-
-    // 3. Nested LLM call; write result to output
+    // Parse and validate path and prompt before this excerpt.
     char *analysis = NULL;
-    err = claw_core_llm_infer_media(&request, &analysis, &error_message);
+    char *error_message = NULL;
+
+    xSemaphoreTake(s_runtime_lock, portMAX_DELAY);
+    if (!s_runtime) {
+        err = ESP_ERR_INVALID_STATE;
+        error_message = strdup("LLM image inference is not configured");
+    } else {
+        err = cap_llm_inspect_runtime_infer_image(
+            s_runtime,
+            path_json->valuestring,
+            CAP_LLM_INSPECT_SYSTEM_PROMPT,
+            prompt_json->valuestring,
+            &analysis,
+            &error_message);
+    }
+    xSemaphoreGive(s_runtime_lock);
     snprintf(output, output_size, "%s", analysis);
     free(analysis);
 }
@@ -86,10 +87,10 @@ static esp_err_t cap_llm_inspect_execute(const char *input_json,
 
 ### Unlike the main Agent chat
 
-`claw_core_llm_infer_media` is a **standalone** LLM invocation, isolated from the user-facing Agent session:
+The private `cap_llm_inspect` runtime is isolated from the user-facing Agent session:
 
 - Uses its own `system_prompt` (image-focused, no chat history)
-- Does not consume the current session token budget as normal turns
+- Does not consume or persist the current session context
 - Does not go through `cap_skill` tool-visibility management
 - Requires multimodal support from the configured backend
 
@@ -115,21 +116,21 @@ If multimodal is unavailable or the path is bad, the error string is returned in
 
 1. **Dedicated system prompt**: image work should not be biased by conversational history; a fixed specialist prompt stabilizes tone.
 
-2. **“Confirm the path first”** in the description: the LLM should use `cap_files` `list_dir` before burning a nested call on a wrong path.
+2. **“Confirm the path first”** in the description: the LLM should use `cap_files` `list_dir` before sending a request for a wrong path.
 
-3. **Stateless**: no retained state; each invocation is its own mini-task.
+3. **No session state**: only copied provider configuration is retained; every image request is independent.
 
 4. **Separation of concerns**: IM downloads live in `cap_im_platform`, paths in `cap_files`, analysis here.
 
-## Extensions
+## Deliberate scope
 
-Same pattern could power:
+The capability intentionally does not include:
 
-- `inspect_audio` (needs audio-capable models)
-- `summarize_document` (text inference entrypoint)
-- `classify_image` (different fixed system prompt)
+- Audio or document processing
+- Agent history, tool loops, or context persistence
+- Streaming, retry, or a generic provider framework
 
 <Aside type="tip">
-  **Nested LLM vs. direct handling?**
-  When the subtask needs semantics (describe an image, judge NL), nested LLM is the straightforward path. For deterministic work (IO, math), avoid nesting to cut latency and cost.
+  **Why keep it narrow?**
+  `inspect_image` needs one local image and one semantic result. Extra Agent-runtime features would increase coupling without helping that job.
 </Aside>

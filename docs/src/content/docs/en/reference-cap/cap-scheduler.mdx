@@ -12,7 +12,7 @@ Source: <LinkToSource relativePath="components/claw_capabilities/cap_scheduler/s
 
 `cap_scheduler` is the **time-trigger center** for ESP-Claw. It is responsible for generating events at specified points in time and pushing them to the `claw_event_router`. The scheduler itself does not execute specific business logic (like sending messages or calling tools); instead, it triggers subsequent automation rules by publishing events.
 
-This "separation of scheduling and execution" design allows scheduled tasks to reuse all action capabilities of the Event Router (`run_agent`, `call_cap`, `run_script`, etc.).
+This "separation of scheduling and execution" design allows scheduled tasks to reuse all Event Router actions (`call_cap`, `run_script`, `send_message`, etc.). Agent work uses `call_cap` with `cap="agent"`.
 
 ## Core Concepts
 

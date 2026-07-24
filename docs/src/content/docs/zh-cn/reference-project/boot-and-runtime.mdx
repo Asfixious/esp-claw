@@ -51,12 +51,12 @@ import LinkToSource from '@/components/LinkToSource.astro';
 <LinkToSource relativePath="components/common/app_claw/app_claw.c" /> 会初始化 ESP-Claw Agent 子系统，按顺序启动各子组件并设置参数，最终启动 Console REPL。
 
 <Steps>
-1. **初始化 Session Manager 与 Event Router**
+1. **初始化 Event Router 与 Capabilities**
 
-    先调用 `cap_session_mgr_set_session_root_dir` 配置会话管理器的会话根目录，
-    再调用 `claw_event_router_init`，载入自动化规则文件路径（demo：`/fatfs/router_rules/router_rules.json`），
-    并配置与 `claw_core` 通信的超时时间及默认是否将消息路由给 Agent（`default_route_messages_to_agent`，当 LLM 配置完整时为 `true`）。
-    `run_agent` 动作采用异步提交模式，Agent 响应通过 `out_message` 事件发布回 Event Router。
+    `claw_event_router_init` 载入 `/fatfs/router_rules/router_rules.json`；随后
+    `app_capabilities_init` 注册并启动启用的 C capabilities，包括仅供系统调用的 `agent` RPC adapter。
+    未匹配消息到 Agent、未匹配 Agent 输出到 channel 两个 fallback 均会启用。
+    Agent 输入为 `call_cap("agent", method + args)`；Session 输出以 `out_message` 事件返回。
 
 2. **初始化调度器**
 

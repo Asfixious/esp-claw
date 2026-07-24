@@ -21,34 +21,33 @@ import { LinkCard } from 'starlight-theme-nova/components'
 
 ## 职责
 
-`claw_event_router` 接收结构化的 Event `claw_event_t`，再按 `router_rules.json`（或运行时增删改的规则）做匹配，执行一串动作（如调用 Capability、运行 Lua、调用 Agent、发送消息、继续抛事件等）。
+`claw_event_router` 接收结构化的 Event `claw_event_t`，再按 `router_rules.json`（或运行时增删改的规则）做匹配，执行一串动作（如调用 Capability、运行 Lua、发送消息、继续抛事件等）。
 
 `claw_event_router` 的运作流程与 `router_rules.json` 的详细语法定义见 [数据流与自动化](@lang/reference-project/dataflow-and-automation)。
 <LinkCard title="数据流与自动化" href="@lang/reference-project/dataflow-and-automation" description="router_rules.json 完整语法、Event Router 工作流程与 Console 命令详解" />
 
 ## 事件来源
 
-能力实现（尤其是 IM gateway、MCP 等）在合适时机调用 `claw_event_router_publish_message` 或 `claw_event_router_publish_trigger` 发布事件。`claw_core` 在设置了 `CLAW_CORE_REQUEST_FLAG_PUBLISH_OUT_MESSAGE` 标志时，也会将 Agent 响应以 `out_message` 类型的事件发布回 Event Router；
-在启用 `Verbose` 阶段通知时，还会在推理过程中发布 `agent_stage` 事件（见 [数据流与自动化](@lang/reference-project/dataflow-and-automation#agent_stage-事件与执行过程通知)）。
+能力实现（尤其是 IM gateway、MCP 等）在合适时机调用 `claw_event_router_publish_message` 或 `claw_event_router_publish_trigger` 发布事件。`cap_agent` 独占消费每个已打开 `claw_agent.h` Session 的 stream，并将完整 Agent 响应发布为 `out_message` 事件；
+工具调用会转换为 `agent_stage` 事件（见 [数据流与自动化](@lang/reference-project/dataflow-and-automation#agent_stage-事件与执行过程通知)）。
 
 路由任务异步处理队列中的事件，避免在回调栈里承担 CPU 负担较重的任务。
 
-## 与 claw_core 的衔接
+## 与 cap_agent 的衔接
 
-`run_agent` 动作将请求异步提交至 `claw_core`，提交后立即返回（状态为 `queued`），不再同步等待 Agent 响应。Agent 完成推理后，`claw_core` 通过 `claw_event_router_publish` 将响应以 `out_message` 事件发布回 Event Router，由规则决定如何处理（通常是 `send_message` 至 IM 通道）。
+Agent 输入使用普通 `call_cap` 动作，指定 `cap: "agent"` 和 RPC envelope `{"method":"session.input","args":{"text":"..."}}`。Event Router 通过 `claw_cap_call_context_t` 透传事件的 Session、request、route 与 correlation 字段。`cap_agent` 立即接收输入，完成后再发布 `source_cap=agent,event_type=out_message`。
 
 `claw_event_router_config_t` 中常见字段含义：
 
-- `core_submit_timeout_ms`：路由线程等待提交请求至 `claw_core` 队列的超时时间。
 - `default_route_messages_to_agent`：是否在没有规则命中时，把某类消息默认送给 Agent。
-- `session_builder`：可选回调，覆盖默认的 `claw_event_build_session_id` 逻辑。
+- `default_route_agent_output_to_channel`：未匹配规则的 Agent `out_message` 是否按事件路由使用出站绑定。
 - `outbound_resolver`：可选回调，在出站绑定表之前解析 `target_channel` 到 cap 名。
 
-`edge_agent` 中，`default_route_messages_to_agent` 取值取决于大语言模型是否已完整配置：如大语言模型 API 未正确配置，此处将为 `false`。
+`edge_agent` 同时启用两个默认路由；显式匹配的规则仍优先于 fallback。
 
-<Aside type="caution" title="LLM 未配置时 claw_core 不会启动">
-  若 LLM 的 API Key、backend_type、model 三项任一为空，`edge_agent` 会跳过 `claw_core_init` 与 `claw_core_start`，整个推理核心不启动。
-  此时 `run_agent` 动作、`ask` 命令、图片 inspect 等依赖 core 的功能完全不可用，直到 LLM 配置补全并重启设备。Event Router、自动化规则、本地 Capability 和 Console REPL 仍可正常使用。
+<Aside type="caution" title="Agent 输入仍要求有效的 LLM API binding">
+  即使初始 API 字段为空，`edge_agent` 也会初始化并启动 AgentSystem。
+  在绑定有效 API 前，Session 输入仍不可用；Event Router、自动化规则、本地 Capability 和 Console REPL 可继续使用。
 </Aside>
 
 ## 队列取消与清理

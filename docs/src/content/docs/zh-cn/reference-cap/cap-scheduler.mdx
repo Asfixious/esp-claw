@@ -12,7 +12,7 @@ import { Aside } from '@astrojs/starlight/components';
 
 `cap_scheduler` 是 ESP-Claw 的**时间触发中心**。它负责在指定的时间点生成事件并推送到 `claw_event_router`。调度器本身不执行具体的业务逻辑（如发消息或调工具），而是通过发布事件来触发后续的自动化规则。
 
-这种「调度与执行分离」的设计，使得定时任务可以复用 Event Router 的所有动作能力（run_agent、call_cap、run_script 等）。
+这种「调度与执行分离」的设计，使得定时任务可以复用 Event Router 的所有动作能力（`call_cap`、`run_script`、`send_message` 等）。Agent 工作使用 `cap="agent"` 的 `call_cap`。
 
 ## 核心概念
 

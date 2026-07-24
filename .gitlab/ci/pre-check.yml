@@ -1,3 +1,17 @@
+pre_check_framework:
+  stage: pre-check
+  tags:
+    - build
+  image: rust:latest
+  extends:
+    - .rules:pre_check:framework
+  script:
+    - rustup component add --toolchain stable rustfmt clippy
+    - rustup toolchain install nightly --profile minimal
+    - cargo +stable install cargo-public-api --locked
+    - ./framework/check.sh
+    - ./framework/harness.sh
+
 pre_check_docs:
   stage: pre-check
   tags:

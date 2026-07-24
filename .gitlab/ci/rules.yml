@@ -127,6 +127,15 @@
       changes: *patterns-docs
     - when: never
 
+.rules:pre_check:framework:
+  rules:
+    - <<: *if-protected-push
+    - <<: *if-label-pre_check
+    - <<: *if-trigger-job
+    - <<: *if-mr
+      changes: *patterns-framework
+    - when: never
+
 .rules:build:doc:
   rules:
     - <<: *if-protected-push

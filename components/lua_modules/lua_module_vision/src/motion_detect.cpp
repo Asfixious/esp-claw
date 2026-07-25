@@ -287,6 +287,9 @@ static esp_err_t motion_normalize_config(motion_detect_config_t *config, int fra
     if (config->roi_x < 0 || config->roi_y < 0 || config->roi_width <= 0 || config->roi_height <= 0 ||
         config->roi_x > frame_width - config->roi_width || config->roi_y > frame_height - config->roi_height ||
         config->block_hit_pixels > config->block_size * config->block_size) {
+        ESP_LOGE(TAG, "invalid config: roi=%d,%d %dx%d frame=%dx%d block_size=%d block_hit_pixels=%d",
+                 config->roi_x, config->roi_y, config->roi_width, config->roi_height, frame_width, frame_height,
+                 config->block_size, config->block_hit_pixels);
         return ESP_ERR_INVALID_ARG;
     }
     return ESP_OK;
@@ -404,6 +407,8 @@ extern "C" esp_err_t motion_detect_process_rgb565(motion_detect_handle_t handle,
         (size_t)width > SIZE_MAX / (size_t)height ||
         (size_t)width * (size_t)height > SIZE_MAX / sizeof(uint16_t) ||
         bytes < (size_t)width * (size_t)height * sizeof(uint16_t)) {
+        ESP_LOGE(TAG, "invalid process input: handle=%p data=%p config=%p out=%p size=%dx%d bytes=%zu",
+                 (void *)handle, (void *)data, (void *)input_config, (void *)out_result, width, height, bytes);
         return ESP_ERR_INVALID_ARG;
     }
 

@@ -16,13 +16,74 @@ local MOTION_OPTS = {
     active_pixel_percent = 5,
     confirm_frames = 2,
     hold_frames = 3,
-    block_size = 4,
-    block_hit_pixels = 15,
 }
 
 local display_started = false
 local camera_started = false
 local detector = motion.new(MOTION_OPTS)
+
+local function fit_size(src_w, src_h, max_w, max_h)
+    if src_w <= max_w and src_h <= max_h then
+        return src_w, src_h
+    end
+
+    local ratio = math.min(max_w / src_w, max_h / src_h)
+    local draw_w = math.floor(src_w * ratio)
+    local draw_h = math.floor(src_h * ratio)
+    if draw_w <= 0 then
+        draw_w = 1
+    end
+    if draw_h <= 0 then
+        draw_h = 1
+    end
+    if draw_w >= 8 then
+        draw_w = draw_w - (draw_w % 8)
+        if draw_w == 0 then
+            draw_w = 8
+        end
+    end
+    if draw_h >= 8 then
+        draw_h = draw_h - (draw_h % 8)
+        if draw_h == 0 then
+            draw_h = 8
+        end
+    end
+    return draw_w, draw_h
+end
+
+local function clamp(value, min_value, max_value)
+    if value < min_value then
+        return min_value
+    end
+    if value > max_value then
+        return max_value
+    end
+    return value
+end
+
+local function draw_motion_box(detect_result, image_w, image_h)
+    local box = detect_result.box
+    if not box or image_w <= 0 or image_h <= 0 then
+        return
+    end
+
+    -- Match display.draw_image(..., mode = "fit") so the overlay box follows the preview pixels.
+    local draw_w, draw_h = fit_size(image_w, image_h, display.width, display.height)
+    local x1 = clamp(math.floor((box.left or box.x or 0) * draw_w / image_w), 0, display.width - 1)
+    local y1 = clamp(math.floor((box.top or box.y or 0) * draw_h / image_h), 0, display.height - 1)
+    local x2 = clamp(math.floor(((box.right or ((box.x or 0) + (box.width or 1) - 1)) + 1) * draw_w / image_w) - 1, 0, display.width - 1)
+    local y2 = clamp(math.floor(((box.bottom or ((box.y or 0) + (box.height or 1) - 1)) + 1) * draw_h / image_h) - 1, 0, display.height - 1)
+    local w = x2 - x1 + 1
+    local h = y2 - y1 + 1
+
+    if w <= 0 or h <= 0 then
+        return
+    end
+    display.draw_rect(x1, y1, w, h, { r = 255, g = 220, b = 40 })
+    if w > 4 and h > 4 then
+        display.draw_rect(x1 + 1, y1 + 1, w - 2, h - 2, { r = 255, g = 48, b = 48 })
+    end
+end
 
 local function cleanup()
     if display_started then
@@ -37,15 +98,15 @@ local function cleanup()
 end
 
 local function draw_result_overlay(frame_index, remaining_s, detect_result)
-    local has_previous = detect_result.has_previous == true
-    local active_pixels = detect_result.active_pixels or 0
-    local moved = detect_result.alert_active == true
-    local status = moved and "MOTION" or (has_previous and "STILL" or "WARMUP")
+    local ready = detect_result.ready == true
+    local score = detect_result.score or 0
+    local moved = detect_result.motion == true
+    local status = moved and "MOTION" or (ready and "STILL" or "WARMUP")
     local bg = { r = 24, g = 24, b = 24 }
 
     if moved then
         bg = { r = 160, g = 24, b = 24 }
-    elseif has_previous then
+    elseif ready then
         bg = { r = 24, g = 96, b = 48 }
     end
 
@@ -55,7 +116,7 @@ local function draw_result_overlay(frame_index, remaining_s, detect_result)
         color = "white",
         font_size = 16,
     })
-    display.draw_text(8, 28, string.format("pixels=%d frame=%d left=%ds", active_pixels, frame_index, remaining_s), {
+    display.draw_text(8, 28, string.format("score=%.3f frame=%d left=%ds", score, frame_index, remaining_s), {
         color = "white",
         font_size = 12,
     })
@@ -104,10 +165,11 @@ local run_ok, run_err = xpcall(function()
         local remaining_s = deadline_s - now_s
         local frame <close> = camera.get_frame(CAPTURE_TIMEOUT_MS)
         local rgb565 <close> = image.convert(frame, image.RGB565)
+        local rgb_info = rgb565:info()
         local detect_result = detector:detect(rgb565)
 
         frames = frames + 1
-        if detect_result.alert_active == true then
+        if detect_result.motion == true then
             moved_frames = moved_frames + 1
         end
 
@@ -117,14 +179,15 @@ local run_ok, run_err = xpcall(function()
             width = display.width,
             height = display.height,
         })
+        draw_motion_box(detect_result, rgb_info.width, rgb_info.height)
         draw_result_overlay(frames, remaining_s, detect_result)
         display.present()
         display.end_frame()
 
         if frames == 1 or frames % 15 == 0 then
-            print(string.format("%s frame=%d detected=%s alert=%s active_pixels=%s event=%s moved_frames=%d",
-                TAG, frames, tostring(detect_result.detected), tostring(detect_result.alert_active),
-                tostring(detect_result.active_pixels), tostring(detect_result.event), moved_frames))
+            print(string.format("%s frame=%d ready=%s motion=%s score=%.3f event=%s moved_frames=%d",
+                TAG, frames, tostring(detect_result.ready), tostring(detect_result.motion),
+                detect_result.score or 0, tostring(detect_result.event), moved_frames))
         end
 
         if FRAME_INTERVAL_MS > 0 then

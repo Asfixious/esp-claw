@@ -29,7 +29,6 @@
 #define LUA_MOTION_DETECT_MT "motion_detect.detector"
 
 static const char *TAG = "lua_vision";
-static const char s_default_detector_registry_key;
 
 typedef struct {
     motion_detect_handle_t handle;
@@ -65,11 +64,6 @@ static void lua_motion_parse_roi(lua_State *L, int opts_idx, motion_detect_confi
         lua_motion_get_table_integer(L, -1, "height", &config->roi_height);
     }
     lua_pop(L, 1);
-
-    lua_motion_get_table_integer(L, opts_idx, "roi_x", &config->roi_x);
-    lua_motion_get_table_integer(L, opts_idx, "roi_y", &config->roi_y);
-    lua_motion_get_table_integer(L, opts_idx, "roi_width", &config->roi_width);
-    lua_motion_get_table_integer(L, opts_idx, "roi_height", &config->roi_height);
 }
 
 static void lua_motion_parse_config(lua_State *L, int opts_idx, motion_detect_config_t *config)
@@ -95,24 +89,32 @@ static void lua_motion_parse_config(lua_State *L, int opts_idx, motion_detect_co
 static void lua_motion_validate_config(lua_State *L, const motion_detect_config_t *config)
 {
     if (config->pixel_diff_threshold < 0 || config->pixel_diff_threshold > 255) {
+        ESP_LOGE(TAG, "invalid motion pixel_diff_threshold=%d", config->pixel_diff_threshold);
         luaL_error(L, "motion_detect pixel_diff_threshold must be in [0, 255]");
     }
     if (config->active_pixel_percent < 1 || config->active_pixel_percent > 100) {
+        ESP_LOGE(TAG, "invalid motion active_pixel_percent=%d", config->active_pixel_percent);
         luaL_error(L, "motion_detect active_pixel_percent must be in [1, 100]");
     }
     if (config->confirm_frames < 1) {
+        ESP_LOGE(TAG, "invalid motion confirm_frames=%d", config->confirm_frames);
         luaL_error(L, "motion_detect confirm_frames must be >= 1");
     }
     if (config->hold_frames < 0) {
+        ESP_LOGE(TAG, "invalid motion hold_frames=%d", config->hold_frames);
         luaL_error(L, "motion_detect hold_frames must be >= 0");
     }
     if (config->block_size < 1 || config->block_size > 255) {
+        ESP_LOGE(TAG, "invalid motion block_size=%d", config->block_size);
         luaL_error(L, "motion_detect block_size must be in [1, 255]");
     }
     if (config->block_hit_pixels < 1 || config->block_hit_pixels > 255) {
+        ESP_LOGE(TAG, "invalid motion block_hit_pixels=%d", config->block_hit_pixels);
         luaL_error(L, "motion_detect block_hit_pixels must be in [1, 255]");
     }
     if (config->box_padding < 0 || config->box_deadband < 0 || config->box_snap_threshold < 0) {
+        ESP_LOGE(TAG, "invalid motion box settings: padding=%d deadband=%d snap=%d",
+                 config->box_padding, config->box_deadband, config->box_snap_threshold);
         luaL_error(L, "motion_detect box padding/deadband/snap values must be >= 0");
     }
 }
@@ -126,9 +128,9 @@ static const char *lua_motion_event_name(motion_detect_event_t event)
 {
     switch (event) {
     case MOTION_DETECT_EVENT_ACTIVATED:
-        return "activated";
+        return "started";
     case MOTION_DETECT_EVENT_CLEARED:
-        return "cleared";
+        return "stopped";
     case MOTION_DETECT_EVENT_NONE:
     default:
         return "none";
@@ -139,14 +141,6 @@ static void lua_motion_push_box(lua_State *L, int x1, int y1, int x2, int y2)
 {
     lua_newtable(L);
     lua_pushinteger(L, x1);
-    lua_setfield(L, -2, "x1");
-    lua_pushinteger(L, y1);
-    lua_setfield(L, -2, "y1");
-    lua_pushinteger(L, x2);
-    lua_setfield(L, -2, "x2");
-    lua_pushinteger(L, y2);
-    lua_setfield(L, -2, "y2");
-    lua_pushinteger(L, x1);
     lua_setfield(L, -2, "left");
     lua_pushinteger(L, y1);
     lua_setfield(L, -2, "top");
@@ -154,6 +148,10 @@ static void lua_motion_push_box(lua_State *L, int x1, int y1, int x2, int y2)
     lua_setfield(L, -2, "right");
     lua_pushinteger(L, y2);
     lua_setfield(L, -2, "bottom");
+    lua_pushinteger(L, x1);
+    lua_setfield(L, -2, "x");
+    lua_pushinteger(L, y1);
+    lua_setfield(L, -2, "y");
     lua_pushnumber(L, ((lua_Number)x1 + (lua_Number)x2) / 2.0);
     lua_setfield(L, -2, "cx");
     lua_pushnumber(L, ((lua_Number)y1 + (lua_Number)y2) / 2.0);
@@ -166,40 +164,18 @@ static void lua_motion_push_box(lua_State *L, int x1, int y1, int x2, int y2)
 
 static void lua_motion_push_result(lua_State *L, const motion_detect_result_t *result)
 {
+    uint32_t roi_pixels = (uint32_t)result->roi_width * (uint32_t)result->roi_height;
+
     lua_newtable(L);
     lua_pushboolean(L, result->has_previous);
-    lua_setfield(L, -2, "has_previous");
-    lua_pushboolean(L, result->detected);
-    lua_setfield(L, -2, "detected");
+    lua_setfield(L, -2, "ready");
     lua_pushboolean(L, result->alert_active);
-    lua_setfield(L, -2, "alert_active");
+    lua_setfield(L, -2, "motion");
     lua_pushstring(L, lua_motion_event_name(result->event));
     lua_setfield(L, -2, "event");
-    lua_pushinteger(L, result->active_pixels);
-    lua_setfield(L, -2, "active_pixels");
-    lua_pushinteger(L, result->threshold_pixels);
-    lua_setfield(L, -2, "threshold_pixels");
-    lua_pushinteger(L, result->positive_frames);
-    lua_setfield(L, -2, "positive_frames");
-    lua_pushinteger(L, result->hold_frames);
-    lua_setfield(L, -2, "hold_frames");
-    lua_pushinteger(L, result->roi_x);
-    lua_setfield(L, -2, "roi_x");
-    lua_pushinteger(L, result->roi_y);
-    lua_setfield(L, -2, "roi_y");
-    lua_pushinteger(L, result->roi_width);
-    lua_setfield(L, -2, "roi_width");
-    lua_pushinteger(L, result->roi_height);
-    lua_setfield(L, -2, "roi_height");
+    lua_pushnumber(L, roi_pixels > 0 ? (lua_Number)result->active_pixels / (lua_Number)roi_pixels : 0);
+    lua_setfield(L, -2, "score");
 
-    lua_pushboolean(L, result->has_raw_box);
-    lua_setfield(L, -2, "has_box");
-    if (result->has_raw_box) {
-        lua_motion_push_box(L, result->raw_x1, result->raw_y1, result->raw_x2, result->raw_y2);
-        lua_setfield(L, -2, "raw_box");
-    }
-    lua_pushboolean(L, result->has_display_box);
-    lua_setfield(L, -2, "has_display_box");
     if (result->has_display_box) {
         lua_motion_push_box(L, result->display_x1, result->display_y1,
                             result->display_x2, result->display_y2);
@@ -207,34 +183,34 @@ static void lua_motion_push_result(lua_State *L, const motion_detect_result_t *r
     }
 }
 
-static int lua_motion_detector_detect_impl(lua_State *L,
-                                           lua_motion_detector_t *detector,
-                                           int frame_index,
-                                           int opts_idx)
+static int lua_motion_detector_detect(lua_State *L)
 {
+    lua_motion_detector_t *detector = lua_motion_check_detector(L, 1);
     lua_image_view_t view = {0};
-    motion_detect_config_t config = detector->config;
     motion_detect_result_t result = {0};
 
-    lua_motion_parse_config(L, opts_idx, &config);
-    lua_motion_validate_config(L, &config);
+    luaL_checkany(L, 2);
+    if (!lua_isnoneornil(L, 3)) {
+        ESP_LOGE(TAG, "motion detector detect got unexpected options argument");
+        return luaL_error(L, "motion_detect detector:detect(frame) does not accept per-call options");
+    }
 
-    esp_err_t err = lua_image_require_format(L, frame_index, LUA_IMAGE_FORMAT_RGB565LE, &view);
+    esp_err_t err = lua_image_require_format(L, 2, LUA_IMAGE_FORMAT_RGB565LE, &view);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motion frame require failed: %s", esp_err_to_name(err));
         return luaL_error(L, "motion_detect expects an RGB565-capable image.frame: %s", esp_err_to_name(err));
     }
     err = motion_detect_process_rgb565(detector->handle, view.data, view.bytes,
-                                       view.width, view.height, &config, &result);
+                                       view.width, view.height, &detector->config, &result);
     lua_image_release_view(&view);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "motion detect failed: %s", esp_err_to_name(err));
         if (err == ESP_ERR_INVALID_ARG) {
-            return luaL_error(L, "motion_detect invalid ROI or block_hit_pixels");
+            return luaL_error(L, "motion_detect invalid ROI or block settings");
         }
         return luaL_error(L, "motion_detect failed: %s", esp_err_to_name(err));
     }
 
-    detector->config = config;
     lua_motion_push_result(L, &result);
     return 1;
 }
@@ -261,17 +237,12 @@ static lua_motion_detector_t *lua_motion_push_detector(lua_State *L, const motio
 static int lua_motion_detector_new(lua_State *L)
 {
     motion_detect_config_t config;
+
     motion_detect_config_set_defaults(&config);
     lua_motion_parse_config(L, 1, &config);
     lua_motion_validate_config(L, &config);
     lua_motion_push_detector(L, &config);
     return 1;
-}
-
-static int lua_motion_detector_detect(lua_State *L)
-{
-    lua_motion_detector_t *detector = lua_motion_check_detector(L, 1);
-    return lua_motion_detector_detect_impl(L, detector, 2, 3);
 }
 
 static int lua_motion_detector_reset(lua_State *L)
@@ -291,34 +262,6 @@ static int lua_motion_detector_gc(lua_State *L)
     lua_motion_detector_t *detector = (lua_motion_detector_t *)luaL_checkudata(L, 1, LUA_MOTION_DETECT_MT);
     motion_detect_delete(detector->handle);
     detector->handle = NULL;
-    return 0;
-}
-
-static lua_motion_detector_t *lua_motion_default_detector(lua_State *L)
-{
-    lua_rawgetp(L, LUA_REGISTRYINDEX, &s_default_detector_registry_key);
-    lua_motion_detector_t *detector = (lua_motion_detector_t *)luaL_testudata(L, -1, LUA_MOTION_DETECT_MT);
-    if (detector != NULL) {
-        lua_pop(L, 1);
-        return detector;
-    }
-    lua_pop(L, 1);
-
-    detector = lua_motion_push_detector(L, NULL);
-    lua_pushvalue(L, -1);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, &s_default_detector_registry_key);
-    lua_pop(L, 1);
-    return detector;
-}
-
-static int lua_motion_module_detect(lua_State *L)
-{
-    return lua_motion_detector_detect_impl(L, lua_motion_default_detector(L), 1, 2);
-}
-
-static int lua_motion_module_reset(lua_State *L)
-{
-    motion_detect_reset(lua_motion_default_detector(L)->handle);
     return 0;
 }
 
@@ -347,8 +290,6 @@ int luaopen_motion_detect(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
         {"new", lua_motion_detector_new},
-        {"detect", lua_motion_module_detect},
-        {"reset", lua_motion_module_reset},
         {NULL, NULL},
     };
     lua_motion_register_metatable(L);

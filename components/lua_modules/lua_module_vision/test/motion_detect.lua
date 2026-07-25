@@ -9,8 +9,6 @@ local MOTION_OPTS = {
     active_pixel_percent = 5,
     confirm_frames = 2,
     hold_frames = 3,
-    block_size = 4,
-    block_hit_pixels = 15,
 }
 
 local function assert_true(value, message)
@@ -58,25 +56,21 @@ local run_ok, run_err = xpcall(function()
     end
 
     assert_type(first_result, "table", "first_result")
-    assert_true(first_result.has_previous == false, "first detect should seed the previous frame")
-    assert_true(first_result.detected == false, "first detect must not report motion")
-    assert_true(first_result.alert_active == false, "first detect must not activate the alert")
+    assert_true(first_result.ready == false, "first detect should seed the previous frame")
+    assert_true(first_result.motion == false, "first detect must not report motion")
     assert_true(first_result.event == "none", "first detect event must be none")
-    assert_type(first_result.threshold_pixels, "number", "first_result.threshold_pixels")
-    assert_true(first_result.roi_width > 0 and first_result.roi_height > 0, "normalized ROI must be non-empty")
+    assert_type(first_result.score, "number", "first_result.score")
 
     local second_result
     do
         local second_frame <close> = get_frame_or_fail()
         second_result = detector:detect(second_frame)
     end
-    assert_true(second_result.has_previous == true, "second detect should compare with the previous frame")
-    assert_type(second_result.detected, "boolean", "second_result.detected")
-    assert_type(second_result.alert_active, "boolean", "second_result.alert_active")
-    assert_type(second_result.active_pixels, "number", "second_result.active_pixels")
-    assert_type(second_result.positive_frames, "number", "second_result.positive_frames")
-    assert_type(second_result.hold_frames, "number", "second_result.hold_frames")
-    assert_true(second_result.event == "none" or second_result.event == "activated" or second_result.event == "cleared",
+    assert_true(second_result.ready == true, "second detect should compare with the previous frame")
+    assert_type(second_result.motion, "boolean", "second_result.motion")
+    assert_type(second_result.score, "number", "second_result.score")
+    assert_true(second_result.score >= 0 and second_result.score <= 1, "second_result.score must be in [0, 1]")
+    assert_true(second_result.event == "none" or second_result.event == "started" or second_result.event == "stopped",
         "unexpected motion event")
 
     detector:reset()
@@ -85,9 +79,9 @@ local run_ok, run_err = xpcall(function()
         local reset_frame <close> = get_frame_or_fail()
         reset_result = detector:detect(reset_frame)
     end
-    assert_true(reset_result.has_previous == false, "detect after reset should seed again")
-    print(string.format("%s PASS detected=%s active_pixels=%d alert=%s", TAG,
-        tostring(second_result.detected), second_result.active_pixels, tostring(second_result.alert_active)))
+    assert_true(reset_result.ready == false, "detect after reset should seed again")
+    print(string.format("%s PASS motion=%s score=%.3f", TAG,
+        tostring(second_result.motion), second_result.score))
 end, debug.traceback)
 
 detector:close()

@@ -50,6 +50,10 @@ type ProviderKey =
   | 'bailian'
   | 'deepseek'
   | 'anthropic'
+  | 'kimi_global'
+  | 'kimi_cn'
+  | 'minimax_global'
+  | 'minimax_cn'
   | 'openai_compatible'
   | 'anthropic_compatible';
 type PlatformId = 'wechat' | 'feishu' | 'qq' | 'telegram';
@@ -144,6 +148,50 @@ const PROVIDER_PRESETS: Record<ProviderKey, ProviderPreset> = {
     llm_image_remote_url_only: 'false',
     llm_model: 'claude-sonnet-4-6',
   },
+  kimi_global: {
+    llm_backend_type: 'openai_compatible',
+    llm_base_url: 'https://api.moonshot.ai/v1',
+    llm_auth_type: 'bearer',
+    llm_default_image_max_bytes: '524288',
+    llm_max_tokens_field: 'max_completion_tokens',
+    llm_supports_tools: 'true',
+    llm_supports_vision: 'true',
+    llm_image_remote_url_only: 'false',
+    llm_model: 'kimi-k2.6',
+  },
+  kimi_cn: {
+    llm_backend_type: 'openai_compatible',
+    llm_base_url: 'https://api.moonshot.cn/v1',
+    llm_auth_type: 'bearer',
+    llm_default_image_max_bytes: '524288',
+    llm_max_tokens_field: 'max_completion_tokens',
+    llm_supports_tools: 'true',
+    llm_supports_vision: 'true',
+    llm_image_remote_url_only: 'false',
+    llm_model: 'kimi-k2.6',
+  },
+  minimax_global: {
+    llm_backend_type: 'anthropic_compatible',
+    llm_base_url: 'https://api.minimaxi.io/anthropic',
+    llm_auth_type: 'none',
+    llm_default_image_max_bytes: '524288',
+    llm_max_tokens_field: 'max_tokens',
+    llm_supports_tools: 'true',
+    llm_supports_vision: 'true',
+    llm_image_remote_url_only: 'false',
+    llm_model: 'MiniMax-M3',
+  },
+  minimax_cn: {
+    llm_backend_type: 'anthropic_compatible',
+    llm_base_url: 'https://api.minimaxi.com/anthropic',
+    llm_auth_type: 'none',
+    llm_default_image_max_bytes: '524288',
+    llm_max_tokens_field: 'max_tokens',
+    llm_supports_tools: 'true',
+    llm_supports_vision: 'true',
+    llm_image_remote_url_only: 'false',
+    llm_model: 'MiniMax-M3',
+  },
   openai_compatible: {
     llm_backend_type: 'openai_compatible',
     llm_base_url: 'https://api.openai.com/v1',
@@ -173,6 +221,10 @@ const PRESET_BUTTONS: ProviderKey[] = [
   'bailian',
   'deepseek',
   'anthropic',
+  'kimi_global',
+  'kimi_cn',
+  'minimax_global',
+  'minimax_cn',
   'openai_compatible',
   'anthropic_compatible',
 ];
@@ -219,29 +271,6 @@ function searchFromConfig(config: Partial<AppConfig>): SearchForm {
   };
 }
 
-function detectProvider(form: LlmForm): ProviderKey {
-  for (const key of ['openai', 'bailian', 'deepseek', 'anthropic'] as ProviderKey[]) {
-    const preset = PROVIDER_PRESETS[key];
-    if (
-      preset.llm_backend_type === form.llm_backend_type.trim() &&
-      preset.llm_base_url === form.llm_base_url.trim() &&
-      preset.llm_auth_type === form.llm_auth_type.trim() &&
-      preset.llm_max_tokens_field === form.llm_max_tokens_field.trim()
-    ) {
-      return key;
-    }
-  }
-  if (
-    form.llm_backend_type.trim() === 'anthropic_compatible' &&
-    form.llm_base_url.trim() === PROVIDER_PRESETS.anthropic_compatible.llm_base_url &&
-    form.llm_auth_type.trim() === PROVIDER_PRESETS.anthropic_compatible.llm_auth_type &&
-    form.llm_max_tokens_field.trim() === PROVIDER_PRESETS.anthropic_compatible.llm_max_tokens_field
-  ) {
-    return 'anthropic_compatible';
-  }
-  return 'openai_compatible';
-}
-
 function isAdvancedProvider(key: ProviderKey): boolean {
   return key === 'openai_compatible' || key === 'anthropic_compatible';
 }
@@ -256,6 +285,14 @@ function providerLabel(key: ProviderKey): string {
       return t('llmProviderDeepSeek') as string;
     case 'anthropic':
       return t('llmProviderAnthropic') as string;
+    case 'kimi_global':
+      return t('llmProviderKimiGlobal') as string;
+    case 'kimi_cn':
+      return t('llmProviderKimiCn') as string;
+    case 'minimax_global':
+      return t('llmProviderMinimaxGlobal') as string;
+    case 'minimax_cn':
+      return t('llmProviderMinimaxCn') as string;
     case 'openai_compatible':
       return t('llmProviderOpenaiCompatible') as string;
     case 'anthropic_compatible':
@@ -512,7 +549,6 @@ export const SetupWizardPage: Component<SetupWizardPageProps> = (props) => {
         setLlmForm(nextLlm);
         setImForm(nextIm);
         setSearchForm(searchFromConfig(config));
-        setProvider(hasAnyLlmConfig ? detectProvider(nextLlm) : 'openai');
         setSelectedPlatforms(selectedPlatformsFromForm(nextIm));
         setWechatAdvancedOpen(
           !!(nextIm.wechat_token || nextIm.wechat_base_url || nextIm.wechat_account_id),

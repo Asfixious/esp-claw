@@ -45,6 +45,16 @@ typedef struct {
     std::array<uint8_t, 3> hsv_max;
 } lua_color_detect_config_t;
 
+typedef struct {
+    int category;
+    float score;
+    int left;
+    int top;
+    int right;
+    int bottom;
+    int area;
+} lua_color_detect_result_t;
+
 static ColorDetect *s_detector;
 static StaticSemaphore_t s_detector_mutex_buffer;
 static SemaphoreHandle_t s_detector_mutex;
@@ -327,6 +337,72 @@ static esp_err_t lua_color_detect_prepare_detector(const lua_color_detect_config
     return ESP_OK;
 }
 
+static bool lua_color_detect_convert_result(const dl::detect::result_t &result, int limit_width, int limit_height, lua_color_detect_result_t *out)
+{
+    if (out == nullptr || result.box.size() < 4 || limit_width <= 0 || limit_height <= 0) {
+        ESP_LOGE(TAG, "invalid color_detect result");
+        return false;
+    }
+
+    // Keep Lua output compatible with the previous local best-result extension.
+    lua_color_detect_result_t converted = {
+        .category = result.category,
+        .score = result.score,
+        .left = std::max(0, std::min(result.box[0], limit_width - 1)),
+        .top = std::max(0, std::min(result.box[1], limit_height - 1)),
+        .right = std::max(0, std::min(result.box[2], limit_width - 1)),
+        .bottom = std::max(0, std::min(result.box[3], limit_height - 1)),
+        .area = 0,
+    };
+    if (converted.right < converted.left || converted.bottom < converted.top) {
+        ESP_LOGE(TAG, "invalid color_detect box: left=%d top=%d right=%d bottom=%d", converted.left, converted.top, converted.right, converted.bottom);
+        return false;
+    }
+
+    converted.area = (converted.right - converted.left + 1) * (converted.bottom - converted.top + 1);
+    if (converted.area <= 0) {
+        ESP_LOGE(TAG, "invalid color_detect box area");
+        return false;
+    }
+
+    *out = converted;
+    return true;
+}
+
+static bool lua_color_detect_select_best(const std::list<dl::detect::result_t> &results,
+                                         const lua_color_detect_config_t *config,
+                                         int limit_width,
+                                         int limit_height,
+                                         lua_color_detect_result_t *out)
+{
+    bool has_best = false;
+    lua_color_detect_result_t best = {};
+
+    if (config == nullptr || out == nullptr) {
+        ESP_LOGE(TAG, "invalid select_best arguments");
+        return false;
+    }
+
+    for (const dl::detect::result_t &result : results) {
+        lua_color_detect_result_t candidate = {};
+        if (!lua_color_detect_convert_result(result, limit_width, limit_height, &candidate)) {
+            continue;
+        }
+        if (config->max_blob_pixels > 0 && candidate.area > config->max_blob_pixels) {
+            continue;
+        }
+        if (!has_best || candidate.area > best.area) {
+            best = candidate;
+            has_best = true;
+        }
+    }
+
+    if (has_best) {
+        *out = best;
+    }
+    return has_best;
+}
+
 static void lua_color_detect_push_empty(lua_State *L, const lua_color_detect_config_t *config, int frame_width, int frame_height)
 {
     lua_newtable(L);
@@ -350,7 +426,7 @@ static void lua_color_detect_push_empty(lua_State *L, const lua_color_detect_con
 
 static void lua_color_detect_push_result(lua_State *L,
                                          const lua_color_detect_config_t *config,
-                                         const ColorDetect::box_result_t *result,
+                                         const lua_color_detect_result_t *result,
                                          int frame_width,
                                          int frame_height)
 {
@@ -426,7 +502,7 @@ static int lua_color_detect_detect(lua_State *L)
 {
     lua_image_view_t view = {};
     lua_color_detect_config_t config = {};
-    ColorDetect::box_result_t best_result = {};
+    lua_color_detect_result_t best_result = {};
     bool detected = false;
     uint16_t *crop = nullptr;
     const uint8_t *detect_data = nullptr;
@@ -479,7 +555,9 @@ static int lua_color_detect_detect(lua_State *L)
 
     err = lua_color_detect_prepare_detector(&config);
     if (err == ESP_OK) {
-        detected = s_detector->run_best(img, config.max_blob_pixels, &best_result);
+        // The registry component exposes run(); Lua keeps the one-best-result API by selecting here.
+        const std::list<dl::detect::result_t> &results = s_detector->run(img);
+        detected = lua_color_detect_select_best(results, &config, detect_width, detect_height, &best_result);
     }
     xSemaphoreGive(mutex);
 

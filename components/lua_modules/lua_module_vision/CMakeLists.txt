@@ -21,11 +21,9 @@ if(CONFIG_APP_CLAW_LUA_MODULE_VISION AND CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT)
     if(CONFIG_LUA_MODULE_VISION_COLOR_DETECT)
         list(APPEND lua_module_vision_srcs
             "src/color_detect.cpp"
-            "color_detect/color_detect.cpp"
         )
         list(APPEND lua_module_vision_requires
-            esp-dl
-            opencv-mobile-prebuilt-newlib
+            espressif__color_detect
         )
     endif()
 
@@ -45,7 +43,13 @@ idf_component_register(
         ${lua_module_vision_srcs}
     INCLUDE_DIRS
         "src"
-        "color_detect"
     REQUIRES
         ${lua_module_vision_requires}
 )
+
+if(CONFIG_LUA_MODULE_VISION_COLOR_DETECT)
+    idf_component_get_property(lua_module_vision_esp_dl_lib espressif__esp-dl COMPONENT_LIB)
+    if(lua_module_vision_esp_dl_lib)
+        target_compile_options(${lua_module_vision_esp_dl_lib} PRIVATE -Wno-non-c-typedef-for-linkage)
+    endif()
+endif()

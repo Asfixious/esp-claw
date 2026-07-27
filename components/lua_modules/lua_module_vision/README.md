@@ -5,6 +5,7 @@ Lua vision modules backed by `image.frame` buffers.
 ## Modules
 
 - `motion_detect`: detects local motion in consecutive frames. It is enabled by default with `LUA_MODULE_VISION_MOTION_DETECT`.
+- `color_detect`: detects the largest matching color blob with the registry `espressif/color_detect` component. It is enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
 - `espdet`: runs ESP-DL ESPDet object detection with a user-provided `.espdl` model. Enable it with `LUA_MODULE_VISION_ESPDET`.
 
 All functions borrow frame data only during the call. Frame-format conversion is handled by the shared `image` module.
@@ -57,6 +58,32 @@ The first `detect()` call seeds the previous-frame buffer and returns `ready = f
 - `box_snap_threshold`: edge distance that snaps immediately, default `24`.
 
 Results include `ready`, `motion`, `event`, `score`, and the smoothed display `box` when motion is active. Events are `"none"`, `"started"`, or `"stopped"`.
+
+## Color Detection
+
+```lua
+local camera = require("camera")
+local color_detect = require("color_detect")
+
+local frame <close> = camera.get_frame(3000)
+local result = color_detect.detect(frame, {
+    source = { x = 0, y = 0, width = 240, height = 240 },
+    h_min = 50,
+    h_max = 88,
+    s_min = 80,
+    s_max = 255,
+    v_min = 50,
+    v_max = 255,
+    min_pixels = 250,
+    max_blob_pixels = 20000,
+})
+
+if result.detected then
+    print("color center", result.cx, result.cy)
+end
+```
+
+`color_detect.detect(frame[, opts])` requests RGB565LE through the image module. The Lua wrapper keeps ROI cropping, HSV threshold parsing, maximum-blob filtering, and source-coordinate mapping around the registry `espressif/color_detect` detector. Results include `count`, `detected`, `pixels`, `category`, `score`, `box`, `left`, `top`, `right`, `bottom`, `x`, `y`, `box_width`, `box_height`, `cx`, `cy`, and `source_*` fields. `color_detect.release()` releases the detector and crop scratch buffer early.
 
 ## ESPDet
 

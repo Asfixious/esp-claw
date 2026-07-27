@@ -23,6 +23,13 @@ export interface SkillFrontmatter {
     cap_groups?: string[]
     manage_mode?: string
   }
+  execution?: {
+    entry?: string
+    icon?: string
+    args?: Record<string, unknown>
+    order?: number
+    visible?: boolean
+  }
   simulator?: {
     type?: string
     entry?: string

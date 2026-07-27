@@ -7,13 +7,14 @@ menu "App Claw Config"
             Enable the console REPL managed by app_claw. When disabled, app_claw
             does not build or start the serial CLI.
 
-    config APP_CLAW_ENABLE_EMOTE
-        bool "Enable App Claw emote"
+    config APP_CLAW_SYSTEM_UI_ENABLE
+        bool "LVGL system UI runtime"
         depends on ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT
         default y
         help
-            Enable expression emote startup and emote asset packaging for boards
-            with LCD display support.
+            Enable the system-level LVGL UI runtime. When the Lua LVGL module
+            is enabled, Lua LVGL scripts switch screens inside this runtime
+            instead of initializing LVGL directly.
 
     choice APP_CLAW_MEMORY_MODE
         prompt "App Claw memory management mode"

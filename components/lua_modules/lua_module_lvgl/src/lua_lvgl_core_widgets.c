@@ -18,7 +18,7 @@ static int lua_lvgl_screen(lua_State *L)
         return luaL_error(L, "lvgl runtime is not initialized");
     }
     screen = lv_screen_active();
-    if (!lua_lvgl_push_obj(L, screen, LUA_LVGL_OBJ_SCREEN)) {
+    if (!lua_lvgl_push_obj_ex(L, screen, LUA_LVGL_OBJ_SCREEN, false)) {
         lua_lvgl_unlock();
         return luaL_error(L, "lvgl object record allocation failed");
     }
@@ -39,6 +39,7 @@ static int lua_lvgl_create_screen(lua_State *L)
         return luaL_error(L, "lvgl runtime is not initialized");
     }
     screen = lv_obj_create(NULL);
+    lua_lvgl_apply_default_font_locked(screen);
     if (!lua_lvgl_push_obj(L, screen, LUA_LVGL_OBJ_SCREEN)) {
         lv_obj_delete(screen);
         lua_lvgl_unlock();
@@ -68,7 +69,11 @@ int lua_lvgl_screen_load(lua_State *L)
         lua_lvgl_unlock();
         return luaL_error(L, "lvgl load requires a screen object");
     }
-    lv_screen_load(screen);
+    err = display_service_session_load_screen_locked(s_lvgl.display_session, screen);
+    if (err != ESP_OK) {
+        lua_lvgl_unlock();
+        return lua_lvgl_error_esp(L, "load screen", err);
+    }
     lua_lvgl_unlock();
     lua_pushboolean(L, 1);
     return 1;

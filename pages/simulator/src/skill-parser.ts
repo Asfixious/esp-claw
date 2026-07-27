@@ -38,8 +38,8 @@ export function parseFilesSection(body: string): string[] {
 
     const match = line.match(/^\s*[-*]\s+(?:`([^`]+)`|([^\s#]+))/)
     const value = (match?.[1] ?? match?.[2] ?? '').trim()
-    if (value && !value.includes('..')) {
-      files.push(value.replaceAll('\\', '/').replace(/^\/+/, ''))
+    if (value) {
+      files.push(normalizeSkillFilePath(value))
     }
   }
 
@@ -47,9 +47,18 @@ export function parseFilesSection(body: string): string[] {
 }
 
 function normalizeSkillFilePath(path: string): string {
-  const normalized = path.trim().replaceAll('\\', '/').replace(/^\/+/, '')
-  if (!normalized || normalized.includes('..')) {
+  const normalized = path.trim().replaceAll('\\', '/')
+  const segments = normalized.split('/')
+  if (!normalized || normalized.startsWith('/') || segments.some((segment) => !segment || segment === '..')) {
     throw new Error(`invalid simulator file path: ${path}`)
+  }
+  return normalized
+}
+
+function normalizeEntryPath(path: string): string {
+  const normalized = normalizeSkillFilePath(path)
+  if (!normalized.endsWith('.lua')) {
+    throw new Error(`invalid simulator entry path: ${path}`)
   }
   return normalized
 }
@@ -66,18 +75,17 @@ export function getSimulatorFiles(frontmatter: SkillFrontmatter, body: string): 
 }
 
 export function inferEntry(frontmatter: SkillFrontmatter, body: string, files: string[]): string {
-  const configured = frontmatter.simulator?.entry
-  if (configured) return normalizeSkillFilePath(configured)
+  const configured = frontmatter.execution?.entry ?? frontmatter.simulator?.entry
+  if (configured) return normalizeEntryPath(configured)
 
   const jsonBlocks = body.matchAll(/```json\s*([\s\S]*?)```/g)
   for (const block of jsonBlocks) {
     try {
       const value = JSON.parse(block[1] ?? '{}') as { path?: string }
       if (typeof value.path === 'string' && value.path.includes('/scripts/')) {
-        return value.path
+        return normalizeEntryPath(value.path
           .replace('{CUR_SKILL_DIR}/', '')
-          .replace('{CUR_SKILL_DIR}', '')
-          .replace(/^\/+/, '')
+          .replace('{CUR_SKILL_DIR}', ''))
       }
     } catch {
       // Ignore non-object examples; SKILL.md examples are user-facing prose.
@@ -92,14 +100,9 @@ export function inferEntry(frontmatter: SkillFrontmatter, body: string, files: s
 }
 
 export function assertSimulatorSupported(frontmatter: SkillFrontmatter): void {
-  const categories = frontmatter.metadata?.category ?? []
-  if (!categories.includes('ui')) {
-    throw new Error('this skill is not marked as simulator-capable: metadata.category must include "ui"')
+  const entry = frontmatter.execution?.entry ?? frontmatter.simulator?.entry
+  if (!entry) {
+    throw new Error('simulator-capable skills must define execution.entry or legacy simulator.entry')
   }
-  if (!frontmatter.simulator?.entry) {
-    throw new Error('simulator-capable skills must define simulator.entry')
-  }
-  if (!Array.isArray(frontmatter.simulator.files) || frontmatter.simulator.files.length === 0) {
-    throw new Error('simulator-capable skills must define non-empty simulator.files')
-  }
+  normalizeEntryPath(entry)
 }

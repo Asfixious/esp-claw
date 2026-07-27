@@ -167,6 +167,7 @@ static const luaL_Reg lua_lvgl_canvas_methods[] = {
     {"fill_bg", lua_lvgl_canvas_fill_bg},
     {"set_px", lua_lvgl_canvas_set_px},
     {"get_px", lua_lvgl_canvas_get_px},
+    {"set_rgb565_data", lua_lvgl_canvas_set_rgb565_data},
     {NULL, NULL},
 };
 
@@ -265,6 +266,24 @@ static const luaL_Reg lua_lvgl_window_methods[] = {
     {NULL, NULL},
 };
 
+static const luaL_Reg lua_lvgl_eaf_methods[] = {
+    {"set_src", lua_lvgl_eaf_set_src},
+    {"set_src_data", lua_lvgl_eaf_set_src_data},
+    {"restart", lua_lvgl_eaf_restart},
+    {"pause", lua_lvgl_eaf_pause},
+    {"resume", lua_lvgl_eaf_resume},
+    {"is_loaded", lua_lvgl_eaf_is_loaded},
+    {"get_loop_count", lua_lvgl_eaf_get_loop_count},
+    {"set_loop_count", lua_lvgl_eaf_set_loop_count},
+    {"get_total_frames", lua_lvgl_eaf_get_total_frames},
+    {"get_current_frame", lua_lvgl_eaf_get_current_frame},
+    {"set_frame_delay", lua_lvgl_eaf_set_frame_delay},
+    {"get_frame_delay", lua_lvgl_eaf_get_frame_delay},
+    {"set_loop_enabled", lua_lvgl_eaf_set_loop_enabled},
+    {"get_loop_enabled", lua_lvgl_eaf_get_loop_enabled},
+    {NULL, NULL},
+};
+
 /* image / line / spinner / keyboard / generic / container expose the base
  * method set only; an empty per-type extra table is enough. */
 static const luaL_Reg lua_lvgl_no_extra_methods[] = {
@@ -323,6 +342,7 @@ static const lua_lvgl_widget_descriptor_t s_widget_descriptors[] = {
     {LUA_LVGL_OBJ_TILE,        "lvgl.obj.tile",        lua_lvgl_no_extra_methods},
     {LUA_LVGL_OBJ_WINDOW,      "lvgl.obj.window",      lua_lvgl_window_methods},
     {LUA_LVGL_OBJ_WINDOW_CHILD, "lvgl.obj.window_child", lua_lvgl_no_extra_methods},
+    {LUA_LVGL_OBJ_EAF,         "lvgl.obj.eaf",         lua_lvgl_eaf_methods},
 };
 
 #define LUA_LVGL_WIDGET_DESCRIPTOR_COUNT \

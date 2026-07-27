@@ -19,8 +19,9 @@ function decodeText(path: string, data: Uint8Array): string | undefined {
 }
 
 function normalizeSkillFilePath(path: string): string {
-  const normalized = path.trim().replaceAll('\\', '/').replace(/^\/+/, '')
-  if (!normalized || normalized.includes('..')) {
+  const normalized = path.trim().replaceAll('\\', '/')
+  const segments = normalized.split('/')
+  if (!normalized || normalized.startsWith('/') || segments.some((segment) => !segment || segment === '..')) {
     throw new Error(`invalid simulator mock file path: ${path}`)
   }
   return normalized
@@ -73,6 +74,7 @@ export async function loadSkill(params: SimulatorParams): Promise<LoadedSkill> {
   const fileList = getSimulatorFiles(frontmatter, body)
   const entry = inferEntry(frontmatter, body, fileList)
   if (!fileList.includes(entry)) fileList.unshift(entry)
+  if (frontmatter.execution?.icon) addUniqueFile(fileList, normalizeSkillFilePath(frontmatter.execution.icon))
 
   let capabilityMocks: CapabilityMocks = {}
   let simulatorMocks: SimulatorMocks = {}

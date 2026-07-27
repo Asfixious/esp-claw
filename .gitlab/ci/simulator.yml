@@ -12,6 +12,7 @@ build_simulator_pages:
     - apt-get update
     - apt-get install -y --no-install-recommends cmake ninja-build python3-venv
     - emcmake cmake -S tools/lua_lvgl_web_sim -B "$SIMULATOR_BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    - embuilder build sdl2
     - emmake ninja -C "$SIMULATOR_BUILD_DIR" esp_claw_sim
     - rm -rf "$SIMULATOR_RUNTIME_DIR"
     - mkdir -p "$SIMULATOR_RUNTIME_DIR"

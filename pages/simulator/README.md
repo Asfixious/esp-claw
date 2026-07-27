@@ -8,7 +8,7 @@ Supported URL shape:
 /?repo=skills-lab&ref=main&skill=skills/flappybird/SKILL.md
 ```
 
-The page downloads `SKILL.md`, requires `metadata.category` to contain `ui`, reads `simulator.entry` and `simulator.files`, downloads those files, and sends a `mountSkill` / `runSkill` message to the embedded WASM runtime.
+The page downloads `SKILL.md`, reads the executable entry from `execution.entry`, downloads the skill files, and sends a `mountSkill` / `runSkill` message to the embedded WASM runtime. Legacy `simulator.entry` and `simulator.files` metadata remain supported for older Skills Lab content, but new skills should use `execution.entry`.
 
 `VITE_SKILLS_LAB_WEB_BASE` must be the Skills Lab site root, not a detail route:
 

@@ -18,15 +18,15 @@ typedef struct {
 } display_named_color_t;
 
 static const display_named_color_t s_named_colors[] = {
-    { "black",       { 0,   0,   0,   255 } },
-    { "white",       { 255, 255, 255, 255 } },
-    { "red",         { 255, 0,   0,   255 } },
-    { "green",       { 0,   255, 0,   255 } },
-    { "blue",        { 0,   0,   255, 255 } },
-    { "yellow",      { 255, 255, 0,   255 } },
-    { "cyan",        { 0,   255, 255, 255 } },
-    { "magenta",     { 255, 0,   255, 255 } },
-    { "transparent", { 0,   0,   0,   0   } },
+    { "black",       { .r = 0,   .g = 0,   .b = 0,   .a = 255 } },
+    { "white",       { .r = 255, .g = 255, .b = 255, .a = 255 } },
+    { "red",         { .r = 255, .g = 0,   .b = 0,   .a = 255 } },
+    { "green",       { .r = 0,   .g = 255, .b = 0,   .a = 255 } },
+    { "blue",        { .r = 0,   .g = 0,   .b = 255, .a = 255 } },
+    { "yellow",      { .r = 255, .g = 255, .b = 0,   .a = 255 } },
+    { "cyan",        { .r = 0,   .g = 255, .b = 255, .a = 255 } },
+    { "magenta",     { .r = 255, .g = 0,   .b = 255, .a = 255 } },
+    { "transparent", { .r = 0,   .g = 0,   .b = 0,   .a = 0   } },
 };
 
 static int display_color_hex_value(char ch)
@@ -202,6 +202,27 @@ uint16_t display_color_blend_rgb565(uint16_t dst, display_color_t src)
     };
 
     return display_color_to_rgb565(blended);
+}
+
+uint32_t display_color_to_rgb888(display_color_t color)
+{
+    return ((uint32_t)color.b << 16) | ((uint32_t)color.g << 8) | (uint32_t)color.r;
+}
+
+uint32_t display_color_blend_rgb888(uint32_t dst, display_color_t src)
+{
+    uint8_t dst_b = (uint8_t)((dst >> 16) & 0xFF);
+    uint8_t dst_g = (uint8_t)((dst >> 8) & 0xFF);
+    uint8_t dst_r = (uint8_t)(dst & 0xFF);
+    uint16_t inv_a = (uint16_t)(255 - src.a);
+    display_color_t blended = {
+        .b = (uint8_t)(((uint16_t)src.b * src.a + (uint16_t)dst_b * inv_a + 127) / 255),
+        .g = (uint8_t)(((uint16_t)src.g * src.a + (uint16_t)dst_g * inv_a + 127) / 255),
+        .r = (uint8_t)(((uint16_t)src.r * src.a + (uint16_t)dst_r * inv_a + 127) / 255),
+        .a = 255,
+    };
+
+    return display_color_to_rgb888(blended);
 }
 
 bool display_color_is_transparent(display_color_t color)

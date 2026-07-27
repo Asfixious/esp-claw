@@ -24,7 +24,7 @@ devices:
         dpi_clk_src: MIPI_DSI_DPI_CLK_SRC_DEFAULT
         dpi_clock_freq_mhz: 48
         pixel_format: LCD_COLOR_PIXEL_FORMAT_RGB565
-        in_color_format: 0
+        in_color_format: LCD_COLOR_FMT_RGB565
         out_color_format: 0
         num_fbs: 2
         flags:

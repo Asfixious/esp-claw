@@ -69,6 +69,12 @@ size_t display_hal_pixel_format_bytes(display_hal_pixel_format_t format);
 
 /* --- Lifecycle --- */
 
+/**
+ * @brief One-time module init. Pre-creates the HAL mutex. Idempotent; must be
+ *        called during module registration before any other HAL API.
+ */
+esp_err_t display_hal_module_init(void);
+
 esp_err_t display_hal_create(display_service_session_handle_t session,
                              esp_lcd_panel_handle_t panel_handle,
                              esp_lcd_panel_io_handle_t io_handle,

@@ -115,7 +115,7 @@ Starts a frame.
 `options` is an optional table:
 - `clear`: boolean, default `true`
 - `color`: background color, default `"black"`
-- `preserve`: boolean, default `true`. When `clear = false`, copy the latest visible framebuffer into the draw framebuffer before drawing. Set this to `false` for full-frame redraw loops that do not need to inherit the previous frame.
+- `preserve`: boolean, default `true`. When `clear = false`, copy the latest visible framebuffer into the draw framebuffer before drawing. Set to `false` for full-frame redraw loops (games/animations) to skip the per-frame SPIRAM memcpy; leave it at the default only if you rely on partial-update presents to keep untouched pixels across frames.
 
 Example:
 

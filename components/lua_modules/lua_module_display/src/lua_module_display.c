@@ -1282,7 +1282,11 @@ int luaopen_display(lua_State *L)
 
 esp_err_t lua_module_display_register(void)
 {
-    esp_err_t err = cap_lua_register_module("display", luaopen_display);
+    esp_err_t err = display_hal_module_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = cap_lua_register_module("display", luaopen_display);
     if (err != ESP_OK) {
         return err;
     }

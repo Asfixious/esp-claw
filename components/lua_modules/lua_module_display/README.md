@@ -115,6 +115,7 @@ Starts a frame.
 `options` is an optional table:
 - `clear`: boolean, default `true`
 - `color`: background color, default `"black"`
+- `preserve`: boolean, default `true`. When `clear = false`, copy the latest visible framebuffer into the draw framebuffer before drawing. Set this to `false` for full-frame redraw loops that do not need to inherit the previous frame.
 
 Example:
 

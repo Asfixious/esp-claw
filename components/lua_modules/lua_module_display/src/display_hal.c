@@ -45,6 +45,7 @@ typedef struct {
     uint8_t visible_framebuffer_index;
     bool frame_active;
     bool framebuffer_initialized;
+    bool preserve_frame;
     display_dirty_rect_t dirty;
     uint8_t *submit_swap_buffer;
     size_t submit_swap_buffer_pixels;
@@ -1033,7 +1034,7 @@ static esp_err_t display_hal_present_full_locked(void)
         s_state.draw_framebuffer_index = (uint8_t)((s_state.draw_framebuffer_index + 1) %
                                                    s_state.framebuffer_count);
         uint8_t *new_draw_fb = display_hal_get_draw_framebuffer_locked();
-        if (new_draw_fb && new_draw_fb != prev_draw_fb) {
+        if (s_state.preserve_frame && new_draw_fb && new_draw_fb != prev_draw_fb) {
             memcpy(new_draw_fb, prev_draw_fb, s_state.framebuffer_bytes);
         }
     }
@@ -1171,7 +1172,7 @@ int display_hal_height(void)
     return s_state.height;
 }
 
-esp_err_t display_hal_begin_frame(bool clear, display_color_t color)
+esp_err_t display_hal_begin_frame(bool clear, display_color_t color, bool preserve)
 {
     esp_err_t ret = display_hal_lock();
     uint8_t *draw_fb = NULL;
@@ -1187,6 +1188,7 @@ esp_err_t display_hal_begin_frame(bool clear, display_color_t color)
     }
     if (ret == ESP_OK) {
         s_state.frame_active = true;
+        s_state.preserve_frame = preserve;
         display_hal_clear_clip_locked();
         draw_fb = display_hal_get_draw_framebuffer_locked();
         visible_fb = display_hal_get_visible_framebuffer_locked();
@@ -1196,7 +1198,7 @@ esp_err_t display_hal_begin_frame(bool clear, display_color_t color)
                 display_dirty_mark(&s_state.dirty, 0, 0, s_state.width, s_state.height);
             }
             s_state.framebuffer_initialized = true;
-        } else if (draw_fb && visible_fb && draw_fb != visible_fb) {
+        } else if (preserve && draw_fb && visible_fb && draw_fb != visible_fb) {
             memcpy(draw_fb, visible_fb, s_state.framebuffer_bytes);
         }
     }

@@ -92,7 +92,7 @@ int display_hal_height(void);
 
 /* --- Frame control --- */
 
-esp_err_t display_hal_begin_frame(bool clear, display_color_t color);
+esp_err_t display_hal_begin_frame(bool clear, display_color_t color, bool preserve);
 esp_err_t display_hal_present(void);
 esp_err_t display_hal_present_full(void);
 esp_err_t display_hal_end_frame(void);

@@ -391,10 +391,11 @@ static int lua_display_backlight(lua_State *L)
  * ---------------------------------------------------------------------- */
 
 static void lua_display_parse_frame_options(lua_State *L, int index,
-                                            bool *clear, display_color_t *color)
+                                            bool *clear, display_color_t *color, bool *preserve)
 {
     if (clear)  { *clear = true; }
     if (color)  { *color = (display_color_t){ .r = 0, .g = 0, .b = 0, .a = 255 }; }
+    if (preserve) { *preserve = true; }
 
     if (lua_isnoneornil(L, index)) {
         return;
@@ -418,14 +419,21 @@ static void lua_display_parse_frame_options(lua_State *L, int index,
         }
     }
     lua_pop(L, 1);
+
+    lua_getfield(L, index, "preserve");
+    if (!lua_isnil(L, -1) && preserve) {
+        *preserve = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
 }
 
 static int lua_display_begin_frame(lua_State *L)
 {
     bool clear = true;
+    bool preserve = true;
     display_color_t color = { .r = 0, .g = 0, .b = 0, .a = 255 };
-    lua_display_parse_frame_options(L, 1, &clear, &color);
-    esp_err_t err = display_hal_begin_frame(clear, color);
+    lua_display_parse_frame_options(L, 1, &clear, &color, &preserve);
+    esp_err_t err = display_hal_begin_frame(clear, color, preserve);
     if (err != ESP_OK) {
         return luaL_error(L, "display begin_frame failed: %s", esp_err_to_name(err));
     }

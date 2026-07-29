@@ -28,7 +28,7 @@ menu "App Claw Config"
             bool "Enable event router subsystem"
             default y
             help
-                Initialize and start claw_event_router (rule dispatch, IM bindings,
+                Initialize and start claw_event_router (rule dispatch, IM Gateway output,
                 startup trigger).
 
         config APP_CLAW_CAP_IM_QQ
@@ -36,39 +36,39 @@ menu "App Claw Config"
             select APP_CLAW_CAP_EVENT_ROUTER
             default y
             help
-                Enable the QQ capability and keep app_claw's direct dependency
-                on cap_im_qq.
+                Enable the QQ backend and keep app_claw's direct dependency
+                on cap_im_platform.
 
         config APP_CLAW_CAP_IM_FEISHU
             bool "Enable Feishu capability"
             select APP_CLAW_CAP_EVENT_ROUTER
             default y
             help
-                Enable the Feishu capability and keep app_claw's direct dependency
-                on cap_im_feishu.
+                Enable the Feishu backend and keep app_claw's direct dependency
+                on cap_im_platform.
 
         config APP_CLAW_CAP_IM_TG
             bool "Enable Telegram capability"
             select APP_CLAW_CAP_EVENT_ROUTER
             default y
             help
-                Enable the Telegram capability and keep app_claw's direct dependency
-                on cap_im_tg.
+                Enable the Telegram backend and keep app_claw's direct dependency
+                on cap_im_platform.
 
         config APP_CLAW_CAP_IM_WECHAT
             bool "Enable WeChat capability"
             select APP_CLAW_CAP_EVENT_ROUTER
             default y
             help
-                Enable the WeChat capability and keep app_claw's direct dependency
-                on cap_im_wechat.
+                Enable the WeChat backend and keep app_claw's direct dependency
+                on cap_im_platform.
 
         config APP_CLAW_CAP_IM_LOCAL
             bool "Enable local / Web IM capability (cap_im_local)"
             select APP_CLAW_CAP_EVENT_ROUTER
             default y
             help
-                Register cap_im_local for in-process IM (e.g. edge_agent Web IM).
+                Register the local/Web private backend with the unified IM Gateway.
 
         config APP_CLAW_CAP_SCHEDULER
             bool "Enable scheduler capability"

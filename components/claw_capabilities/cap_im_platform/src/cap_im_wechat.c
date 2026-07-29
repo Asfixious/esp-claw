@@ -19,8 +19,7 @@
 #include "cJSON.h"
 #include "claw_cap.h"
 #include "claw_task.h"
-#include "claw_event_publisher.h"
-#include "claw_im_session.h"
+#include "claw_im_gateway.h"
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_http_client.h"
@@ -750,14 +749,17 @@ static esp_err_t cap_im_wechat_publish_inbound_text(const char *chat_id,
         return ESP_OK;
     }
 
-    return claw_im_session_publish_message(
-        "wechat_gateway",
-        "wechat",
-        chat_id,
-        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
-        content,
-        sender_id,
-        message_id);
+    return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "wechat_gateway",
+        .channel = "wechat",
+        .chat_id = chat_id,
+        .sender_id = sender_id,
+        .message_id = message_id,
+        .event_type = "message",
+        .content_type = "text",
+        .text = content,
+        .timestamp_ms = cap_im_wechat_now_ms(),
+    });
 }
 
 static esp_err_t cap_im_wechat_publish_attachment_event(const char *chat_id,
@@ -766,27 +768,22 @@ static esp_err_t cap_im_wechat_publish_attachment_event(const char *chat_id,
                                                         const char *content_type,
                                                         const char *payload_json)
 {
-    claw_event_t event = {0};
-
     if (!chat_id || !message_id || !content_type || !payload_json) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    strlcpy(event.source_cap, "wechat_gateway", sizeof(event.source_cap));
-    strlcpy(event.event_type, "attachment_saved", sizeof(event.event_type));
-    strlcpy(event.source_channel, "wechat", sizeof(event.source_channel));
-    strlcpy(event.chat_id, chat_id, sizeof(event.chat_id));
-    if (sender_id && sender_id[0]) {
-        strlcpy(event.sender_id, sender_id, sizeof(event.sender_id));
-    }
-    strlcpy(event.message_id, message_id, sizeof(event.message_id));
-    strlcpy(event.content_type, content_type, sizeof(event.content_type));
-    event.timestamp_ms = cap_im_wechat_now_ms();
-    event.session_policy = CLAW_SESSION_POLICY_CHAT;
-    snprintf(event.event_id, sizeof(event.event_id), "wechat-attach-%" PRId64, event.timestamp_ms);
-    event.text = "";
-    event.payload_json = (char *)payload_json;
-    return claw_event_router_publish(&event);
+    return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "wechat_gateway",
+        .channel = "wechat",
+        .chat_id = chat_id,
+        .sender_id = sender_id,
+        .message_id = message_id,
+        .event_type = "attachment_saved",
+        .content_type = content_type,
+        .text = "",
+        .payload_json = payload_json,
+        .timestamp_ms = cap_im_wechat_now_ms(),
+    });
 }
 
 static esp_err_t cap_im_wechat_download_buffer(const char *url,
@@ -2078,43 +2075,21 @@ static esp_err_t cap_im_wechat_send_image_message(const char *chat_id,
     return cap_im_wechat_send_message_json(msg);
 }
 
-static esp_err_t cap_im_wechat_send_message_execute(const char *input_json,
-                                                    const claw_cap_call_context_t *ctx,
-                                                    char *output,
-                                                    size_t output_size)
+static esp_err_t cap_im_wechat_gateway_send_message(
+    const claw_im_gateway_message_t *request,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    const char *chat_id = NULL;
-    const char *message = NULL;
-    const char *event_type = NULL;
+    const char *message = request->message;
     cap_im_wechat_stage_send_mode_t stage_mode;
-    esp_err_t err;
 
-    if (!input_json || !output || output_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    root = cJSON_Parse(input_json);
-    if (!root) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    chat_id = cap_im_wechat_string_value(cJSON_GetObjectItemCaseSensitive(root, "chat_id"));
-    message = cap_im_wechat_string_value(cJSON_GetObjectItemCaseSensitive(root, "message"));
-    event_type = cap_im_wechat_string_value(cJSON_GetObjectItemCaseSensitive(root, "event_type"));
-    if (!chat_id || !message) {
-        cJSON_Delete(root);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    stage_mode = cap_im_wechat_stage_send_mode_for_event(chat_id, event_type);
+    (void)user_ctx;
+    stage_mode = cap_im_wechat_stage_send_mode_for_event(request->chat_id,
+                                                         request->event_type);
     if (stage_mode == CAP_IM_WECHAT_STAGE_SKIP) {
         ESP_LOGI(TAG,
                  "skip agent_stage text for chat=%s after %d consecutive stage messages",
-                 chat_id,
+                 request->chat_id,
                  CAP_IM_WECHAT_STAGE_LIMIT);
-        cJSON_Delete(root);
-        strlcpy(output, "{\"ok\":true,\"skipped\":true}", output_size);
         return ESP_OK;
     }
 
@@ -2122,56 +2097,21 @@ static esp_err_t cap_im_wechat_send_message_execute(const char *input_json,
         message =
             "Due to Weixin's limitation of supporting only up to 10 output messages, any subsequent step messages will be ignored.";
     }
-
-    err = cap_im_wechat_send_text(chat_id, message);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    strlcpy(output, "{\"ok\":true}", output_size);
-    return ESP_OK;
+    return cap_im_wechat_send_text(request->chat_id, message);
 }
 
-static esp_err_t cap_im_wechat_send_image_execute(const char *input_json,
-                                                  const claw_cap_call_context_t *ctx,
-                                                  char *output,
-                                                  size_t output_size)
+static esp_err_t cap_im_wechat_gateway_send_image(
+    const claw_im_gateway_media_t *media,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    const char *chat_id = NULL;
-    const char *path = NULL;
-    const char *caption = NULL;
-    esp_err_t err;
-
-    (void)ctx;
-
-    if (!input_json || !output || output_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    root = cJSON_Parse(input_json);
-    if (!root) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    chat_id = cap_im_wechat_string_value(cJSON_GetObjectItemCaseSensitive(root, "chat_id"));
-    path = cap_im_wechat_string_value(cJSON_GetObjectItemCaseSensitive(root, "path"));
-    caption = cap_im_wechat_string_value(cJSON_GetObjectItemCaseSensitive(root, "caption"));
-    if (!chat_id || !path) {
-        cJSON_Delete(root);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_im_wechat_send_image(chat_id, path, caption);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    strlcpy(output, "{\"ok\":true}", output_size);
-    return ESP_OK;
+    (void)user_ctx;
+    return cap_im_wechat_send_image(media->chat_id, media->path, media->caption);
 }
+
+static const claw_im_gateway_platform_ops_t s_wechat_gateway_ops = {
+    .send_message = cap_im_wechat_gateway_send_message,
+    .send_image = cap_im_wechat_gateway_send_image,
+};
 
 static esp_err_t cap_im_wechat_gateway_init(void)
 {
@@ -2255,28 +2195,6 @@ static const claw_cap_descriptor_t s_wechat_descriptors[] = {
         .start = cap_im_wechat_gateway_start,
         .stop = cap_im_wechat_gateway_stop,
     },
-    {
-        .id = "wechat_send_message",
-        .name = "wechat_send_message",
-        .family = "im",
-        .description = "Send a WeChat text message.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"event_type\":{\"type\":\"string\"}},\"required\":[\"chat_id\",\"message\"]}",
-        .execute = cap_im_wechat_send_message_execute,
-    },
-    {
-        .id = "wechat_send_image",
-        .name = "wechat_send_image",
-        .family = "im",
-        .description = "Send a WeChat image from a local path.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"caption\":{\"type\":\"string\"}},\"required\":[\"chat_id\",\"path\"]}",
-        .execute = cap_im_wechat_send_image_execute,
-    },
 };
 
 static const claw_cap_group_t s_wechat_group = {
@@ -2287,11 +2205,23 @@ static const claw_cap_group_t s_wechat_group = {
 
 esp_err_t cap_im_wechat_register_group(void)
 {
-    if (claw_cap_group_exists(s_wechat_group.group_id)) {
-        return ESP_OK;
-    }
+    esp_err_t err;
 
-    return claw_cap_register_group(&s_wechat_group);
+    ESP_RETURN_ON_ERROR(claw_im_gateway_register_group(),
+                        TAG,
+                        "register IM Gateway group failed");
+    if (!claw_cap_group_exists(s_wechat_group.group_id)) {
+        err = claw_cap_register_group(&s_wechat_group);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    return claw_im_gateway_register_platform(
+               &(claw_im_gateway_platform_config_t) {
+        .channel = "wechat",
+        .cap_group_id = s_wechat_group.group_id,
+        .ops = &s_wechat_gateway_ops,
+    });
 }
 
 esp_err_t cap_im_wechat_set_client_config(const cap_im_wechat_client_config_t *config)

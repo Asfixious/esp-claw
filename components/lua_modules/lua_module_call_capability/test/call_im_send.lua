@@ -16,40 +16,40 @@ local a = type(args) == "table" and args or {}
 local CHANNELS = {
     qq = {
         context_channel = "qq",
-        text = "qq_send_message",
-        image = "qq_send_image",
-        file = "qq_send_file",
+        text = "send_message",
+        image = "send_image",
+        file = "send_file",
     },
     telegram = {
         context_channel = "telegram",
-        text = "tg_send_message",
-        image = "tg_send_image",
-        file = "tg_send_file",
+        text = "send_message",
+        image = "send_image",
+        file = "send_file",
     },
     tg = {
         context_channel = "telegram",
-        text = "tg_send_message",
-        image = "tg_send_image",
-        file = "tg_send_file",
+        text = "send_message",
+        image = "send_image",
+        file = "send_file",
     },
     feishu = {
         context_channel = "feishu",
-        text = "feishu_send_message",
-        image = "feishu_send_image",
-        file = "feishu_send_file",
+        text = "send_message",
+        image = "send_image",
+        file = "send_file",
     },
     wechat = {
         context_channel = "wechat",
-        text = "wechat_send_message",
-        image = "wechat_send_image",
+        text = "send_message",
+        image = "send_image",
     },
     web = {
         context_channel = "web",
-        text = "local_send_message",
+        text = "send_message",
     },
     local = {
-        context_channel = "web",
-        text = "local_send_message",
+        context_channel = "local",
+        text = "send_message",
     },
 }
 

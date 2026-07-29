@@ -38,7 +38,7 @@ The **order** of rules in `router_rules.json` is evaluation order. Each rule typ
     |--------------|----------|
     | `call_cap` | Run a capability, including the `agent` RPC endpoint |
     | `run_script` | Run a Lua script |
-    | `send_message` | Send IM via outbound binding |
+    | `send_message` | Send through the unified IM Gateway using `channel + chat_id` |
     | `emit_event` | Emit a new Event back into `claw_event_router` |
     | `drop` | Drop the Event |
 

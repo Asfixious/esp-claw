@@ -1,6 +1,6 @@
 dependencies:
-  claw_im_session:
-    path: ../../claw_modules/claw_im_session
+  claw_im_gateway:
+    path: ../../claw_modules/claw_im_gateway
   claw_utils:
     path: ../../claw_modules/claw_utils
   espressif/esp_websocket_client: "^1.4.0"

@@ -39,8 +39,8 @@ static const char *TAG = "claw_event_router";
 #define CLAW_EVENT_ROUTER_ACK_SIZE                256
 #define CLAW_EVENT_ROUTER_FIELD_SIZE               96
 #define CLAW_EVENT_ROUTER_cap_SIZE          64
-#define CLAW_EVENT_ROUTER_BINDING_SIZE             16
 #define CLAW_EVENT_ROUTER_PENDING_TABLE_SIZE        6
+#define CLAW_EVENT_ROUTER_SEND_MESSAGE_CAP "send_message"
 _Static_assert(CLAW_EVENT_ROUTER_PENDING_TABLE_SIZE >= CLAW_EVENT_ROUTER_DEFAULT_QUEUE_LEN,
                "pending table must cover the default event queue length");
 
@@ -51,11 +51,6 @@ typedef struct {
     char event_type[32];
     char source_cap[32];
 } claw_event_router_pending_t;
-
-typedef struct {
-    char channel[24];
-    char cap_name[CLAW_EVENT_ROUTER_cap_SIZE];
-} claw_event_router_binding_t;
 
 typedef struct {
     bool has_text;
@@ -75,8 +70,6 @@ typedef struct {
     size_t max_rules;
     size_t max_actions_per_rule;
     size_t cap_output_size;
-    size_t binding_count;
-    claw_event_router_binding_t bindings[CLAW_EVENT_ROUTER_BINDING_SIZE];
     claw_event_router_rule_t *rules;
     size_t rule_count;
     claw_event_router_result_t last_result;
@@ -1478,61 +1471,6 @@ static cJSON *claw_event_router_render_json(const cJSON *input, const cJSON *ctx
     return cJSON_Duplicate((cJSON *)input, 1);
 }
 
-static esp_err_t claw_event_router_default_outbound_resolver(const claw_event_t *event,
-                                                             const char *target_channel,
-                                                             const char *target_endpoint,
-                                                             char *cap_name,
-                                                             size_t cap_name_size)
-{
-    size_t i;
-
-    (void)event;
-    (void)target_endpoint;
-
-    if (!cap_name || cap_name_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    cap_name[0] = '\0';
-
-    claw_event_router_lock();
-    for (i = 0; i < s_runtime->binding_count; i++) {
-        if (strcmp(s_runtime->bindings[i].channel, target_channel ? target_channel : "") == 0) {
-            strlcpy(cap_name,
-                    s_runtime->bindings[i].cap_name,
-                    cap_name_size);
-            claw_event_router_unlock();
-            return ESP_OK;
-        }
-    }
-    claw_event_router_unlock();
-    return ESP_ERR_NOT_FOUND;
-}
-
-static esp_err_t claw_event_router_resolve_outbound_cap(const claw_event_t *event,
-                                                        const char *target_channel,
-                                                        const char *target_endpoint,
-                                                        char *cap_name,
-                                                        size_t cap_name_size)
-{
-    if (s_runtime->config.outbound_resolver) {
-        esp_err_t err = s_runtime->config.outbound_resolver(event,
-                                                           target_channel,
-                                                           target_endpoint,
-                                                           cap_name,
-                                                           cap_name_size,
-                                                           s_runtime->config.outbound_resolver_user_ctx);
-        if (err != ESP_ERR_NOT_FOUND) {
-            return err;
-        }
-    }
-
-    return claw_event_router_default_outbound_resolver(event,
-                                                       target_channel,
-                                                       target_endpoint,
-                                                       cap_name,
-                                                       cap_name_size);
-}
-
 static void claw_event_router_update_last_output(cJSON *ctx,
                                                  const char *kind,
                                                  const char *target,
@@ -1696,7 +1634,6 @@ static esp_err_t claw_event_router_execute_send_message_action(
     const char *channel = NULL;
     const char *chat_id = NULL;
     const char *message = NULL;
-    char cap_name[CLAW_EVENT_ROUTER_cap_SIZE] = {0};
     char session_id[16] = {0};
     char output[256] = {0};
     cJSON *payload_root = NULL;
@@ -1735,37 +1672,24 @@ static esp_err_t claw_event_router_execute_send_message_action(
                  "send_message fallback last.output message_len=%u",
                  (unsigned int)(message ? strlen(message) : 0));
     }
-    if (!message || !message[0]) {
+    if (!channel || !channel[0] || !chat_id || !chat_id[0] ||
+            !message || !message[0]) {
         ESP_LOGW(TAG,
-                 "send_message dropped: empty message rule=%s channel=%s chat_id=%s",
+                 "send_message dropped: incomplete route rule=%s channel=%s chat_id=%s message=%s",
                  rule ? rule->id : "-",
                  channel ? channel : "(null)",
-                 chat_id ? chat_id : "(null)");
+                 chat_id ? chat_id : "(null)",
+                 message && message[0] ? "present" : "missing");
         cJSON_Delete(rendered_input);
         return ESP_ERR_INVALID_ARG;
     }
-
-    err = claw_event_router_resolve_outbound_cap(event,
-                                                 channel,
-                                                 chat_id,
-                                                 cap_name,
-                                                 sizeof(cap_name));
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "send_message resolve failed channel=%s chat_id=%s err=%s",
-                 channel ? channel : "(null)",
-                 chat_id ? chat_id : "(null)",
-                 esp_err_to_name(err));
-        cJSON_Delete(rendered_input);
-        return err;
-    }
-    ESP_LOGD(TAG, "send_message resolved cap=%s", cap_name);
 
     payload_root = cJSON_CreateObject();
     if (!payload_root) {
         cJSON_Delete(rendered_input);
         return ESP_ERR_NO_MEM;
     }
+    cJSON_AddStringToObject(payload_root, "channel", channel);
     cJSON_AddStringToObject(payload_root, "chat_id", chat_id);
     cJSON_AddStringToObject(payload_root, "message", message);
     cJSON_AddStringToObject(payload_root, "event_type", event->event_type);
@@ -1788,16 +1712,20 @@ static esp_err_t claw_event_router_execute_send_message_action(
     call_ctx.correlation_id = event->correlation_id[0] ?
                               event->correlation_id : event->message_id;
     call_ctx.caller = CLAW_CAP_CALLER_SYSTEM;
-    err = claw_cap_call(cap_name, payload, &call_ctx, output, sizeof(output));
+    err = claw_cap_call(CLAW_EVENT_ROUTER_SEND_MESSAGE_CAP,
+                        payload,
+                        &call_ctx,
+                        output,
+                        sizeof(output));
     ESP_LOGI(TAG,
              "send_message cap=%s err=%s output=%s",
-             cap_name,
+             CLAW_EVENT_ROUTER_SEND_MESSAGE_CAP,
              esp_err_to_name(err),
              output[0] ? output : "-");
     free(payload);
     claw_event_router_update_last_output(ctx,
                                          "send_message",
-                                         cap_name,
+                                         CLAW_EVENT_ROUTER_SEND_MESSAGE_CAP,
                                          err == ESP_OK ? "ok" : "error",
                                          err == ESP_OK ? message : output);
 
@@ -1811,7 +1739,7 @@ static esp_err_t claw_event_router_execute_send_message_action(
     if (err != ESP_OK && !action->fail_open) {
         ESP_LOGW(TAG, "Rule %s send_message via %s failed: %s",
                  rule->id,
-                 cap_name,
+                 CLAW_EVENT_ROUTER_SEND_MESSAGE_CAP,
                  esp_err_to_name(err));
     }
 
@@ -2548,39 +2476,6 @@ esp_err_t claw_event_router_publish_trigger(const char *source_cap,
     snprintf(event.event_id, sizeof(event.event_id), "evt-%" PRId64, event.timestamp_ms);
     event.payload_json = (char *)(payload_json ? payload_json : "{}");
     return claw_event_router_publish(&event);
-}
-
-esp_err_t claw_event_router_register_outbound_binding(const char *channel,
-                                                      const char *cap_name)
-{
-    if (!s_runtime || !s_runtime->initialized || !channel || !channel[0] ||
-            !cap_name || !cap_name[0]) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    claw_event_router_lock();
-    for (size_t i = 0; i < s_runtime->binding_count; i++) {
-        if (strcmp(s_runtime->bindings[i].channel, channel) == 0) {
-            strlcpy(s_runtime->bindings[i].cap_name,
-                    cap_name,
-                    sizeof(s_runtime->bindings[i].cap_name));
-            claw_event_router_unlock();
-            return ESP_OK;
-        }
-    }
-    if (s_runtime->binding_count >= CLAW_EVENT_ROUTER_BINDING_SIZE) {
-        claw_event_router_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-    strlcpy(s_runtime->bindings[s_runtime->binding_count].channel,
-            channel,
-            sizeof(s_runtime->bindings[s_runtime->binding_count].channel));
-    strlcpy(s_runtime->bindings[s_runtime->binding_count].cap_name,
-            cap_name,
-            sizeof(s_runtime->bindings[s_runtime->binding_count].cap_name));
-    s_runtime->binding_count++;
-    claw_event_router_unlock();
-    return ESP_OK;
 }
 
 esp_err_t claw_event_router_handle_event(const claw_event_t *event,

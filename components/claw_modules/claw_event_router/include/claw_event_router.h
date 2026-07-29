@@ -18,13 +18,6 @@
 extern "C" {
 #endif
 
-typedef esp_err_t (*claw_event_router_outbound_resolver_fn)(const claw_event_t *event,
-                                                            const char *target_channel,
-                                                            const char *target_endpoint,
-                                                            char *cap_name,
-                                                            size_t cap_name_size,
-                                                            void *user_ctx);
-
 typedef struct {
     const char *rules_path;
     size_t max_rules;
@@ -36,8 +29,6 @@ typedef struct {
     BaseType_t task_core;
     bool default_route_messages_to_agent;
     bool default_route_agent_output_to_channel;
-    claw_event_router_outbound_resolver_fn outbound_resolver;
-    void *outbound_resolver_user_ctx;
 } claw_event_router_config_t;
 
 typedef struct {
@@ -105,8 +96,6 @@ esp_err_t claw_event_router_cancel_event(const char *event_id);
 esp_err_t claw_event_router_purge_queue(const char *event_type_filter,
                                         const char *source_cap_filter,
                                         size_t *out_cancelled);
-esp_err_t claw_event_router_register_outbound_binding(const char *channel,
-                                                      const char *cap_name);
 esp_err_t claw_event_router_handle_event(const claw_event_t *event,
                                          claw_event_router_result_t *out_result);
 esp_err_t claw_event_router_list_rules(claw_event_router_rule_t **out_rules,

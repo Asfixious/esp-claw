@@ -22,6 +22,8 @@
 #include "cap_system.h"
 #endif
 #include "claw_agent.h"
+#include "claw_im_gateway.h"
+#include "claw_im_session.h"
 #include "claw_paths.h"
 #include "claw_skill.h"
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
@@ -30,6 +32,7 @@
 #endif
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -42,6 +45,58 @@ static const char *TAG = "app_claw";
 static const char *APP_STARTUP_EVENT_SOURCE_CAP = "app_claw";
 static const char *APP_STARTUP_EVENT_TYPE = "startup";
 static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
+
+static esp_err_t app_claw_handle_im_gateway_inbound(
+    const claw_im_gateway_inbound_event_t *inbound,
+    void *user_ctx)
+{
+    claw_event_t event = {0};
+    const char *event_type;
+
+    (void)user_ctx;
+    if (!inbound) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    event_type = inbound->event_type && inbound->event_type[0] ?
+                 inbound->event_type : "message";
+    if (strcmp(event_type, "message") == 0 &&
+            inbound->text && inbound->text[0]) {
+        return claw_im_session_publish_message(
+                   inbound->source_cap,
+                   inbound->channel,
+                   inbound->chat_id,
+                   CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
+                   inbound->text,
+                   inbound->sender_id,
+                   inbound->message_id);
+    }
+
+    strlcpy(event.source_cap, inbound->source_cap, sizeof(event.source_cap));
+    strlcpy(event.event_type, event_type, sizeof(event.event_type));
+    strlcpy(event.source_channel, inbound->channel, sizeof(event.source_channel));
+    strlcpy(event.chat_id, inbound->chat_id, sizeof(event.chat_id));
+    if (inbound->sender_id) {
+        strlcpy(event.sender_id, inbound->sender_id, sizeof(event.sender_id));
+    }
+    strlcpy(event.message_id, inbound->message_id, sizeof(event.message_id));
+    if (inbound->content_type) {
+        strlcpy(event.content_type,
+                inbound->content_type,
+                sizeof(event.content_type));
+    }
+    event.timestamp_ms = inbound->timestamp_ms > 0 ?
+                         inbound->timestamp_ms : esp_timer_get_time() / 1000;
+    event.session_policy = CLAW_SESSION_POLICY_CHAT;
+    snprintf(event.event_id,
+             sizeof(event.event_id),
+             "im-%lld",
+             (long long)event.timestamp_ms);
+    event.text = (char *)(inbound->text ? inbound->text : "");
+    event.payload_json = (char *)(inbound->payload_json ?
+                                  inbound->payload_json : "{}");
+    return claw_event_router_publish(&event);
+}
 #endif
 
 static SemaphoreHandle_t s_config_lock;
@@ -242,6 +297,13 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
                         }),
                         TAG, "Failed to init scheduler");
 #endif
+#if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
+    ESP_RETURN_ON_ERROR(claw_im_gateway_set_inbound_handler(
+                            app_claw_handle_im_gateway_inbound,
+                            NULL),
+                        TAG,
+                        "Failed to configure IM Gateway ingress");
+#endif
     ESP_RETURN_ON_ERROR(app_capabilities_init(config, &paths), TAG, "Failed to init capabilities");
 
     ESP_RETURN_ON_ERROR(claw_skill_init(&(claw_skill_config_t) {
@@ -269,27 +331,6 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
              config->llm_api_key[0] ? "configured" : "missing");
     ESP_RETURN_ON_ERROR(claw_agent_init(&agent_config), TAG, "Failed to initialize AgentSystem");
     ESP_RETURN_ON_ERROR(claw_agent_start(), TAG, "Failed to start AgentSystem");
-
-#if CONFIG_APP_CLAW_CAP_IM_QQ
-    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding("qq", "qq_send_message"),
-                        TAG, "Failed to bind QQ outbound");
-#endif
-#if CONFIG_APP_CLAW_CAP_IM_FEISHU
-    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding("feishu", "feishu_send_message"),
-                        TAG, "Failed to bind Feishu outbound");
-#endif
-#if CONFIG_APP_CLAW_CAP_IM_TG
-    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding("telegram", "tg_send_message"),
-                        TAG, "Failed to bind Telegram outbound");
-#endif
-#if CONFIG_APP_CLAW_CAP_IM_WECHAT
-    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding("wechat", "wechat_send_message"),
-                        TAG, "Failed to bind WeChat outbound");
-#endif
-#if CONFIG_APP_CLAW_CAP_IM_LOCAL
-    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding("web", "local_send_message"),
-                        TAG, "Failed to bind Web / local IM outbound");
-#endif
 
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     ESP_RETURN_ON_ERROR(claw_event_router_start(), TAG, "Failed to start event router");

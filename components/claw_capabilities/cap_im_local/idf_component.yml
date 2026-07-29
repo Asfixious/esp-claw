@@ -1,0 +1,3 @@
+dependencies:
+  claw_im_gateway:
+    path: ../../claw_modules/claw_im_gateway

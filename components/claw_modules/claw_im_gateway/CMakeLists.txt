@@ -1,12 +1,10 @@
 idf_component_register(
     SRCS
-        "src/cap_im_local.c"
+        "src/claw_im_gateway.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         claw_cap
-        claw_im_gateway
-        esp_timer
         freertos
-        console
+        json
 )

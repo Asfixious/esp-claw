@@ -77,7 +77,7 @@ This walkthrough uses sample app `application/edge_agent`, covering entry <LinkT
 
     - **cap_files**: file root `/fatfs`.
     - **cap_lua**: Lua root `/fatfs/scripts/`.
-    - **cap_im_platform**: when IM credentials exist, apply QQ / Feishu / Telegram / WeChat App ID, Secret, or Token fields, then configure the shared inbox path (`/fatfs/inbox/`) plus max attachment size. The component registers the per-platform groups (`cap_im_qq`, `cap_im_feishu`, `cap_im_tg`, `cap_im_wechat`).
+    - **claw_im_gateway / cap_im_platform**: register the unified IM send APIs; when IM credentials exist, apply QQ / Feishu / Telegram / WeChat App ID, Secret, or Token fields, then configure the shared inbox path (`/fatfs/inbox/`) plus max attachment size. Platform groups (`cap_im_qq`, `cap_im_feishu`, `cap_im_tg`, `cap_im_wechat`) own connection lifecycle and register private send backends with the Gateway.
     - **cap_http_request**: store the configured `search_http_allowlist` for guarded outbound HTTP requests.
     - **cap_web_search**: store Brave / Tavily keys when non-empty.
     - **cap_router_mgr**: register Event Router console commands (`event_router`).
@@ -88,9 +88,9 @@ This walkthrough uses sample app `application/edge_agent`, covering entry <LinkT
 
     <br />
 
-6. **Bind outbound IM channels**
+6. **Configure the unified IM Gateway**
 
-    `claw_event_router_register_outbound_binding` maps `qq`, `feishu`, `telegram`, `wechat`, and `web` to their send caps (e.g. `qq_send_message` and `local_send_message`).
+    Register the `cap_im_gateway` APIs `send_message`, `send_image`, and `send_file`. Each IM platform privately registers a backend for channels such as `qq`, `feishu`, `telegram`, `wechat`, and `web`; Event Router only calls the unified API, and the Gateway selects a backend using `channel + chat_id`.
 
 7. **Init claw_core (conditional)**
 

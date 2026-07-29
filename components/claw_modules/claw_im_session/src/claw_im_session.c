@@ -7,6 +7,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -131,6 +132,126 @@ static bool claw_im_session_is_command(const char *text)
            *text == '\r' || *text == '\f' || *text == '\v';
 }
 
+static const char *claw_im_session_xml_entity(char value)
+{
+    switch (value) {
+    case '&':
+        return "&amp;";
+    case '<':
+        return "&lt;";
+    case '>':
+        return "&gt;";
+    case '"':
+        return "&quot;";
+    case '\'':
+        return "&apos;";
+    default:
+        return NULL;
+    }
+}
+
+static bool claw_im_session_xml_escaped_size(const char *value,
+                                             size_t *out_size)
+{
+    size_t size = 0;
+
+    if (!value || !out_size) {
+        return false;
+    }
+    while (*value) {
+        const char *entity = claw_im_session_xml_entity(*value++);
+        size_t part_size = entity ? strlen(entity) : 1;
+
+        if (part_size > SIZE_MAX - size) {
+            return false;
+        }
+        size += part_size;
+    }
+    *out_size = size;
+    return true;
+}
+
+static char *claw_im_session_xml_escape_into(char *out, const char *value)
+{
+    while (*value) {
+        const char *entity = claw_im_session_xml_entity(*value++);
+
+        if (entity) {
+            size_t entity_size = strlen(entity);
+
+            memcpy(out, entity, entity_size);
+            out += entity_size;
+        } else {
+            *out++ = value[-1];
+        }
+    }
+    return out;
+}
+
+static bool claw_im_session_add_size(size_t *total, size_t value)
+{
+    if (value > SIZE_MAX - *total) {
+        return false;
+    }
+    *total += value;
+    return true;
+}
+
+static esp_err_t claw_im_session_wrap_message(const char *channel,
+                                              const char *chat_id,
+                                              const char *text,
+                                              char **out_message)
+{
+    static const char open[] = "<message channel=\"";
+    static const char chat_id_open[] = "\" chat_id=\"";
+    static const char body_open[] = "\">\n";
+    static const char close[] = "\n</message>";
+    size_t channel_size;
+    size_t chat_id_size;
+    size_t text_size;
+    size_t total_size = 1;
+    char *message;
+    char *cursor;
+
+    if (!channel || !chat_id || !text || !out_message) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_message = NULL;
+    if (!claw_im_session_xml_escaped_size(channel, &channel_size) ||
+            !claw_im_session_xml_escaped_size(chat_id, &chat_id_size) ||
+            !claw_im_session_xml_escaped_size(text, &text_size) ||
+            !claw_im_session_add_size(&total_size, sizeof(open) - 1) ||
+            !claw_im_session_add_size(&total_size, channel_size) ||
+            !claw_im_session_add_size(&total_size,
+                                      sizeof(chat_id_open) - 1) ||
+            !claw_im_session_add_size(&total_size, chat_id_size) ||
+            !claw_im_session_add_size(&total_size, sizeof(body_open) - 1) ||
+            !claw_im_session_add_size(&total_size, text_size) ||
+            !claw_im_session_add_size(&total_size, sizeof(close) - 1)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    message = malloc(total_size);
+    if (!message) {
+        return ESP_ERR_NO_MEM;
+    }
+    cursor = message;
+    memcpy(cursor, open, sizeof(open) - 1);
+    cursor += sizeof(open) - 1;
+    cursor = claw_im_session_xml_escape_into(cursor, channel);
+    memcpy(cursor, chat_id_open, sizeof(chat_id_open) - 1);
+    cursor += sizeof(chat_id_open) - 1;
+    cursor = claw_im_session_xml_escape_into(cursor, chat_id);
+    memcpy(cursor, body_open, sizeof(body_open) - 1);
+    cursor += sizeof(body_open) - 1;
+    cursor = claw_im_session_xml_escape_into(cursor, text);
+    memcpy(cursor, close, sizeof(close) - 1);
+    cursor += sizeof(close) - 1;
+    *cursor = '\0';
+    *out_message = message;
+    return ESP_OK;
+}
+
 static esp_err_t claw_im_session_call_agent(const char *method,
                                             cJSON *args,
                                             cJSON **out_response)
@@ -249,6 +370,7 @@ esp_err_t claw_im_session_publish_message(
     const char *message_id)
 {
     claw_im_session_input_t input = {0};
+    char *agent_message = NULL;
     esp_err_t err;
 
     if (!source_cap || !channel || !chat_id || !text) {
@@ -262,21 +384,31 @@ esp_err_t claw_im_session_publish_message(
                                                  sender_id,
                                                  message_id);
     }
+    err = claw_im_session_wrap_message(channel,
+                                       chat_id,
+                                       text,
+                                       &agent_message);
+    if (err != ESP_OK) {
+        return err;
+    }
     err = claw_im_session_prepare_input(channel,
                                         chat_id,
                                         persistence,
                                         &input);
     if (err != ESP_OK) {
+        free(agent_message);
         return err;
     }
-    return claw_event_router_publish_session_message(source_cap,
-                                                     channel,
-                                                     chat_id,
-                                                     input.session_id,
-                                                     input.request_id,
-                                                     text,
-                                                     sender_id,
-                                                     message_id);
+    err = claw_event_router_publish_session_message(source_cap,
+                                                    channel,
+                                                    chat_id,
+                                                    input.session_id,
+                                                    input.request_id,
+                                                    agent_message,
+                                                    sender_id,
+                                                    message_id);
+    free(agent_message);
+    return err;
 }
 
 esp_err_t claw_im_session_get_selected(const char *channel,

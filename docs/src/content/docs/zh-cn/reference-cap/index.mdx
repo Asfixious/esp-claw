@@ -25,7 +25,7 @@ import LinkToSource from '@/components/LinkToSource.astro';
 
 | 分类 | 组件 | 说明 |
 |------|------|------|
-| **IM 接入** | `cap_im_platform` | 飞书、QQ、Telegram、微信的统一 IM 组件，并注册 `cap_im_tg` 等按平台划分的运行时 Group |
+| **IM 接入** | `claw_im_gateway` + `cap_im_platform` | Gateway 暴露统一发送 API；飞书、QQ、Telegram、微信作为私有平台后端接入 |
 | **文件系统** | `cap_files` | 受管 FATFS 目录的读写、编辑、复制、移动、列举与删除 |
 | **Lua 脚本** | `cap_lua` | Lua 脚本的写入、同步/异步执行与任务管理 |
 | **Skill 管理** | `cap_skill` | Skill 的注册/注销与激活（暴露 core 功能为工具，激活时返回完整文档） |

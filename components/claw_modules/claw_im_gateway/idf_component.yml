@@ -1,0 +1,3 @@
+dependencies:
+  claw_cap:
+    path: ../claw_cap

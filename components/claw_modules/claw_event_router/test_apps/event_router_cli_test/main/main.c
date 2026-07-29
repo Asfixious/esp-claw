@@ -102,8 +102,8 @@ static const claw_cap_descriptor_t s_test_agent_descriptors[] = {
         .execute = test_agent_execute,
     },
     {
-        .id = "test_send_message",
-        .name = "test_send_message",
+        .id = "send_message",
+        .name = "send_message",
         .family = "test",
         .description = "Capture Router outbound messages.",
         .kind = CLAW_CAP_KIND_CALLABLE,
@@ -230,11 +230,6 @@ static esp_err_t init_event_router(void)
     };
 
     ESP_RETURN_ON_ERROR(claw_event_router_init(&config), TAG, "Failed to init event router");
-    ESP_RETURN_ON_ERROR(claw_event_router_register_outbound_binding(
-                            "cli",
-                            "test_send_message"),
-                        TAG,
-                        "Failed to register test outbound binding");
     return claw_event_router_start();
 }
 

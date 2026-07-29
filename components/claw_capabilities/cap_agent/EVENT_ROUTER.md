@@ -29,7 +29,7 @@ claw_agent.h Session stream
   -> cap_agent event pump
   -> claw_event_t
   -> Event Router
-  -> outbound binding
+  -> send_message (IM Gateway)
   -> IM send capability
 ```
 
@@ -282,8 +282,8 @@ Event Router 队列不是 token stream。聚合 `OUTPUT_DELTA` 可避免长回�
 ```
 
 `send_message` 在未显式指定 channel/chat 时使用 event 的 target/source route，
-再通过 `claw_event_router_register_outbound_binding(channel, cap)` 找到对应 IM
-发送 capability。应用同时启用默认 Agent-output fallback，使规则文件缺少该规则时
+并直接调用 IM Gateway 的统一 `send_message` capability。Gateway 根据
+`channel + chat_id` 选择已注册的平台后端。应用同时启用默认 Agent-output fallback，使规则文件缺少该规则时
 仍能返回 IM；显式匹配的规则优先。
 
 ## 7. 生命周期与所有权
@@ -302,7 +302,7 @@ Event Router 队列不是 token stream。聚合 `OUTPUT_DELTA` 可避免长回�
 - Session 未打开或没有 event pump：`ESP_ERR_INVALID_STATE`/`ESP_ERR_NOT_FOUND`。
 - event queue 满：publish 失败；若这是输入请求，已登记的 IM `request_id` 会回滚。
 - pending route 队列满：submit 在进入 Rust Session 前失败，不产生无路由 turn。
-- 未注册 outbound binding：Agent event 保留在 Router 结果中，但 IM 发送失败。
+- channel 没有已注册或已启动的平台后端：Agent event 保留在 Router 结果中，但 IM 发送失败。
 
 ## 9. 固件资源上限
 

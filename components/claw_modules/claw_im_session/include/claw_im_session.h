@@ -20,9 +20,11 @@ typedef struct {
     uint32_t request_id;
 } claw_im_session_input_t;
 
-/* IM ingress helper: resolve channel+chat to the global AgentSystem ids, then
- * publish those ids with the text event. /session remains a control message
- * parsed by cap_agent and therefore does not create an implicit session. */
+/* IM ingress helper: resolve channel+chat to the global AgentSystem ids, wrap
+ * ordinary Agent input as
+ * <message channel="..." chat_id="...">...</message>, then publish it.
+ * /session remains an unwrapped control message parsed by cap_agent and
+ * therefore does not create an implicit session. */
 esp_err_t claw_im_session_publish_message(
     const char *source_cap,
     const char *channel,

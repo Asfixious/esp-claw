@@ -19,8 +19,8 @@
 
 #include "cJSON.h"
 #include "claw_task.h"
-#include "claw_event_publisher.h"
-#include "claw_im_session.h"
+#include "claw_im_gateway.h"
+#include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_attr.h"
 #include "esp_http_client.h"
@@ -259,14 +259,17 @@ static esp_err_t cap_im_tg_publish_inbound_text(const char *chat_id,
         return ESP_OK;
     }
 
-    return claw_im_session_publish_message(
-        "tg_gateway",
-        "telegram",
-        chat_id,
-        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
-        content,
-        sender_id,
-        message_id);
+    return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "tg_gateway",
+        .channel = "telegram",
+        .chat_id = chat_id,
+        .sender_id = sender_id,
+        .message_id = message_id,
+        .event_type = "message",
+        .content_type = "text",
+        .text = content,
+        .timestamp_ms = cap_im_tg_now_ms(),
+    });
 }
 
 static esp_err_t cap_im_tg_publish_attachment_event(const char *chat_id,
@@ -275,27 +278,22 @@ static esp_err_t cap_im_tg_publish_attachment_event(const char *chat_id,
                                                     const char *content_type,
                                                     const char *payload_json)
 {
-    claw_event_t event = {0};
-
     if (!chat_id || !message_id || !content_type || !payload_json) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    strlcpy(event.source_cap, "tg_gateway", sizeof(event.source_cap));
-    strlcpy(event.event_type, "attachment_saved", sizeof(event.event_type));
-    strlcpy(event.source_channel, "telegram", sizeof(event.source_channel));
-    strlcpy(event.chat_id, chat_id, sizeof(event.chat_id));
-    if (sender_id && sender_id[0]) {
-        strlcpy(event.sender_id, sender_id, sizeof(event.sender_id));
-    }
-    strlcpy(event.message_id, message_id, sizeof(event.message_id));
-    strlcpy(event.content_type, content_type, sizeof(event.content_type));
-    event.timestamp_ms = cap_im_tg_now_ms();
-    event.session_policy = CLAW_SESSION_POLICY_CHAT;
-    snprintf(event.event_id, sizeof(event.event_id), "tg-attach-%" PRId64, event.timestamp_ms);
-    event.text = "";
-    event.payload_json = (char *)payload_json;
-    return claw_event_router_publish(&event);
+    return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "tg_gateway",
+        .channel = "telegram",
+        .chat_id = chat_id,
+        .sender_id = sender_id,
+        .message_id = message_id,
+        .event_type = "attachment_saved",
+        .content_type = content_type,
+        .text = "",
+        .payload_json = payload_json,
+        .timestamp_ms = cap_im_tg_now_ms(),
+    });
 }
 
 static void cap_im_tg_log_stack_watermark(const char *label)
@@ -1240,124 +1238,35 @@ static esp_err_t cap_im_tg_gateway_stop(void)
     return ESP_OK;
 }
 
-static esp_err_t cap_im_tg_send_message_execute(const char *input_json,
-                                                const claw_cap_call_context_t *ctx,
-                                                char *output,
-                                                size_t output_size)
+static esp_err_t cap_im_tg_gateway_send_message(
+    const claw_im_gateway_message_t *message,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    cJSON *chat_id_json;
-    cJSON *message_json;
-    const char *chat_id = NULL;
-    const char *message = NULL;
-    esp_err_t err;
-
-    root = cJSON_Parse(input_json ? input_json : "{}");
-    if (!root) {
-        snprintf(output, output_size, "Error: invalid JSON");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    chat_id_json = cJSON_GetObjectItem(root, "chat_id");
-    message_json = cJSON_GetObjectItem(root, "message");
-    if (cJSON_IsString(chat_id_json) && chat_id_json->valuestring && chat_id_json->valuestring[0]) {
-        chat_id = chat_id_json->valuestring;
-    } else if (ctx && ctx->chat_id && ctx->chat_id[0]) {
-        chat_id = ctx->chat_id;
-    }
-    if (cJSON_IsString(message_json) && message_json->valuestring && message_json->valuestring[0]) {
-        message = message_json->valuestring;
-    }
-
-    if (!chat_id || !message) {
-        cJSON_Delete(root);
-        snprintf(output,
-                 output_size,
-                 "Error: chat_id and message are required (chat_id may come from ctx)");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_im_tg_send_text(chat_id, message);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        snprintf(output, output_size, "Error: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    snprintf(output, output_size, "reply already sent to user");
-    return ESP_OK;
+    (void)user_ctx;
+    return cap_im_tg_send_text(message->chat_id, message->message);
 }
 
-static esp_err_t cap_im_tg_send_media_execute(const char *input_json,
-                                              const claw_cap_call_context_t *ctx,
-                                              char *output,
-                                              size_t output_size,
-                                              bool is_image)
+static esp_err_t cap_im_tg_gateway_send_image(
+    const claw_im_gateway_media_t *media,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    cJSON *chat_id_json;
-    cJSON *path_json;
-    cJSON *caption_json;
-    const char *chat_id = NULL;
-    const char *path = NULL;
-    const char *caption = NULL;
-    esp_err_t err;
-
-    root = cJSON_Parse(input_json ? input_json : "{}");
-    if (!root) {
-        snprintf(output, output_size, "Error: invalid JSON");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    chat_id_json = cJSON_GetObjectItem(root, "chat_id");
-    path_json = cJSON_GetObjectItem(root, "path");
-    caption_json = cJSON_GetObjectItem(root, "caption");
-    if (cJSON_IsString(chat_id_json) && chat_id_json->valuestring && chat_id_json->valuestring[0]) {
-        chat_id = chat_id_json->valuestring;
-    } else if (ctx && ctx->chat_id && ctx->chat_id[0]) {
-        chat_id = ctx->chat_id;
-    }
-    if (cJSON_IsString(path_json) && path_json->valuestring && path_json->valuestring[0]) {
-        path = path_json->valuestring;
-    }
-    if (cJSON_IsString(caption_json) && caption_json->valuestring) {
-        caption = caption_json->valuestring;
-    }
-
-    if (!chat_id || !path) {
-        cJSON_Delete(root);
-        snprintf(output,
-                 output_size,
-                 "Error: chat_id and path are required (chat_id may come from ctx)");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_im_tg_send_media(chat_id, path, caption, is_image);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        snprintf(output, output_size, "Error: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    snprintf(output, output_size, "reply already sent to user");
-    return ESP_OK;
+    (void)user_ctx;
+    return cap_im_tg_send_image(media->chat_id, media->path, media->caption);
 }
 
-static esp_err_t cap_im_tg_send_image_execute(const char *input_json,
-                                              const claw_cap_call_context_t *ctx,
-                                              char *output,
-                                              size_t output_size)
+static esp_err_t cap_im_tg_gateway_send_file(
+    const claw_im_gateway_media_t *media,
+    void *user_ctx)
 {
-    return cap_im_tg_send_media_execute(input_json, ctx, output, output_size, true);
+    (void)user_ctx;
+    return cap_im_tg_send_file(media->chat_id, media->path, media->caption);
 }
 
-static esp_err_t cap_im_tg_send_file_execute(const char *input_json,
-                                             const claw_cap_call_context_t *ctx,
-                                             char *output,
-                                             size_t output_size)
-{
-    return cap_im_tg_send_media_execute(input_json, ctx, output, output_size, false);
-}
+static const claw_im_gateway_platform_ops_t s_tg_gateway_ops = {
+    .send_message = cap_im_tg_gateway_send_message,
+    .send_image = cap_im_tg_gateway_send_image,
+    .send_file = cap_im_tg_gateway_send_file,
+};
 
 static const claw_cap_descriptor_t s_tg_descriptors[] = {
     {
@@ -1373,39 +1282,6 @@ static const claw_cap_descriptor_t s_tg_descriptors[] = {
         .start = cap_im_tg_gateway_start,
         .stop = cap_im_tg_gateway_stop,
     },
-    {
-        .id = "tg_send_message",
-        .name = "tg_send_message",
-        .family = "im",
-        .description = "Send a text message to an explicit Telegram chat_id.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}},\"required\":[\"chat_id\",\"message\"]}",
-        .execute = cap_im_tg_send_message_execute,
-    },
-    {
-        .id = "tg_send_image",
-        .name = "tg_send_image",
-        .family = "im",
-        .description = "Send an image file from a local path to a Telegram chat.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"caption\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
-        .execute = cap_im_tg_send_image_execute,
-    },
-    {
-        .id = "tg_send_file",
-        .name = "tg_send_file",
-        .family = "im",
-        .description = "Send a file from a local path to a Telegram chat.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"caption\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
-        .execute = cap_im_tg_send_file_execute,
-    },
 };
 
 static const claw_cap_group_t s_tg_group = {
@@ -1416,13 +1292,25 @@ static const claw_cap_group_t s_tg_group = {
 
 esp_err_t cap_im_tg_register_group(void)
 {
+    esp_err_t err;
+
     cap_im_tg_init_defaults();
+    ESP_RETURN_ON_ERROR(claw_im_gateway_register_group(),
+                        TAG,
+                        "register IM Gateway group failed");
 
-    if (claw_cap_group_exists(s_tg_group.group_id)) {
-        return ESP_OK;
+    if (!claw_cap_group_exists(s_tg_group.group_id)) {
+        err = claw_cap_register_group(&s_tg_group);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
-
-    return claw_cap_register_group(&s_tg_group);
+    return claw_im_gateway_register_platform(
+               &(claw_im_gateway_platform_config_t) {
+        .channel = "telegram",
+        .cap_group_id = s_tg_group.group_id,
+        .ops = &s_tg_gateway_ops,
+    });
 }
 
 esp_err_t cap_im_tg_set_token(const char *bot_token)

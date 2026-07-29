@@ -77,7 +77,7 @@ import LinkToSource from '@/components/LinkToSource.astro';
 
     - **cap_files**：设置文件访问根目录（`/fatfs`）。
     - **cap_lua**：设置 Lua 脚本根目录（`/fatfs/scripts/`）。
-    - **cap_im_platform**：若 IM 凭证非空，则写入 QQ / 飞书 / Telegram / 微信的 App ID、Secret 或 Token 等字段，并配置共享附件存盘目录（`/fatfs/inbox/`）与最大文件大小。该组件会注册各平台运行时 Group（`cap_im_qq`、`cap_im_feishu`、`cap_im_tg`、`cap_im_wechat`）。
+    - **claw_im_gateway / cap_im_platform**：注册统一 IM 发送 API；若 IM 凭证非空，则写入 QQ / 飞书 / Telegram / 微信的 App ID、Secret 或 Token 等字段，并配置共享附件存盘目录（`/fatfs/inbox/`）与最大文件大小。平台 Group（`cap_im_qq`、`cap_im_feishu`、`cap_im_tg`、`cap_im_wechat`）负责连接生命周期，并把私有发送后端注册到 Gateway。
     - **cap_http_request**：写入配置中的 `search_http_allowlist`，供受保护的外部 HTTP 请求使用。
     - **cap_web_search**：若 Brave / Tavily key 非空则写入搜索密钥。
     - **cap_router_mgr**：注册 Event Router 的管理命令（`event_router`）。
@@ -88,9 +88,9 @@ import LinkToSource from '@/components/LinkToSource.astro';
 
     <br />
 
-6. **绑定出站 IM 通道**
+6. **配置统一 IM Gateway**
 
-    调用 `claw_event_router_register_outbound_binding`，将 `qq`、`feishu`、`telegram`、`wechat`、`web` 五个来源分别绑定到对应的发送 cap（如 `qq_send_message`、`local_send_message`）。
+    注册 `cap_im_gateway` 的统一 `send_message`、`send_image`、`send_file` API。各 IM 平台以 `qq`、`feishu`、`telegram`、`wechat`、`web` 等 channel 注册私有发送后端；Event Router 只调用统一 API，由 Gateway 按 `channel + chat_id` 选择后端。
 
 7. **初始化 claw_core（条件执行）**
 

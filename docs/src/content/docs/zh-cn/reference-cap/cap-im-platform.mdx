@@ -12,17 +12,25 @@ Skill：<LinkToSource relativePath="components/claw_capabilities/cap_im_platform
 
 ## 定位
 
-`cap_im_platform` 是 ESP-Claw 的统一 IM 源码组件。它把飞书、QQ、Telegram、微信以及共享附件处理实现放在同一个 ESP-IDF 组件中，但运行时接口仍按平台拆分。
+`cap_im_platform` 是 ESP-Claw 的 IM 平台后端组件。它把飞书、QQ、Telegram、微信以及共享附件处理实现放在同一个 ESP-IDF 组件中，并统一接入 `claw_im_gateway`。
 
-这意味着构建依赖已经统一，但原有运行时 Group ID 与工具名保持稳定：
+公开发送接口只属于 `cap_im_gateway` Group：
 
-| 运行时 Group | 事件源 | 文本 | 图片 | 文件 |
-|--------------|--------|------|------|------|
-| `cap_im_feishu` | `feishu_gateway` | `feishu_send_message` | `feishu_send_image` | `feishu_send_file` |
-| `cap_im_qq` | `qq_gateway` | `qq_send_message` | `qq_send_image` | `qq_send_file` |
-| `cap_im_tg` | `tg_gateway` | `tg_send_message` | `tg_send_image` | `tg_send_file` |
-| `cap_im_wechat` | `wechat_gateway` | `wechat_send_message` | `wechat_send_image` | 不支持 |
-| `cap_im_local` | `local_gateway` | `local_send_message` | — | — |
+| Capability | 路由字段 | 说明 |
+|------------|----------|------|
+| `send_message` | `channel + chat_id` | 发送文本 |
+| `send_image` | `channel + chat_id` | 发送本地图片 |
+| `send_file` | `channel + chat_id` | 发送本地文件 |
+
+平台 Group 只保留连接生命周期和事件源；它们向 Gateway 私下注册发送后端，不再向 Agent 暴露平台前缀工具：
+
+| 平台 Group | channel | 事件源 | 后端发送支持 |
+|------------|---------|--------|--------------|
+| `cap_im_feishu` | `feishu` | `feishu_gateway` | 文本、图片、文件 |
+| `cap_im_qq` | `qq` | `qq_gateway` | 文本、图片、文件 |
+| `cap_im_tg` | `telegram` | `tg_gateway` | 文本、图片、文件 |
+| `cap_im_wechat` | `wechat` | `wechat_gateway` | 文本、图片 |
+| `cap_im_local` | `web` / `local` | `local_gateway` | 文本 |
 
 ## 组件结构
 
@@ -41,40 +49,45 @@ Skill：<LinkToSource relativePath="components/claw_capabilities/cap_im_platform
 
 每个 IM 后端都遵循同一组职责：
 
-1. **事件源**：从 IM 平台接收消息，归一化后发布到 `claw_event_router`。
-2. **可调用工具**：暴露平台专属发送函数，供 Agent、Console 或自动化规则发送文本和媒体。
+1. **事件源**：从 IM 平台接收消息并交给 `claw_im_gateway` 归一化；应用决定如何进入 Session / Event Router。
+2. **私有发送后端**：向 Gateway 注册 channel 与文本/媒体发送回调，不注册平台专属 Capability。
 3. **附件处理**：把入站媒体保存到配置的 inbox 根目录，并发布 `attachment_saved` 事件供下游规则处理。
 
 ```d2
 im_api: "IM 平台 API"
-gateway: "平台网关\n(飞书 / QQ / Telegram / 微信)"
+backend: "平台后端\n(飞书 / QQ / Telegram / 微信)"
+gateway: "claw_im_gateway"
+ingress: "应用入站策略"
 router: "claw_event_router"
 adapter: "cap_agent\nRPC + event pump"
 agent: "claw-agent\nSession"
 fatfs: "FATFS inbox"
-tools: "发送工具\n*_send_message / *_send_image / *_send_file"
+tools: "统一发送 API\nsend_message / send_image / send_file"
 
-im_api -> gateway: "入站消息"
-gateway -> router: "message 事件"
-gateway -> fatfs: "保存附件"
-gateway -> router: "attachment_saved 事件"
+im_api -> backend: "入站消息"
+backend -> gateway: "归一化入站"
+gateway -> ingress: "统一事件"
+ingress -> router: "message / attachment_saved"
+backend -> fatfs: "保存附件"
 router -> adapter: "call_cap(\"agent\")"
 adapter -> agent: "session.input"
 agent -> adapter: "Session stream"
 adapter -> router: "out_message 事件"
 agent -> tools: "LLM 工具调用"
-tools -> im_api: "出站文本/媒体"
-router -> tools: "send_message 绑定"
+router -> tools: "最终回复"
+tools -> gateway: "channel + chat_id"
+gateway -> backend: "选择私有后端"
+backend -> im_api: "出站文本/媒体"
 ```
 
 ## 启动与可见性
 
-应用启动时会按启用的平台分别准备凭证和附件配置，再注册对应的运行时 Group。`edge_agent` 会把 Event Router 的出站 channel，例如 `qq`、`feishu`、`telegram`、`wechat`、`web`，绑定到对应发送工具。
+应用启动时会先注册 `cap_im_gateway`，再按启用的平台准备凭证、附件配置和运行时 Group。平台注册时把自己的 channel 与私有发送回调交给 Gateway；Event Router 不维护出站绑定表。
 
-统一 IM Skill 在 `cap_groups` 中声明四个平台的运行时 Group。激活该 Skill 后，模型会同时获得平台专属工具和通道选择说明，避免跨平台误发或重复回复。
+统一 IM Skill 在 `cap_groups` 中只声明 `cap_im_gateway`。激活该 Skill 后，模型获得三个统一工具及 channel 路由说明，不会看到平台专属发送工具。
 
 <Aside type="note">
-  `cap_im_platform` 当前是源码组件，而不是单个运行时 Group。保留按平台划分的 Group 可以维持现有配置、Skill 可见性和 enable/disable 行为。
+  `cap_im_platform` 是源码组件，不是公开发送 Group。保留按平台划分的 Group 是为了独立管理各连接的配置、启动与停止状态。
 </Aside>
 
 ## 平台差异
@@ -109,26 +122,29 @@ attach_task -> tg_api: "getFile -> 下载 URL"
 attach_task -> fatfs: "流式写入"
 attach_task -> router: "attachment_saved 事件"
 
-llm_call: "LLM 工具调用\ntg_send_message\ntg_send_image / tg_send_file"
-llm_call -> tg_api: "sendMessage\nsendPhoto / sendDocument"
+llm_call: "统一工具调用\nsend_message\nsend_image / send_file"
+gateway: "claw_im_gateway\nchannel=telegram"
+llm_call -> gateway
+gateway -> tg_api: "sendMessage\nsendPhoto / sendDocument"
 ```
 
 ### 事件源：长轮询机制
 
 Telegram 后端在 `cap_im_tg` Group 的 `start` 钩子中启动两个 FreeRTOS 任务。
 
-`tg_poll_task` 持续调用 `getUpdates`（带 20 秒 long-poll 超时），将收到的每条消息解析后发布事件：
+`tg_poll_task` 持续调用 `getUpdates`（带 20 秒 long-poll 超时），将收到的每条消息解析后发布到 Gateway：
 
 ```c
-// 文本消息 -> 标准 message 事件
-claw_event_router_publish_message(
-    "tg_gateway",   // source_cap（事件来源标识）
-    "telegram",     // source_channel（渠道）
-    chat_id,        // 会话 ID
-    text,           // 消息正文
-    sender_id,      // 发送者 ID
-    message_id      // 消息 ID
-);
+claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t){
+    .source_cap = "tg_gateway",
+    .channel = "telegram",
+    .chat_id = chat_id,
+    .sender_id = sender_id,
+    .message_id = message_id,
+    .event_type = "message",
+    .content_type = "text",
+    .text = text,
+});
 ```
 
 `claw_event_router` 收到此事件后，根据规则决定是交给 `claw_core` 运行 Agent，还是触发自动化动作。
@@ -180,27 +196,26 @@ static bool cap_im_tg_dedup_check_and_record(const char *update_key)
 
 ### 可调用工具
 
-`cap_im_tg` 运行时 Group 注册了四个 Capability 描述符：
+`cap_im_gateway` 注册三个公开 Capability；`cap_im_tg` 只保留 `tg_gateway` 事件源和私有发送实现：
 
 | 工具 ID | 描述 | kind |
 |---------|------|------|
-| `tg_gateway` | 轮询网关（事件源） | `EVENT_SOURCE` |
-| `tg_send_message` | 发送文本消息到指定 chat_id | `CALLABLE` |
-| `tg_send_image` | 发送本地图片文件到 Telegram | `CALLABLE` |
-| `tg_send_file` | 发送本地任意文件到 Telegram | `CALLABLE` |
+| `send_message` | 按 channel 与 chat_id 发送文本 | `CALLABLE` |
+| `send_image` | 按 channel 与 chat_id 发送本地图片 | `CALLABLE` |
+| `send_file` | 按 channel 与 chat_id 发送本地文件 | `CALLABLE` |
 
-`tg_send_message` 中，如果输入没有提供 `chat_id`，会从当前调用上下文取值：
+主动发送时可显式提供路由；回复当前会话时也可由调用上下文继承：
 
-```c
-// chat_id 优先级：JSON 参数 > 调用上下文
-if (cJSON_IsString(chat_id_json) && chat_id_json->valuestring[0]) {
-    chat_id = chat_id_json->valuestring;
-} else if (ctx && ctx->chat_id && ctx->chat_id[0]) {
-    chat_id = ctx->chat_id;  // 从会话上下文自动继承
-}
+```lua
+capability.call("send_message", {
+  message = "hello"
+}, {
+  channel = "telegram",
+  chat_id = "123456789"
+})
 ```
 
-超长文本会自动分片以适配 Telegram 限制。`tg_send_image` 和 `tg_send_file` 通过 multipart/form-data 上传文件，使用 `stat()` 预先获取精确 `Content-Length`，并通过 `esp_http_client_open` 手动流式写入各 part，避免将整个文件载入内存。
+路由优先使用调用上下文中的显式 target，其次使用输入 JSON，最后继承当前来源上下文。Telegram 私有后端仍会自动分片超长文本；图片和文件仍通过 multipart/form-data 流式上传。
 
 ### 配置 API
 

@@ -5,7 +5,7 @@ This module describes how to call registered capabilities directly from Lua.
 ## How to call
 - Import it with `local capability = require("capability")`
 - Main API: `ok, out, err = capability.call(name, payload[, opts])`. ALWAYS follow the 3-element pattern, `ok, out, err`, to receive the result, for example `local ok, xxx_out, err = capability.call("xxx", ...)`.
-- `name` must match the real registered capability id, for example `qq_send_message`, `qq_send_image`, or `qq_send_file`.
+- `name` must match the real registered capability id. IM sends use the unified `send_message`, `send_image`, and `send_file` APIs.
 
 ## API
 
@@ -22,7 +22,7 @@ This module describes how to call registered capabilities directly from Lua.
 - `nil` becomes `{}`.
 - A Lua `table` is serialized to compact JSON.
 - A `string` must already be valid JSON and is passed through unchanged.
-- The payload keys must match the target capability schema exactly. For example, `qq_send_message` expects `message`, not `text`.
+- The payload keys must match the target capability schema exactly. For example, `send_message` expects `message`, not `text`.
 
 ## Supported `opts`
 - `session_id: string`
@@ -33,20 +33,13 @@ This module describes how to call registered capabilities directly from Lua.
 
 If an `opts` field is missing, the module tries to inherit the same field from global `args`.
 
-## IM capability mapping
-- QQ text/image/file:
-  - `qq_send_message` with required `chat_id` and `message`
-  - `qq_send_image` with required `chat_id`, `path`, and optional `caption`
-  - `qq_send_file` with required `chat_id`, `path`, and optional `caption`
-- Telegram text/image/file:
-  - `tg_send_message` with required `chat_id` and `message`
-  - `tg_send_image` with required `chat_id`, `path`, and optional `caption`
-  - `tg_send_file` with required `chat_id`, `path`, and optional `caption`
-- WeChat text/image:
-  - `wechat_send_message` with `message`
-  - `wechat_send_image` with `path` and optional `caption`
-- Always pass `chat_id` explicitly for `qq`, `tg`, and `wechat` calls.
-- Prefer putting `chat_id` in `opts` for `qq` and `tg`, and in `payload` for `wechat`.
+## IM Gateway API
+- `send_message` sends text and requires `message`.
+- `send_image` sends a local image and requires `path`; `caption` is optional.
+- `send_file` sends a local file and requires `path`; `caption` is optional.
+- Routing uses `channel` plus `chat_id`. Put them in `opts`, or in the payload when an explicit target should override inherited context.
+- Supported channels are `qq`, `feishu`, `telegram`, `wechat`, `web`, and `local`.
+- WeChat does not support `send_file`; Web/local currently supports only `send_message`.
 
 ## If you want to call other generic capabilities
 - Use activate_skill to activate the needed capability and learn what is the schema of the input arguments; what is the schema of the return values.
@@ -58,7 +51,7 @@ If an `opts` field is missing, the module tries to inherit the same field from g
 ```lua
 local capability = require("capability")
 
-local ok, out, err = capability.call("qq_send_message", {
+local ok, out, err = capability.call("send_message", {
   message = "hello from lua"
 }, {
   channel = "qq",
@@ -73,7 +66,7 @@ print(ok, out, err)
 ```lua
 local capability = require("capability")
 
-local ok1, out1, err1 = capability.call("qq_send_image", {
+local ok1, out1, err1 = capability.call("send_image", {
   path = "/fatfs/statistics/ESP-Claw.png",
   caption = "image from lua"
 }, {
@@ -82,7 +75,7 @@ local ok1, out1, err1 = capability.call("qq_send_image", {
   source_cap = "lua_script"
 })
 
-local ok2, out2, err2 = capability.call("qq_send_file", {
+local ok2, out2, err2 = capability.call("send_file", {
   path = "/fatfs/reports/status.json",
   caption = "latest report"
 }, {
@@ -99,7 +92,7 @@ print(ok2, out2, err2)
 ```lua
 local capability = require("capability")
 
-local ok, out, err = capability.call("tg_send_message", {
+local ok, out, err = capability.call("send_message", {
   message = "hello from lua"
 }, {
   channel = "telegram",
@@ -113,7 +106,7 @@ print(ok, out, err)
 ```lua
 local capability = require("capability")
 
-local ok, out, err = capability.call("tg_send_message", {
+local ok, out, err = capability.call("send_message", {
   message = "telegram reply from lua"
 }, {
   channel = "telegram",
@@ -127,11 +120,11 @@ print(ok, out, err)
 ```lua
 local capability = require("capability")
 
-local ok, out, err = capability.call("wechat_send_message", {
-  chat_id = "room123",
+local ok, out, err = capability.call("send_message", {
   message = "hello from lua"
 }, {
   channel = "wechat",
+  chat_id = "room123",
   source_cap = "lua_script"
 })
 print(ok, out, err)
@@ -141,12 +134,12 @@ print(ok, out, err)
 ```lua
 local capability = require("capability")
 
-local ok, out, err = capability.call("wechat_send_image", {
-  chat_id = "wxid_abc123",
+local ok, out, err = capability.call("send_image", {
   path = "/fatfs/statistics/ESP-Claw.png",
   caption = "image from lua"
 }, {
   channel = "wechat",
+  chat_id = "wxid_abc123",
   source_cap = "lua_script"
 })
 print(ok, out, err)

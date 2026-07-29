@@ -11,10 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "cJSON.h"
 #include "claw_cap.h"
-#include "claw_event_publisher.h"
-#include "claw_im_session.h"
+#include "claw_im_gateway.h"
+#include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -82,13 +81,6 @@ static void cap_im_local_build_message_id(char *buf, size_t buf_size, const char
              "%s-%" PRId64,
              prefix ? prefix : "local",
              cap_im_local_now_ms());
-}
-
-static const char *cap_im_local_json_string(cJSON *root, const char *key)
-{
-    cJSON *item = cJSON_GetObjectItem(root, key);
-
-    return cJSON_IsString(item) && item->valuestring ? item->valuestring : NULL;
 }
 
 static esp_err_t cap_im_local_gateway_init(void)
@@ -200,71 +192,22 @@ static esp_err_t cap_im_local_send_text_impl(const char *channel,
     return callback(&message, callback_user_ctx);
 }
 
-static esp_err_t cap_im_local_send_message_execute(const char *input_json,
-                                                   const claw_cap_call_context_t *ctx,
-                                                   char *output,
-                                                   size_t output_size)
+static esp_err_t cap_im_local_gateway_send_message(
+    const claw_im_gateway_message_t *message,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    const char *channel = NULL;
-    const char *chat_id = NULL;
-    const char *message = NULL;
-    const char *message_id = NULL;
-    const char *link_url = NULL;
-    const char *link_label = NULL;
-    static char s_default_channel_buf[16];
-    esp_err_t err;
-
-    root = cJSON_Parse(input_json ? input_json : "{}");
-    if (!root) {
-        snprintf(output, output_size, "Error: invalid JSON");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    channel = cap_im_local_json_string(root, "channel");
-    chat_id = cap_im_local_json_string(root, "chat_id");
-    message = cap_im_local_json_string(root, "message");
-    message_id = cap_im_local_json_string(root, "message_id");
-    link_url = cap_im_local_json_string(root, "link_url");
-    link_label = cap_im_local_json_string(root, "link_label");
-
-    if ((!chat_id || !chat_id[0]) && ctx && ctx->chat_id && ctx->chat_id[0]) {
-        chat_id = ctx->chat_id;
-    }
-    if (!channel || !channel[0]) {
-        if (ctx && ctx->channel && ctx->channel[0]) {
-            channel = ctx->channel;
-        } else {
-            err = cap_im_local_lock();
-            if (err != ESP_OK) {
-                cJSON_Delete(root);
-                snprintf(output, output_size, "Error: %s", esp_err_to_name(err));
-                return err;
-            }
-            strlcpy(s_default_channel_buf, s_local.default_channel, sizeof(s_default_channel_buf));
-            cap_im_local_unlock();
-            channel = s_default_channel_buf;
-        }
-    }
-
-    if (!chat_id || !chat_id[0] || !message || !message[0]) {
-        cJSON_Delete(root);
-        snprintf(output,
-                 output_size,
-                 "Error: chat_id and message are required (chat_id may come from ctx)");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_im_local_send_text_with_link(channel, chat_id, message_id, message, link_url, link_label);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        snprintf(output, output_size, "Error: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    snprintf(output, output_size, "reply already sent to local IM");
-    return ESP_OK;
+    (void)user_ctx;
+    return cap_im_local_send_text_with_link(message->channel,
+                                            message->chat_id,
+                                            message->message_id,
+                                            message->message,
+                                            message->link_url,
+                                            message->link_label);
 }
+
+static const claw_im_gateway_platform_ops_t s_local_gateway_ops = {
+    .send_message = cap_im_local_gateway_send_message,
+};
 
 static const claw_cap_descriptor_t s_local_descriptors[] = {
     {
@@ -280,17 +223,6 @@ static const claw_cap_descriptor_t s_local_descriptors[] = {
         .start = cap_im_local_gateway_start,
         .stop = cap_im_local_gateway_stop,
     },
-    {
-        .id = "local_send_message",
-        .name = "local_send_message",
-        .family = "im",
-        .description = "Send a text message to a local IM client via registered callback.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"channel\":{\"type\":\"string\"},\"chat_id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"link_url\":{\"type\":\"string\"},\"link_label\":{\"type\":\"string\"}},\"required\":[\"chat_id\",\"message\"]}",
-        .execute = cap_im_local_send_message_execute,
-    },
 };
 
 static const claw_cap_group_t s_local_group = {
@@ -301,11 +233,29 @@ static const claw_cap_group_t s_local_group = {
 
 esp_err_t cap_im_local_register_group(void)
 {
-    if (claw_cap_group_exists(s_local_group.group_id)) {
-        return ESP_OK;
-    }
+    esp_err_t err;
 
-    return claw_cap_register_group(&s_local_group);
+    ESP_RETURN_ON_ERROR(claw_im_gateway_register_group(),
+                        TAG,
+                        "register IM Gateway group failed");
+    if (!claw_cap_group_exists(s_local_group.group_id)) {
+        err = claw_cap_register_group(&s_local_group);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    ESP_RETURN_ON_ERROR(claw_im_gateway_register_platform(
+                            &(claw_im_gateway_platform_config_t) {
+        .channel = "web",
+        .cap_group_id = s_local_group.group_id,
+        .ops = &s_local_gateway_ops,
+    }), TAG, "register Web IM backend failed");
+    return claw_im_gateway_register_platform(
+               &(claw_im_gateway_platform_config_t) {
+        .channel = "local",
+        .cap_group_id = s_local_group.group_id,
+        .ops = &s_local_gateway_ops,
+    });
 }
 
 esp_err_t cap_im_local_set_config(const cap_im_local_config_t *config)
@@ -431,14 +381,17 @@ esp_err_t cap_im_local_emit_user_message(const char *channel,
         if (!has_text) {
             return ESP_ERR_INVALID_ARG;
         }
-        return claw_im_session_publish_message(
-            "local_gateway",
-            resolved_channel,
-            chat_id,
-            CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
-            text,
-            resolved_sender_id,
-            resolved_message_id);
+        return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+            .source_cap = "local_gateway",
+            .channel = resolved_channel,
+            .chat_id = chat_id,
+            .sender_id = resolved_sender_id,
+            .message_id = resolved_message_id,
+            .event_type = "message",
+            .content_type = "text",
+            .text = text,
+            .timestamp_ms = cap_im_local_now_ms(),
+        });
     }
 
     combined = calloc(1, CAP_IM_LOCAL_EMIT_COMBINED_MAX);
@@ -481,14 +434,17 @@ esp_err_t cap_im_local_emit_user_message(const char *channel,
              combined,
              strlen(combined) > 80 ? "..." : "");
 
-    err = claw_im_session_publish_message(
-        "local_gateway",
-        resolved_channel,
-        chat_id,
-        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
-        combined,
-        resolved_sender_id,
-        resolved_message_id);
+    err = claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "local_gateway",
+        .channel = resolved_channel,
+        .chat_id = chat_id,
+        .sender_id = resolved_sender_id,
+        .message_id = resolved_message_id,
+        .event_type = "message",
+        .content_type = "text",
+        .text = combined,
+        .timestamp_ms = cap_im_local_now_ms(),
+    });
     free(combined);
     return err;
 }

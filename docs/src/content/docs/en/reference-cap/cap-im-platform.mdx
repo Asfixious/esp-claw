@@ -12,17 +12,25 @@ Skill: <LinkToSource relativePath="components/claw_capabilities/cap_im_platform/
 
 ## Role
 
-`cap_im_platform` is the unified source component for ESP-Claw IM integrations. It bundles the Feishu, QQ, Telegram, WeChat, and shared attachment implementation into one ESP-IDF component, while keeping the runtime surface split by platform.
+`cap_im_platform` is the IM platform backend component for ESP-Claw. It bundles the Feishu, QQ, Telegram, WeChat, and shared attachment implementations into one ESP-IDF component and connects all of them to `claw_im_gateway`.
 
-This means the build dependency is unified, but the existing runtime group ids and tool names remain stable:
+Only the `cap_im_gateway` group exposes public send APIs:
 
-| Runtime group | Event source | Text | Image | File |
-|---------------|--------------|------|-------|------|
-| `cap_im_feishu` | `feishu_gateway` | `feishu_send_message` | `feishu_send_image` | `feishu_send_file` |
-| `cap_im_qq` | `qq_gateway` | `qq_send_message` | `qq_send_image` | `qq_send_file` |
-| `cap_im_tg` | `tg_gateway` | `tg_send_message` | `tg_send_image` | `tg_send_file` |
-| `cap_im_wechat` | `wechat_gateway` | `wechat_send_message` | `wechat_send_image` | Not supported |
-| `cap_im_local` | `local_gateway` | `local_send_message` | — | — |
+| Capability | Route fields | Description |
+|------------|--------------|-------------|
+| `send_message` | `channel + chat_id` | Send text |
+| `send_image` | `channel + chat_id` | Send a local image |
+| `send_file` | `channel + chat_id` | Send a local file |
+
+Platform groups retain connection lifecycle and event sources. They privately register send backends with the Gateway instead of exposing platform-prefixed tools to the Agent:
+
+| Platform group | channel | Event source | Backend send support |
+|----------------|---------|--------------|----------------------|
+| `cap_im_feishu` | `feishu` | `feishu_gateway` | Text, image, file |
+| `cap_im_qq` | `qq` | `qq_gateway` | Text, image, file |
+| `cap_im_tg` | `telegram` | `tg_gateway` | Text, image, file |
+| `cap_im_wechat` | `wechat` | `wechat_gateway` | Text, image |
+| `cap_im_local` | `web` / `local` | `local_gateway` | Text |
 
 ## Component layout
 
@@ -41,40 +49,45 @@ The platform component keeps each backend in its own source file so protocol-spe
 
 Each backend follows the same split:
 
-1. **Event source**: receive messages from the IM platform, normalize them, and publish `claw_event_router` events.
-2. **Callable tools**: expose platform-specific send functions so the Agent, Console, or automation can send text or media.
+1. **Event source**: receive messages from the IM platform and hand them to `claw_im_gateway` for normalization; the application decides how they enter Session / Event Router.
+2. **Private send backend**: register channel-specific text/media callbacks with the Gateway, without registering platform-specific capabilities.
 3. **Attachment handling**: save inbound media under the configured inbox root and publish `attachment_saved` events for downstream rules.
 
 ```d2
 im_api: "IM platform API"
-gateway: "platform gateway\n(Feishu / QQ / Telegram / WeChat)"
+backend: "platform backend\n(Feishu / QQ / Telegram / WeChat)"
+gateway: "claw_im_gateway"
+ingress: "application ingress policy"
 router: "claw_event_router"
 adapter: "cap_agent\nRPC + event pump"
 agent: "claw-agent\nSession"
 fatfs: "FATFS inbox"
-tools: "send tools\n*_send_message / *_send_image / *_send_file"
+tools: "unified send API\nsend_message / send_image / send_file"
 
-im_api -> gateway: "inbound messages"
-gateway -> router: "message event"
-gateway -> fatfs: "save attachments"
-gateway -> router: "attachment_saved event"
+im_api -> backend: "inbound messages"
+backend -> gateway: "normalized ingress"
+gateway -> ingress: "unified event"
+ingress -> router: "message / attachment_saved"
+backend -> fatfs: "save attachments"
 router -> adapter: "call_cap(\"agent\")"
 adapter -> agent: "session.input"
 agent -> adapter: "Session stream"
 adapter -> router: "out_message event"
 agent -> tools: "LLM tool call"
-tools -> im_api: "outbound text/media"
-router -> tools: "send_message binding"
+router -> tools: "final reply"
+tools -> gateway: "channel + chat_id"
+gateway -> backend: "select private backend"
+backend -> im_api: "outbound text/media"
 ```
 
 ## Startup and visibility
 
-Application startup prepares credentials and attachment settings per enabled platform, then registers the matching runtime groups. The `edge_agent` app binds outbound Event Router channels such as `qq`, `feishu`, `telegram`, `wechat`, and `web` to the corresponding send tools.
+Application startup registers `cap_im_gateway`, then prepares credentials, attachment settings, and runtime groups for enabled platforms. Each platform registers its channel and private send callbacks with the Gateway; Event Router has no outbound binding table.
 
-The unified Skill declares all four IM runtime groups in `cap_groups`. Activating the Skill gives the model the platform-specific tools together with the guidance for choosing the current channel and avoiding duplicate replies.
+The unified IM Skill declares only `cap_im_gateway` in `cap_groups`. Activating it gives the model the three unified tools and channel routing guidance, without exposing platform-specific send tools.
 
 <Aside type="note">
-  `cap_im_platform` is a source component, not currently a single runtime group. Keeping per-platform groups preserves existing configuration, Skill visibility, and enable/disable behavior.
+  `cap_im_platform` is a source component, not a public send group. Per-platform groups remain so each connection can manage its configuration, start, and stop state independently.
 </Aside>
 
 ## Platform differences
@@ -109,26 +122,29 @@ attach_task -> tg_api: "getFile -> download URL"
 attach_task -> fatfs: "stream write"
 attach_task -> router: "attachment_saved event"
 
-llm_call: "LLM tool calls\ntg_send_message\ntg_send_image / tg_send_file"
-llm_call -> tg_api: "sendMessage\nsendPhoto / sendDocument"
+llm_call: "unified tool calls\nsend_message\nsend_image / send_file"
+gateway: "claw_im_gateway\nchannel=telegram"
+llm_call -> gateway
+gateway -> tg_api: "sendMessage\nsendPhoto / sendDocument"
 ```
 
 ### Event source: long polling
 
 The Telegram backend starts two FreeRTOS tasks from the `cap_im_tg` group `start` hook.
 
-`tg_poll_task` calls `getUpdates` with a 20 s long-poll timeout, parses each update, and publishes events:
+`tg_poll_task` calls `getUpdates` with a 20 s long-poll timeout, parses each update, and publishes it to the Gateway:
 
 ```c
-// Text -> standard message event
-claw_event_router_publish_message(
-    "tg_gateway",   // source_cap
-    "telegram",     // source_channel
-    chat_id,        // chat id
-    text,           // body
-    sender_id,      // sender id
-    message_id      // message id
-);
+claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t){
+    .source_cap = "tg_gateway",
+    .channel = "telegram",
+    .chat_id = chat_id,
+    .sender_id = sender_id,
+    .message_id = message_id,
+    .event_type = "message",
+    .content_type = "text",
+    .text = text,
+});
 ```
 
 `claw_event_router` then routes the event to `claw_core` for the Agent or to automation actions.
@@ -180,27 +196,26 @@ Downstream rules can listen for `attachment_saved` and chain `cap_llm_inspect`, 
 
 ### Callable tools
 
-The `cap_im_tg` runtime group registers four descriptors:
+`cap_im_gateway` registers three public capabilities; `cap_im_tg` retains only the `tg_gateway` event source and private send implementation:
 
 | Tool ID | Description | kind |
 |---------|-------------|------|
-| `tg_gateway` | Poll gateway (event source) | `EVENT_SOURCE` |
-| `tg_send_message` | Send text to a chat_id | `CALLABLE` |
-| `tg_send_image` | Send a local image file | `CALLABLE` |
-| `tg_send_file` | Send a local arbitrary file | `CALLABLE` |
+| `send_message` | Send text by channel and chat_id | `CALLABLE` |
+| `send_image` | Send a local image by channel and chat_id | `CALLABLE` |
+| `send_file` | Send a local file by channel and chat_id | `CALLABLE` |
 
-For `tg_send_message`, `chat_id` falls back to the current call context when omitted:
+Proactive sends may provide an explicit route; replies can inherit the current call context:
 
-```c
-// chat_id precedence: JSON arg > call context
-if (cJSON_IsString(chat_id_json) && chat_id_json->valuestring[0]) {
-    chat_id = chat_id_json->valuestring;
-} else if (ctx && ctx->chat_id && ctx->chat_id[0]) {
-    chat_id = ctx->chat_id;  // inherit session context
-}
+```lua
+capability.call("send_message", {
+  message = "hello"
+}, {
+  channel = "telegram",
+  chat_id = "123456789"
+})
 ```
 
-Long text is chunked to fit Telegram's message limits. `tg_send_image` and `tg_send_file` upload via multipart/form-data, using `stat()` for exact `Content-Length` and streaming parts through `esp_http_client_open` instead of buffering the whole file in RAM.
+Routing prefers an explicit target in the call context, then input JSON, then the current source context. The private Telegram backend still chunks long text and streams image/file multipart uploads.
 
 ### Configuration API
 

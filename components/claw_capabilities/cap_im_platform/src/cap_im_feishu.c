@@ -20,8 +20,8 @@
 #include "cap_im_attachment.h"
 #include "claw_cap.h"
 #include "claw_task.h"
-#include "claw_event_publisher.h"
-#include "claw_im_session.h"
+#include "claw_im_gateway.h"
+#include "esp_check.h"
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_attr.h"
@@ -966,14 +966,17 @@ static esp_err_t cap_im_feishu_publish_inbound_text(const char *chat_id,
         return ESP_OK;
     }
 
-    return claw_im_session_publish_message(
-        "feishu_gateway",
-        "feishu",
-        chat_id,
-        CLAW_AGENT_SESSION_PERSISTENCE_PERSISTENT,
-        content,
-        sender_id,
-        message_id);
+    return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "feishu_gateway",
+        .channel = "feishu",
+        .chat_id = chat_id,
+        .sender_id = sender_id,
+        .message_id = message_id,
+        .event_type = "message",
+        .content_type = "text",
+        .text = content,
+        .timestamp_ms = cap_im_feishu_now_ms(),
+    });
 }
 
 static esp_err_t cap_im_feishu_publish_attachment_event(const char *chat_id,
@@ -982,27 +985,22 @@ static esp_err_t cap_im_feishu_publish_attachment_event(const char *chat_id,
                                                         const char *content_type,
                                                         const char *payload_json)
 {
-    claw_event_t event = {0};
-
     if (!chat_id || !message_id || !content_type || !payload_json) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    strlcpy(event.source_cap, "feishu_gateway", sizeof(event.source_cap));
-    strlcpy(event.event_type, "attachment_saved", sizeof(event.event_type));
-    strlcpy(event.source_channel, "feishu", sizeof(event.source_channel));
-    strlcpy(event.chat_id, chat_id, sizeof(event.chat_id));
-    strlcpy(event.content_type, content_type, sizeof(event.content_type));
-    strlcpy(event.message_id, message_id, sizeof(event.message_id));
-    if (sender_id && sender_id[0]) {
-        strlcpy(event.sender_id, sender_id, sizeof(event.sender_id));
-    }
-    snprintf(event.event_id, sizeof(event.event_id), "feishu-attach-%" PRId64, cap_im_feishu_now_ms());
-    event.timestamp_ms = cap_im_feishu_now_ms();
-    event.session_policy = CLAW_SESSION_POLICY_CHAT;
-    event.text = "";
-    event.payload_json = (char *)payload_json;
-    return claw_event_router_publish(&event);
+    return claw_im_gateway_publish_inbound(&(claw_im_gateway_inbound_event_t) {
+        .source_cap = "feishu_gateway",
+        .channel = "feishu",
+        .chat_id = chat_id,
+        .sender_id = sender_id,
+        .message_id = message_id,
+        .event_type = "attachment_saved",
+        .content_type = content_type,
+        .text = "",
+        .payload_json = payload_json,
+        .timestamp_ms = cap_im_feishu_now_ms(),
+    });
 }
 
 static char *cap_im_feishu_strdup_or_empty(const char *value)
@@ -2990,136 +2988,45 @@ static esp_err_t cap_im_feishu_send_media_internal(const char *chat_id,
     return ESP_OK;
 }
 
-static esp_err_t cap_im_feishu_send_message_execute(const char *input_json,
-                                                    const claw_cap_call_context_t *ctx,
-                                                    char *output,
-                                                    size_t output_size)
+static esp_err_t cap_im_feishu_gateway_send_message(
+    const claw_im_gateway_message_t *message,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    cJSON *chat_id_json = NULL;
-    cJSON *message_json = NULL;
-    const char *chat_id = NULL;
-    const char *message = NULL;
     esp_err_t err;
 
-    if (!input_json || !output || output_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    root = cJSON_Parse(input_json);
-    if (!root) {
-        snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid json\"}");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    chat_id_json = cJSON_GetObjectItem(root, "chat_id");
-    message_json = cJSON_GetObjectItem(root, "message");
-    if (cJSON_IsString(chat_id_json) && chat_id_json->valuestring && chat_id_json->valuestring[0]) {
-        chat_id = chat_id_json->valuestring;
-    } else if (ctx && ctx->chat_id && ctx->chat_id[0]) {
-        chat_id = ctx->chat_id;
-    }
-    message = cJSON_IsString(message_json) ? message_json->valuestring : NULL;
-    if (!chat_id || !chat_id[0] || !message || !message[0]) {
-        cJSON_Delete(root);
-        snprintf(output,
-                 output_size,
-                 "{\"ok\":false,\"error\":\"chat_id and message are required (chat_id may come from ctx)\"}");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_im_feishu_send_markdown_card(chat_id, message);
+    (void)user_ctx;
+    err = cap_im_feishu_send_markdown_card(message->chat_id, message->message);
     if (err != ESP_OK) {
         ESP_LOGW(TAG,
                  "Feishu markdown card send failed chat=%s err=%s, falling back to text",
-                 chat_id,
+                 message->chat_id,
                  esp_err_to_name(err));
-        err = cap_im_feishu_send_text(chat_id, message);
+        err = cap_im_feishu_send_text(message->chat_id, message->message);
     }
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        snprintf(output, output_size, "{\"ok\":false,\"error\":\"%s\"}", esp_err_to_name(err));
-        return err;
-    }
-
-    snprintf(output, output_size, "{\"ok\":true}");
-    return ESP_OK;
+    return err;
 }
 
-static esp_err_t cap_im_feishu_send_media_execute(const char *input_json,
-                                                  const claw_cap_call_context_t *ctx,
-                                                  char *output,
-                                                  size_t output_size,
-                                                  bool is_image)
+static esp_err_t cap_im_feishu_gateway_send_image(
+    const claw_im_gateway_media_t *media,
+    void *user_ctx)
 {
-    cJSON *root = NULL;
-    cJSON *chat_id_json = NULL;
-    cJSON *path_json = NULL;
-    cJSON *caption_json = NULL;
-    const char *chat_id = NULL;
-    const char *path = NULL;
-    const char *caption = NULL;
-    esp_err_t err;
-
-    if (!input_json || !output || output_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    root = cJSON_Parse(input_json ? input_json : "{}");
-    if (!root) {
-        snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid json\"}");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    chat_id_json = cJSON_GetObjectItem(root, "chat_id");
-    path_json = cJSON_GetObjectItem(root, "path");
-    caption_json = cJSON_GetObjectItem(root, "caption");
-    if (cJSON_IsString(chat_id_json) && chat_id_json->valuestring && chat_id_json->valuestring[0]) {
-        chat_id = chat_id_json->valuestring;
-    } else if (ctx && ctx->chat_id && ctx->chat_id[0]) {
-        chat_id = ctx->chat_id;
-    }
-    if (cJSON_IsString(path_json) && path_json->valuestring && path_json->valuestring[0]) {
-        path = path_json->valuestring;
-    }
-    if (cJSON_IsString(caption_json) && caption_json->valuestring) {
-        caption = caption_json->valuestring;
-    }
-
-    if (!chat_id || !path) {
-        cJSON_Delete(root);
-        snprintf(output,
-                 output_size,
-                 "{\"ok\":false,\"error\":\"chat_id and path are required (chat_id may come from ctx)\"}");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_im_feishu_send_media_internal(chat_id, path, caption, is_image);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        snprintf(output, output_size, "{\"ok\":false,\"error\":\"%s\"}", esp_err_to_name(err));
-        return err;
-    }
-
-    snprintf(output, output_size, "{\"ok\":true}");
-    return ESP_OK;
+    (void)user_ctx;
+    return cap_im_feishu_send_image(media->chat_id, media->path, media->caption);
 }
 
-static esp_err_t cap_im_feishu_send_image_execute(const char *input_json,
-                                                  const claw_cap_call_context_t *ctx,
-                                                  char *output,
-                                                  size_t output_size)
+static esp_err_t cap_im_feishu_gateway_send_file(
+    const claw_im_gateway_media_t *media,
+    void *user_ctx)
 {
-    return cap_im_feishu_send_media_execute(input_json, ctx, output, output_size, true);
+    (void)user_ctx;
+    return cap_im_feishu_send_file(media->chat_id, media->path, media->caption);
 }
 
-static esp_err_t cap_im_feishu_send_file_execute(const char *input_json,
-                                                 const claw_cap_call_context_t *ctx,
-                                                 char *output,
-                                                 size_t output_size)
-{
-    return cap_im_feishu_send_media_execute(input_json, ctx, output, output_size, false);
-}
+static const claw_im_gateway_platform_ops_t s_feishu_gateway_ops = {
+    .send_message = cap_im_feishu_gateway_send_message,
+    .send_image = cap_im_feishu_gateway_send_image,
+    .send_file = cap_im_feishu_gateway_send_file,
+};
 
 static const claw_cap_descriptor_t s_feishu_descriptors[] = {
     {
@@ -3134,39 +3041,6 @@ static const claw_cap_descriptor_t s_feishu_descriptors[] = {
         .start = cap_im_feishu_gateway_start,
         .stop = cap_im_feishu_gateway_stop,
     },
-    {
-        .id = "feishu_send_message",
-        .name = "feishu_send_message",
-        .family = "im",
-        .description = "Send a text message to a Feishu chat_id or user open_id.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}},\"required\":[\"chat_id\",\"message\"]}",
-        .execute = cap_im_feishu_send_message_execute,
-    },
-    {
-        .id = "feishu_send_image",
-        .name = "feishu_send_image",
-        .family = "im",
-        .description = "Send an image file from a local path to a Feishu chat.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"caption\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
-        .execute = cap_im_feishu_send_image_execute,
-    },
-    {
-        .id = "feishu_send_file",
-        .name = "feishu_send_file",
-        .family = "im",
-        .description = "Send a file from a local path to a Feishu chat.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"caption\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
-        .execute = cap_im_feishu_send_file_execute,
-    },
 };
 
 static const claw_cap_group_t s_feishu_group = {
@@ -3177,13 +3051,25 @@ static const claw_cap_group_t s_feishu_group = {
 
 esp_err_t cap_im_feishu_register_group(void)
 {
+    esp_err_t err;
+
     cap_im_feishu_init_defaults();
+    ESP_RETURN_ON_ERROR(claw_im_gateway_register_group(),
+                        TAG,
+                        "register IM Gateway group failed");
 
-    if (claw_cap_group_exists(s_feishu_group.group_id)) {
-        return ESP_OK;
+    if (!claw_cap_group_exists(s_feishu_group.group_id)) {
+        err = claw_cap_register_group(&s_feishu_group);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
-
-    return claw_cap_register_group(&s_feishu_group);
+    return claw_im_gateway_register_platform(
+               &(claw_im_gateway_platform_config_t) {
+        .channel = "feishu",
+        .cap_group_id = s_feishu_group.group_id,
+        .ops = &s_feishu_gateway_ops,
+    });
 }
 
 esp_err_t cap_im_feishu_set_credentials(const char *app_id, const char *app_secret)

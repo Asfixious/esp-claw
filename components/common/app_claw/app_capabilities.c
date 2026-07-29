@@ -57,6 +57,7 @@
 #include "cap_web_search.h"
 #endif
 #include "claw_cap.h"
+#include "claw_im_gateway.h"
 #include "claw_paths.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -784,6 +785,8 @@ esp_err_t app_capabilities_init(const app_claw_config_t *config,
     ESP_RETURN_ON_ERROR(claw_cap_init(), TAG, "Failed to init claw_cap");
     ESP_GOTO_ON_ERROR(cap_agent_register_group(),
                       cleanup, TAG, "Failed to register agent capability");
+    ESP_GOTO_ON_ERROR(claw_im_gateway_register_group(),
+                      cleanup, TAG, "Failed to register IM Gateway capability");
 
     entries = calloc(entry_count > 0 ? entry_count : 1, sizeof(entries[0]));
     enabled_map = calloc(entry_count > 0 ? entry_count : 1, sizeof(enabled_map[0]));

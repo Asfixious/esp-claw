@@ -15,7 +15,7 @@ The module is split into three header files:
 |--------|------|
 | <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event.h" /> | Event struct `claw_event_t`, session policy enum `claw_event_session_policy_t`, `claw_event_clone`/`claw_event_free`/`claw_event_build_session_id` |
 | <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event_publisher.h" /> | Event publishing API: `claw_event_router_publish`/`claw_event_router_publish_message`/`claw_event_router_publish_trigger`, and the `claw_event_publish_fn` callback type |
-| <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event_router.h" /> | Router initialization, rule CRUD, configuration, outbound binding, `claw_event_router_handle_event`, etc. (imports `claw_event.h` for types) |
+| <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event_router.h" /> | Router initialization, rule CRUD, configuration, `claw_event_router_handle_event`, etc. (imports `claw_event.h` for types) |
 
 At minimum, include `claw_event_publisher.h` if you only need to publish events (it automatically includes `claw_event.h`).
 
@@ -40,8 +40,7 @@ Agent input uses the ordinary `call_cap` action with `cap: "agent"` and the RPC 
 Common fields in `claw_event_router_config_t`:
 
 - `default_route_messages_to_agent`: whether certain messages are routed to the Agent when no rule matches.
-- `default_route_agent_output_to_channel`: whether unmatched Agent `out_message` events use the outbound binding for their route.
-- `outbound_resolver`: optional callback to resolve the `target_channel` to a capability name before checking the binding table.
+- `default_route_agent_output_to_channel`: whether unmatched Agent `out_message` events call the unified IM Gateway with their event route.
 
 In `edge_agent`, both default routes are enabled. Explicit matching rules still take priority over either fallback.
 
@@ -65,14 +64,12 @@ In `edge_agent`, both default routes are enabled. Explicit matching rules still 
 
 </Aside>
 
-## Outbound channel bindings
+## IM Gateway outbound routing
 
-`claw_event_router_register_outbound_binding(channel, cap_name)` maps logical channel names to real capability names.
+User-facing platform backends hand incoming messages to the IM Gateway for normalization. The Event `channel` identifies the source and becomes the default target channel for follow-on Events.
+When the Event Router handles a final send-message Event, it always invokes the `send_message` capability and places the target `channel` and `chat_id` in the call context. The IM Gateway then selects the QQ, Feishu, Telegram, WeChat, or Web backend using `channel + chat_id`.
 
-User-facing “components” in ESP-Claw are also capabilities. When wrapping user input as an Event they add a `channel` field for the source and act as the default target `channel` for follow-on Events from that trigger.
-When the Event Router handles a final send-message Event, it resolves the target `channel` to a capability and invokes its `send_message` action. If an `outbound_resolver` is configured, it is called first; if it doesn't match, the binding table is used.
-
-In `edge_agent`, QQ, Feishu, Telegram, WeChat, and Web (local IM) each bind their send path and `channel` name.
+The Event Router no longer maintains a channel-to-capability binding table, and platforms no longer expose dedicated tools such as `qq_send_message` or `feishu_send_message`.
 
 ## Session policy
 

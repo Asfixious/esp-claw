@@ -15,7 +15,7 @@ import { LinkCard } from 'starlight-theme-nova/components'
 |--------|------|
 | <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event.h" /> | 事件结构体 `claw_event_t`、会话策略枚举 `claw_event_session_policy_t`、`claw_event_clone`/`claw_event_free`/`claw_event_build_session_id` |
 | <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event_publisher.h" /> | 事件发布 API：`claw_event_router_publish`/`claw_event_router_publish_message`/`claw_event_router_publish_trigger`，以及 `claw_event_publish_fn` 回调类型 |
-| <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event_router.h" /> | 路由器初始化、规则 CRUD、配置、出站绑定、`claw_event_router_handle_event` 等（通过 `#include "claw_event.h"` 引入事件类型） |
+| <LinkToSource relativePath="components/claw_modules/claw_event_router/include/claw_event_router.h" /> | 路由器初始化、规则 CRUD、配置、`claw_event_router_handle_event` 等（通过 `#include "claw_event.h"` 引入事件类型） |
 
 仅发布事件时，最少需要包含 `claw_event_publisher.h`（其自动引入 `claw_event.h`）。
 
@@ -40,8 +40,7 @@ Agent 输入使用普通 `call_cap` 动作，指定 `cap: "agent"` 和 RPC envel
 `claw_event_router_config_t` 中常见字段含义：
 
 - `default_route_messages_to_agent`：是否在没有规则命中时，把某类消息默认送给 Agent。
-- `default_route_agent_output_to_channel`：未匹配规则的 Agent `out_message` 是否按事件路由使用出站绑定。
-- `outbound_resolver`：可选回调，在出站绑定表之前解析 `target_channel` 到 cap 名。
+- `default_route_agent_output_to_channel`：未匹配规则的 Agent `out_message` 是否按事件路由调用统一 IM Gateway。
 
 `edge_agent` 同时启用两个默认路由；显式匹配的规则仍优先于 fallback。
 
@@ -65,14 +64,12 @@ Agent 输入使用普通 `call_cap` 动作，指定 `cap: "agent"` 和 RPC envel
 
 </Aside>
 
-## 出站通道绑定
+## IM Gateway 出站路由
 
-`claw_event_router_register_outbound_binding(channel, cap_name)` 把逻辑 channel 名映射到真实 Capability 名。
+提供用户交互的平台后端会把消息交给 IM Gateway 归一化。Event 中的 `channel` 标示来源，也作为后续 Event 的默认目标 channel。
+当 Event Router 处理最终发送消息的 Event 时，它统一调用 `send_message` capability，并把目标 `channel`、`chat_id` 放入调用上下文。IM Gateway 再用 `channel + chat_id` 选择 QQ、飞书、Telegram、微信或 Web 后端。
 
-提供用户交互的「组件」在 ESP-Claw 中也是一种 Capability。它将用户消息包装为 Event 时会添加 `channel` 字段，标示消息来源，并充当由该 Event 触发的一系列 Event 的默认目标 `channel`。
-当 Event Router 接收到最终发送消息的 Event 时，会根据目标 `channel` 字段找到对应的 Capability 并调用其 `send_message` 动作。若配置了 `outbound_resolver`，则先调用自定义解析器，未命中再查表。
-
-`edge_agent` 中，QQ、飞书、Telegram、微信、Web（本地 IM）分别绑定了其发送消息的函数与 `channel` 名称。
+Event Router 不再维护 channel 到平台 Capability 的绑定表；平台也不再暴露 `qq_send_message`、`feishu_send_message` 等专属工具。
 
 ## 会话策略
 

@@ -83,6 +83,12 @@ dependencies:
   claw_event_router:
     path: ../../claw_modules/claw_event_router
 
+  claw_im_gateway:
+    path: ../../claw_modules/claw_im_gateway
+
+  claw_im_session:
+    path: ../../claw_modules/claw_im_session
+
   claw_utils:
     path: ../../claw_modules/claw_utils
 

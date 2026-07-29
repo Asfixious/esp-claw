@@ -38,7 +38,7 @@ Event 是 ESP-Claw 框架中的消息载体，包含了 Event ID、来源、目�
     |--------------|----------|
     | `call_cap` | 执行某个 Capability，包括 `agent` RPC 入口 |
     | `run_script` | 运行 Lua 脚本 |
-    | `send_message` | 发送 IM 消息至出站绑定的目标 |
+    | `send_message` | 通过统一 IM Gateway 按 `channel + chat_id` 发送消息 |
     | `emit_event` | 生成新的事件并传递给 `claw_event_router` |
     | `drop` | 丢弃事件 |
 

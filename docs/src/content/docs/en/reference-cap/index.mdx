@@ -25,7 +25,7 @@ Descriptors are grouped into **capability groups** (`claw_cap_group_t`)—the sm
 
 | Family | Components | Notes |
 |--------|------------|-------|
-| **IM ingress** | `cap_im_platform` | Unified component for Feishu, QQ, Telegram, and WeChat; registers per-platform groups such as `cap_im_tg` |
+| **IM ingress** | `claw_im_gateway` + `cap_im_platform` | The Gateway exposes unified send APIs; Feishu, QQ, Telegram, and WeChat plug in as private backends |
 | **Filesystem** | `cap_files` | Managed FATFS read/write, edit, copy, move, delete, and listing |
 | **Lua** | `cap_lua` | Author, sync/async run, and track Lua jobs |
 | **Skill admin** | `cap_skill` | Register/unregister and activate Skills, exposing core features as tools and returning the full document on activation |

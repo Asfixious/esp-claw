@@ -21,6 +21,7 @@ extern "C" {
 typedef struct {
     char fatfs_base_path[APP_CLAW_PATH_LEN];          /**< Writable data root */
     char agent_root_dir[APP_CLAW_PATH_LEN];           /**< Agent runtime persistence root */
+    char skill_state_root_dir[APP_CLAW_PATH_LEN];     /**< Legacy C skill session state */
     char skills_root_dir[APP_CLAW_PATH_LEN];          /**< Writable skills root */
     char system_skills_root_dir[APP_CLAW_PATH_LEN];   /**< Read-only firmware-baked skills root */
     char lua_root_dir[APP_CLAW_PATH_LEN];             /**< Lua scripts root */

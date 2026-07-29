@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #if CONFIG_APP_CLAW_CAP_SCHEDULER
 #include "cap_scheduler.h"
@@ -22,6 +23,7 @@
 #endif
 #include "claw_agent.h"
 #include "claw_paths.h"
+#include "claw_skill.h"
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
 #include "claw_event_publisher.h"
 #include "claw_event_router.h"
@@ -47,6 +49,16 @@ static app_claw_config_t s_current_config;
 static bool s_current_config_valid;
 static app_claw_save_config_fn s_save_config;
 static void *s_save_config_user_ctx;
+
+static esp_err_t app_claw_ensure_directory(const char *path)
+{
+    struct stat st = {0};
+
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
+    }
+    return mkdir(path, 0755) == 0 ? ESP_OK : ESP_FAIL;
+}
 
 static esp_err_t app_claw_ensure_config_lock(void)
 {
@@ -162,6 +174,8 @@ static esp_err_t build_storage_paths(app_claw_storage_paths_t *paths)
                         TAG, "data home unavailable");
     ESP_RETURN_ON_ERROR(claw_paths_join(CLAW_PATH_DATA, "agent", paths->agent_root_dir, sizeof(paths->agent_root_dir)),
                         TAG, "agent root path too long");
+    ESP_RETURN_ON_ERROR(claw_paths_join(CLAW_PATH_DATA, "agent/skill_state", paths->skill_state_root_dir, sizeof(paths->skill_state_root_dir)),
+                        TAG, "skill state root path too long");
     ESP_RETURN_ON_ERROR(claw_paths_join(CLAW_PATH_DATA, "skills", paths->skills_root_dir, sizeof(paths->skills_root_dir)),
                         TAG, "skills root path too long");
     ESP_RETURN_ON_ERROR(claw_paths_join(CLAW_PATH_DATA, "scripts", paths->lua_root_dir, sizeof(paths->lua_root_dir)),
@@ -198,6 +212,12 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
     }
     ESP_RETURN_ON_ERROR(app_claw_store_current_config(config), TAG, "Failed to store Claw config");
     ESP_RETURN_ON_ERROR(build_storage_paths(&paths), TAG, "Failed to resolve storage paths");
+    ESP_RETURN_ON_ERROR(app_claw_ensure_directory(paths.agent_root_dir),
+                        TAG, "Failed to create agent root");
+    ESP_RETURN_ON_ERROR(app_claw_ensure_directory(paths.skills_root_dir),
+                        TAG, "Failed to create skills root");
+    ESP_RETURN_ON_ERROR(app_claw_ensure_directory(paths.skill_state_root_dir),
+                        TAG, "Failed to create skill state root");
 
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     router_config.default_route_messages_to_agent = true;
@@ -223,6 +243,16 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
                         TAG, "Failed to init scheduler");
 #endif
     ESP_RETURN_ON_ERROR(app_capabilities_init(config, &paths), TAG, "Failed to init capabilities");
+
+    ESP_RETURN_ON_ERROR(claw_skill_init(&(claw_skill_config_t) {
+                            .session_state_root_dir = paths.skill_state_root_dir,
+                            .max_file_bytes = 64 * 1024,
+                        }),
+                        TAG, "Failed to initialize C skill registry");
+    ESP_RETURN_ON_ERROR(claw_skill_add_directory(paths.skills_root_dir),
+                        TAG, "Failed to register writable skills");
+    ESP_RETURN_ON_ERROR(claw_skill_add_directory(paths.system_skills_root_dir),
+                        TAG, "Failed to register system skills");
 
     agent_config.api_key = config->llm_api_key;
     agent_config.backend_type = config->llm_backend_type;

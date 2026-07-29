@@ -43,12 +43,14 @@
 #include "claw_cap.h"
 #include "claw_event_publisher.h"
 #include "claw_event_router.h"
+#include "claw_skill.h"
 #include "cJSON.h"
 #include "esp_console.h"
 #include "esp_log.h"
 
 static const char *TAG = "app_claw_cli";
 static const size_t CAP_OUTPUT_BUF_SIZE = 1024;
+static const size_t SKILL_OUTPUT_BUF_SIZE = 64 * 1024;
 
 static uint32_t s_current_session_id;
 static uint32_t s_active_turn_id;
@@ -1021,6 +1023,51 @@ static int cmd_auto(int argc, char **argv)
     return 1;
 }
 
+static int cmd_skill(int argc, char **argv)
+{
+    char *output;
+    esp_err_t err;
+
+    if (argc < 2) {
+        printf("Usage: skill <list|catalog|load|reload> [skill_id]\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "reload") == 0) {
+        err = claw_skill_reload_registry();
+        printf("%s\n", err == ESP_OK ? "Skills reloaded" : esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
+    }
+    if (strcmp(argv[1], "load") == 0 && argc < 3) {
+        printf("Usage: skill load <skill_id>\n");
+        return 1;
+    }
+
+    output = calloc(1, SKILL_OUTPUT_BUF_SIZE);
+    if (!output) {
+        printf("Out of memory\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "list") == 0) {
+        err = claw_skill_read_skills_list(output, SKILL_OUTPUT_BUF_SIZE);
+    } else if (strcmp(argv[1], "catalog") == 0) {
+        err = claw_skill_render_catalog_json(output, SKILL_OUTPUT_BUF_SIZE);
+    } else if (strcmp(argv[1], "load") == 0) {
+        err = claw_skill_read_document(argv[2], output, SKILL_OUTPUT_BUF_SIZE);
+    } else {
+        free(output);
+        printf("Usage: skill <list|catalog|load|reload> [skill_id]\n");
+        return 1;
+    }
+
+    if (err == ESP_OK) {
+        printf("%s\n", output);
+    } else {
+        printf("skill %s failed: %s\n", argv[1], esp_err_to_name(err));
+    }
+    free(output);
+    return err == ESP_OK ? 0 : 1;
+}
+
 static void register_cap_cli_commands(void)
 {
 #if CONFIG_APP_CLAW_CAP_IM_QQ
@@ -1127,6 +1174,15 @@ esp_err_t app_claw_cli_start(void)
     }
 
     {
+        esp_console_cmd_t skill_cmd = {
+            .command = "skill",
+            .help = "Skill operations: skill <list|catalog|load|reload> [skill_id]",
+            .func = cmd_skill,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&skill_cmd));
+    }
+
+    {
         esp_console_cmd_t auto_cmd = {
             .command = "auto",
             .help = "Automation operations: auto <reload|rules|rule|add_rule|update_rule|delete_rule|last|emit_message|emit_trigger> ...",
@@ -1135,6 +1191,6 @@ esp_err_t app_claw_cli_start(void)
         ESP_ERROR_CHECK(esp_console_cmd_register(&auto_cmd));
     }
 
-    printf("Type 'help', 'auto rules', 'auto last', or 'auto emit_message qq_gateway qq 123 hello'\n");
+    printf("Type 'help', 'skill list', 'auto rules', or 'auto last'\n");
     return esp_console_start_repl(repl);
 }

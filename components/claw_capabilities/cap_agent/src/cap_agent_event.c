@@ -892,7 +892,8 @@ esp_err_t cap_agent_event_attach(uint32_t session_id)
 
 esp_err_t cap_agent_event_submit(uint32_t session_id,
                                  const char *text,
-                                 const cap_agent_event_route_t *route)
+                                 const cap_agent_event_route_t *route,
+                                 bool interrupt_active_turn)
 {
     cap_agent_event_pump_t *pump;
     cap_agent_pending_route_t *pending;
@@ -931,9 +932,14 @@ esp_err_t cap_agent_event_submit(uint32_t session_id,
     }
 
     /* Keep TURN_STARTED behind this mutex until the Rust actor has accepted or
-     * rejected the submit, then append route metadata in the same FIFO order
-     * as SessionControl::append(). */
-    err = claw_agent_session_submit(session_id, text);
+     * rejected the input, then append route metadata in the same FIFO order
+     * as SessionControl::append(). Interrupt before submit: it is a no-op when
+     * idle and therefore cannot target the new turn. */
+    err = interrupt_active_turn ?
+          claw_agent_session_interrupt(session_id) : ESP_OK;
+    if (err == ESP_OK) {
+        err = claw_agent_session_submit(session_id, text);
+    }
     if (err == ESP_OK) {
         if (pump->pending_route_tail) {
             pump->pending_route_tail->next = pending;

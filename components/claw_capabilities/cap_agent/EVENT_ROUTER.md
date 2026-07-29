@@ -160,7 +160,9 @@ claw_agent.h Session stream
 这是 IM/Event Router 的标准入口：
 
 - 有 `request_id` 时调用 `claw_agent_session_respond`。
-- 无 `request_id` 时调用 `claw_agent_session_submit`。
+- 无 `request_id` 时先调用 `claw_agent_session_interrupt`，再调用
+  `claw_agent_session_submit`。空闲 Session 上的 interrupt 是 no-op；有正在
+  运行的 turn 时，新 IM 消息会先中断它，再作为下一条输入提交。
 
 因此路由规则不需要区分普通消息与权限回复。
 

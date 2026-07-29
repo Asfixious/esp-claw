@@ -83,7 +83,10 @@ The C system always calls the same capability surface:
 
 Event Router executes this through `call_cap` with `cap="agent"`. Session and request IDs are passed through `claw_cap_call_context_t`; route and correlation fields bind asynchronous output to the originating IM conversation.
 
-`session.input` selects `respond` when `request_id` is non-zero and `submit` otherwise. Lifecycle and explicit control methods use the same `method + args` envelope.
+`session.input` selects `respond` when `request_id` is non-zero. Otherwise it
+interrupts the current turn before submitting the new input; interrupt is a
+no-op when the session is idle. Lifecycle and explicit control methods use the
+same `method + args` envelope.
 
 See the [Event Router](./claw-event-router) and [Dataflow and automation](@lang/reference-project/dataflow-and-automation) pages for the rule path.
 

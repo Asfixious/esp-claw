@@ -27,12 +27,15 @@ bool cap_agent_event_is_attached(uint32_t session_id);
  * already-open stream. */
 esp_err_t cap_agent_event_attach(uint32_t session_id);
 
-/* Submit through the Rust session actor, then attach the route only when that
- * actor accepts the new turn. The actor remains the sole busy/concurrency
- * authority; this function only closes the event/route race. */
+/* Optionally interrupt the active turn, submit through the Rust session actor,
+ * then attach the route only when that actor accepts the new turn. Interrupt
+ * is issued before submit so an idle session cannot interrupt the new turn.
+ * The actor remains the sole busy/concurrency authority; this function only
+ * closes the event/route race. */
 esp_err_t cap_agent_event_submit(uint32_t session_id,
                                  const char *text,
-                                 const cap_agent_event_route_t *route);
+                                 const cap_agent_event_route_t *route,
+                                 bool interrupt_active_turn);
 
 #ifdef __cplusplus
 }

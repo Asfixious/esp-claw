@@ -107,7 +107,10 @@ Agent input is an ordinary capability call; there is no Agent-specific Router ac
 }
 ```
 
-The incoming event's numeric `session_id` and optional `request_id` are forwarded through the call context. `session.input` submits a new turn when `request_id` is zero and responds to `INPUT_REQUESTED` otherwise.
+The incoming event's numeric `session_id` and optional `request_id` are
+forwarded through the call context. When `request_id` is zero, `session.input`
+interrupts the running turn before submitting a new one; interrupt is a no-op
+for an idle session. Otherwise it responds to `INPUT_REQUESTED`.
 
 ## Event Router workflow
 

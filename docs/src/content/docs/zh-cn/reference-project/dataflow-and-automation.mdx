@@ -107,7 +107,10 @@ Agent 输入是普通 Capability 调用，不存在 Agent 专用 Router action�
 }
 ```
 
-入站事件的 numeric `session_id` 与可选 `request_id` 通过 call context 传递。`request_id` 为零时 `session.input` 提交新 turn，否则回答 `INPUT_REQUESTED`。
+入站事件的 numeric `session_id` 与可选 `request_id` 通过 call context
+传递。`request_id` 为零时，`session.input` 先中断正在运行的 turn，再提交
+新 turn；Session 空闲时 interrupt 是 no-op。非零时则回答
+`INPUT_REQUESTED`。
 
 ## Event Router 的工作流程
 

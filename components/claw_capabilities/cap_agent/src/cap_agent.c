@@ -621,9 +621,15 @@ static esp_err_t cap_agent_execute_input(const cap_agent_rpc_request_t *request,
             }
         }
     } else {
-        operation = "submit";
+        bool interrupt_active_turn =
+            request->method == CAP_AGENT_RPC_SESSION_INPUT;
+
+        operation = interrupt_active_turn ? "interrupt" : "submit";
         cap_agent_route_from_context(ctx, &route);
-        err = cap_agent_event_submit(request->session_id, request->text, &route);
+        err = cap_agent_event_submit(request->session_id,
+                                     request->text,
+                                     &route,
+                                     interrupt_active_turn);
     }
     if (err != ESP_OK) {
         return err;

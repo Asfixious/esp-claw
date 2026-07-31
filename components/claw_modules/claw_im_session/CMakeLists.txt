@@ -8,5 +8,5 @@ idf_component_register(
         claw_event_router
         freertos
         framework
-        json
+        cjson
 )

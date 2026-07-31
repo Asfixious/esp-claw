@@ -5,5 +5,5 @@ idf_component_register(
         "include"
     REQUIRES
         freertos
-        json
+        cjson
 )

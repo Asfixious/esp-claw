@@ -11,6 +11,6 @@ idf_component_register(
         claw_im_session
         esp_timer
         freertos
-        json
+        cjson
         framework
 )

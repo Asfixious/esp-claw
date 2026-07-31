@@ -6,5 +6,5 @@ idf_component_register(
     REQUIRES
         claw_cap
         freertos
-        json
+        cjson
 )

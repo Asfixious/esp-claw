@@ -127,7 +127,7 @@
       changes: *patterns-docs
     - when: never
 
-.rules:pre_check:framework:
+.rules:check:framework:
   rules:
     - <<: *if-protected-push
     - <<: *if-label-pre_check

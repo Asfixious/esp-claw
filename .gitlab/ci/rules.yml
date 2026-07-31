@@ -22,8 +22,8 @@
 .patterns-components_common: &patterns-components_common
 - "components/common/**/*"
 
-.patterns-framework: &patterns-framework
-  - "framework/**/*"
+.patterns-agent_framework: &patterns-agent_framework
+  - "agent-framework/**/*"
 
 # application folder, in the alphabetic order
 .patterns-application_mcp_server_point: &patterns-application_mcp_server_point
@@ -90,7 +90,7 @@
     - <<: *if-mr
       changes: *patterns-components_common
     - <<: *if-mr
-      changes: *patterns-framework
+      changes: *patterns-agent_framework
     - <<: *if-mr
       changes: *patterns-application_edge_agent
     - <<: *if-mr
@@ -127,13 +127,13 @@
       changes: *patterns-docs
     - when: never
 
-.rules:check:framework:
+.rules:check:agent_framework:
   rules:
     - <<: *if-protected-push
     - <<: *if-label-pre_check
     - <<: *if-trigger-job
     - <<: *if-mr
-      changes: *patterns-framework
+      changes: *patterns-agent_framework
     - when: never
 
 .rules:build:doc:

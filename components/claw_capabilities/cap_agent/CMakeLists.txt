@@ -12,5 +12,5 @@ idf_component_register(
         esp_timer
         freertos
         cjson
-        framework
+        agent-framework
 )

@@ -7,6 +7,6 @@ idf_component_register(
         claw_cap
         claw_event_router
         freertos
-        framework
+        agent-framework
         cjson
 )

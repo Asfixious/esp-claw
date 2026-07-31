@@ -85,7 +85,8 @@ Event Router 使用 `cap="agent"` 的 `call_cap` 执行它。Session/request ID 
 
 `session.input` 在 `request_id` 非零时选择 `respond`；否则先 interrupt
 当前 turn，再 submit 新输入。空闲 Session 上的 interrupt 是 no-op。
-生命周期与显式控制方法使用相同的 `method + args` envelope。
+生命周期与显式控制方法使用相同的
+`method + args` envelope。
 
 规则链路详见 [Event Router](./claw-event-router) 与 [数据流与自动化](@lang/reference-project/dataflow-and-automation)。
 

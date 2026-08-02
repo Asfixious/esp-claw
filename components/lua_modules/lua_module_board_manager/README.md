@@ -16,6 +16,15 @@ This module describes how to correctly use board_manager when writing Lua script
 - Call `board_manager.get_audio_codec_input_params(name)` or `board_manager.get_audio_codec_output_params(name)` to get codec handles and format parameters
 - Call `board_manager.get_camera_paths()` to get camera device paths such as `dev_path` and `meta_path`
 
+## Return values
+- `get_board_info()` returns a metadata table.
+- `init_device(name)` and `deinit_device(name)` return `true` on success or `nil, err` on failure.
+- `get_device_handle(name)`, `get_device_config_handle(name)`, and `get_lcd_touch_handle(name)` return a lightuserdata handle or `nil, err`.
+- `get_display_lcd_params(name)` returns `panel_handle, io_handle, lcd_width, lcd_height, panel_if, pixel_format`.
+- `get_audio_codec_input_params(name)` returns `codec_handle, sample_rate, channels, bits, init_gain_db`.
+- `get_audio_codec_output_params(name)` returns `codec_handle, sample_rate, channels, bits`.
+- `get_camera_paths()` returns a table with camera path fields when the board exposes them.
+
 ## Example
 ```lua
 local board_manager = require("board_manager")

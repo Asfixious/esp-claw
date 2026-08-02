@@ -67,8 +67,6 @@ typedef enum {
  */
 size_t display_hal_pixel_format_bytes(display_hal_pixel_format_t format);
 
-/* --- Lifecycle --- */
-
 /**
  * @brief One-time module init. Pre-creates the HAL mutex. Idempotent; must be
  *        called during module registration before any other HAL API.
@@ -91,12 +89,8 @@ esp_err_t display_hal_destroy(void);
  */
 display_hal_pixel_format_t display_hal_get_pixel_format(void);
 
-/* --- Geometry --- */
-
 int display_hal_width(void);
 int display_hal_height(void);
-
-/* --- Frame control --- */
 
 esp_err_t display_hal_begin_frame(bool clear, display_color_t color, bool preserve);
 esp_err_t display_hal_present(void);
@@ -104,8 +98,6 @@ esp_err_t display_hal_present_full(void);
 esp_err_t display_hal_end_frame(void);
 bool display_hal_is_frame_active(void);
 esp_err_t display_hal_get_animation_info(display_hal_animation_info_t *info);
-
-/* --- Drawing primitives --- */
 
 esp_err_t display_hal_clear(display_color_t color);
 esp_err_t display_hal_set_clip_rect(int x, int y, int width, int height);
@@ -134,8 +126,6 @@ esp_err_t display_hal_draw_triangle(int x1, int y1, int x2, int y2,
 esp_err_t display_hal_fill_triangle(int x1, int y1, int x2, int y2,
                                     int x3, int y3, display_color_t color);
 
-/* --- Text --- */
-
 esp_err_t display_hal_measure_text(const char *text, uint8_t font_size,
                                    uint16_t *out_width, uint16_t *out_height);
 esp_err_t display_hal_draw_text(int x, int y, const char *text, uint8_t font_size,
@@ -146,17 +136,7 @@ esp_err_t display_hal_draw_text_aligned(int x, int y, int width, int height,
                                         display_hal_text_align_t align,
                                         display_hal_text_valign_t valign);
 
-/* --- Bitmap ---
- *
- * @c pixels points to a tightly packed pixel buffer whose byte layout is
- * described by @p src_format:
- *   - DISPLAY_HAL_PIXEL_FORMAT_RGB565: little-endian uint16_t per pixel.
- *   - DISPLAY_HAL_PIXEL_FORMAT_RGB888: 3 input bytes per pixel in R,G,B order.
- *
- * @p src_format must currently match the HAL's active pixel format; a
- * mismatched call returns ESP_ERR_INVALID_ARG. RGB888 input pixels are
- * converted to native BGR before they reach the framebuffer or panel.
- */
+
 esp_err_t display_hal_draw_bitmap(int x, int y, int w, int h,
                                   const void *pixels,
                                   display_hal_pixel_format_t src_format);

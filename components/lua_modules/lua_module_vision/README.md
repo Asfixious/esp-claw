@@ -5,14 +5,14 @@ Lua vision modules backed by `image.frame` buffers.
 ## Modules
 
 - `motion_detect`: detects local motion in consecutive frames. It is enabled by default with `LUA_MODULE_VISION_MOTION_DETECT`.
-- `color_detect`: detects the largest matching color blob with the registry `espressif/color_detect` component. It is enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
-- `espdet`: runs ESP-DL ESPDet object detection with a user-provided `.espdl` model. Enable it with `LUA_MODULE_VISION_ESPDET`.
+- `color_detect`: detects the largest matching color blob. It is enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
+- `espdet`: runs ESPDet object detection with a user-provided `.espdl` model. Enable it with `LUA_MODULE_VISION_ESPDET`.
 
-All functions borrow frame data only during the call. Frame-format conversion is handled by the shared `image` module.
+All functions borrow frame data only during the call. Pass `image.frame` values directly unless the API explicitly documents raw byte input.
 
 ## Motion Detection
 
-The detector compares RGB565 luma against the previous frame inside an ROI, groups changed pixels into blocks, pads and smooths the resulting box, and uses confirm/hold state to produce a stable alert.
+`motion_detect` compares each frame with the previous frame and reports whether motion is active.
 
 ```lua
 local camera = require("camera")
@@ -83,7 +83,11 @@ if result.detected then
 end
 ```
 
-`color_detect.detect(frame[, opts])` requests RGB565LE through the image module. The Lua wrapper keeps ROI cropping, HSV threshold parsing, maximum-blob filtering, and source-coordinate mapping around the registry `espressif/color_detect` detector. Results include `count`, `detected`, `pixels`, `category`, `score`, `box`, `left`, `top`, `right`, `bottom`, `x`, `y`, `box_width`, `box_height`, `cx`, `cy`, and `source_*` fields. `color_detect.release()` releases the detector and crop scratch buffer early.
+`color_detect.detect(frame[, opts])` accepts an `image.frame` and returns a table. Options include `source = { x, y, width, height }`, `h_min`, `h_max`, `s_min`, `s_max`, `v_min`, `v_max`, `min_pixels`, `max_blob_pixels`, and `max_pixels`. `s_*` and `v_*` may use `0..1` or `0..255`; hue uses `0..180`.
+
+Results include `count`, `detected`, `width`, `height`, and `source_*` fields. When a blob is detected, the table also includes `pixels`, `category`, `score`, `box`, `left`, `top`, `right`, `bottom`, `x`, `y`, `box_width`, `box_height`, `cx`, and `cy`.
+
+`color_detect.release()` releases detector resources early.
 
 ## ESPDet
 
@@ -103,4 +107,10 @@ print("detection count=" .. tostring(result.count))
 espdet.unload()
 ```
 
-`espdet.detect(frame, opts)` requests RGB565LE through the image module. Load a model once with `espdet.load(path[, opts])`, or pass `opts.model_path` to a detect call. Results include `count`; each detection includes `category`, `score`, `box`, `left`, `top`, `right`, `bottom`, `x`, `y`, `width`, and `height`.
+API:
+- `espdet.load(path[, opts])` loads a model and returns `true`.
+- `espdet.detect(frame[, opts])` accepts an `image.frame`.
+- `espdet.detect(rgb565_bytes, width, height[, opts])` accepts raw RGB565LE bytes.
+- `espdet.unload()` releases the loaded model and returns no values.
+
+Options include `model_path` or `path`, `model_name`, `score_threshold` or `score_thr`, and `nms_threshold` or `nms_thr`. Results include `count`; each detection includes `category`, `score`, `box`, `left`, `top`, `right`, `bottom`, `x`, `y`, `width`, `height`, and optional `keypoint`.

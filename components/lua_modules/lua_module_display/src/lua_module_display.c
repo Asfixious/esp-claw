@@ -2,12 +2,6 @@
  * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
- *
- * Lua "display" module.
- *
- * Ported from esp-claw lua_module_halo_display.c.
- * HAL calls are routed through display_hal.h which the board layer must
- * implement. Image file loading and decoding live in lua_module_image.
  */
 #include "lua_module_display.h"
 
@@ -28,17 +22,10 @@
 
 static const char *TAG = "lua_display";
 
-/*
- * Owner name registered with display_service for Lua raw-display ownership.
- */
 #define LUA_DISPLAY_OWNER "lua_display"
 
 static display_service_session_handle_t s_display_session;
 static bool s_display_active;
-
-/* -------------------------------------------------------------------------
- * Argument helpers (mirrors the reference implementation)
- * ---------------------------------------------------------------------- */
 
 static int lua_display_check_integer_arg(lua_State *L, int index, const char *name)
 {
@@ -194,10 +181,6 @@ static void lua_display_reject_table_field(lua_State *L, int index, const char *
     }
 }
 
-/* -------------------------------------------------------------------------
- * Screen lifecycle
- * ---------------------------------------------------------------------- */
-
 static void lua_display_exit_cleanup(lua_State *L)
 {
     esp_err_t err;
@@ -284,10 +267,6 @@ static int lua_display_deinit(lua_State *L)
     lua_pushboolean(L, 1);
     return 1;
 }
-
-/* -------------------------------------------------------------------------
- * Basic drawing
- * ---------------------------------------------------------------------- */
 
 static int lua_display_clear(lua_State *L)
 {
@@ -385,10 +364,6 @@ static int lua_display_backlight(lua_State *L)
     }
     return 0;
 }
-
-/* -------------------------------------------------------------------------
- * Frame management
- * ---------------------------------------------------------------------- */
 
 static void lua_display_parse_frame_options(lua_State *L, int index,
                                             bool *clear, display_color_t *color, bool *preserve)
@@ -540,10 +515,6 @@ static void lua_display_set_module_metatable(lua_State *L)
     lua_setfield(L, -2, "__newindex");
     lua_setmetatable(L, -2);
 }
-
-/* -------------------------------------------------------------------------
- * Pixel buffers and images
- * ---------------------------------------------------------------------- */
 
 static int lua_display_align_down(int value, int align)
 {
@@ -1043,10 +1014,6 @@ static int lua_display_draw_pixels(lua_State *L)
     return 2;
 }
 
-/* -------------------------------------------------------------------------
- * Shape drawing
- * ---------------------------------------------------------------------- */
-
 static int lua_display_fill_circle(lua_State *L)
 {
     int cx = lua_display_check_integer_arg(L, 1, "cx");
@@ -1194,10 +1161,6 @@ static int lua_display_fill_triangle(lua_State *L)
     }
     return 0;
 }
-
-/* -------------------------------------------------------------------------
- * Module registration
- * ---------------------------------------------------------------------- */
 
 int luaopen_display(lua_State *L)
 {

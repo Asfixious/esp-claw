@@ -27,7 +27,7 @@ After `display.init(...)` succeeds:
 - `display.width` returns the current screen width
 - `display.height` returns the current screen height
 - Most drawing APIs can be used
-- `display_service` grants Lua foreground ownership (via dummy‑draw) for the lifetime of the display session
+- The Lua script owns the display session until `display.deinit()`.
 
 Touch input for the same session can be read through `lcd_touch` with the touch handle from `board_manager`:
 
@@ -75,7 +75,7 @@ Initializes the drawing context.
 - Common values come from `board_manager.PANEL_IF_IO`, `board_manager.PANEL_IF_RGB`, and `board_manager.PANEL_IF_MIPI_DSI`
 - `pixel_format`: optional framebuffer format; defaults to RGB565
 - Accepts either `display.PIXEL_FORMAT_RGB565` / `display.PIXEL_FORMAT_RGB888`, or the string `"rgb565"` / `"rgb888"`
-- Must match the byte layout the underlying LCD panel driver is configured for; the HAL only allocates buffers and streams bytes, it does not reconfigure the panel bit depth
+- Must match the byte layout configured for the LCD panel.
 - Byte-swap is applied only when the framebuffer is RGB565 (independent of interface); RGB888 buffers are never byte-swapped
 - RGB565 is stored as standard RGB565; RGB888 is stored and submitted as native BGR888. Lua color values keep RGB semantics at parse time.
 - Returns `true` on success
@@ -302,7 +302,7 @@ Draws a filled triangle.
 
 ## Raw pixel APIs
 
-These APIs draw RGB565 pixel buffers. Prefer `display.draw_image(...)` when the source is already an `image.frame`, because it borrows the image buffer during the C call and avoids creating a large Lua string.
+These APIs draw RGB565 or RGB888 pixel buffers. Prefer `display.draw_image(...)` when the source is already an `image.frame`.
 
 ### `display.draw_pixels(x, y, data, opts)`
 
@@ -354,8 +354,7 @@ display.draw_pixels(0, 0, rgb565_bytes, {
 Draws an `image.frame` directly. The display module requests the panel's
 active pixel format from the image module (RGB565LE when
 `display.pixel_format == "rgb565"`, native BGR888 when it is `"rgb888"`).
-When the image module can provide a borrowed or cached converted view, the HAL
-draws that native buffer directly and avoids an extra RGB-to-BGR copy.
+The image module provides the requested display format for the duration of the call.
 
 `opts` is optional:
 
@@ -385,7 +384,7 @@ display.draw_image(0, 0, frame, {
 
 ## Error behavior and constraints
 
-- Most APIs raise Lua errors directly when arguments are invalid or the HAL returns an error
+- Most APIs raise Lua errors directly when arguments are invalid or drawing fails
 - Integer-only APIs reject non-integer Lua values
 - File path validation is handled by the `image` module when loading or saving image files
 - `draw_pixels(...)` rejects buffers that are too short

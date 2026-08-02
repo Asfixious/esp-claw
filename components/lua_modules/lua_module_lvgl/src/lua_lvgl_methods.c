@@ -27,8 +27,6 @@
 
 #include "lua_lvgl_private.h"
 
-/* --- Base method table: methods every widget gets ---------------------- */
-
 static const luaL_Reg lua_lvgl_base_methods[] = {
     {"set_pos", lua_lvgl_set_pos},
     {"get_pos", lua_lvgl_get_pos},
@@ -47,8 +45,6 @@ static const luaL_Reg lua_lvgl_base_methods[] = {
     {"clean", lua_lvgl_clean},
     {NULL, NULL},
 };
-
-/* --- Per-type extra method tables -------------------------------------- */
 
 static const luaL_Reg lua_lvgl_screen_methods[] = {
     {"load", lua_lvgl_screen_load},
@@ -290,8 +286,6 @@ static const luaL_Reg lua_lvgl_no_extra_methods[] = {
     {NULL, NULL},
 };
 
-/* --- Type -> metatable name + extra methods table ---------------------- */
-
 typedef struct {
     lua_lvgl_obj_type_t type;
     const char *mt_name;
@@ -359,8 +353,6 @@ const char *lua_lvgl_metatable_for_type(lua_lvgl_obj_type_t type)
      * the userdata remains recognizable to lua_lvgl_check_ud. */
     return "lvgl.obj.generic";
 }
-
-/* --- Metatable construction helpers ------------------------------------ */
 
 /* Build a per-type "methods" table whose metatable's __index points to the
  * shared base methods table at stack absolute index `base_idx`. The newly

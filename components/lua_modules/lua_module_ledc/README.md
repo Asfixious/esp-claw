@@ -20,10 +20,7 @@ servo control.
 - `duty_percent`: optional, defaults to `50`
 - `duty_resolution_bits`: optional, defaults to `14`
 
-When camera support is enabled, dynamic Lua LEDC allocation skips timer 0 and
-channel 0. Some board-manager camera devices use those LEDC resources for sensor
-XCLK before Lua starts, and reconfiguring them for servo PWM can break camera
-frame timing.
+On boards with camera support, available LEDC timers/channels may be reduced. Creating a PWM handle returns an error if no suitable LEDC resource is available.
 
 ## Example
 

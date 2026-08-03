@@ -4,7 +4,7 @@
   stage: build
   tags:
     - build
-  image: ${CI_REGISTRY_IMAGE}/ci/idf-rust:release-v6.1
+  image: espressif/idf:release-v6.1
   variables:
     # Enable ccache for all build jobs. See configure_ci_environment.sh for more ccache related settings.
     IDF_CCACHE_ENABLE: "1"
@@ -45,6 +45,7 @@
     EXAMPLE_BOARD_PATH: "boards"
     BUILD_RECURSIVE: "1"
   script:
+    - pip install idf_build_apps esp-bmgr-assist
     - |
       if [ -n "${EXAMPLE_BOARD_BRAND}" ]; then
         export EXAMPLE_BOARD_PATH="boards/${EXAMPLE_BOARD_BRAND}"
@@ -65,11 +66,6 @@ build_application_edge_agent:
   extends:
     - .build_examples_template
     - .rules:build:application_edge_agent
-  before_script:
-    - . /opt/rust/export-esp.sh
-    - . "${IDF_PATH}/export.sh"
-    - rustc --version
-    - rustc +esp --version
   variables:
     EXAMPLE_DIR: application/edge_agent
   parallel:

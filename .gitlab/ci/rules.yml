@@ -127,7 +127,7 @@
       changes: *patterns-docs
     - when: never
 
-.rules:check:agent_framework:
+.rules:pre_check:agent_framework:
   rules:
     - <<: *if-protected-push
     - <<: *if-label-pre_check

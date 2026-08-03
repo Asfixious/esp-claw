@@ -1,3 +1,23 @@
+pre_check_agent_framework:
+  stage: pre-check
+  tags:
+    - build
+  image: rust:1.96.0
+  extends:
+    - .rules:pre_check:agent_framework
+  script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends pkg-config
+    - rustup component add --toolchain stable rustfmt clippy
+    - rustup toolchain install nightly --profile minimal
+    - cargo +stable install cargo-public-api --locked
+    - cargo install espup --version 0.17.1 --locked
+    - espup install --std --stable-version 1.96.0 --toolchain-version 1.95.0.0 --targets esp32s3,esp32c5,esp32p4 --export-file /tmp/export-esp.sh
+    - . /tmp/export-esp.sh
+    - ./agent-framework/check.sh
+    - ./agent-framework/build-idf-staticlib.sh --check
+    - ./agent-framework/harness.sh
+
 pre_check_docs:
   stage: pre-check
   tags:

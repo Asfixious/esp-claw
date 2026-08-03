@@ -4,7 +4,7 @@
   stage: build
   tags:
     - build
-  image: ${IMAGE}
+  image: ${CI_REGISTRY_IMAGE}/ci/idf-rust:release-v6.1
   variables:
     # Enable ccache for all build jobs. See configure_ci_environment.sh for more ccache related settings.
     IDF_CCACHE_ENABLE: "1"
@@ -45,7 +45,6 @@
     EXAMPLE_BOARD_PATH: "boards"
     BUILD_RECURSIVE: "1"
   script:
-    - pip install idf_build_apps esp-bmgr-assist
     - |
       if [ -n "${EXAMPLE_BOARD_BRAND}" ]; then
         export EXAMPLE_BOARD_PATH="boards/${EXAMPLE_BOARD_BRAND}"
@@ -62,26 +61,15 @@
               ${EXAMPLE_APPEND_ARGS}
     - python .gitlab/ci/package_firmware.py
 
-.build_idf_active_release_version:
-  parallel:
-    matrix:
-      - IMAGE: espressif/idf:release-v5.5
-
 build_application_edge_agent:
   extends:
     - .build_examples_template
     - .rules:build:application_edge_agent
   before_script:
-    - apt-get update
-    - apt-get install --yes --no-install-recommends build-essential curl pkg-config
-    - |
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable
-    - export PATH="${HOME}/.cargo/bin:${PATH}"
-    - cargo install espup --locked
-    - espup install
-    - . "${HOME}/export-esp.sh"
+    - . /opt/rust/export-esp.sh
     - . "${IDF_PATH}/export.sh"
+    - rustc --version
+    - rustc +esp --version
   variables:
     EXAMPLE_DIR: application/edge_agent
   parallel:
@@ -101,115 +89,93 @@ build_application_edge_agent:
       #   CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
       #   ```
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["esp32_S3_DevKitC_1", "esp32_S3_DevKitC_1_breadboard", "esp32_S3_DevKitC_1_N32R16V_breadboard"]
+      - EXAMPLE_BOARD: ["esp32_S3_DevKitC_1", "esp32_S3_DevKitC_1_breadboard", "esp32_S3_DevKitC_1_N32R16V_breadboard"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "espressif"
         EXAMPLE_CONFIG: "sdkconfig.console.jtag=jtag"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: esp32_p4_function_ev
+      - EXAMPLE_BOARD: esp32_p4_function_ev
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "espressif"
         EXAMPLE_CONFIG: "sdkconfig.console.jtag=jtag"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["esp32_p4x_function_ev", "esp32_p4_eye", "esp32_p4x_eye"]
+      - EXAMPLE_BOARD: ["esp32_p4x_function_ev", "esp32_p4_eye", "esp32_p4x_eye"]
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "espressif"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["esp_vocat_board_v1_2", "esp_box_3", "esp_sparkbot"]
+      - EXAMPLE_BOARD: ["esp_vocat_board_v1_2", "esp_box_3", "esp_sparkbot"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "espressif"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: esp_SensairShuttle
+      - EXAMPLE_BOARD: esp_SensairShuttle
         EXAMPLE_TARGET: esp32c5
         EXAMPLE_BOARD_BRAND: "espressif"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["m5stack_sticks3", "m5stack_cores3"]
+      - EXAMPLE_BOARD: ["m5stack_sticks3", "m5stack_cores3"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "m5stack"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: m5stack_tab5
+      - EXAMPLE_BOARD: m5stack_tab5
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "m5stack"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["dfrobot_k10", "dfrobot_ai_camera", "dfrobot_firebeetle_2_ESP32_S3", "dfrobot_romeo_ESP32_S3"]
+      - EXAMPLE_BOARD: ["dfrobot_k10", "dfrobot_ai_camera", "dfrobot_firebeetle_2_ESP32_S3", "dfrobot_romeo_ESP32_S3"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "dfrobot"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: lilygo_t_display_s3
+      - EXAMPLE_BOARD: lilygo_t_display_s3
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "lilygo"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: xingzhi_395
+      - EXAMPLE_BOARD: xingzhi_395
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "Nologo.Tech"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: waveshare_esp32_p4_nano
+      - EXAMPLE_BOARD: waveshare_esp32_p4_nano
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "waveshare"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["waveshare_ESP32_S3_RLCD_4_2", "waveshare_esp32_s3_geek", "waveshare_esp32_s3_zero_n8r8", "waveshare_ESP32_S3_Touch_AMOLED_2_16"]
+      - EXAMPLE_BOARD: ["waveshare_ESP32_S3_RLCD_4_2", "waveshare_esp32_s3_geek", "waveshare_esp32_s3_zero_n8r8", "waveshare_ESP32_S3_Touch_AMOLED_2_16"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "waveshare"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["movecall_cuican_esp32s3", "movecall_moji_esp32s3"]
+      - EXAMPLE_BOARD: ["movecall_cuican_esp32s3", "movecall_moji_esp32s3"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "movecall"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: movecall_moji2_esp32c5
+      - EXAMPLE_BOARD: movecall_moji2_esp32c5
         EXAMPLE_TARGET: esp32c5
         EXAMPLE_BOARD_BRAND: "movecall"
 
-      - IMAGE: ["espressif/idf:latest"]
-        EXAMPLE_BOARD: esp32_s31_korvo1
+      - EXAMPLE_BOARD: esp32_s31_korvo1
         EXAMPLE_TARGET: esp32s31
         EXAMPLE_BOARD_BRAND: "espressif"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: dfrobot_firebeetle_2_ESP32_P4_for_camera
+      - EXAMPLE_BOARD: dfrobot_firebeetle_2_ESP32_P4_for_camera
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "dfrobot"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: lilygo_t_display_p4_v1
+      - EXAMPLE_BOARD: lilygo_t_display_p4_v1
         EXAMPLE_TARGET: esp32p4
         EXAMPLE_BOARD_BRAND: "lilygo"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: nm_cyd_c5
+      - EXAMPLE_BOARD: nm_cyd_c5
         EXAMPLE_TARGET: esp32c5
         EXAMPLE_BOARD_BRAND: "rockbase-iot"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: dfrobot_firebeetle_2_ESP32_C5_for_display
+      - EXAMPLE_BOARD: dfrobot_firebeetle_2_ESP32_C5_for_display
         EXAMPLE_TARGET: esp32c5
         EXAMPLE_BOARD_BRAND: "dfrobot"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: anyboard
+      - EXAMPLE_BOARD: anyboard
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "community"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["eda_ai_gamebox", "eda_robot_pro", "eda_super_bear", "eda_tv_pro"]
+      - EXAMPLE_BOARD: ["eda_ai_gamebox", "eda_robot_pro", "eda_super_bear", "eda_tv_pro"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "lceda-course-examples"
 
-      - IMAGE: ["espressif/idf:release-v5.5"]
-        EXAMPLE_BOARD: ["xiao_esp32s3_sense"]
+      - EXAMPLE_BOARD: ["xiao_esp32s3_sense"]
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "seeedstudio"
 
@@ -218,7 +184,6 @@ build_application_mcp_server_point:
     - .build_examples_template
     - .rules:build:application_mcp_server_point
   variables:
-    IMAGE: espressif/idf:release-v5.5
     EXAMPLE_DIR: application/mcp_server_point
   parallel:
     matrix:

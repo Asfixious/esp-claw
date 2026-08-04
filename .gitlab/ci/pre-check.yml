@@ -7,7 +7,7 @@ pre_check_agent_framework:
     - .rules:pre_check:agent_framework
   script:
     - apt-get update
-    - apt-get install --yes --no-install-recommends pkg-config
+    - apt-get install --yes --no-install-recommends pkg-config zstd
     - rustup component add --toolchain stable rustfmt clippy
     - rustup toolchain install nightly --profile minimal
     - cargo +stable install cargo-public-api --locked

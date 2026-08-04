@@ -12,10 +12,10 @@ Builds the complete prebuilt archive set for:
   esp32s3, esp32c5, esp32p4, and esp32s31
 
 The archives are written to:
-  crates/claw-cabi/prebuilt/<idf-target>/libclaw_cabi.a
+  crates/claw-cabi/prebuilt/<idf-target>/libclaw_cabi.a.zst
 
-With --check, newly built archives are compared byte-for-byte with the
-committed prebuilt set without overwriting it.
+With --check, committed archives are decompressed and compared byte-for-byte
+with newly built archives without overwriting the committed set.
 
 Set CLAW_DEBUG=1 to build the rich-logging variant. Production logging is used
 otherwise.
@@ -40,6 +40,11 @@ fi
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "ERROR: cargo is not available; install Rust before building" >&2
+    exit 1
+fi
+
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "ERROR: zstd is required to manage prebuilt archives" >&2
     exit 1
 fi
 
@@ -117,24 +122,30 @@ for idf_target in "${idf_targets[@]}"; do
     esac
 
     cargo_archive="${CARGO_TARGET_DIR}/${rust_target}/release/libclaw_cabi.a"
-    output_archive="${output_root}/${idf_target}/libclaw_cabi.a"
+    output_archive="${output_root}/${idf_target}/libclaw_cabi.a.zst"
     if (( check_only )); then
         if [[ ! -f "$output_archive" ]]; then
             echo "ERROR: committed archive is missing: $output_archive" >&2
             exit 1
         fi
-        if ! cmp -s "$cargo_archive" "$output_archive"; then
+        temporary_archive="$(mktemp "${TMPDIR:-/tmp}/libclaw_cabi.${idf_target}.XXXXXX.a")"
+        trap 'rm -f "$temporary_archive"' EXIT
+        zstd -d -f -q "$output_archive" -o "$temporary_archive"
+        if ! cmp -s "$cargo_archive" "$temporary_archive"; then
             echo "ERROR: prebuilt archive is stale: $output_archive" >&2
             echo "Run ./build-idf-staticlib.sh and commit all four archives." >&2
             exit 1
         fi
+        rm -f "$temporary_archive"
+        trap - EXIT
         echo "Matched: $output_archive"
     else
         output_dir="${output_root}/${idf_target}"
         mkdir -p "$output_dir"
         temporary_archive="$(mktemp "${output_archive}.tmp.XXXXXX")"
         trap 'rm -f "$temporary_archive"' EXIT
-        install -m 0644 "$cargo_archive" "$temporary_archive"
+        zstd -19 -T1 -f -q "$cargo_archive" -o "$temporary_archive"
+        chmod 0644 "$temporary_archive"
         mv -f "$temporary_archive" "$output_archive"
         trap - EXIT
         echo "Built: $output_archive"

@@ -21,19 +21,40 @@ claw_resolve_idf_libc_target(claw_idf_libc_target)
 set(claw_rust_profile "release")
 set(CLAW_RUST_PREBUILT_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/crates/claw-cabi/prebuilt" CACHE PATH
-    "Root containing per-IDF-target prebuilt libclaw_cabi.a archives")
+    "Root containing per-IDF-target prebuilt libclaw_cabi.a.zst archives")
 
 if(CLAW_RUST_PREBUILT_DIR)
     get_filename_component(claw_rust_prebuilt_dir
         "${CLAW_RUST_PREBUILT_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
-    set(claw_rust_lib
-        "${claw_rust_prebuilt_dir}/${IDF_TARGET}/libclaw_cabi.a")
-    if(NOT EXISTS "${claw_rust_lib}")
+    set(claw_rust_prebuilt_archive
+        "${claw_rust_prebuilt_dir}/${IDF_TARGET}/libclaw_cabi.a.zst")
+    if(NOT EXISTS "${claw_rust_prebuilt_archive}")
         message(FATAL_ERROR
-            "Prebuilt Rust archive not found: ${claw_rust_lib}. "
+            "Prebuilt Rust archive not found: ${claw_rust_prebuilt_archive}. "
             "Run agent-framework/build-idf-staticlib.sh first.")
     endif()
-    message(STATUS "Using prebuilt Claw Rust archive: ${claw_rust_lib}")
+
+    find_program(CLAW_ZSTD_EXECUTABLE NAMES zstd)
+    if(NOT CLAW_ZSTD_EXECUTABLE)
+        message(FATAL_ERROR
+            "zstd is required to unpack ${claw_rust_prebuilt_archive}")
+    endif()
+
+    set(claw_rust_unpack_dir
+        "${CMAKE_CURRENT_BINARY_DIR}/claw-rust-prebuilt/${IDF_TARGET}")
+    set(claw_rust_lib "${claw_rust_unpack_dir}/libclaw_cabi.a")
+    add_custom_command(
+        OUTPUT "${claw_rust_lib}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${claw_rust_unpack_dir}"
+        COMMAND "${CLAW_ZSTD_EXECUTABLE}" -d -f -q
+                "${claw_rust_prebuilt_archive}" -o "${claw_rust_lib}"
+        DEPENDS "${claw_rust_prebuilt_archive}"
+        COMMENT "Unpacking prebuilt Claw Rust archive (${IDF_TARGET})"
+        VERBATIM
+    )
+    add_custom_target(claw_rust_unpack DEPENDS "${claw_rust_lib}")
+    message(STATUS
+        "Using compressed prebuilt Claw Rust archive: ${claw_rust_prebuilt_archive}")
 else()
     set(claw_rust_lib
         "${CMAKE_CURRENT_SOURCE_DIR}/target/${claw_rust_target}/${claw_rust_profile}/libclaw_cabi.a")
@@ -68,7 +89,10 @@ set_target_properties(claw_cabi_rust PROPERTIES
 
 target_link_libraries(${COMPONENT_LIB} PUBLIC claw_cabi_rust)
 
-if(NOT CLAW_RUST_PREBUILT_DIR)
+if(CLAW_RUST_PREBUILT_DIR)
+    add_dependencies(claw_cabi_rust claw_rust_unpack)
+    add_dependencies(${COMPONENT_LIB} claw_rust_unpack)
+else()
     add_dependencies(claw_cabi_rust claw_rust_build)
     add_dependencies(${COMPONENT_LIB} claw_rust_build)
 endif()

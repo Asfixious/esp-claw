@@ -68,10 +68,11 @@ Build the complete Rust runtime as a target-specific static archive:
 
 Each run builds archives for `esp32s3`, `esp32c5`, `esp32p4`, and `esp32s31`.
 The archives are written to
-`crates/claw-cabi/prebuilt/<idf-target>/libclaw_cabi.a`. These archives are
-committed with the repository, and ESP-IDF links the archive matching
-`IDF_TARGET` by default. No Rust toolchain is needed unless the Rust sources
-change.
+`crates/claw-cabi/prebuilt/<idf-target>/libclaw_cabi.a.zst`. These compressed
+archives are committed with the repository. During an ESP-IDF build, CMake
+uses `zstd` to unpack the archive matching `IDF_TARGET` into the build
+directory before linking it. No Rust toolchain is needed unless the Rust
+sources change.
 
 CI verifies that all committed archives match the Rust sources without
 overwriting them:
@@ -87,8 +88,9 @@ idf.py -C ../application/edge_agent build
 ```
 
 Set `CLAW_DEBUG=1` while running the archive build script to enable rich
-logging. To bypass the committed archives during Rust development, configure
-with an empty prebuilt directory:
+logging. Both archive generation and normal firmware builds require the
+`zstd` command. To bypass the committed archives during Rust development,
+configure with an empty prebuilt directory:
 
 ```bash
 idf.py \

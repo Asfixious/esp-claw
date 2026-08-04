@@ -45,6 +45,8 @@
     EXAMPLE_BOARD_PATH: "boards"
     BUILD_RECURSIVE: "1"
   script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends zstd
     - pip install idf_build_apps esp-bmgr-assist
     - |
       if [ -n "${EXAMPLE_BOARD_BRAND}" ]; then

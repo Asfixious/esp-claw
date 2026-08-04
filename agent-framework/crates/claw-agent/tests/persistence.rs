@@ -17,13 +17,11 @@ use claw_agent::tools::{
 };
 use claw_agent::{AgentPersistenceConfig, AgentSystem, Message, SessionId, SessionPersistence};
 use claw_interface::{
-    BlockingHttpAdapter, ClawFs, DiskFs, ImmediateTimer, SharedScriptHttp, StdThread, TokioExecutor,
+    BlockingHttpAdapter, Cancel, ClawFs, ClawHttp, DiskFs, HttpJsonRequest, HttpResponse,
+    HttpResponseFuture, HttpStatusCode, ImmediateTimer, SharedScriptHttp, StdThread, TokioExecutor,
 };
 #[cfg(feature = "multiagent")]
-use claw_interface::{
-    Cancel, ClawHttp, ClawTimer, HttpError, HttpJsonRequest, HttpResponse, HttpResponseFuture,
-    HttpStatusCode, SleepOutcome, TimerFuture,
-};
+use claw_interface::{ClawTimer, HttpError, SleepOutcome, TimerFuture};
 use futures_lite::future::block_on;
 use futures_lite::StreamExt;
 use serde_json::{json, Value};
@@ -32,9 +30,11 @@ use support::{install_script, llm_config, serialize_script, Sse};
 use tempdir::TempDir;
 
 type DiskSystem = AgentSystem<DiskFs, Sse<BlockingHttpAdapter<SharedScriptHttp>>, ImmediateTimer>;
+type CancelledToolSystem = AgentSystem<DiskFs, Sse<CancelledToolHttp>, ImmediateTimer>;
 #[cfg(feature = "multiagent")]
 type PersistentSubagentSystem = AgentSystem<DiskFs, Sse<PersistentSubagentHttp>, PendingTimer>;
 
+static CANCELLED_TOOL_REQUESTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 #[cfg(feature = "multiagent")]
 static PERSISTENT_SUBAGENT_POLLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -159,6 +159,48 @@ fn root_agent_inflight_toolcall_is_on_disk_before_the_tool_body_can_finish() {
 
     let completed = read_payload(&path);
     assert_eq!(completed["inflight_toolcalls"], json!([]));
+}
+
+#[test]
+fn cancelling_an_inflight_tool_does_not_poison_reloaded_request_history() {
+    let temp = TempDir::new("cancelled-inflight-tool").unwrap();
+    let root = temp.path().to_string_lossy().into_owned();
+    cancelled_tool_requests().clear();
+
+    let gate = Arc::new(ToolGate::default());
+    let system = build_cancelled_tool_system(
+        &root,
+        [ToolGroup::new(
+            "test",
+            true,
+            [Tool::from_async(BlockingTool {
+                gate: Arc::clone(&gate),
+            })],
+        )],
+    );
+    system.start_all().unwrap();
+    let session = system.new_session(SessionPersistence::Persistent).unwrap();
+    let (control, mut events) = system.open_session(session).unwrap();
+    block_on(control.append(Message::text("run the blocking tool"))).unwrap();
+
+    wait_until(&gate.started, "blocking tool did not start");
+    block_on(control.cancel()).unwrap();
+    let _ = support::drain_until_turn_ended(&mut events);
+    drop(control);
+    drop(events);
+    drop(system);
+
+    let system = build_cancelled_tool_system(&root, std::iter::empty());
+    system.start_all().unwrap();
+    let (control, mut events) = system.open_session(session).unwrap();
+    block_on(control.append(Message::text("continue after restart"))).unwrap();
+    let _ = support::drain_until_turn_ended(&mut events);
+
+    let requests = cancelled_tool_requests();
+    assert_eq!(requests.len(), 2, "unexpected agent requests: {requests:?}");
+    let request: Value = serde_json::from_str(&requests[1]).unwrap();
+    let messages = request["messages"].as_array().unwrap();
+    assert_tool_calls_are_closed(messages);
 }
 
 #[test]
@@ -413,6 +455,108 @@ fn build_configured_system_with_tool_groups(
         .link_api(llm_config(), claw_agent::ApiPurpose::RootAgent, true)
         .unwrap();
     system
+}
+
+fn build_cancelled_tool_system(
+    root: &str,
+    tool_groups: impl IntoIterator<Item = ToolGroup>,
+) -> CancelledToolSystem {
+    let system = CancelledToolSystem::with_tool_groups::<StdThread, TokioExecutor>(
+        DiskFs::absolute(),
+        AgentPersistenceConfig {
+            persistence_root: root.to_owned(),
+            skill_roots: Vec::new(),
+        },
+        tool_groups,
+    )
+    .unwrap();
+    system
+        .link_api(llm_config(), claw_agent::ApiPurpose::RootAgent, true)
+        .unwrap();
+    system
+}
+
+#[derive(Default)]
+struct CancelledToolHttp;
+
+impl ClawHttp for CancelledToolHttp {
+    fn post_json<'a>(
+        &'a mut self,
+        request: &'a HttpJsonRequest<'a>,
+        _cancel: Cancel<'a>,
+    ) -> HttpResponseFuture<'a> {
+        let body = request.body.to_owned();
+        Box::pin(async move {
+            let response = if is_agent_iteration_request(&body) {
+                let request_number = {
+                    let mut requests = cancelled_tool_requests();
+                    requests.push(body);
+                    requests.len()
+                };
+                if request_number == 1 {
+                    assistant_tool_call("blocking_tool", json!({ "value": "held" }))
+                } else {
+                    support::assistant_text("continued")
+                }
+            } else {
+                support::assistant_text("[]")
+            };
+            Ok(HttpResponse {
+                status_code: HttpStatusCode::OK,
+                body: response,
+            })
+        })
+    }
+}
+
+fn is_agent_iteration_request(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value.get("tools").is_some() && value.get("response_format").is_none()
+}
+
+fn assert_tool_calls_are_closed(messages: &[Value]) {
+    let mut pending = Vec::new();
+    for message in messages {
+        let role = message["role"].as_str();
+        match role {
+            Some("assistant") => {
+                assert!(
+                    pending.is_empty(),
+                    "assistant message followed unclosed tool calls {pending:?}"
+                );
+                pending.extend(
+                    message["tool_calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|call| call["id"].as_str().map(str::to_owned)),
+                );
+            }
+            Some("tool") => {
+                let id = message["tool_call_id"].as_str().unwrap();
+                let Some(index) = pending.iter().position(|pending_id| pending_id == id) else {
+                    panic!("tool result {id:?} has no pending tool call");
+                };
+                pending.remove(index);
+            }
+            _ => assert!(
+                pending.is_empty(),
+                "{role:?} message followed unclosed tool calls {pending:?}"
+            ),
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "request ended with unclosed tool calls {pending:?}"
+    );
+}
+
+fn cancelled_tool_requests() -> std::sync::MutexGuard<'static, Vec<String>> {
+    CANCELLED_TOOL_REQUESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Default)]

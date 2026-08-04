@@ -155,6 +155,7 @@ pub claw_memory::transcript_store::Turn::id: core::option::Option<claw_memory::t
 pub claw_memory::transcript_store::Turn::messages: alloc::vec::Vec<serde_json::value::Value>
 pub struct claw_memory::transcript_store::TurnHandle
 impl claw_memory::transcript_store::TurnHandle
+pub fn claw_memory::transcript_store::TurnHandle::abandon(&mut self)
 pub fn claw_memory::transcript_store::TurnHandle::assistant(&self) -> core::result::Result<claw_memory::transcript_store::AssistantHandle<'_>, claw_memory::transcript_store::TurnError>
 pub fn claw_memory::transcript_store::TurnHandle::tool(&self, &str, bool) -> core::result::Result<claw_memory::transcript_store::ToolHandle<'_>, claw_memory::transcript_store::TurnError>
 pub fn claw_memory::transcript_store::TurnHandle::user(&self) -> core::result::Result<claw_memory::transcript_store::UserHandle<'_>, claw_memory::transcript_store::TurnError>
@@ -334,6 +335,7 @@ pub claw_memory::Turn::id: core::option::Option<claw_memory::transcript_store::T
 pub claw_memory::Turn::messages: alloc::vec::Vec<serde_json::value::Value>
 pub struct claw_memory::TurnHandle
 impl claw_memory::transcript_store::TurnHandle
+pub fn claw_memory::transcript_store::TurnHandle::abandon(&mut self)
 pub fn claw_memory::transcript_store::TurnHandle::assistant(&self) -> core::result::Result<claw_memory::transcript_store::AssistantHandle<'_>, claw_memory::transcript_store::TurnError>
 pub fn claw_memory::transcript_store::TurnHandle::tool(&self, &str, bool) -> core::result::Result<claw_memory::transcript_store::ToolHandle<'_>, claw_memory::transcript_store::TurnError>
 pub fn claw_memory::transcript_store::TurnHandle::user(&self) -> core::result::Result<claw_memory::transcript_store::UserHandle<'_>, claw_memory::transcript_store::TurnError>

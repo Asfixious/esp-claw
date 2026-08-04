@@ -500,7 +500,9 @@ impl<H: ClawHttp, Timer: ClawTimer> BaseAgent<H, Timer> {
 
     fn abandon_open_task(&mut self) {
         self.effect_inbox.clear();
-        drop(self.active_turn.take());
+        if let Some(mut turn) = self.active_turn.take() {
+            turn.abandon();
+        }
     }
 }
 

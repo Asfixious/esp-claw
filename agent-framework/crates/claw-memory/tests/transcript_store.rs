@@ -97,6 +97,49 @@ fn an_empty_turn_does_not_advance_turn_version() {
 }
 
 #[test]
+fn abandoning_a_turn_discards_it_without_persisting() {
+    let filesystem = Arc::new(MemFs::new());
+    let store =
+        TranscriptStore::new(Arc::clone(&filesystem), 10, "/transcript-abandoned-turn").unwrap();
+    let initial_turn_version = store.turn_version();
+    let mut turn = store.open_turn().unwrap();
+    {
+        let mut user = turn.user().unwrap();
+        user.append("do not retain this");
+    }
+    assert_eq!(store.turns().len(), 1);
+
+    turn.abandon();
+    drop(turn);
+
+    assert!(store.turns().is_empty());
+    assert_eq!(store.turn_version(), initial_turn_version);
+
+    let next_turn = store.open_turn().unwrap();
+    {
+        let mut user = next_turn.user().unwrap();
+        user.append("retain this");
+    }
+    drop(next_turn);
+    let turns = store.turns();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].id, Some(TurnId::new(1)));
+    assert_eq!(turns[0].messages[0]["content"], "retain this");
+    assert_eq!(store.turn_version(), initial_turn_version.saturating_add(1));
+    drop(store);
+
+    let reloaded = TranscriptStore::new(filesystem, 10, "/transcript-abandoned-turn").unwrap();
+    let turns = reloaded.turns();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].id, Some(TurnId::new(1)));
+    assert_eq!(turns[0].messages[0]["content"], "retain this");
+    assert_eq!(
+        reloaded.turn_version(),
+        initial_turn_version.saturating_add(1)
+    );
+}
+
+#[test]
 fn a_second_turn_cannot_open_until_the_handle_drops() {
     let store = store();
     let turn = store.clone().open_turn().unwrap();

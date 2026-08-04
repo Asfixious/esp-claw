@@ -34,7 +34,8 @@
 //! The unique [`TurnHandle`] returned by [`open_turn`](TranscriptStore::open_turn)
 //! owns one turn. [`UserHandle`], [`AssistantHandle`], and [`ToolHandle`] append
 //! the role-specific content; dropping a child handle finishes that message.
-//! Dropping the turn commits it and writes it to the injected filesystem.
+//! Dropping the turn commits it and writes it to the injected filesystem unless
+//! the owner first marks it abandoned.
 //! In-progress content remains visible through [`Transcript::turns`] as the
 //! trailing turn with no id.
 //!
@@ -397,8 +398,9 @@ impl<F: ClawFs> Drop for TranscriptStore<F> {
 /// Build one with [`TranscriptStore::new`], append turns through the [`TurnHandle`]
 /// returned by [`open_turn`](Self::open_turn), and read the turn-structured
 /// transcript with [`turns`](Self::turns). Dropping a non-empty turn persists it
-/// immediately; dropping the store retries any pending failed write. Drive a
-/// single store from one thread.
+/// immediately unless [`TurnHandle::abandon`] marked it for discard; dropping
+/// the store retries any pending failed write. Drive a single store from one
+/// thread.
 ///
 /// # Examples
 ///
@@ -629,7 +631,8 @@ impl<F: ClawFs> TranscriptStore<F> {
 
     /// Open a turn. Build each message through the nested handle returned by
     /// [`TurnHandle::user`], [`TurnHandle::assistant`], or
-    /// [`TurnHandle::tool`]. Dropping the turn commits and persists the group.
+    /// [`TurnHandle::tool`]. Dropping the turn commits and persists the group
+    /// unless [`TurnHandle::abandon`] marked it for discard.
     ///
     /// Only one turn may be open at a time. A second overlapping call returns
     /// [`TurnError::AlreadyOpen`] rather than permitting messages to interleave.
@@ -654,6 +657,7 @@ impl<F: ClawFs> TranscriptStore<F> {
         let persist_state = Arc::clone(&state);
         Ok(TurnHandle {
             state,
+            disposition: TurnDisposition::Commit,
             on_drop: Some(Box::new(move || {
                 persist(
                     filesystem.as_ref(),
@@ -724,8 +728,8 @@ impl<F: ClawFs> Transcript for TranscriptStore<F> {
 ///
 /// Open role-specific child scopes with [`user`](Self::user),
 /// [`assistant`](Self::assistant), and [`tool`](Self::tool). Each child finishes
-/// its message when dropped. Dropping this handle commits the complete turn and
-/// persists the committed turn.
+/// its message when dropped. Dropping this handle commits and persists the turn
+/// unless [`abandon`](Self::abandon) marked it for discard.
 ///
 /// # Examples
 ///
@@ -754,13 +758,28 @@ impl<F: ClawFs> Transcript for TranscriptStore<F> {
 /// assert_eq!(turns.last().map(|t| (t.id, t.messages.len())), Some((None, 3)));
 /// drop(turn); // commits and persists
 /// ```
-#[must_use = "the turn is committed and persisted when this handle is dropped"]
+#[must_use = "the turn is finalized when this handle is dropped"]
 pub struct TurnHandle {
     state: Arc<Mutex<StoreState>>,
+    disposition: TurnDisposition,
     on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnDisposition {
+    Commit,
+    Abandon,
+}
+
 impl TurnHandle {
+    /// Mark this turn to be discarded when the handle drops.
+    ///
+    /// Abandoning preserves RAII cleanup while preventing the open messages from
+    /// becoming a committed or persisted transcript turn.
+    pub fn abandon(&mut self) {
+        self.disposition = TurnDisposition::Abandon;
+    }
+
     /// Open a user-message scope.
     pub fn user(&self) -> Result<UserHandle<'_>, TurnError> {
         start_message(self.state.as_ref(), MessageDraft::User(String::new()))?;
@@ -807,6 +826,10 @@ impl Drop for TurnHandle {
             let Some(mut turn) = state.open_turn.take() else {
                 return;
             };
+            if self.disposition == TurnDisposition::Abandon {
+                state.invalidate_turns_cache();
+                return;
+            }
             turn.finish_message();
             if turn.messages.is_empty() {
                 false

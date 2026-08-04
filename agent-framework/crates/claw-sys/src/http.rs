@@ -147,11 +147,24 @@ mod espidf_driver {
         keep_alive_interval: c_int,
         keep_alive_count: c_int,
         if_name: *mut c_void,
-        // Remaining bitfields/ports/cfg are left out; esp_http_client only reads
-        // them when the corresponding feature flags are set, none of which we
-        // enable. The struct is zero-initialized, so trailing fields read as 0.
+        // Remaining optional fields and addr_type are left out. The C-side ABI
+        // guard verifies that they still fit here; zero initialization keeps
+        // every omitted option disabled and addr_type at its default value.
         _reserved: [u8; 64],
     }
+
+    // `claw_rs_idf_compat.c` asserts the corresponding ESP-IDF C layout. Keep
+    // these assertions in Rust as the other half of that ABI contract.
+    const _: [(); 208] = [(); core::mem::size_of::<esp_http_client_config_t>()];
+    const _: [(); 56] = [(); core::mem::offset_of!(esp_http_client_config_t, client_key_password)];
+    const _: [(); 92] = [(); core::mem::offset_of!(esp_http_client_config_t, event_handler)];
+    const _: [(); 96] = [(); core::mem::offset_of!(esp_http_client_config_t, transport_type)];
+    const _: [(); 100] = [(); core::mem::offset_of!(esp_http_client_config_t, buffer_size)];
+    const _: [(); 104] = [(); core::mem::offset_of!(esp_http_client_config_t, buffer_size_tx)];
+    const _: [(); 108] = [(); core::mem::offset_of!(esp_http_client_config_t, user_data)];
+    const _: [(); 112] = [(); core::mem::offset_of!(esp_http_client_config_t, is_async)];
+    const _: [(); 120] = [(); core::mem::offset_of!(esp_http_client_config_t, crt_bundle_attach)];
+    const _: [(); 124] = [(); core::mem::offset_of!(esp_http_client_config_t, keep_alive_enable)];
 
     extern "C" {
         fn esp_http_client_init(config: *const esp_http_client_config_t) -> *mut c_void;

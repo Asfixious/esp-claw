@@ -10,6 +10,7 @@ idf_component_register(
         "test_app_main.c"
         "test_claw_sys.c"
         "test_wifi.c"
+        "../../../csrc/claw_rs_idf_compat.c"
         "../../../csrc/claw_rs_log.c"
     INCLUDE_DIRS
         "."

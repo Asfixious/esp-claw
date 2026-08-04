@@ -53,6 +53,13 @@ uv run --script crates/claw-context/scripts/context_viewer.py
 
 ## Prebuilt ESP-IDF static library
 
+This framework supports **ESP-IDF v6.1.x only**. The currently validated SDK
+checkout is `release/v6.1` at commit
+`3e24f276fa9be527762c0c0891ad3fbb00029f06`. Firmware builds compile an IDF
+version guard and an `esp_http_client_config_t` ABI fingerprint; unsupported
+versions or incompatible v6.1 header changes fail the build rather than
+reaching device runtime with a misaligned Rust FFI struct.
+
 Build the complete Rust runtime as a target-specific static archive:
 
 ```bash

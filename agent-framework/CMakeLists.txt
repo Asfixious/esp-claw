@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS
+        "crates/claw-sys/csrc/claw_rs_idf_compat.c"
         "crates/claw-sys/csrc/claw_rs_log.c"
     INCLUDE_DIRS
         "crates/claw-cabi/include"

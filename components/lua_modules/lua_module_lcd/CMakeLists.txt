@@ -9,6 +9,7 @@ idf_component_register(
         esp_lcd_gc9107
         esp_lcd_gc9b71
         esp_lcd_gc9d01
+        esp_lcd_nt35510
         esp_lcd_co5300
         esp_lcd_spd2010
         esp_lcd_sh8601

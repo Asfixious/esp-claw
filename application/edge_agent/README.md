@@ -36,7 +36,7 @@ Skill manifests and built-in Lua scripts/docs are synced into `build/system_fs_i
 ### Prerequisites
 
 - ESP-IDF is installed and exported
-- `ESP-IDF v5.5.4` is recommended
+- `ESP-IDF v6.1` is required
 
 ```bash
 . <your-esp-idf-path>/export.sh

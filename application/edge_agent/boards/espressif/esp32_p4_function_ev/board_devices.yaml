@@ -58,7 +58,7 @@ devices:
         frequency: SDMMC_FREQ_HIGHSPEED
         bus_width: 4
         # If using slot 0, the pin must be configured as 0, the IO pins actually used are configured by the SDMMC driver
-        # For more details, please check https://github.com/espressif/esp-idf/blob/v5.5.1/components/esp_driver_sdmmc/src/sdmmc_host.c#L668
+        # For more details, please check https://github.com/espressif/esp-idf/blob/release/v6.1/components/esp_driver_sdmmc/src/sd_host_sdmmc.c#L1283
         pins:
           clk: 0
           cmd: 0

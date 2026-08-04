@@ -80,7 +80,7 @@ Use **`idf.py menuconfig`** to change **`APP_CLAW_CAP_*`**, Lua driver/module op
 
 ## Prerequisites
 
-- **ESP-IDF** installed and exported (developed against **v5.5.x**, e.g. 5.5.4).
+- **ESP-IDF v6.1** installed and exported.
 - Optional: `pip install esp-bmgr-assist` for board-manager CLI ergonomics.
 
 ```bash

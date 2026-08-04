@@ -18,7 +18,7 @@
 #include "esp_lcd_gc9d01.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_nt35510.h"
+#include "esp_lcd_nt35510.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_sh8601.h"

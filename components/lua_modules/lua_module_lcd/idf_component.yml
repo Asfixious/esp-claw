@@ -1,17 +1,21 @@
 dependencies:
   espressif/esp_lcd_gc9107:
-    version: "*"
-  esp_lcd_gc9b71:
-    version: "*"
-  esp_lcd_gc9d01:
-    version: "*"
-  esp_lcd_co5300:
-    version: "*"
-  esp_lcd_spd2010:
-    version: "*"
-  esp_lcd_sh8601:
-    version: "*"
-  esp_lcd_st77916:
-    version: "*"
-  esp_lcd_st77922:
-    version: "*"
+    version: "2.0.0"
+    override_path: "../../third_party/esp_lcd_gc9107"
+  espressif/esp_lcd_gc9b71:
+    version: "2.0.0~1"
+  espressif/esp_lcd_gc9d01:
+    version: "2.0.0"
+    override_path: "../../third_party/esp_lcd_gc9d01"
+  espressif/esp_lcd_nt35510:
+    version: "1.0.0"
+  espressif/esp_lcd_co5300:
+    version: "2.1.0"
+  espressif/esp_lcd_spd2010:
+    version: "2.0.0~1"
+  espressif/esp_lcd_sh8601:
+    version: "2.0.1~1"
+  espressif/esp_lcd_st77916:
+    version: "2.0.2"
+  espressif/esp_lcd_st77922:
+    version: "2.0.2"

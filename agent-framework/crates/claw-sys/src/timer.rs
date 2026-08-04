@@ -37,6 +37,10 @@ impl ClawTimer for EspIdfTimer {
 #[cfg(target_os = "espidf")]
 const ESP_OK: c_int = 0;
 
+/// Indefinite wait for ESP-IDF's `uint32_t` blocking timer-stop timeout.
+#[cfg(target_os = "espidf")]
+const PORT_MAX_DELAY: u32 = u32::MAX;
+
 /// `esp_timer_dispatch_t::ESP_TIMER_TASK`: dispatch the callback from the shared
 /// `esp_timer` service task (not an ISR).
 #[cfg(target_os = "espidf")]
@@ -65,14 +69,14 @@ extern "C" {
         out_handle: *mut EspTimerHandle,
     ) -> c_int;
     fn esp_timer_start_once(timer: EspTimerHandle, timeout_us: u64) -> c_int;
-    fn esp_timer_stop(timer: EspTimerHandle) -> c_int;
+    fn esp_timer_stop_blocking(timer: EspTimerHandle, timeout_ticks: u32) -> c_int;
     fn esp_timer_delete(timer: EspTimerHandle) -> c_int;
 }
 
 /// Shared between the future and the `esp_timer` callback. An extra `Arc` strong
 /// count is handed to the timer as its `arg` so the callback's pointer stays
-/// valid across the FFI boundary; it is reclaimed in `Drop` once the timer has
-/// been stopped and deleted.
+/// valid across the FFI boundary. The callback consumes that count when it
+/// runs; otherwise `Drop` reclaims it after synchronously stopping the timer.
 #[cfg(target_os = "espidf")]
 struct SleepState {
     fired: AtomicBool,
@@ -84,9 +88,15 @@ struct EspIdfSleep<'cancel> {
     cancel: Cancel<'cancel>,
     duration: Duration,
     state: Arc<SleepState>,
-    /// `Some` once the one-shot timer has been created and armed. Its presence
-    /// also tracks the extra `Arc` strong count handed to the timer.
-    handle: Option<EspTimerHandle>,
+    /// `Some` once the one-shot timer has been created and armed. The raw state
+    /// pointer carries the extra `Arc` strong count handed to the callback.
+    registration: Option<TimerRegistration>,
+}
+
+#[cfg(target_os = "espidf")]
+struct TimerRegistration {
+    handle: EspTimerHandle,
+    state_arg: *const SleepState,
 }
 
 #[cfg(target_os = "espidf")]
@@ -99,7 +109,7 @@ impl<'cancel> EspIdfSleep<'cancel> {
                 fired: AtomicBool::new(duration == Duration::ZERO),
                 waker: Mutex::new(None),
             }),
-            handle: None,
+            registration: None,
         }
     }
 
@@ -108,17 +118,17 @@ impl<'cancel> EspIdfSleep<'cancel> {
     /// `Completed` (skip the backoff) instead of hanging — a create/arm failure
     /// is surfaced, never fatal.
     fn start(&mut self) -> bool {
-        if self.handle.is_some() {
+        if self.registration.is_some() {
             return true;
         }
-        // Hand an extra strong count to the callback via `arg`; reclaimed in
-        // `Drop` once the timer is stopped and deleted.
+        // Hand an extra strong count to the callback via `arg`; the callback
+        // consumes it if fired, otherwise `Drop` reclaims it after stopping.
         let arg = Arc::into_raw(Arc::clone(&self.state)) as *mut c_void;
         let create_args = EspTimerCreateArgs {
             callback: Some(timer_callback),
             arg,
             dispatch_method: ESP_TIMER_TASK,
-            name: b"claw_timer\0".as_ptr() as *const c_char,
+            name: c"claw_timer".as_ptr(),
             skip_unhandled_events: false,
         };
         let mut handle: EspTimerHandle = core::ptr::null_mut();
@@ -135,7 +145,10 @@ impl<'cancel> EspIdfSleep<'cancel> {
             }
             return false;
         }
-        self.handle = Some(handle);
+        self.registration = Some(TimerRegistration {
+            handle,
+            state_arg: arg as *const SleepState,
+        });
         true
     }
 }
@@ -170,29 +183,44 @@ impl Future for EspIdfSleep<'_> {
 #[cfg(target_os = "espidf")]
 impl Drop for EspIdfSleep<'_> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            // Stop + delete first: for `ESP_TIMER_TASK` dispatch `esp_timer_delete`
-            // waits for any in-flight callback to finish, so no callback can run
-            // (or touch `state`) after this returns. Only then reclaim the strong
-            // count handed to the timer.
-            unsafe {
-                esp_timer_stop(handle);
-                esp_timer_delete(handle);
-                drop(Arc::from_raw(Arc::as_ptr(&self.state)));
+        if let Some(registration) = self.registration.take() {
+            // `esp_timer_stop()` and `esp_timer_delete()` do not wait for a
+            // callback that the timer task has already dispatched. IDF 6.1's
+            // blocking stop supplies the synchronization required before a
+            // callback argument can be reclaimed.
+            let stop_result =
+                unsafe { esp_timer_stop_blocking(registration.handle, PORT_MAX_DELAY) };
+            let delete_result = unsafe { esp_timer_delete(registration.handle) };
+            if delete_result != ESP_OK {
+                log::error!("failed to delete ESP timer: error={delete_result}");
+            }
+
+            // The callback reconstructs and consumes the raw strong count
+            // before publishing `fired`. If it never started, a successful
+            // blocking stop guarantees it never can, so Drop owns the count.
+            // On an unexpected stop failure, retain the count rather than risk
+            // freeing memory that a callback may still dereference.
+            if stop_result == ESP_OK && !self.state.fired.load(Ordering::Acquire) {
+                drop(unsafe { Arc::from_raw(registration.state_arg) });
+            } else if stop_result != ESP_OK {
+                log::error!(
+                    "failed to synchronize ESP timer callback; retaining callback state: error={stop_result}"
+                );
             }
         }
     }
 }
 
 /// One-shot `esp_timer` callback (runs on the shared timer task): mark the sleep
-/// fired and wake its task. The strong count backing `arg` is owned by the timer
-/// until `Drop` reclaims it, so the pointer is valid here.
+/// fired and wake its task. Reconstructing the callback's `Arc` before
+/// publishing `fired` keeps the state alive even if waking immediately drops
+/// the future on another task.
 #[cfg(target_os = "espidf")]
 extern "C" fn timer_callback(arg: *mut c_void) {
     if arg.is_null() {
         return;
     }
-    let state = unsafe { &*(arg as *const SleepState) };
+    let state = unsafe { Arc::from_raw(arg as *const SleepState) };
     state.fired.store(true, Ordering::Release);
     let waker = lock(&state.waker).take();
     if let Some(waker) = waker {

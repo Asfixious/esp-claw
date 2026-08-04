@@ -7,6 +7,7 @@ idf_component_register(
     REQUIRES
         claw_cap
         esp_http_client
+        esp_timer
         esp-tls
         mbedtls
         freertos
@@ -62,7 +63,7 @@ endif()
 add_library(claw_cabi_rust STATIC IMPORTED GLOBAL)
 set_target_properties(claw_cabi_rust PROPERTIES
     IMPORTED_LOCATION "${claw_rust_lib}"
-    INTERFACE_LINK_LIBRARIES "idf::esp_http_client;idf::esp-tls;idf::mbedtls;${claw_idf_libc_target};idf::freertos;idf::pthread"
+    INTERFACE_LINK_LIBRARIES "idf::esp_http_client;idf::esp_timer;idf::esp-tls;idf::mbedtls;${claw_idf_libc_target};idf::freertos;idf::pthread"
 )
 
 target_link_libraries(${COMPONENT_LIB} PUBLIC claw_cabi_rust)

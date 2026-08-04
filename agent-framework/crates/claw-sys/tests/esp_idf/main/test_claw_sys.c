@@ -24,6 +24,11 @@ TEST_CASE("claw_sys EspIdfThread spawns, runs and joins a worker", "[claw_sys]")
     TEST_ASSERT_EQUAL_INT(0, claw_sys_selftest_thread());
 }
 
+TEST_CASE("claw_sys EspIdfTimer safely drops armed futures", "[claw_sys][timer]")
+{
+    TEST_ASSERT_EQUAL_INT(0, claw_sys_selftest_timer_drop_race());
+}
+
 TEST_CASE("claw_sys sync ClawHttp POST returns HTTP 200", "[claw_sys][network]")
 {
     char body[768] = {0};

@@ -23,6 +23,9 @@ int claw_sys_selftest_log(void);
 /* Spawn + join an EspIdfThread worker and verify its side effect. Returns 0 on success. */
 int claw_sys_selftest_thread(void);
 
+/* Repeatedly race one-shot timer dispatch against dropping the sleep future. */
+int claw_sys_selftest_timer_drop_race(void);
+
 /*
  * Blocking POST via the synchronous ClawHttp seam. Returns the HTTP status code
  * (e.g. 200) on a completed request, or a negative selftest error. The response

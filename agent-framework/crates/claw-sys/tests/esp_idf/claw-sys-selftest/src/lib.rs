@@ -14,6 +14,8 @@
 use core::cell::Cell;
 use core::ffi::{c_char, c_int};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use std::ffi::CStr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,8 +24,8 @@ use claw_interface::http::{
     blocking::ClawHttp as BlockingClawHttp, Cancel, ClawHttp, HttpAuth, HttpError, HttpJsonRequest,
     HttpStatusCode, StreamingHttp,
 };
-use claw_interface::{ClawThread, CoreAffinity, Priority};
-use claw_sys::{EspIdfHttp, EspIdfThread};
+use claw_interface::{ClawThread, ClawTimer, CoreAffinity, Priority};
+use claw_sys::{EspIdfHttp, EspIdfThread, EspIdfTimer};
 use futures_lite::StreamExt as _;
 
 use log::Level;
@@ -46,6 +48,8 @@ const ERR_STREAM_BODY: c_int = -8;
 const ERR_STREAM_CANCEL: c_int = -9;
 /// The same transport could not complete another HTTP exchange after streaming.
 const ERR_STREAM_REUSE: c_int = -10;
+/// No timer could be armed during the timer-drop stress scenario.
+const ERR_TIMER_ARM: c_int = -11;
 
 /// Borrow a C string as `&str`, or `None` if null / not UTF-8.
 ///
@@ -115,6 +119,32 @@ pub extern "C" fn claw_sys_selftest_thread() -> c_int {
         OK
     } else {
         ERR_THREAD_RESULT
+    }
+}
+
+/// Repeatedly arm a very short one-shot timer and immediately drop its future.
+/// This exercises the race where the timer task dispatches the callback while
+/// cancellation destroys the losing future branch.
+#[no_mangle]
+pub extern "C" fn claw_sys_selftest_timer_drop_race() -> c_int {
+    const ATTEMPTS: u32 = 2_000;
+
+    let mut armed = 0_u32;
+    for _ in 0..ATTEMPTS {
+        let cancel = AtomicBool::new(false);
+        let mut timer = EspIdfTimer;
+        let mut sleep = timer.sleep(Duration::from_micros(50), Cancel::new(&cancel));
+        let mut context = Context::from_waker(Waker::noop());
+        if matches!(sleep.as_mut().poll(&mut context), Poll::Pending) {
+            armed = armed.saturating_add(1);
+        }
+        drop(sleep);
+    }
+
+    if armed == 0 {
+        ERR_TIMER_ARM
+    } else {
+        OK
     }
 }
 

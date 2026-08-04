@@ -28,7 +28,7 @@ default-members = [
 # staticlib carries real object code that links cleanly into the image.
 [profile.release]
 panic = "abort"
-opt-level = "s"
+opt-level = "z"
 codegen-units = 1
 lto = false
 

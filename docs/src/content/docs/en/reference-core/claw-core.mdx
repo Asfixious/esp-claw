@@ -96,11 +96,12 @@ AgentSystem snapshots the enabled LLM-visible C capabilities as Rust tools durin
 
 The `agent` capability is system-only and is not marked callable by the LLM, preventing recursive self-invocation.
 
+Reasoning deltas are forwarded without an agent-framework byte cap.
+
 ## Compile-time features
 
 `claw-agent` is the runtime-shape feature boundary:
 
-- Exactly one of `reasoning_short`, `reasoning_medium`, or `reasoning_long` selects the accumulated reasoning-byte cap.
 - `stage_verbose` forwards detailed stage support to `claw-core`.
 - `multiagent` compiles the Session-scoped subagent graph and lifecycle tools.
 - `cache_profile` enables provider token/cache usage diagnostics.
@@ -112,7 +113,7 @@ The `agent` capability is system-only and is not marked callable by the LLM, pre
 - `rich_logging` installs structured tracing and compiles duplicate plain-log callsites out.
 - `cache_profile` changes the C event ABI by enabling `USAGE`.
 
-The firmware CMake build currently selects `prod_logging` and `claw-agent/reasoning_medium`.
+The firmware CMake build currently selects `prod_logging`.
 
 ## Error model
 

@@ -90,7 +90,7 @@ for rust_target in "${rust_targets[@]}"; do
         --release \
         --package claw-cabi \
         --no-default-features \
-        --features "${logging_feature},claw-agent/reasoning_medium" \
+        --features "${logging_feature}" \
         --target "$rust_target" \
         -Z build-std=std,panic_abort \
         "${build_std_feature_args[@]}"

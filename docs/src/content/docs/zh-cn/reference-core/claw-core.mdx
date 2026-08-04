@@ -96,11 +96,12 @@ AgentSystem 初始化时会将启用且对 LLM 可见的 C capabilities 快照�
 
 `agent` capability 仅供系统调用，不标记为 LLM callable，从而防止递归自调用。
 
+Reasoning delta 会完整转发，agent framework 不设置字节上限。
+
 ## 编译期 features
 
 `claw-agent` 是 runtime shape 的 feature 边界：
 
-- `reasoning_short`、`reasoning_medium`、`reasoning_long` 必须三选一，用于设置累计 reasoning 字节上限。
 - `stage_verbose` 将详细 stage 支持传递给 `claw-core`。
 - `multiagent` 编译 Session-scoped subagent graph 与 lifecycle tools。
 - `cache_profile` 启用 provider token/cache usage diagnostics。
@@ -112,7 +113,7 @@ AgentSystem 初始化时会将启用且对 LLM 可见的 C capabilities 快照�
 - `rich_logging` 安装 structured tracing，并在编译期移除重复 plain-log callsites。
 - `cache_profile` 通过启用 `USAGE` 改变 C event ABI。
 
-固件 CMake build 当前选择 `prod_logging` 与 `claw-agent/reasoning_medium`。
+固件 CMake build 当前选择 `prod_logging`。
 
 ## 错误模型
 

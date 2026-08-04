@@ -11,14 +11,12 @@ run() {
 workspace_flags=(
     --workspace
     --all-targets
-    # Avoid unifying claw-core's reasoning_short default with claw-agent's
-    # reasoning_medium default. claw-core gets its own tier matrix below.
-    --exclude
-    claw-core
 )
 
 feature_packages=(
+    claw-agent
     claw-api
+    claw-core
     claw-persistence
     claw-context
     claw-interface
@@ -47,12 +45,6 @@ trace_ceiling_features=(
     trace_max_info
     trace_max_debug
     trace_max_trace
-)
-
-reasoning_tier_features=(
-    reasoning_short
-    reasoning_medium
-    reasoning_long
 )
 
 run_package_all_features() {
@@ -92,42 +84,6 @@ run_claw_log_feature_matrix() {
     done
 }
 
-run_claw_core_feature_matrix() {
-    local cargo_cmd="$1"
-    local feature
-
-    # claw-core's reasoning tier features are mutually exclusive. Exercise each
-    # tier individually with the remaining feature enabled instead of asking
-    # Cargo to unify impossible combinations via --all-features.
-    for feature in "${reasoning_tier_features[@]}"; do
-        if [[ "$cargo_cmd" == "clippy" ]]; then
-            run cargo "$cargo_cmd" -p claw-core --all-targets --no-default-features --features "$feature multiagent intrusive-observability" -- -D warnings
-        else
-            run cargo "$cargo_cmd" -p claw-core --all-targets --no-default-features --features "$feature multiagent intrusive-observability"
-        fi
-    done
-}
-
-run_claw_agent_feature_matrix() {
-    local cargo_cmd="$1"
-    local feature
-
-    # claw-agent is the public feature boundary and forwards the same exclusive
-    # reasoning tiers to claw-core. Exercise one complete shape at a time.
-    for feature in "${reasoning_tier_features[@]}"; do
-        if [[ "$cargo_cmd" == "clippy" ]]; then
-            run cargo "$cargo_cmd" -p claw-agent --all-targets \
-                --no-default-features \
-                --features "$feature multiagent cache_profile intrusive-observability" \
-                -- -D warnings
-        else
-            run cargo "$cargo_cmd" -p claw-agent --all-targets \
-                --no-default-features \
-                --features "$feature multiagent cache_profile intrusive-observability"
-        fi
-    done
-}
-
 run_claw_cabi_feature_matrix() {
     local cargo_cmd="$1"
     local features
@@ -148,19 +104,13 @@ run_claw_cabi_feature_matrix() {
 run cargo fmt --all --check
 run cargo clippy "${workspace_flags[@]}" -- -D warnings
 run_package_all_features clippy
-run_claw_agent_feature_matrix clippy
 run_claw_cabi_feature_matrix clippy
 run_claw_log_feature_matrix clippy
-run_claw_core_feature_matrix clippy
 run cargo check "${workspace_flags[@]}"
 run_package_all_features check
-run_claw_agent_feature_matrix check
 run_claw_cabi_feature_matrix check
 run_claw_log_feature_matrix check
-run_claw_core_feature_matrix check
 run cargo test "${workspace_flags[@]}"
 run_package_all_features test
-run_claw_agent_feature_matrix test
 run_claw_cabi_feature_matrix test
 run_claw_log_feature_matrix test
-run_claw_core_feature_matrix test

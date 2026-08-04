@@ -48,7 +48,7 @@ else()
     add_custom_target(claw_rust_build
         BYPRODUCTS "${claw_rust_lib}"
         COMMAND cargo +esp build --release -p claw-cabi
-                --features ${claw_rust_logging_feature},claw-agent/reasoning_medium
+                --features ${claw_rust_logging_feature}
                 --target ${claw_rust_target}
                 -Z build-std=std,panic_abort
                 ${claw_rust_build_std_feature_args}

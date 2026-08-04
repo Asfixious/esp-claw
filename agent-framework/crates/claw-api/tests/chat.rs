@@ -66,6 +66,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// `tracing` caches callsite interest process-wide, while these tests install
+// subscribers only for the current thread. Keep async chat calls serial so an
+// untraced call on another test thread cannot register a shared callsite as
+// disabled while a trace assertion is running.
+static ASYNC_CHAT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Clone, Default)]
 struct RecordingTraceSink(Arc<Mutex<Vec<(Level, String)>>>);
 
@@ -242,6 +248,7 @@ fn blocking_chat_requires_config() {
 
 #[test]
 fn async_chat_requires_config() {
+    let _async_chat_guard = lock(&ASYNC_CHAT_TEST_LOCK);
     let http = MockHttp::new("unused");
     let mut api = ClawApiAsync::new(Owned(http), ImmediateTimer);
     let messages = json!([{"role": "user", "content": "hello"}]);
@@ -334,6 +341,7 @@ fn openai_chat_profiles_cache_usage() -> TestResult {
 
 #[test]
 fn async_openai_chat_text() -> TestResult {
+    let _async_chat_guard = lock(&ASYNC_CHAT_TEST_LOCK);
     let http =
         MockHttp::new(r#"{"choices":[{"message":{"role":"assistant","content":"hi async"}}]}"#);
     install_mock_http(Arc::clone(&http));
@@ -840,6 +848,7 @@ fn retry_succeeds_after_transient_failures() {
 
 #[test]
 fn async_retry_uses_timer_backoff() {
+    let _async_chat_guard = lock(&ASYNC_CHAT_TEST_LOCK);
     let http = FlakyHttp::new(
         2,
         transport_error("connection reset"),
@@ -871,6 +880,7 @@ fn async_retry_uses_timer_backoff() {
 
 #[test]
 fn async_chat_traces_attempts_and_retries_without_payloads() {
+    let _async_chat_guard = lock(&ASYNC_CHAT_TEST_LOCK);
     const SECRET_ERROR: &str = "secret transport detail";
     const SECRET_PROMPT: &str = "secret user prompt";
     const SECRET_RESPONSE: &str = "secret model response";
@@ -1003,6 +1013,7 @@ fn async_chat_traces_attempts_and_retries_without_payloads() {
 
 #[test]
 fn async_chat_traces_final_nonretryable_failure() {
+    let _async_chat_guard = lock(&ASYNC_CHAT_TEST_LOCK);
     let http = FlakyHttp::new(
         9,
         unexpected_status(401, "secret authorization failure"),
@@ -1055,6 +1066,7 @@ fn async_chat_traces_final_nonretryable_failure() {
 
 #[test]
 fn async_chat_traces_cancelled_retry_backoff() {
+    let _async_chat_guard = lock(&ASYNC_CHAT_TEST_LOCK);
     let http = FlakyHttp::new(9, transport_error("temporary failure"), "{}");
     install_flaky_http(Arc::clone(&http));
     let mut rt = configured_async::<Owned<FlakyHttp>, CancelledTimer>(cfg(

@@ -284,6 +284,7 @@ dependencies = [
  "claw-utils",
  "futures-core",
  "futures-lite 2.6.1",
+ "log",
  "serde",
  "serde_json",
  "strum",

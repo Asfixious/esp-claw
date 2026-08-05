@@ -69,6 +69,25 @@ impl ProviderSse {
             Self::Anthropic(parser) => parser.is_done(),
         }
     }
+
+    /// Log shape-only parser state after a clean HTTP EOF without a provider
+    /// terminal event. No response payload is included.
+    pub(crate) fn log_incomplete(&self, chunks: u64, body_bytes: u64) {
+        match self {
+            Self::OpenAi(parser) => log::info!(
+                "LLM stream EOF before provider completion: provider=openai_compatible chunks={chunks} body_bytes={body_bytes} pending_bytes={} pending_is_done={} saw_delta={} saw_finish_reason={}",
+                parser.frames.pending_bytes(),
+                parser.frames.pending_has_data_payload(OPENAI_DONE),
+                parser.events.has_delta(),
+                parser.saw_finish_reason,
+            ),
+            Self::Anthropic(parser) => log::info!(
+                "LLM stream EOF before provider completion: provider=anthropic chunks={chunks} body_bytes={body_bytes} pending_bytes={} saw_delta={}",
+                parser.frames.pending_bytes(),
+                parser.events.has_delta(),
+            ),
+        }
+    }
 }
 
 /// A provider-specific streaming parser.
@@ -211,6 +230,16 @@ impl FrameBuffer {
         let text = core::str::from_utf8(payload).map_err(|_| ClawApiError::Parse)?;
         Ok(Some(text.to_string()))
     }
+
+    fn pending_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn pending_has_data_payload(&self, expected: &str) -> bool {
+        core::str::from_utf8(&self.buf)
+            .ok()
+            .is_some_and(|frame| data_payloads(frame).any(|payload| payload == expected))
+    }
 }
 
 /// Yield each `data:` payload in an SSE frame (skipping `event:`, comments, and
@@ -243,6 +272,7 @@ struct OpenAiToolCall {
 pub(crate) struct OpenAiSse {
     frames: FrameBuffer,
     done: bool,
+    saw_finish_reason: bool,
     events: ContentEvents,
     tool_calls: Vec<OpenAiToolCall>,
     #[cfg(feature = "cache_profile")]
@@ -264,12 +294,18 @@ impl OpenAiSse {
         if let Some(usage) = parse_openai_usage(&value) {
             merge_usage(&mut self.usage, usage);
         }
-        let Some(delta) = value
-            .get("choices")
-            .and_then(|choices| choices.get(0))
-            .and_then(|choice| choice.get("delta"))
-        else {
-            return Ok(()); // e.g. a usage-only final chunk carries no delta
+        let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) else {
+            return Ok(()); // e.g. a usage-only final chunk carries no choice
+        };
+        if choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+        {
+            self.saw_finish_reason = true;
+        }
+        let Some(delta) = choice.get("delta") else {
+            return Ok(());
         };
 
         if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
@@ -694,6 +730,25 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
         );
         assert!(!parser.is_done());
+    }
+
+    #[test]
+    fn openai_diagnostics_track_terminal_hint_and_unframed_done() {
+        let mut parser = OpenAiSse::new();
+        let mut out = Vec::new();
+        let body = concat!(
+            ": keep-alive\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]",
+        );
+
+        parser.push(body.as_bytes(), &mut out).unwrap();
+
+        assert!(!parser.is_done());
+        assert!(parser.frames.pending_bytes() > 0);
+        assert!(parser.frames.pending_has_data_payload(OPENAI_DONE));
+        assert!(parser.saw_finish_reason);
     }
 
     #[cfg(feature = "cache_profile")]

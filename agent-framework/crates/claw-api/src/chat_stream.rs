@@ -74,6 +74,8 @@ pub(crate) struct ProviderStream<S> {
     /// `None` once the stream has completed or yielded a terminal error.
     parser: Option<ProviderSse>,
     queue: VecDeque<Result<ChatStreamEvent, ChatError>>,
+    chunks: u64,
+    body_bytes: u64,
 }
 
 impl<S> ProviderStream<S> {
@@ -82,6 +84,8 @@ impl<S> ProviderStream<S> {
             bytes,
             parser: Some(parser),
             queue: VecDeque::new(),
+            chunks: 0,
+            body_bytes: 0,
         }
     }
 }
@@ -104,6 +108,8 @@ where
             }
             match Pin::new(&mut this.bytes).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
+                    this.chunks = this.chunks.saturating_add(1);
+                    this.body_bytes = this.body_bytes.saturating_add(chunk.len() as u64);
                     let mut deltas = Vec::new();
                     let Some(parser) = this.parser.as_mut() else {
                         return Poll::Ready(None);
@@ -123,6 +129,9 @@ where
                     return Poll::Ready(Some(Err(read_error(error))));
                 }
                 Poll::Ready(None) => {
+                    if let Some(parser) = this.parser.as_ref() {
+                        parser.log_incomplete(this.chunks, this.body_bytes);
+                    }
                     this.parser = None;
                     return Poll::Ready(Some(Err(ChatError::truncated_stream())));
                 }

@@ -177,6 +177,11 @@ build_application_edge_agent:
         EXAMPLE_TARGET: esp32s3
         EXAMPLE_BOARD_BRAND: "seeedstudio"
 
+      - IMAGE: ["espressif/idf:release-v5.5"]
+        EXAMPLE_BOARD: ["metalio_claw_4"]
+        EXAMPLE_TARGET: esp32p4
+        EXAMPLE_BOARD_BRAND: "cloudzao"
+
 build_application_mcp_server_point:
   extends:
     - .build_examples_template

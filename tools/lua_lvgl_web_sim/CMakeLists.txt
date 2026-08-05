@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 project(lv_emscripten C CXX)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -s USE_SDL=2")
 get_filename_component(ESP_CLAW_ROOT "${PROJECT_SOURCE_DIR}/../.." ABSOLUTE)
 
 include(FetchContent)
@@ -16,10 +15,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(lvgl)
 
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    set(ESP_CLAW_SIM_FETCH_TIMESTAMP_ARGS DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+endif()
+
 FetchContent_Declare(
     lua
     URL https://www.lua.org/ftp/lua-5.4.8.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    ${ESP_CLAW_SIM_FETCH_TIMESTAMP_ARGS}
 )
 FetchContent_MakeAvailable(lua)
 set(LUA_SRC_DIR ${lua_SOURCE_DIR}/src)
@@ -65,6 +68,7 @@ set(ESP_CLAW_SIM_SOURCES
     ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_core_widgets.c
     ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_complex_widgets.c
     ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_demos.c
+    ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_eaf.c
     ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_events.c
     ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_font.c
     ${ESP_CLAW_ROOT}/components/lua_modules/lua_module_lvgl/src/lua_lvgl_extra_widgets.c
@@ -79,7 +83,8 @@ set(ESP_CLAW_SIM_SOURCES
     ${LUA_SOURCES}
 )
 
-set(ESP_CLAW_SIM_COMMON_LINK_FLAGS "-O3 --shell-file ${PROJECT_SOURCE_DIR}/esp_claw_shell.html -s ASYNCIFY=1 -s ASYNCIFY_STACK_SIZE=262144 -s EXPORTED_RUNTIME_METHODS=['ccall','FS']")
+# Keep SDL as a final-link option. Putting USE_SDL in global compile flags makes every parallel emcc compile try to initialize the same Emscripten port cache.
+set(ESP_CLAW_SIM_COMMON_LINK_FLAGS "-O3 --shell-file ${PROJECT_SOURCE_DIR}/esp_claw_shell.html -s USE_SDL=2 -s ASYNCIFY=1 -s ASYNCIFY_STACK_SIZE=262144 -s EXPORTED_RUNTIME_METHODS=['ccall','FS']")
 set(ESP_CLAW_SIM_RUNTIME_ASSETS "--preload-file ${PROJECT_SOURCE_DIR}/sim/lvgl_web_shim.lua@/sim/lvgl_web_shim.lua --preload-file ${PROJECT_SOURCE_DIR}/sim_assets/fonts@/fonts")
 set(ESP_CLAW_SIM_EMBED_ASSETS "--embed-file ${PROJECT_SOURCE_DIR}/sim/lvgl_web_shim.lua@/sim/lvgl_web_shim.lua --embed-file ${PROJECT_SOURCE_DIR}/sim_assets/fonts@/fonts")
 

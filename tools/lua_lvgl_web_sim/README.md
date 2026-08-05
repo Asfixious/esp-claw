@@ -15,6 +15,7 @@ From an Emscripten environment:
 
 ```bash
 emcmake cmake -S tools/lua_lvgl_web_sim -B build/lua_lvgl_web_sim -G Ninja -DCMAKE_BUILD_TYPE=Release
+embuilder build sdl2
 emmake ninja -C build/lua_lvgl_web_sim esp_claw_sim esp_claw_sim_release
 ```
 

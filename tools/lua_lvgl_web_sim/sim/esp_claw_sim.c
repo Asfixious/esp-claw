@@ -63,6 +63,14 @@ static char *sim_js_take_last_string(void)
     });
 }
 
+static int sim_lua_error_last_string(lua_State *L, const char *fallback)
+{
+    char *message = sim_js_take_last_string();
+    lua_pushstring(L, message && message[0] ? message : fallback);
+    free(message);
+    return lua_error(L);
+}
+
 static const char *sim_basename(const char *path)
 {
     const char *slash = strrchr(path, '/');
@@ -168,6 +176,26 @@ static int sim_polled_touch_id(void)
     return EM_ASM_INT({ return Module.__polledTouchEvent ? (Module.__polledTouchEvent.id | 0) : 0; });
 }
 
+static int sim_polled_touch_kind(void)
+{
+    return EM_ASM_INT({
+        const type = Module.__polledTouchEvent ? Module.__polledTouchEvent.type : "";
+        if (type === "down") return 1;
+        if (type === "move") return 2;
+        if (type === "up") return 3;
+        if (type === "cancel") return 4;
+        if (type === "wheel") return 5;
+        return 0;
+    });
+}
+
+static int sim_polled_touch_delta_y(void)
+{
+    return EM_ASM_INT({
+        return Module.__polledTouchEvent ? (Module.__polledTouchEvent.deltaY | 0) : 0;
+    });
+}
+
 static int sim_canvas_width(void)
 {
     int width = EM_ASM_INT({
@@ -194,6 +222,24 @@ static void sim_canvas_clear(sim_color_t color)
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.restore();
     }, color.r, color.g, color.b, color.a);
+}
+
+static void sim_canvas_push_clip(int x, int y, int w, int h)
+{
+    EM_ASM({
+        const ctx = Module.canvas.getContext('2d');
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect($0, $1, Math.max(0, $2), Math.max(0, $3));
+        ctx.clip();
+    }, x, y, w, h);
+}
+
+static void sim_canvas_pop_clip(void)
+{
+    EM_ASM({
+        Module.canvas.getContext('2d').restore();
+    });
 }
 
 static void sim_canvas_fill_rect(int x, int y, int w, int h, sim_color_t color)
@@ -1068,6 +1114,9 @@ static int luaopen_storage(lua_State *L)
 
 static int lua_touch_poll(lua_State *L)
 {
+    static const char *event_types[] = {"unknown", "down", "move", "up", "cancel", "wheel"};
+    int kind;
+
     if (!sim_take_touch_event()) {
         lua_pushnil(L);
         return 1;
@@ -1082,6 +1131,14 @@ static int lua_touch_poll(lua_State *L)
     lua_setfield(L, -2, "pressed");
     lua_pushinteger(L, sim_polled_touch_id());
     lua_setfield(L, -2, "id");
+    kind = sim_polled_touch_kind();
+    if (kind < 0 || kind > 5) {
+        kind = 0;
+    }
+    lua_pushstring(L, event_types[kind]);
+    lua_setfield(L, -2, "type");
+    lua_pushinteger(L, sim_polled_touch_delta_y());
+    lua_setfield(L, -2, "delta_y");
     return 1;
 }
 
@@ -1267,9 +1324,75 @@ static int luaopen_i2c(lua_State *L)
     return 1;
 }
 
+EM_JS(int, sim_camera_open_js, (const char *path, int width, int height), {
+    const service = Module.__simServices && Module.__simServices.camera;
+    if (!service) {
+        Module.__simLastString = "camera service is not available";
+        return 0;
+    }
+    const result = service.openSync(UTF8ToString(path), { width, height });
+    if (!result || !result.ok) {
+        Module.__simLastString = (result && result.error) || "camera.open failed";
+        return 0;
+    }
+    return 1;
+});
+
+EM_JS(void, sim_camera_close_js, (), {
+    const service = Module.__simServices && Module.__simServices.camera;
+    if (service) {
+        service.close();
+    }
+});
+
+EM_JS(int, sim_camera_info_width_js, (), {
+    const service = Module.__simServices && Module.__simServices.camera;
+    return service ? (service.info().width | 0) : 320;
+});
+
+EM_JS(int, sim_camera_info_height_js, (), {
+    const service = Module.__simServices && Module.__simServices.camera;
+    return service ? (service.info().height | 0) : 240;
+});
+
+EM_JS(int, sim_camera_capture_frame_js, (), {
+    const service = Module.__simServices && Module.__simServices.camera;
+    if (!service) {
+        Module.__simLastString = "camera service is not available";
+        return 0;
+    }
+    const result = service.captureFrame();
+    if (!result || !result.ok) {
+        Module.__simLastString = (result && result.error) || "camera.get_frame failed";
+        return 0;
+    }
+    return result.ptr | 0;
+});
+
+EM_JS(int, sim_camera_frame_width_js, (), {
+    return Module.__simCameraFrame ? (Module.__simCameraFrame.width | 0) : 0;
+});
+
+EM_JS(int, sim_camera_frame_height_js, (), {
+    return Module.__simCameraFrame ? (Module.__simCameraFrame.height | 0) : 0;
+});
+
+EM_JS(int, sim_camera_frame_len_js, (), {
+    return Module.__simCameraFrame ? (Module.__simCameraFrame.len | 0) : 0;
+});
+
 static int lua_camera_open(lua_State *L)
 {
-    (void)luaL_optstring(L, 1, "/dev/sim_camera0");
+    const char *path = luaL_optstring(L, 1, "/dev/sim_camera0");
+    int width = 0;
+    int height = 0;
+    if (lua_istable(L, 2)) {
+        get_int_field(L, 2, "width", &width);
+        get_int_field(L, 2, "height", &height);
+    }
+    if (!sim_camera_open_js(path, width, height)) {
+        return sim_lua_error_last_string(L, "camera.open failed");
+    }
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1277,16 +1400,19 @@ static int lua_camera_open(lua_State *L)
 static int lua_camera_close(lua_State *L)
 {
     (void)L;
+    sim_camera_close_js();
     lua_pushboolean(L, 1);
     return 1;
 }
 
 static int lua_camera_info(lua_State *L)
 {
+    int width = sim_camera_info_width_js();
+    int height = sim_camera_info_height_js();
     lua_newtable(L);
-    lua_pushinteger(L, 320);
+    lua_pushinteger(L, width > 0 ? width : 320);
     lua_setfield(L, -2, "width");
-    lua_pushinteger(L, 240);
+    lua_pushinteger(L, height > 0 ? height : 240);
     lua_setfield(L, -2, "height");
     lua_pushstring(L, "RGBP");
     lua_setfield(L, -2, "pixel_format");
@@ -1302,14 +1428,19 @@ static int lua_camera_frame_release(lua_State *L)
 
 static int lua_camera_get_frame(lua_State *L)
 {
-    int w = 320;
-    int h = 240;
-    size_t len = (size_t)w * (size_t)h * 2u;
-    char *buf = (char *)calloc(len, 1);
     (void)luaL_optinteger(L, 1, 1000);
-    if (!buf) {
-        return luaL_error(L, "out of memory");
+    int ptr = sim_camera_capture_frame_js();
+    if (!ptr) {
+        return sim_lua_error_last_string(L, "camera.get_frame failed");
     }
+    int w = sim_camera_frame_width_js();
+    int h = sim_camera_frame_height_js();
+    int len = sim_camera_frame_len_js();
+    if (w <= 0 || h <= 0 || len <= 0) {
+        free((void *)ptr);
+        return luaL_error(L, "camera.get_frame returned invalid frame");
+    }
+
     lua_newtable(L);
     lua_pushinteger(L, w);
     lua_setfield(L, -2, "width");
@@ -1317,11 +1448,13 @@ static int lua_camera_get_frame(lua_State *L)
     lua_setfield(L, -2, "height");
     lua_pushstring(L, "RGBP");
     lua_setfield(L, -2, "pixel_format");
-    lua_pushlstring(L, buf, len);
+    lua_pushinteger(L, len);
+    lua_setfield(L, -2, "bytes");
+    lua_pushlstring(L, (const char *)ptr, (size_t)len);
     lua_setfield(L, -2, "data");
     lua_pushcfunction(L, lua_camera_frame_release);
     lua_setfield(L, -2, "release");
-    free(buf);
+    free((void *)ptr);
     return 1;
 }
 
@@ -1594,9 +1727,46 @@ static int luaopen_json(lua_State *L)
     return 1;
 }
 
+static int lua_capability_http_request(lua_State *L)
+{
+    const char *method = "GET";
+    const char *url = "";
+    int ok;
+    char *text;
+
+    if (lua_istable(L, 2)) {
+        method = opt_string_field(L, 2, "method", method);
+        url = opt_string_field(L, 2, "url", url);
+    }
+
+    ok = EM_ASM_INT({
+        const result = Module.__simServices.capability.call("http_request", {
+            method: UTF8ToString($0),
+            url: UTF8ToString($1),
+        });
+        Module.__simLastString = result && result.text ? result.text : "";
+        return result && result.ok ? 1 : 0;
+    }, method, url);
+    text = sim_js_take_last_string();
+    if (ok) {
+        lua_pushboolean(L, 1);
+        lua_pushstring(L, text ? text : "");
+        lua_pushnil(L);
+    } else {
+        lua_pushboolean(L, 0);
+        lua_pushnil(L);
+        lua_pushstring(L, text && text[0] ? text : "http_request mock not found");
+    }
+    free(text);
+    return 3;
+}
+
 static int lua_capability_call(lua_State *L)
 {
     const char *name = luaL_optstring(L, 1, "unknown");
+    if (strcmp(name, "http_request") == 0) {
+        return lua_capability_http_request(L);
+    }
     lua_pushboolean(L, 0);
     lua_pushnil(L);
     lua_pushfstring(L, "capability '%s' is not available in Web simulator", name);
@@ -1941,6 +2111,13 @@ static int lua_arg_schema_int(lua_State *L)
     return 1;
 }
 
+static int lua_arg_schema_bool(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
 static int lua_arg_schema_parse(lua_State *L)
 {
     int raw_idx;
@@ -1977,6 +2154,8 @@ static int luaopen_arg_schema(lua_State *L)
     lua_newtable(L);
     lua_pushcfunction(L, lua_arg_schema_int);
     lua_setfield(L, -2, "int");
+    lua_pushcfunction(L, lua_arg_schema_bool);
+    lua_setfield(L, -2, "bool");
     lua_pushcfunction(L, lua_arg_schema_parse);
     lua_setfield(L, -2, "parse");
     return 1;
@@ -2465,30 +2644,115 @@ static int lua_display_draw_image(lua_State *L)
 {
     int x;
     int y;
-    int w = 64;
-    int h = 64;
-    sim_color_t color = {80, 120, 160, 255};
+    int full_w = 0;
+    int full_h = 0;
+    int dst_w;
+    int dst_h;
+    int src_x = 0;
+    int src_y = 0;
+    int src_w;
+    int src_h;
+    size_t len = 0;
+    const char *data = NULL;
+    const char *pixel_format = NULL;
+    const char *mode = "raw";
 
     require_display(L);
     x = (int)luaL_checkinteger(L, 1);
     y = (int)luaL_checkinteger(L, 2);
     luaL_checktype(L, 3, LUA_TTABLE);
+
     lua_getfield(L, 3, "width");
-    w = (int)luaL_optinteger(L, -1, w);
+    full_w = (int)luaL_optinteger(L, -1, 0);
     lua_pop(L, 1);
     lua_getfield(L, 3, "height");
-    h = (int)luaL_optinteger(L, -1, h);
+    full_h = (int)luaL_optinteger(L, -1, 0);
     lua_pop(L, 1);
+    if (full_w <= 0 || full_h <= 0) {
+        return luaL_error(L, "display draw_image invalid image size");
+    }
+
+    lua_getfield(L, 3, "pixel_format");
+    pixel_format = luaL_optstring(L, -1, "RGBP");
+    if (strcmp(pixel_format, "RGBP") != 0 && strcmp(pixel_format, "RGB565") != 0) {
+        lua_pop(L, 1);
+        return luaL_error(L, "display draw_image unsupported pixel format: %s", pixel_format);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 3, "data");
+    data = luaL_checklstring(L, -1, &len);
+    size_t expected = (size_t)full_w * (size_t)full_h * 2u;
+    if (len < expected) {
+        lua_pop(L, 1);
+        return luaL_error(L, "display draw_image data too short (%d bytes, need %d)", (int)len, (int)expected);
+    }
+
+    src_w = full_w;
+    src_h = full_h;
+    dst_w = src_w;
+    dst_h = src_h;
     if (lua_istable(L, 4)) {
+        int opts_idx = lua_absindex(L, 4);
+        parse_source_rect(L, opts_idx, &src_x, &src_y, &src_w, &src_h);
         lua_getfield(L, 4, "width");
-        w = (int)luaL_optinteger(L, -1, w);
+        dst_w = (int)luaL_optinteger(L, -1, dst_w);
         lua_pop(L, 1);
         lua_getfield(L, 4, "height");
-        h = (int)luaL_optinteger(L, -1, h);
+        dst_h = (int)luaL_optinteger(L, -1, dst_h);
         lua_pop(L, 1);
+        get_int_field(L, opts_idx, "dst_width", &dst_w);
+        get_int_field(L, opts_idx, "dst_height", &dst_h);
+        get_int_field(L, opts_idx, "max_width", &dst_w);
+        get_int_field(L, opts_idx, "max_height", &dst_h);
+        mode = opt_string_field(L, opts_idx, "mode", "raw");
     }
-    sim_canvas_fill_rect(x, y, w, h, color);
-    return 0;
+
+    if (src_x < 0 || src_y < 0 || src_w <= 0 || src_h <= 0 || src_x + src_w > full_w || src_y + src_h > full_h) {
+        lua_pop(L, 1);
+        return luaL_error(L, "display draw_image source rectangle out of bounds");
+    }
+    if ((strcmp(mode, "fit") == 0 || strcmp(mode, "cover") == 0 || strcmp(mode, "stretch") == 0) &&
+        (dst_w <= 0 || dst_h <= 0)) {
+        lua_pop(L, 1);
+        return luaL_error(L, "display draw_image invalid destination size");
+    }
+
+    if (strcmp(mode, "fit") == 0) {
+        double scale_w = (double)dst_w / (double)src_w;
+        double scale_h = (double)dst_h / (double)src_h;
+        double scale = scale_w < scale_h ? scale_w : scale_h;
+        dst_w = (int)(src_w * scale);
+        dst_h = (int)(src_h * scale);
+        if (dst_w < 1) { dst_w = 1; }
+        if (dst_h < 1) { dst_h = 1; }
+    } else if (strcmp(mode, "cover") == 0) {
+        int64_t lhs = (int64_t)src_w * dst_h;
+        int64_t rhs = (int64_t)dst_w * src_h;
+        if (lhs > rhs) {
+            int new_w = (int)((int64_t)src_h * dst_w / dst_h);
+            src_x += (src_w - new_w) / 2;
+            src_w = new_w;
+        } else if (lhs < rhs) {
+            int new_h = (int)((int64_t)src_w * dst_h / dst_w);
+            src_y += (src_h - new_h) / 2;
+            src_h = new_h;
+        }
+    } else if (strcmp(mode, "stretch") != 0 && strcmp(mode, "crop") != 0 && strcmp(mode, "raw") != 0) {
+        lua_pop(L, 1);
+        return luaL_error(L, "display draw_image invalid mode");
+    }
+
+    if (strcmp(mode, "raw") == 0 || strcmp(mode, "crop") == 0) {
+        dst_w = src_w;
+        dst_h = src_h;
+    }
+
+    sim_canvas_rgb565(x, y, (const uint8_t *)data, full_w, src_x, src_y, src_w, src_h, dst_w, dst_h);
+    lua_pop(L, 1);
+    lua_pushinteger(L, dst_w);
+    lua_pushinteger(L, dst_h);
+    return 2;
 }
 
 static int lua_display_backlight(lua_State *L)
@@ -2498,9 +2762,22 @@ static int lua_display_backlight(lua_State *L)
     return 1;
 }
 
-static int lua_display_clip_noop(lua_State *L)
+static int lua_display_set_clip_rect(lua_State *L)
 {
-    (void)L;
+    int x = (int)luaL_checkinteger(L, 1);
+    int y = (int)luaL_checkinteger(L, 2);
+    int w = (int)luaL_checkinteger(L, 3);
+    int h = (int)luaL_checkinteger(L, 4);
+    require_display(L);
+    sim_canvas_push_clip(x, y, w, h);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int lua_display_clear_clip_rect(lua_State *L)
+{
+    require_display(L);
+    sim_canvas_pop_clip();
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -2537,8 +2814,8 @@ static int luaopen_display(lua_State *L)
         {"draw_pixels", lua_display_draw_pixels},
         {"draw_image", lua_display_draw_image},
         {"backlight", lua_display_backlight},
-        {"set_clip_rect", lua_display_clip_noop},
-        {"clear_clip_rect", lua_display_clip_noop},
+        {"set_clip_rect", lua_display_set_clip_rect},
+        {"clear_clip_rect", lua_display_clear_clip_rect},
         {"_claim_owner", lua_display_claim_owner},
         {"_release_owner", lua_display_release_owner},
         {NULL, NULL},

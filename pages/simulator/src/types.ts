@@ -23,6 +23,13 @@ export interface SkillFrontmatter {
     cap_groups?: string[]
     manage_mode?: string
   }
+  execution?: {
+    entry?: string
+    icon?: string
+    args?: Record<string, unknown>
+    order?: number
+    visible?: boolean
+  }
   simulator?: {
     type?: string
     entry?: string
@@ -31,6 +38,28 @@ export interface SkillFrontmatter {
     height?: number
     touch?: boolean
     audio?: string
+  }
+}
+
+export interface CapabilityMocks {
+  http_request?: Array<{
+    method?: string
+    url?: string
+    url_contains?: string
+    status?: number
+    status_text?: string
+    body?: string
+    body_file?: string
+  }>
+}
+
+export interface SimulatorMocks {
+  capability?: CapabilityMocks
+  network_radio?: {
+    stations?: Array<{
+      title: string
+      url: string
+    }>
   }
 }
 
@@ -48,4 +77,6 @@ export interface LoadedSkill {
   files: SkillFile[]
   entry: string
   virtualRoot: string
+  capabilityMocks: CapabilityMocks
+  simulatorMocks: SimulatorMocks
 }

@@ -31,6 +31,7 @@ export interface Strings {
   firmwareRequirementsLabel: string;
   firmwareDescriptionLabel: string;
   downloadFirmwareLocalLink: string;
+  closeBtn: string;
 
   downloadBtn: string;
   flashBtn: string;
@@ -108,14 +109,13 @@ export interface Strings {
   chooseVersionPlaceholder: string;
   versionMaster: string;
   advancedSettingsLabel: string;
-  flashModeLabel: string;
-  flashModeFullErase: string;
-  flashModeEraseSelectPartitions: string;
-  flashModeSelectPartitions: string;
-  partitionSelectionHintErase: string;
-  partitionSelectionHintPreserve: string;
+  eraseFlashBeforeFlash: string;
+  partitionSelectionHint: string;
   erasingFlash: string;
   downloadingPartitions: string;
+  mergingFirmware: string;
+  downloadReady: string;
+  downloadError: string;
   flashingPartition: string;
   loadingVersions: string;
   loadVersionsError: string;
@@ -152,6 +152,7 @@ const en: Strings = {
   firmwareRequirementsLabel: "Firmware requirements",
   firmwareDescriptionLabel: "Firmware description",
   downloadFirmwareLocalLink: "Download firmware locally",
+  closeBtn: "Close",
 
   downloadBtn: "Download Firmware",
   flashBtn: "Flash Firmware",
@@ -234,14 +235,13 @@ const en: Strings = {
   chooseVersionPlaceholder: "Choose a version",
   versionMaster: "Latest (master)",
   advancedSettingsLabel: "Advanced Settings",
-  flashModeLabel: "Flash Mode",
-  flashModeFullErase: "Erase flash and flash all partitions",
-  flashModeEraseSelectPartitions: "Erase flash and select partitions to flash",
-  flashModeSelectPartitions: "Select partitions to flash (unchanged partitions preserved)",
-  partitionSelectionHintErase: "Select partitions to write. The entire flash will be erased first.",
-  partitionSelectionHintPreserve: "Select partitions to write. Unchecked partitions will not be modified.",
-  erasingFlash: "Erasing flash…",
+  eraseFlashBeforeFlash: "Erase entire flash before flashing (may take a few minutes)",
+  partitionSelectionHint: "Select partitions to flash.",
+  erasingFlash: "Erasing flash (may take a few minutes)…",
   downloadingPartitions: "Downloading partition files…",
+  mergingFirmware: "Merging partition files…",
+  downloadReady: "Merged firmware is ready. Download started automatically.",
+  downloadError: "Download failed: ",
   flashingPartition: "Flashing {name} at {offset}…",
   loadingVersions: "Loading versions…",
   loadVersionsError: "Failed to load version list",
@@ -278,6 +278,7 @@ const zhCn: Strings = {
   firmwareRequirementsLabel: "固件要求",
   firmwareDescriptionLabel: "固件说明",
   downloadFirmwareLocalLink: "下载固件到本地",
+  closeBtn: "关闭",
 
   downloadBtn: "下载固件",
   flashBtn: "开始烧录",
@@ -358,14 +359,13 @@ const zhCn: Strings = {
   chooseVersionPlaceholder: "选择版本",
   versionMaster: "最新版 (master)",
   advancedSettingsLabel: "高级设置",
-  flashModeLabel: "烧录模式",
-  flashModeFullErase: "擦除 Flash 并烧写全部分区",
-  flashModeEraseSelectPartitions: "擦除 Flash 并选择需要烧录的分区",
-  flashModeSelectPartitions: "手动选择分区（未选中的分区不会被修改）",
-  partitionSelectionHintErase: "选择需要烧录的分区。烧录前会先擦除整片 Flash。",
-  partitionSelectionHintPreserve: "选择需要烧录的分区。未选中的分区不会被修改。",
-  erasingFlash: "正在擦除 Flash…",
+  eraseFlashBeforeFlash: "烧录前擦除全部 Flash（约需数分钟）",
+  partitionSelectionHint: "选择需要烧录的分区。",
+  erasingFlash: "正在擦除 Flash（约需数分钟）…",
   downloadingPartitions: "正在下载分区文件…",
+  mergingFirmware: "正在合并分区文件…",
+  downloadReady: "合并固件已准备完成，已自动开始下载。",
+  downloadError: "下载失败：",
   flashingPartition: "正在烧录 {name} 到 {offset}…",
   loadingVersions: "正在加载版本列表…",
   loadVersionsError: "加载版本列表失败",

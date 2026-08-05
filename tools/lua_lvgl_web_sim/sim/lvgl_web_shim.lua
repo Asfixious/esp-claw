@@ -1,4 +1,5 @@
 local display = require("display")
+local system = require("system")
 local touch = require("touch")
 
 local lvgl = {}
@@ -9,6 +10,10 @@ local state = {
     screen = nil,
     indev = {},
     pressed_target = nil,
+    scroll_target = nil,
+    pointer_y = nil,
+    drag_distance = 0,
+    dragging = false,
 }
 
 local methods = {}
@@ -51,6 +56,8 @@ local function object(kind, parent, opts)
         checked = opt(opts, "checked", false),
         align = opt(opts, "align", "top_left"),
         handlers = {},
+        scroll_y = 0,
+        content_height = 0,
     }
     setmetatable(obj, { __index = methods })
     if parent and parent.children then
@@ -64,7 +71,7 @@ local function resolve(obj, parent)
     local pw = parent and parent.w or state.width
     local ph = parent and parent.h or state.height
     local px = parent and parent.abs_x or 0
-    local py = parent and parent.abs_y or 0
+    local py = parent and (parent.abs_y - (parent.scroll_y or 0)) or 0
     local x = obj.x or 0
     local y = obj.y or 0
     local align = obj.align or "top_left"
@@ -110,6 +117,38 @@ local function hit_test(obj, x, y)
     return obj
 end
 
+local function is_vertical_scrollable(obj)
+    local dir = obj and obj.scroll and obj.scroll.dir
+    return dir == "ver" or dir == "both" or dir == "all"
+end
+
+local function find_scrollable(obj)
+    while obj do
+        if is_vertical_scrollable(obj) then
+            return obj
+        end
+        obj = obj.parent
+    end
+    return nil
+end
+
+local function clamp_scroll(obj)
+    local max_scroll = math.max(0, (obj.content_height or obj.h) - obj.h)
+    obj.scroll_y = math.max(0, math.min(max_scroll, obj.scroll_y or 0))
+    return max_scroll
+end
+
+local function scroll_by(obj, delta_y)
+    if not obj or delta_y == 0 then
+        return false
+    end
+    clamp_scroll(obj)
+    local previous = obj.scroll_y or 0
+    obj.scroll_y = previous + delta_y
+    clamp_scroll(obj)
+    return obj.scroll_y ~= previous
+end
+
 local function emit(obj, event_name)
     local count = 0
     while obj do
@@ -132,9 +171,6 @@ local function update_pointer_value(obj, x)
         if next_value ~= obj.value then
             obj.value = next_value
             emit(obj, "value_changed")
-            if state.screen then
-                render(state.screen, nil)
-            end
             return 1
         end
     end
@@ -189,14 +225,34 @@ function render(obj, parent)
         end
     end
 
-    local flow_y = obj.abs_y + (obj.style.pad or 0)
+    local pad = obj.style.pad or 0
+    local flow_y = pad
+    local content_height = pad
     for _, child in ipairs(obj.children) do
         if obj.flex and obj.flex.flow == "column" then
             child.x = math.floor((obj.w - child.w) / 2)
-            child.y = flow_y - obj.abs_y
+            child.y = flow_y
             flow_y = flow_y + child.h + (obj.style.pad_row or 8)
         end
+        content_height = math.max(content_height, (child.y or 0) + child.h + pad)
+    end
+    obj.content_height = math.max(obj.h, content_height)
+    local max_scroll = clamp_scroll(obj)
+
+    local clipped = is_vertical_scrollable(obj)
+    if clipped then
+        display.set_clip_rect(obj.abs_x, obj.abs_y, obj.w, obj.h)
+    end
+    for _, child in ipairs(obj.children) do
         render(child, obj)
+    end
+    if clipped then
+        display.clear_clip_rect()
+        if max_scroll > 0 and obj.scroll.scrollbar ~= "off" then
+            local bar_h = math.max(18, math.floor(obj.h * obj.h / obj.content_height))
+            local bar_y = obj.abs_y + math.floor((obj.h - bar_h) * obj.scroll_y / max_scroll)
+            display.fill_round_rect(obj.abs_x + obj.w - 4, bar_y, 3, bar_h, 2, "#64748B")
+        end
     end
     if obj.kind == "screen" then
         display.present()
@@ -230,6 +286,7 @@ end
 
 function methods:set_scroll(opts)
     self.scroll = opts or {}
+    self.scroll_y = self.scroll_y or 0
     return true
 end
 
@@ -557,39 +614,96 @@ function lvgl.msgbox(parent, opts)
     return obj
 end
 
+local function reset_pointer_state()
+    state.pressed_target = nil
+    state.scroll_target = nil
+    state.pointer_y = nil
+    state.drag_distance = 0
+    state.dragging = false
+end
+
 local function process_one_event()
     local event = touch.poll()
     if not event or not state.screen then
-        return 0
+        return false, 0, false
     end
     local target = hit_test(state.screen, event.x, event.y)
     local count = 0
-    if event.pressed then
+    local layout_changed = false
+    local event_type = event.type
+    if event_type == nil or event_type == "unknown" then
+        event_type = event.pressed and "move" or "up"
+    end
+
+    if event_type == "wheel" then
+        layout_changed = scroll_by(find_scrollable(target), event.delta_y or 0)
+    elseif event_type == "down" then
         state.pressed_target = target
+        state.scroll_target = find_scrollable(target)
+        state.pointer_y = event.y
+        state.drag_distance = 0
+        state.dragging = false
         if target then
             count = count + emit(target, "pressed")
-            count = count + update_pointer_value(target, event.x)
+            local updated = update_pointer_value(target, event.x)
+            count = count + updated
         end
-    else
-        if target then
-            count = count + update_pointer_value(target, event.x)
+    elseif event_type == "move" then
+        local pressed = state.pressed_target
+        if state.pointer_y ~= nil then
+            local delta_y = event.y - state.pointer_y
+            state.pointer_y = event.y
+            state.drag_distance = state.drag_distance + math.abs(delta_y)
+            if state.drag_distance >= 4 then
+                state.dragging = true
+            end
+            if state.scroll_target and delta_y ~= 0 then
+                layout_changed = scroll_by(state.scroll_target, -delta_y)
+            end
         end
-        if target and state.pressed_target == target then
-            count = count + emit(target, "clicked")
+        if pressed and pressed.kind == "slider" then
+            local updated = update_pointer_value(pressed, event.x)
+            count = count + updated
         end
-        state.pressed_target = nil
+    elseif event_type == "up" or event_type == "cancel" then
+        local pressed = state.pressed_target
+        if pressed and pressed.kind == "slider" then
+            local updated = update_pointer_value(pressed, event.x)
+            count = count + updated
+        end
+        if pressed then
+            count = count + emit(pressed, "released")
+            if event_type == "up" and not state.dragging and target == pressed then
+                count = count + emit(pressed, "clicked")
+            end
+        end
+        reset_pointer_state()
     end
-    return count
+    return true, count, layout_changed
 end
 
 function lvgl.process_events(timeout_ms)
-    local count = process_one_event()
-    while count > 0 do
-        local next_count = process_one_event()
-        if next_count == 0 then
+    local count = 0
+    local dirty = false
+    for _ = 1, 32 do
+        local consumed, handled, layout_changed = process_one_event()
+        if not consumed then
             break
         end
-        count = count + next_count
+        count = count + handled
+        if layout_changed and state.screen then
+            render(state.screen, nil)
+            dirty = false
+        elseif handled > 0 then
+            dirty = true
+        end
+    end
+    if dirty and state.screen then
+        render(state.screen, nil)
+    end
+    timeout_ms = tonumber(timeout_ms) or 0
+    if timeout_ms > 0 then
+        system.delay_ms(timeout_ms)
     end
     return count
 end

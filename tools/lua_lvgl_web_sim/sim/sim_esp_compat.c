@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,7 +9,9 @@
 #include "lvgl.h"
 
 #include "cap_lua.h"
+#include "claw_paths.h"
 #include "display_arbiter.h"
+#include "display_service.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -16,6 +19,7 @@
 #include "esp_timer.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lv_eaf.h"
 
 struct sim_semaphore {
     int count;
@@ -30,6 +34,22 @@ struct sim_esp_timer {
     bool active;
 };
 
+struct display_service_session_t {
+    bool active;
+    display_service_mode_t mode;
+    uint32_t flags;
+    display_service_session_cleanup_cb_t cleanup_cb;
+    void *user_ctx;
+};
+
+typedef struct {
+    char *src;
+    int32_t loop_count;
+    bool loop_enabled;
+    uint32_t frame_delay_ms;
+    bool paused;
+} sim_lv_eaf_state_t;
+
 static display_arbiter_owner_t s_display_owner = DISPLAY_ARBITER_OWNER_NONE;
 static esp_lcd_panel_io_callbacks_t s_io_callbacks;
 static void *s_io_user_ctx;
@@ -39,6 +59,15 @@ static uint8_t *s_canvas_rgba;
 static int s_canvas_width;
 static int s_canvas_height;
 static size_t s_canvas_rgba_size;
+static struct display_service_session_t s_display_session;
+static lv_display_t *s_display_service_display;
+static void *s_display_service_draw_buf;
+static size_t s_display_service_draw_buf_size;
+static bool s_display_service_started;
+static char s_claw_path_roots[CLAW_PATH_ROOT_MAX][256] = {
+    "/storage",
+    "/system",
+};
 
 const char *esp_err_to_name(esp_err_t err)
 {
@@ -59,6 +88,44 @@ const char *esp_err_to_name(esp_err_t err)
 display_arbiter_owner_t display_arbiter_get_owner(void)
 {
     return s_display_owner;
+}
+
+esp_err_t claw_paths_set(claw_path_root_t root, const char *path)
+{
+    int written;
+
+    if (root < 0 || root >= CLAW_PATH_ROOT_MAX || !path || !path[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    written = snprintf(s_claw_path_roots[root], sizeof(s_claw_path_roots[root]), "%s", path);
+    return written > 0 && (size_t)written < sizeof(s_claw_path_roots[root]) ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+const char *claw_paths_get(claw_path_root_t root)
+{
+    if (root < 0 || root >= CLAW_PATH_ROOT_MAX || !s_claw_path_roots[root][0]) {
+        return NULL;
+    }
+    return s_claw_path_roots[root];
+}
+
+esp_err_t claw_paths_join(claw_path_root_t root, const char *subpath, char *out, size_t out_size)
+{
+    const char *root_path = claw_paths_get(root);
+    int written;
+
+    if (!root_path || !out || out_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!subpath || !subpath[0]) {
+        written = snprintf(out, out_size, "%s", root_path);
+    } else {
+        while (*subpath == '/' || *subpath == '\\') {
+            subpath++;
+        }
+        written = snprintf(out, out_size, "%s/%s", root_path, subpath);
+    }
+    return written > 0 && (size_t)written < out_size ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }
 
 esp_err_t display_arbiter_acquire(display_arbiter_owner_t owner)
@@ -238,6 +305,310 @@ static void sim_copy_xrgb8888_to_rgba(int x, int y, int width, int height, const
             dst += 4;
         }
     }
+}
+
+static int sim_canvas_current_width(void)
+{
+    int width = EM_ASM_INT({ return Module.canvas ? (Module.canvas.width | 0) : 0; });
+    return width > 0 ? width : 800;
+}
+
+static int sim_canvas_current_height(void)
+{
+    int height = EM_ASM_INT({ return Module.canvas ? (Module.canvas.height | 0) : 0; });
+    return height > 0 ? height : 480;
+}
+
+static void display_service_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map)
+{
+    esp_err_t err = esp_lcd_panel_draw_bitmap(NULL, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px_map);
+
+    if (err != ESP_OK) {
+        EM_ASM({ console.error("display_service flush failed"); });
+    }
+    lv_display_flush_ready(display);
+}
+
+esp_err_t display_service_start(const display_service_config_t *config)
+{
+    int width;
+    int height;
+    int buffer_lines;
+    size_t draw_buf_size;
+    void *draw_buf;
+
+    if (s_display_service_started) {
+        return ESP_OK;
+    }
+    if (!lv_is_initialized()) {
+        lv_init();
+    }
+
+    width = sim_canvas_current_width();
+    height = sim_canvas_current_height();
+    buffer_lines = config && config->buffer_lines > 0 ? (int)config->buffer_lines : height;
+    if (buffer_lines > height) {
+        buffer_lines = height;
+    }
+    draw_buf_size = (size_t)width * (size_t)buffer_lines * 4u;
+    draw_buf = malloc(draw_buf_size);
+    if (!draw_buf) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_display_service_display = lv_display_create(width, height);
+    if (!s_display_service_display) {
+        free(draw_buf);
+        return ESP_ERR_NO_MEM;
+    }
+    lv_display_set_color_format(s_display_service_display, LV_COLOR_FORMAT_XRGB8888);
+    lv_display_set_flush_cb(s_display_service_display, display_service_flush_cb);
+    lv_display_set_buffers(s_display_service_display, draw_buf, NULL, draw_buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    s_display_service_draw_buf = draw_buf;
+    s_display_service_draw_buf_size = draw_buf_size;
+    s_display_service_started = true;
+    return ESP_OK;
+}
+
+void display_service_stop(void)
+{
+    if (s_display_session.active) {
+        (void)display_service_close(&s_display_session);
+    }
+    if (s_display_service_display) {
+        lv_display_delete(s_display_service_display);
+        s_display_service_display = NULL;
+    }
+    free(s_display_service_draw_buf);
+    s_display_service_draw_buf = NULL;
+    s_display_service_draw_buf_size = 0;
+    s_display_service_started = false;
+}
+
+bool display_service_is_started(void)
+{
+    return s_display_service_started;
+}
+
+esp_err_t display_service_open(const display_service_session_config_t *config, display_service_session_handle_t *ret_session)
+{
+    esp_err_t err;
+
+    if (!config || !ret_session) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_display_session.active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = display_service_start(&config->display_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+    memset(&s_display_session, 0, sizeof(s_display_session));
+    s_display_session.active = true;
+    s_display_session.mode = config->mode;
+    s_display_session.flags = config->flags;
+    s_display_session.cleanup_cb = config->cleanup_cb;
+    s_display_session.user_ctx = config->user_ctx;
+    *ret_session = &s_display_session;
+    return ESP_OK;
+}
+
+esp_err_t display_service_close(display_service_session_handle_t session)
+{
+    display_service_session_cleanup_cb_t cleanup_cb;
+    void *user_ctx;
+
+    if (session != &s_display_session || !s_display_session.active) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cleanup_cb = s_display_session.cleanup_cb;
+    user_ctx = s_display_session.user_ctx;
+    if (cleanup_cb) {
+        cleanup_cb(session, user_ctx);
+    }
+    memset(&s_display_session, 0, sizeof(s_display_session));
+    return ESP_OK;
+}
+
+bool display_service_session_is_valid(display_service_session_handle_t session)
+{
+    return session == &s_display_session && s_display_session.active;
+}
+
+lv_display_t *display_service_session_display(display_service_session_handle_t session)
+{
+    return display_service_session_is_valid(session) ? s_display_service_display : NULL;
+}
+
+esp_err_t display_service_session_load_screen_locked(display_service_session_handle_t session, lv_obj_t *screen)
+{
+    if (!display_service_session_is_valid(session) || !screen) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    lv_screen_load(screen);
+    return ESP_OK;
+}
+
+esp_err_t display_service_session_load_screen(display_service_session_handle_t session, lv_obj_t *screen)
+{
+    return display_service_session_load_screen_locked(session, screen);
+}
+
+esp_err_t display_service_lock(void)
+{
+    return ESP_OK;
+}
+
+void display_service_unlock(void)
+{
+}
+
+static sim_lv_eaf_state_t *sim_lv_eaf_state(lv_obj_t *obj)
+{
+    return obj ? (sim_lv_eaf_state_t *)lv_obj_get_user_data(obj) : NULL;
+}
+
+static void sim_lv_eaf_delete_cb(lv_event_t *event)
+{
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(event);
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+
+    if (!state) {
+        return;
+    }
+    free(state->src);
+    free(state);
+    lv_obj_set_user_data(obj, NULL);
+}
+
+lv_obj_t *lv_eaf_create(lv_obj_t *parent)
+{
+    lv_obj_t *obj = lv_obj_create(parent);
+    sim_lv_eaf_state_t *state;
+
+    if (!obj) {
+        return NULL;
+    }
+    state = (sim_lv_eaf_state_t *)calloc(1, sizeof(*state));
+    if (!state) {
+        lv_obj_delete(obj);
+        return NULL;
+    }
+    state->loop_count = -1;
+    state->loop_enabled = true;
+    state->frame_delay_ms = 100;
+    lv_obj_set_user_data(obj, state);
+    lv_obj_add_event_cb(obj, sim_lv_eaf_delete_cb, LV_EVENT_DELETE, NULL);
+    return obj;
+}
+
+void lv_eaf_set_src(lv_obj_t *obj, const char *src)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    char *copy = NULL;
+
+    if (!state) {
+        return;
+    }
+    if (src) {
+        size_t len = strlen(src) + 1;
+        copy = (char *)malloc(len);
+        if (!copy) {
+            return;
+        }
+        memcpy(copy, src, len);
+    }
+    free(state->src);
+    state->src = copy;
+}
+
+void lv_eaf_set_src_data(lv_obj_t *obj, const void *data, size_t size)
+{
+    (void)data;
+    (void)size;
+    lv_eaf_set_src(obj, "<src_data>");
+}
+
+void lv_eaf_restart(lv_obj_t *obj)
+{
+    (void)obj;
+}
+
+void lv_eaf_pause(lv_obj_t *obj)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    if (state) {
+        state->paused = true;
+    }
+}
+
+void lv_eaf_resume(lv_obj_t *obj)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    if (state) {
+        state->paused = false;
+    }
+}
+
+bool lv_eaf_is_loaded(lv_obj_t *obj)
+{
+    (void)obj;
+    return false;
+}
+
+int32_t lv_eaf_get_total_frames(lv_obj_t *obj)
+{
+    (void)obj;
+    return 0;
+}
+
+int32_t lv_eaf_get_current_frame(lv_obj_t *obj)
+{
+    (void)obj;
+    return 0;
+}
+
+void lv_eaf_set_loop_count(lv_obj_t *obj, int32_t count)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    if (state) {
+        state->loop_count = count;
+    }
+}
+
+int32_t lv_eaf_get_loop_count(lv_obj_t *obj)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    return state ? state->loop_count : -1;
+}
+
+void lv_eaf_set_loop_enabled(lv_obj_t *obj, bool enabled)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    if (state) {
+        state->loop_enabled = enabled;
+    }
+}
+
+bool lv_eaf_get_loop_enabled(lv_obj_t *obj)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    return state ? state->loop_enabled : false;
+}
+
+void lv_eaf_set_frame_delay(lv_obj_t *obj, uint32_t delay_ms)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    if (state) {
+        state->frame_delay_ms = delay_ms;
+    }
+}
+
+uint32_t lv_eaf_get_frame_delay(lv_obj_t *obj)
+{
+    sim_lv_eaf_state_t *state = sim_lv_eaf_state(obj);
+    return state ? state->frame_delay_ms : 0;
 }
 
 void sim_esp_compat_pump_once(void)

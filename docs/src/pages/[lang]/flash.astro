@@ -441,13 +441,7 @@ const flashBootJson = JSON.stringify({
       padding: 0 1rem 0.85rem;
     }
 
-    .flash-mode-options {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-
-    .radio-label {
+    .checkbox-label {
       display: flex;
       align-items: center;
       gap: 0.5rem;
@@ -456,13 +450,13 @@ const flashBootJson = JSON.stringify({
       cursor: pointer;
     }
 
-    .radio-label input[type="radio"] {
+    .checkbox-label input[type="checkbox"] {
       width: auto;
       accent-color: var(--accent);
     }
 
     .partition-selection {
-      margin-top: 0.75rem;
+      margin-top: 0.85rem;
     }
 
     .partition-list {
@@ -948,6 +942,13 @@ const flashBootJson = JSON.stringify({
       max-height: 150px;
     }
 
+    .modal-download-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+
     .reconnect-prompt {
       margin-top: 1rem;
       padding: 1rem;
@@ -1259,23 +1260,12 @@ const flashBootJson = JSON.stringify({
           <details class="advanced-settings" id="advanced-settings" style="margin-top: 1rem;">
             <summary class="advanced-settings-summary">{s.advancedSettingsLabel}</summary>
             <div class="advanced-settings-body">
-              <label class="section-label" style="margin-top: 0.75rem;">{s.flashModeLabel}</label>
-              <div class="flash-mode-options">
-                <label class="radio-label">
-                  <input type="radio" name="flash-mode" value="full-erase" checked />
-                  {s.flashModeFullErase}
-                </label>
-                <label class="radio-label">
-                  <input type="radio" name="flash-mode" value="erase-select-partitions" />
-                  {s.flashModeEraseSelectPartitions}
-                </label>
-                <label class="radio-label">
-                  <input type="radio" name="flash-mode" value="select-partitions" />
-                  {s.flashModeSelectPartitions}
-                </label>
-              </div>
-              <div class="partition-selection" id="partition-selection" style="display:none;">
-                <p class="section-note" id="partition-selection-hint">{s.partitionSelectionHintPreserve}</p>
+              <label class="checkbox-label">
+                <input type="checkbox" id="erase-flash-checkbox" />
+                {s.eraseFlashBeforeFlash}
+              </label>
+              <div class="partition-selection" id="partition-selection">
+                <p class="section-note" id="partition-selection-hint">{s.partitionSelectionHint}</p>
                 <div class="partition-list" id="partition-list"></div>
               </div>
             </div>
@@ -1418,6 +1408,14 @@ const flashBootJson = JSON.stringify({
             <div class="progress-bar" id="modal-progress-bar"></div>
           </div>
           <div class="progress-log" id="modal-progress-log"></div>
+        </div>
+        <div class="modal-download-actions" id="modal-download-actions" hidden>
+          <button type="button" class="btn-primary" id="modal-download-btn">
+            {s.downloadBtn}
+          </button>
+          <button type="button" class="btn-secondary" id="modal-download-close-btn">
+            {s.closeBtn}
+          </button>
         </div>
         <div class="reconnect-prompt" id="modal-reconnect-prompt" hidden>
           <div class="reconnect-title">{s.postFlashReconnectTitle}</div>

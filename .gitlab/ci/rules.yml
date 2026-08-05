@@ -36,10 +36,10 @@
   - "docs/**/*"
 
 .patterns-simulator: &patterns-simulator
+  - "components/claw_capabilities/cap_lua/**/*"
+  - "components/lua_modules/**/*"
   - "pages/simulator/**/*"
   - "tools/lua_lvgl_web_sim/**/*"
-  - "components/lua_modules/lua_module_lvgl/**/*"
-  - "components/lua_modules/lua_module_display/**/*"
 
 ##############
 # if anchors #

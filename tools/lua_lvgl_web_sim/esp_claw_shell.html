@@ -1,6 +1,13 @@
 <html>
   <head>
+    <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      window.__espClawEmbedded = new URLSearchParams(window.location.search).get("embedded") === "1";
+      if (window.__espClawEmbedded) {
+        document.documentElement.classList.add("embedded");
+      }
+    </script>
     <style>
       html, body {
         margin: 0;
@@ -27,6 +34,7 @@
         aspect-ratio: var(--sim-aspect, 5 / 3);
         background: black;
         image-rendering: pixelated;
+        touch-action: none;
       }
       #side {
         display: flex;
@@ -81,21 +89,21 @@
           grid-template-rows: auto 320px;
         }
       }
-      body.embedded {
+      html.embedded body {
         grid-template-columns: 1fr;
         padding: 0;
         background: #000;
       }
-      body.embedded #stage {
+      html.embedded #stage {
         width: 100%;
         height: 100%;
       }
-      body.embedded #canvas {
+      html.embedded #canvas {
         width: 100%;
         height: 100%;
         object-fit: contain;
       }
-      body.embedded #side {
+      html.embedded #side {
         display: none;
       }
     </style>
@@ -126,10 +134,16 @@
       <textarea id="log" readonly></textarea>
     </aside>
     <script>
+      const postHostEvent = (type, detail = {}) => {
+        if (window.__espClawEmbedded && window.parent) {
+          window.parent.postMessage({ type, ...detail }, "*");
+        }
+      };
       const appendLog = (text) => {
         const log = document.getElementById("log");
         log.value += text + "\n";
         log.scrollTop = log.scrollHeight;
+        postHostEvent("esp-claw-sim:log", { message: String(text) });
       };
       const formatError = (value) => {
         if (!value) {
@@ -172,7 +186,16 @@
         heightInput.disabled = disabled;
         applyResolutionButton.disabled = disabled;
       };
-      const releasedTouchState = (session) => ({ x: 0, y: 0, pressed: false, id: 0, session });
+      const releasedTouchState = (session) => ({
+        x: 0,
+        y: 0,
+        pressed: false,
+        id: 0,
+        pointerId: 0,
+        type: "up",
+        deltaY: 0,
+        session,
+      });
       const resetInputQueue = () => {
         if (!Module.__touchEvents) {
           Module.__touchEvents = [];
@@ -216,6 +239,7 @@
         }
         if (!quiet) {
           appendLog(`[sim] resolution: ${width}x${height}`);
+          postHostEvent("esp-claw-sim:resolutionChanged", { width, height });
         }
       };
       const createSimServices = () => {
@@ -236,6 +260,198 @@
           const normalized = "/" + String(path).replace(/\\/g, "/").replace(/^\/+/, "");
           ensureDir(normalized.split("/").slice(0, -1).join("/"));
           moduleRef().FS.writeFile(normalized, new TextEncoder().encode(String(text)));
+        };
+        const readText = (path) => {
+          const normalized = "/" + String(path).replace(/\\/g, "/").replace(/^\/+/, "");
+          return moduleRef().FS.readFile(normalized, { encoding: "utf8" });
+        };
+        const capabilityService = {
+          root: "",
+          mocks: {},
+          configure(root, mocks) {
+            this.root = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+            this.mocks = mocks && typeof mocks === "object" ? mocks : {};
+          },
+          call(name, request = {}) {
+            if (name !== "http_request") {
+              return { ok: false, text: `capability '${name}' is not available in Web simulator` };
+            }
+
+            const candidates = Array.isArray(this.mocks.http_request) ? this.mocks.http_request : [];
+            const method = String(request.method || "GET").toUpperCase();
+            const url = String(request.url || "");
+            const match = candidates.find((item) => {
+              if (!item || typeof item !== "object") {
+                return false;
+              }
+              if (item.method && String(item.method).toUpperCase() !== method) {
+                return false;
+              }
+              if (item.url && String(item.url) !== url) {
+                return false;
+              }
+              if (item.url_contains && !url.includes(String(item.url_contains))) {
+                return false;
+              }
+              return Boolean(item.url || item.url_contains || !url);
+            });
+
+            if (!match) {
+              return { ok: false, text: `http_request mock not found: ${method} ${url}` };
+            }
+
+            let body = typeof match.body === "string" ? match.body : "";
+            if (!body && match.body_file) {
+              const bodyPath = String(match.body_file).replace(/\\/g, "/").replace(/^\/+/, "");
+              try {
+                body = readText(`${this.root}/${bodyPath}`);
+              } catch (err) {
+                return { ok: false, text: `http_request mock body not found: ${bodyPath}` };
+              }
+            }
+
+            const status = Number(match.status || 200);
+            const statusText = String(match.status_text || "OK");
+            return { ok: true, text: `HTTP ${status} ${statusText}\n${body}` };
+          },
+        };
+        const cameraService = {
+          stream: null,
+          video: null,
+          canvas: null,
+          ctx: null,
+          width: 320,
+          height: 240,
+          pixelFormat: "RGBP",
+          lastError: "",
+          log(message) {
+            appendLog("[camera] " + message);
+          },
+          async open(path, opts = {}) {
+            try {
+              if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+                throw new Error("browser camera is not available");
+              }
+              if (!window.isSecureContext) {
+                throw new Error("browser camera requires HTTPS or localhost");
+              }
+
+              this.close();
+              const requestedWidth = Number(opts.width || 0);
+              const requestedHeight = Number(opts.height || 0);
+              const constraints = {
+                video: {
+                  width: requestedWidth > 0 ? { ideal: requestedWidth } : undefined,
+                  height: requestedHeight > 0 ? { ideal: requestedHeight } : undefined,
+                },
+                audio: false,
+              };
+              this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+              const video = document.createElement("video");
+              video.muted = true;
+              video.playsInline = true;
+              video.autoplay = true;
+              video.srcObject = this.stream;
+              await new Promise((resolve, reject) => {
+                const cleanup = () => {
+                  video.removeEventListener("loadedmetadata", onReady);
+                  video.removeEventListener("error", onError);
+                };
+                const onReady = () => {
+                  cleanup();
+                  resolve();
+                };
+                const onError = () => {
+                  cleanup();
+                  reject(new Error("camera video element failed"));
+                };
+                video.addEventListener("loadedmetadata", onReady, { once: true });
+                video.addEventListener("error", onError, { once: true });
+              });
+              await video.play();
+
+              this.video = video;
+              this.width = requestedWidth > 0 ? requestedWidth : (video.videoWidth || 320);
+              this.height = requestedHeight > 0 ? requestedHeight : (video.videoHeight || 240);
+              this.canvas = document.createElement("canvas");
+              this.canvas.width = this.width;
+              this.canvas.height = this.height;
+              this.ctx = this.canvas.getContext("2d", { willReadFrequently: true });
+              if (!this.ctx) {
+                throw new Error("camera canvas context is not available");
+              }
+              this.lastError = "";
+              this.log(`opened ${path || "/dev/sim_camera0"} ${this.width}x${this.height}`);
+              return { ok: true };
+            } catch (err) {
+              this.close();
+              this.lastError = err && err.message ? err.message : String(err);
+              return { ok: false, error: this.lastError };
+            }
+          },
+          openSync(path) {
+            if (this.stream && this.video && this.ctx) {
+              return { ok: true };
+            }
+            const error = this.lastError || `camera is not ready: ${path || "/dev/sim_camera0"}`;
+            return { ok: false, error };
+          },
+          info() {
+            return {
+              width: this.width || 320,
+              height: this.height || 240,
+              pixel_format: this.pixelFormat,
+            };
+          },
+          captureFrame() {
+            try {
+              if (!this.video || !this.ctx || !this.canvas) {
+                throw new Error("camera is not open");
+              }
+              const width = this.width || this.video.videoWidth || 320;
+              const height = this.height || this.video.videoHeight || 240;
+              if (this.canvas.width !== width || this.canvas.height !== height) {
+                this.canvas.width = width;
+                this.canvas.height = height;
+              }
+              this.ctx.drawImage(this.video, 0, 0, width, height);
+              const rgba = this.ctx.getImageData(0, 0, width, height).data;
+              const len = width * height * 2;
+              const ptr = (Module._malloc || _malloc)(len);
+              const heap = Module.HEAPU8 || HEAPU8;
+              for (let i = 0, j = ptr; i < rgba.length; i += 4, j += 2) {
+                const r = rgba[i] >> 3;
+                const g = rgba[i + 1] >> 2;
+                const b = rgba[i + 2] >> 3;
+                const value = (r << 11) | (g << 5) | b;
+                heap[j] = value & 0xff;
+                heap[j + 1] = (value >> 8) & 0xff;
+              }
+              this.lastError = "";
+              Module.__simCameraFrame = { ptr, len, width, height, pixelFormat: this.pixelFormat };
+              return { ok: true, ptr, len, width, height, pixelFormat: this.pixelFormat };
+            } catch (err) {
+              this.lastError = err && err.message ? err.message : String(err);
+              Module.__simCameraFrame = null;
+              return { ok: false, error: this.lastError };
+            }
+          },
+          close() {
+            if (this.stream) {
+              for (const track of this.stream.getTracks()) {
+                track.stop();
+              }
+            }
+            if (this.video) {
+              this.video.pause();
+              this.video.srcObject = null;
+            }
+            this.stream = null;
+            this.video = null;
+            this.canvas = null;
+            this.ctx = null;
+            return true;
+          },
         };
         const audioService = {
           outputs: new Map(),
@@ -471,9 +687,21 @@
           queues: new Map(),
           locks: new Map(),
           jobs: new Map(),
+          networkRadioStations: [],
           lastError: "",
           log(message) {
             appendLog("[thread] " + message);
+          },
+          configureSimulatorMocks(mocks = {}) {
+            const stations = mocks && mocks.network_radio && Array.isArray(mocks.network_radio.stations)
+              ? mocks.network_radio.stations
+              : [];
+            this.networkRadioStations = stations
+              .filter((station) => station && typeof station.title === "string" && typeof station.url === "string")
+              .map((station) => ({
+                title: station.title,
+                url: station.url,
+              }));
           },
           queueCreate(name, opts = {}) {
             if (this.queues.has(name)) {
@@ -680,21 +908,27 @@
             this.queueSend("network_radio_reply", JSON.stringify(status));
           },
           resolveStationUrl(title) {
-            const stations = {
-              "宕傚北921": "http://lhttp.qingting.fm/live/20212426/64k.mp3",
-              "闀挎矙101.7鍩庡競涔嬪０": "http://lhttp.qingting.fm/live/4237/64k.mp3",
-              "涓婃捣缁忓吀947": "http://lhttp.qingting.fm/live/267/64k.mp3",
-              "婀栧寳缁忓吀闊充箰骞挎挱": "http://lhttp.qingting.fm/live/1296/64k.mp3",
-              "鎴愰兘骞翠唬闊充箰鎬€鏃уソ澹伴煶": "http://lhttp.qingting.fm/live/20211686/64k.mp3",
-              "灞变笢缁忓吀闊充箰骞挎挱": "http://lhttp.qingting.fm/live/20240/64k.mp3",
-              "鏉窞90.7": "http://lhttp.qingting.fm/live/15318146/64k.mp3",
-              "澶╂触TIKI 100.5": "http://lhttp.qingting.fm/live/20003/64k.mp3",
-            };
-            return stations[title] || "http://lhttp.qingting.fm/live/15318146/64k.mp3";
+            const query = String(title || "").trim();
+            const queryLower = query.toLowerCase();
+            const match = query
+              ? this.networkRadioStations.find((station) => {
+                const stationTitle = String(station.title || "");
+                const stationLower = stationTitle.toLowerCase();
+                return stationTitle === query || stationLower === queryLower || stationLower.includes(queryLower);
+              })
+              : null;
+            if (match) {
+              return match.url;
+            }
+            const fallback = this.networkRadioStations.find((station) => station.title === "杭州90.7")
+              || this.networkRadioStations[0];
+            return fallback ? fallback.url : "http://lhttp.qingting.fm/live/15318146/64k.mp3";
           },
         };
         return {
           runtime: { nextId: 1, currentId: 0 },
+          capability: capabilityService,
+          camera: cameraService,
           audio: audioService,
           thread: threadService,
           resetForRun(path) {
@@ -710,6 +944,7 @@
           stopAll() {
             threadService.stopAll();
             audioService.stopAll();
+            cameraService.close();
             appendLog("[runtime] stopped");
           },
         };
@@ -751,6 +986,8 @@
           Module.__inputEnabled = false;
           Module.__touchEvents = [];
           Module.__touchState = releasedTouchState(0);
+          Module.__scriptPeripherals = new Map();
+          const maxTouchEvents = 32;
           Module.__takeTouchEvent = () => {
             const currentSession = Module.__inputSessionId || 0;
             while (Module.__touchEvents && Module.__touchEvents.length) {
@@ -765,41 +1002,100 @@
             }
             return null;
           };
-          const setTouchEvent = (event, pressed) => {
+          const enqueueTouchEvent = (touchEvent) => {
+            const events = Module.__touchEvents;
+            const last = events.length ? events[events.length - 1] : null;
+            if (touchEvent.type === "move" && last && last.type === "move"
+                && last.session === touchEvent.session && last.pointerId === touchEvent.pointerId) {
+              events[events.length - 1] = touchEvent;
+              return;
+            }
+            if (touchEvent.type === "wheel" && last && last.type === "wheel"
+                && last.session === touchEvent.session) {
+              last.x = touchEvent.x;
+              last.y = touchEvent.y;
+              last.deltaY += touchEvent.deltaY;
+              last.id = touchEvent.id;
+              return;
+            }
+            if (events.length >= maxTouchEvents) {
+              const coalescible = events.findIndex((item) => item.type === "move" || item.type === "wheel");
+              if (coalescible >= 0) {
+                events.splice(coalescible, 1);
+              } else {
+                events.shift();
+              }
+            }
+            events.push(touchEvent);
+          };
+          const pointerPosition = (event) => {
+            const rect = Module.canvas.getBoundingClientRect();
+            return {
+              x: Math.max(0, Math.min(Module.canvas.width - 1,
+                Math.round((event.clientX - rect.left) * Module.canvas.width / rect.width))),
+              y: Math.max(0, Math.min(Module.canvas.height - 1,
+                Math.round((event.clientY - rect.top) * Module.canvas.height / rect.height))),
+              scaleY: Module.canvas.height / Math.max(1, rect.height),
+            };
+          };
+          const setTouchEvent = (event, pressed, type) => {
             if (!Module.__inputEnabled) {
               return;
             }
             if (pressed) {
               Module.__simServices.audio.unlock();
             }
-            const rect = Module.canvas.getBoundingClientRect();
-            const x = Math.max(0, Math.min(Module.canvas.width - 1,
-              Math.round((event.clientX - rect.left) * Module.canvas.width / rect.width)));
-            const y = Math.max(0, Math.min(Module.canvas.height - 1,
-              Math.round((event.clientY - rect.top) * Module.canvas.height / rect.height)));
-            const touchEvent = { x, y, pressed, id: ++touchId, session: Module.__inputSessionId };
+            const position = pointerPosition(event);
+            const touchEvent = {
+              x: position.x,
+              y: position.y,
+              pressed,
+              id: ++touchId,
+              pointerId: Number(event.pointerId || 0),
+              type,
+              deltaY: 0,
+              session: Module.__inputSessionId,
+            };
             Module.__touchState = touchEvent;
-            Module.__touchEvents.push(touchEvent);
+            enqueueTouchEvent(touchEvent);
           };
           Module.canvas.addEventListener("pointerdown", (event) => {
             Module.canvas.setPointerCapture?.(event.pointerId);
-            setTouchEvent(event, true);
+            setTouchEvent(event, true, "down");
             event.preventDefault();
           });
           Module.canvas.addEventListener("pointerup", (event) => {
-            setTouchEvent(event, false);
+            setTouchEvent(event, false, "up");
+            Module.canvas.releasePointerCapture?.(event.pointerId);
             event.preventDefault();
           });
           Module.canvas.addEventListener("pointermove", (event) => {
             if (event.buttons || Module.__touchState.pressed) {
-              setTouchEvent(event, true);
+              setTouchEvent(event, true, "move");
               event.preventDefault();
             }
           });
           Module.canvas.addEventListener("pointercancel", (event) => {
-            setTouchEvent(event, false);
+            setTouchEvent(event, false, "cancel");
             event.preventDefault();
           });
+          Module.canvas.addEventListener("wheel", (event) => {
+            if (!Module.__inputEnabled) {
+              return;
+            }
+            const position = pointerPosition(event);
+            enqueueTouchEvent({
+              x: position.x,
+              y: position.y,
+              pressed: false,
+              id: ++touchId,
+              pointerId: 0,
+              type: "wheel",
+              deltaY: Math.round(event.deltaY * position.scaleY),
+              session: Module.__inputSessionId,
+            });
+            event.preventDefault();
+          }, { passive: false });
           const normalizePath = (path) => {
             const clean = path.replace(/\\/g, "/").replace(/^\/+/, "");
             return "/" + clean.split("/").filter(Boolean).join("/");
@@ -844,19 +1140,32 @@
           const runPath = async (path, clearLog) => {
             const button = document.getElementById("runButton");
             const stopButton = document.getElementById("stopButton");
+            let rc = 1;
             button.disabled = true;
             stopButton.disabled = false;
             Module.__stopRequested = false;
             startInputSession();
             setResolutionControlsDisabled(true);
+            postHostEvent("esp-claw-sim:running", { path });
             const log = document.getElementById("log");
             if (clearLog !== false) {
               log.value = "";
             }
             try {
               Module.__simServices.resetForRun(path);
+              const peripherals = Module.__scriptPeripherals.get(normalizePath(path)) || [];
+              if (peripherals.includes("camera")) {
+                const camera = Module.__simServices.camera;
+                const result = await camera.open("/dev/sim_camera0", {
+                  width: Module.canvas.width || 800,
+                  height: Module.canvas.height || 480,
+                });
+                if (!result.ok) {
+                  Module.print("[camera] " + result.error);
+                }
+              }
               enableInputSession();
-              const rc = await Module.ccall("esp_claw_sim_run_file", "number", ["string"], [path], { async: true });
+              rc = await Module.ccall("esp_claw_sim_run_file", "number", ["string"], [path], { async: true });
               Module.print("[sim] exit code: " + rc);
               return rc;
             } catch (err) {
@@ -867,6 +1176,7 @@
               stopButton.disabled = true;
               stopInputSession();
               setResolutionControlsDisabled(false);
+              postHostEvent("esp-claw-sim:exited", { code: rc, stopped: Module.__stopRequested });
             }
           };
           const run = async () => {
@@ -901,6 +1211,7 @@
                 Module.printErr(err && err.stack ? err.stack : String(err));
               }
               Module.print("[sim] stop requested");
+              postHostEvent("esp-claw-sim:stopping");
             },
             exists(path) {
               try {
@@ -928,8 +1239,12 @@
                   }
                 }
                 if (skill.entry) {
-                  addScriptOption(normalizePath(skill.entry));
+                  const entry = normalizePath(skill.entry);
+                  addScriptOption(entry);
+                  Module.__scriptPeripherals.set(entry, Array.isArray(skill.peripherals) ? skill.peripherals : []);
                 }
+                Module.__simServices.capability.configure(skill.root || "", skill.capabilityMocks || {});
+                Module.__simServices.thread.configureSimulatorMocks(skill.simulatorMocks || {});
                 Module.print("[sim] mounted skill: " + (skill.id || "unknown"));
                 event.source && event.source.postMessage({
                   type: "esp-claw-sim:mounted",
@@ -944,6 +1259,10 @@
                 await window.espClawSim.runPath(path, true);
               } else if (data.type === "esp-claw-sim:stop") {
                 window.espClawSim.stop();
+              } else if (data.type === "esp-claw-sim:setResolution") {
+                const width = clampResolution(data.width, canvas.width || 800);
+                const height = clampResolution(data.height, canvas.height || 480);
+                setCanvasResolution(width, height, false);
               }
             } catch (err) {
               Module.printErr(err && err.stack ? err.stack : String(err));
@@ -997,10 +1316,11 @@
               event.target.value = "";
             }
           });
-          const shellParams = new URLSearchParams(window.location.search);
-          if (shellParams.get("embedded") === "1") {
-            document.body.classList.add("embedded");
-            window.parent && window.parent.postMessage({ type: "esp-claw-sim:ready" }, "*");
+          if (window.__espClawEmbedded) {
+            postHostEvent("esp-claw-sim:ready", {
+              width: Module.canvas.width || 800,
+              height: Module.canvas.height || 480,
+            });
           }
         }
       };

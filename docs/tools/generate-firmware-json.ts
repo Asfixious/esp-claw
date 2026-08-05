@@ -34,6 +34,7 @@ interface PackageMeta {
   flash_files: Record<string, string>;
   flash_settings: FlashSettings;
   min_flash_size: string;
+  min_psram_size?: string | number;
   nvs_info?: { start_addr: string; size: string };
 }
 
@@ -75,6 +76,18 @@ function getMasterRef(): string {
     if (hash) return hash;
   } catch {}
   return new Date().toISOString().slice(0, 19).replace("T", "_").replace(/:/g, "");
+}
+
+function parsePsramMB(value: unknown): number {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return parseFlashMB(value);
+  }
+
+  throw new Error(`unsupported min_psram_size type: ${typeof value}`);
 }
 
 function parseFlashMB(value: unknown): number {
@@ -245,6 +258,16 @@ async function main(): Promise<number> {
       continue;
     }
 
+    let minPsramMB = 0;
+    if (meta.min_psram_size != null) {
+      try {
+        minPsramMB = parsePsramMB(meta.min_psram_size);
+      } catch (error) {
+        log(`skip one metadata: invalid min_psram_size (${(error as Error).message})`);
+        continue;
+      }
+    }
+
     const chipKey = makeChipKey(chip.trim());
     const brandKey = brand.trim();
     const boardKey = board_name.trim();
@@ -268,7 +291,7 @@ async function main(): Promise<number> {
       partition_table: partition_table,
       nvs_info: nvs_info,
       min_flash_size: minFlashMB,
-      min_psram_size: 0,
+      min_psram_size: minPsramMB,
     };
   }
 

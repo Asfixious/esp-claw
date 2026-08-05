@@ -91,7 +91,7 @@ static void on_wifi_state_changed(bool connected, void *user_ctx)
 
     esp_err_t err = app_claw_set_network_status(connected, ap_ssid);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to update network emote: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Failed to update network UI: %s", esp_err_to_name(err));
     }
 }
 
@@ -329,7 +329,6 @@ void app_main(void)
     app_config_to_claw(s_config, s_claw_config);
     init_timezone(app_config_get_timezone(s_config)); // no need to check error
     ESP_ERROR_CHECK(esp_board_manager_init());
-    ESP_ERROR_CHECK(app_claw_ui_start());
     ESP_ERROR_CHECK(app_fs_init());
 
     /* Publish the resolved storage roots so any component can compose paths
@@ -338,6 +337,9 @@ void app_main(void)
     ESP_ERROR_CHECK(claw_paths_set(CLAW_PATH_SYSTEM, app_fs_system_base_path()));
 
     ESP_ERROR_CHECK(wifi_manager_init());
+
+    ESP_ERROR_CHECK(app_claw_ui_start());
+
     ESP_ERROR_CHECK(http_server_init(&(http_server_config_t) {
         .storage_base_path = app_fs_storage_base_path(),
         .services = {

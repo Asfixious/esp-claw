@@ -169,6 +169,14 @@ def _resolve_console_output(sdkconfig: Dict) -> str:
     return 'unknown'
 
 
+def _resolve_min_psram_size_mb(sdkconfig: Dict) -> int:
+    if sdkconfig.get('SPIRAM') is not True:
+        return 0
+    if sdkconfig.get('SPIRAM_XIP_FROM_PSRAM') is True:
+        return 8
+    return 4
+
+
 def _extract_partition_table(build_dir: Path, flasher_data: Dict) -> List[Dict]:
     partition_info = flasher_data.get('partition-table')
     if not isinstance(partition_info, dict):
@@ -309,6 +317,7 @@ def main() -> int:
                 'flash_files': flash_files,
                 'flash_settings': flash_settings,
                 'min_flash_size': flash_size,
+                'min_psram_size': _resolve_min_psram_size_mb(sdkconfig),
             }
             if nvs_start and nvs_size:
                 metadata['nvs_info'] = {

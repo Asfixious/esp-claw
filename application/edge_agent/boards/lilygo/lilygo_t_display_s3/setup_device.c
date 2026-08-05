@@ -171,8 +171,6 @@ static int display_lcd_init(void *config, int cfg_size, void **device_handle)
         },
         .bus_width = 8,
         .max_transfer_bytes = LCD_MAX_TRANSFER_BYTES,
-        .psram_trans_align = 64,
-        .sram_trans_align = 4,
     };
     ret = esp_lcd_new_i80_bus(&bus_cfg, &i80_bus);
     ESP_RETURN_ON_ERROR(ret, TAG, "esp_lcd_new_i80_bus failed");

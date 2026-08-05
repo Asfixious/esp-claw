@@ -29,25 +29,23 @@ _Static_assert(sizeof(void *) == 4, "claw-sys requires 32-bit ESP-IDF pointers")
  */
 _Static_assert(offsetof(esp_http_client_config_t, url) == 0,
                "ESP-IDF HTTP ABI changed before url");
-_Static_assert(offsetof(esp_http_client_config_t, client_key) == 56,
-               "ESP-IDF HTTP ABI changed before client_key");
-_Static_assert(offsetof(esp_http_client_config_t, client_key_password) == 60,
+_Static_assert(offsetof(esp_http_client_config_t, client_key_password) == 56,
                "ESP-IDF HTTP ABI changed before client_key_password");
-_Static_assert(offsetof(esp_http_client_config_t, event_handler) == 96,
+_Static_assert(offsetof(esp_http_client_config_t, event_handler) == 92,
                "ESP-IDF HTTP ABI changed before event_handler");
-_Static_assert(offsetof(esp_http_client_config_t, transport_type) == 100,
+_Static_assert(offsetof(esp_http_client_config_t, transport_type) == 96,
                "ESP-IDF HTTP ABI changed before transport_type");
-_Static_assert(offsetof(esp_http_client_config_t, buffer_size) == 104,
+_Static_assert(offsetof(esp_http_client_config_t, buffer_size) == 100,
                "ESP-IDF HTTP ABI changed before buffer_size");
-_Static_assert(offsetof(esp_http_client_config_t, buffer_size_tx) == 108,
+_Static_assert(offsetof(esp_http_client_config_t, buffer_size_tx) == 104,
                "ESP-IDF HTTP ABI changed before buffer_size_tx");
-_Static_assert(offsetof(esp_http_client_config_t, user_data) == 112,
+_Static_assert(offsetof(esp_http_client_config_t, user_data) == 108,
                "ESP-IDF HTTP ABI changed before user_data");
-_Static_assert(offsetof(esp_http_client_config_t, is_async) == 116,
+_Static_assert(offsetof(esp_http_client_config_t, is_async) == 112,
                "ESP-IDF HTTP ABI changed before is_async");
-_Static_assert(offsetof(esp_http_client_config_t, crt_bundle_attach) == 124,
+_Static_assert(offsetof(esp_http_client_config_t, crt_bundle_attach) == 120,
                "ESP-IDF HTTP ABI changed before crt_bundle_attach");
-_Static_assert(offsetof(esp_http_client_config_t, keep_alive_enable) == 128,
+_Static_assert(offsetof(esp_http_client_config_t, keep_alive_enable) == 124,
                "ESP-IDF HTTP ABI changed before keep_alive_enable");
 
 /* Rust reserves 208 bytes, including zero-filled space for IDF's tail fields. */

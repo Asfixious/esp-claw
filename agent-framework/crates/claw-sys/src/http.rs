@@ -123,7 +123,6 @@ mod espidf_driver {
         client_cert_len: usize,
         client_key_pem: *const c_char,
         client_key_len: usize,
-        client_key: *const c_void,
         client_key_password: *const c_char,
         client_key_password_len: usize,
         tls_version: c_int,
@@ -151,22 +150,21 @@ mod espidf_driver {
         // Remaining optional fields and addr_type are left out. The C-side ABI
         // guard verifies that they still fit here; zero initialization keeps
         // every omitted option disabled and addr_type at its default value.
-        _reserved: [u8; 60],
+        _reserved: [u8; 64],
     }
 
     // `claw_rs_idf_compat.c` asserts the corresponding ESP-IDF C layout. Keep
     // these assertions in Rust as the other half of that ABI contract.
     const _: [(); 208] = [(); core::mem::size_of::<esp_http_client_config_t>()];
-    const _: [(); 56] = [(); core::mem::offset_of!(esp_http_client_config_t, client_key)];
-    const _: [(); 60] = [(); core::mem::offset_of!(esp_http_client_config_t, client_key_password)];
-    const _: [(); 96] = [(); core::mem::offset_of!(esp_http_client_config_t, event_handler)];
-    const _: [(); 100] = [(); core::mem::offset_of!(esp_http_client_config_t, transport_type)];
-    const _: [(); 104] = [(); core::mem::offset_of!(esp_http_client_config_t, buffer_size)];
-    const _: [(); 108] = [(); core::mem::offset_of!(esp_http_client_config_t, buffer_size_tx)];
-    const _: [(); 112] = [(); core::mem::offset_of!(esp_http_client_config_t, user_data)];
-    const _: [(); 116] = [(); core::mem::offset_of!(esp_http_client_config_t, is_async)];
-    const _: [(); 124] = [(); core::mem::offset_of!(esp_http_client_config_t, crt_bundle_attach)];
-    const _: [(); 128] = [(); core::mem::offset_of!(esp_http_client_config_t, keep_alive_enable)];
+    const _: [(); 56] = [(); core::mem::offset_of!(esp_http_client_config_t, client_key_password)];
+    const _: [(); 92] = [(); core::mem::offset_of!(esp_http_client_config_t, event_handler)];
+    const _: [(); 96] = [(); core::mem::offset_of!(esp_http_client_config_t, transport_type)];
+    const _: [(); 100] = [(); core::mem::offset_of!(esp_http_client_config_t, buffer_size)];
+    const _: [(); 104] = [(); core::mem::offset_of!(esp_http_client_config_t, buffer_size_tx)];
+    const _: [(); 108] = [(); core::mem::offset_of!(esp_http_client_config_t, user_data)];
+    const _: [(); 112] = [(); core::mem::offset_of!(esp_http_client_config_t, is_async)];
+    const _: [(); 120] = [(); core::mem::offset_of!(esp_http_client_config_t, crt_bundle_attach)];
+    const _: [(); 124] = [(); core::mem::offset_of!(esp_http_client_config_t, keep_alive_enable)];
 
     extern "C" {
         fn esp_http_client_init(config: *const esp_http_client_config_t) -> *mut c_void;

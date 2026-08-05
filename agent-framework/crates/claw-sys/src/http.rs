@@ -80,6 +80,16 @@ mod espidf_driver {
     const ERRNO_EAGAIN: c_int = 11;
     const ERRNO_EINPROGRESS: c_int = 115;
 
+    /// Per-`poll_next` drain caps for the streaming body. A single poll keeps
+    /// advancing `esp_http_client_perform` (non-blocking, so it never blocks the
+    /// cooperative executor) until the socket would block, the transfer
+    /// finishes, or one of these caps is hit. Draining more than one step per
+    /// poll keeps the SSE stream from being starved by the single-core
+    /// round-robin scheduler; the caps bound head-of-line blocking and the
+    /// transient body buffer so other tasks (other agents, UI, REPL) still run.
+    const MAX_STREAM_STEPS_PER_POLL: u32 = 8;
+    const MAX_STREAM_BYTES_PER_POLL: usize = 16 * 1024;
+
     // --- esp_http_client FFI ------------------------------------------------
     #[repr(C)]
     struct esp_http_client_event_t {
@@ -660,6 +670,12 @@ mod espidf_driver {
             status_code_from_c_int(status).map(Some)
         }
 
+        /// Bytes currently accumulated by response-data callbacks but not yet
+        /// handed to the stream. Used to detect per-step progress while draining.
+        fn buffered_body_len(&self) -> usize {
+            self.ctx.body.len()
+        }
+
         /// Move bytes collected by response-data callbacks out as one stream
         /// item. The replacement buffer receives subsequent ESP-IDF callbacks.
         fn take_body_chunk(&mut self) -> Option<Vec<u8>> {
@@ -994,9 +1010,38 @@ mod espidf_driver {
                 return this.fail(timeout_error(this.timeout_ms));
             }
 
-            match this.conn.perform_raw_step() {
-                Ok(complete) => this.transfer_complete = complete,
-                Err(error) => return this.fail(error),
+            // Drain as much as the non-blocking transport currently offers,
+            // instead of a single step per poll. Stops when the transfer
+            // finishes, a step yields no new bytes (socket would block now), or
+            // a per-poll cap is reached. Cancel/deadline are re-checked each
+            // iteration so long drains stay responsive.
+            let mut steps: u32 = 0;
+            loop {
+                let before = this.conn.buffered_body_len();
+                match this.conn.perform_raw_step() {
+                    Ok(complete) => this.transfer_complete = complete,
+                    Err(error) => return this.fail(error),
+                }
+                steps += 1;
+                let buffered = this.conn.buffered_body_len();
+
+                if this.transfer_complete {
+                    break;
+                }
+                // No new bytes this step: the transport can make no further
+                // progress right now, so stop and yield.
+                if buffered == before {
+                    break;
+                }
+                if steps >= MAX_STREAM_STEPS_PER_POLL || buffered >= MAX_STREAM_BYTES_PER_POLL {
+                    break;
+                }
+                if this.cancel.is_cancelled() {
+                    return this.fail(HttpError::Aborted);
+                }
+                if this.deadline.expired() {
+                    return this.fail(timeout_error(this.timeout_ms));
+                }
             }
 
             if let Some(chunk) = this.conn.take_body_chunk() {
@@ -1007,8 +1052,8 @@ mod espidf_driver {
                 return Poll::Ready(None);
             }
 
-            // `perform` made as much progress as the non-blocking transport
-            // currently allows. Cooperatively yield before the next step.
+            // The transport made as much progress as it currently allows.
+            // Cooperatively yield before the next drain.
             cx.waker().wake_by_ref();
             Poll::Pending
         }

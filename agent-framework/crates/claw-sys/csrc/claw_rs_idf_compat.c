@@ -22,6 +22,14 @@
 /* All ESP-IDF targets supported by this repository use a 32-bit C ABI. */
 _Static_assert(sizeof(void *) == 4, "claw-sys requires 32-bit ESP-IDF pointers");
 
+/* These values are consumed by the Rust HTTP event callback. */
+_Static_assert(HTTP_EVENT_ON_HEADER == 3,
+               "ESP-IDF HTTP event ABI changed before ON_HEADER");
+_Static_assert(HTTP_EVENT_ON_DATA == 6,
+               "ESP-IDF HTTP event ABI changed before ON_DATA");
+_Static_assert(HTTP_EVENT_ON_FINISH == 7,
+               "ESP-IDF HTTP event ABI changed before ON_FINISH");
+
 /*
  * These offsets mirror esp_http_client_config_t in claw-sys/src/http.rs.
  * Checking the fields Rust writes catches both unconditional upstream fields

@@ -92,11 +92,13 @@ mod espidf_driver {
         header_value: *mut c_char,
     }
 
-    // esp_http_client_event_id_t: ERROR=0, ON_CONNECTED=1, HEADERS_SENT=2,
-    // ON_HEADER=3, ON_DATA=4, ON_FINISH=5, ...
+    // ESP-IDF v6.1's esp_http_client_event_id_t inserts
+    // ON_HEADERS_COMPLETE and ON_STATUS_CODE between ON_HEADER and ON_DATA.
+    // `claw_rs_idf_compat.c` asserts every value consumed here so an SDK enum
+    // change fails the firmware build instead of silently dropping body data.
     const HTTP_EVENT_ON_HEADER: c_int = 3;
-    const HTTP_EVENT_ON_DATA: c_int = 4;
-    const HTTP_EVENT_ON_FINISH: c_int = 5;
+    const HTTP_EVENT_ON_DATA: c_int = 6;
+    const HTTP_EVENT_ON_FINISH: c_int = 7;
     const HTTP_METHOD_GET: c_int = 0;
     const HTTP_METHOD_POST: c_int = 1;
 

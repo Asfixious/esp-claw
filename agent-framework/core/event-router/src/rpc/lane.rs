@@ -38,25 +38,25 @@ impl<const M: usize> AlignedFrame<M> {
 }
 
 struct StaticPipeState {
-    len: usize,
-    kind: LaneFrameKind,
-    occupied: bool,
-    frame_borrowed: bool,
-    frame_reserved: bool,
+    frame: PipeFrameState,
     reader_open: bool,
     writer_open: bool,
     reader_waker: Option<Waker>,
     writer_waker: Option<Waker>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipeFrameState {
+    Empty,
+    Reserved,
+    Ready { len: usize, kind: LaneFrameKind },
+    Borrowed { len: usize, kind: LaneFrameKind },
+}
+
 impl StaticPipeState {
     const fn new() -> Self {
         Self {
-            len: 0,
-            kind: LaneFrameKind::Message,
-            occupied: false,
-            frame_borrowed: false,
-            frame_reserved: false,
+            frame: PipeFrameState::Empty,
             reader_open: true,
             writer_open: true,
             reader_waker: None,
@@ -80,47 +80,11 @@ impl<const M: usize> StaticPipe<M> {
 
     fn reset(&self) {
         let mut state = self.state.borrow_mut();
-        state.len = 0;
-        state.kind = LaneFrameKind::Message;
-        state.occupied = false;
-        state.frame_borrowed = false;
-        state.frame_reserved = false;
+        state.frame = PipeFrameState::Empty;
         state.reader_open = true;
         state.writer_open = true;
         state.reader_waker = None;
         state.writer_waker = None;
-    }
-
-    fn poll_encode_frame(
-        &self,
-        context: &mut Context<'_>,
-        kind: LaneFrameKind,
-        encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
-    ) -> (Poll<RpcResult<()>>, Option<Waker>) {
-        let mut state = self.state.borrow_mut();
-        if !state.writer_open {
-            return (Poll::Ready(Err(RpcError::FrameWriterClosed)), None);
-        }
-        if !state.reader_open {
-            return (Poll::Ready(Err(RpcError::FrameReaderClosed)), None);
-        }
-        if state.occupied || state.frame_reserved {
-            update_waker(&mut state.writer_waker, context.waker());
-            return (Poll::Pending, None);
-        }
-
-        let mut bytes = self.bytes.borrow_mut();
-        let length = match encode(&mut bytes.bytes) {
-            Ok(length) => length,
-            Err(error) => return (Poll::Ready(Err(error)), None),
-        };
-        if length > M {
-            return (Poll::Ready(Err(RpcError::InvalidFrameState)), None);
-        }
-        state.len = length;
-        state.kind = kind;
-        state.occupied = true;
-        (Poll::Ready(Ok(())), state.reader_waker.take())
     }
 
     fn poll_reserve_frame(
@@ -134,7 +98,7 @@ impl<const M: usize> StaticPipe<M> {
         if !state.reader_open {
             return Poll::Ready(Err(RpcError::FrameReaderClosed));
         }
-        if state.occupied || state.frame_reserved {
+        if state.frame != PipeFrameState::Empty {
             update_waker(&mut state.writer_waker, context.waker());
             return Poll::Pending;
         }
@@ -143,7 +107,7 @@ impl<const M: usize> StaticPipe<M> {
             Ok(bytes) => RefMut::map(bytes, |frame| &mut frame.bytes[..]),
             Err(_) => return Poll::Ready(Err(RpcError::InvalidFrameState)),
         };
-        state.frame_reserved = true;
+        state.frame = PipeFrameState::Reserved;
         Poll::Ready(Ok(bytes))
     }
 
@@ -153,7 +117,7 @@ impl<const M: usize> StaticPipe<M> {
         kind: LaneFrameKind,
     ) -> (RpcResult<()>, Option<Waker>) {
         let mut state = self.state.borrow_mut();
-        if !state.frame_reserved || state.occupied || state.frame_borrowed {
+        if state.frame != PipeFrameState::Reserved {
             return (Err(RpcError::InvalidFrameState), None);
         }
         if !state.writer_open {
@@ -172,44 +136,42 @@ impl<const M: usize> StaticPipe<M> {
             );
         }
 
-        state.frame_reserved = false;
-        state.len = length;
-        state.kind = kind;
-        state.occupied = true;
+        state.frame = PipeFrameState::Ready { len: length, kind };
         (Ok(()), state.reader_waker.take())
     }
 
     fn cancel_reserved_frame(&self) -> Option<Waker> {
         let mut state = self.state.borrow_mut();
-        if !state.frame_reserved {
+        if state.frame != PipeFrameState::Reserved {
             return None;
         }
-        state.frame_reserved = false;
+        state.frame = PipeFrameState::Empty;
         state.writer_waker.take()
     }
 
     fn poll_borrow_frame(&'static self, context: &mut Context<'_>) -> BorrowedLaneFramePoll {
         let mut state = self.state.borrow_mut();
-        if state.frame_borrowed {
-            update_waker(&mut state.reader_waker, context.waker());
-            return Poll::Pending;
-        }
-        if !state.occupied {
-            if !state.writer_open {
-                return Poll::Ready(Ok(None));
+        let (length, kind) = match state.frame {
+            PipeFrameState::Borrowed { .. } => {
+                update_waker(&mut state.reader_waker, context.waker());
+                return Poll::Pending;
             }
-            update_waker(&mut state.reader_waker, context.waker());
-            return Poll::Pending;
-        }
-        let length = state.len;
-        let kind = state.kind;
-        state.frame_borrowed = true;
+            PipeFrameState::Empty | PipeFrameState::Reserved => {
+                if !state.writer_open && state.frame == PipeFrameState::Empty {
+                    return Poll::Ready(Ok(None));
+                }
+                update_waker(&mut state.reader_waker, context.waker());
+                return Poll::Pending;
+            }
+            PipeFrameState::Ready { len, kind } => (len, kind),
+        };
+        state.frame = PipeFrameState::Borrowed { len: length, kind };
         drop(state);
 
         match Ref::filter_map(self.bytes.borrow(), |frame| frame.bytes.get(..length)) {
             Ok(bytes) => Poll::Ready(Ok(Some((bytes, kind)))),
             Err(_) => {
-                self.state.borrow_mut().frame_borrowed = false;
+                self.state.borrow_mut().frame = PipeFrameState::Ready { len: length, kind };
                 Poll::Ready(Err(RpcError::InvalidFrameState))
             }
         }
@@ -217,12 +179,10 @@ impl<const M: usize> StaticPipe<M> {
 
     fn release_borrowed_frame(&self) -> (Option<Waker>, Option<Waker>) {
         let mut state = self.state.borrow_mut();
-        if !state.frame_borrowed {
+        if !matches!(state.frame, PipeFrameState::Borrowed { .. }) {
             return (None, None);
         };
-        state.frame_borrowed = false;
-        state.len = 0;
-        state.occupied = false;
+        state.frame = PipeFrameState::Empty;
         (state.writer_waker.take(), state.reader_waker.take())
     }
 
@@ -560,14 +520,6 @@ pub(crate) trait LanePool {
         direction: RpcDirection,
         context: &mut Context<'_>,
     ) -> Poll<RpcResult<Option<BorrowedFrame>>>;
-    fn poll_encode_frame(
-        &self,
-        lane: usize,
-        direction: RpcDirection,
-        context: &mut Context<'_>,
-        kind: LaneFrameKind,
-        encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
-    ) -> Poll<RpcResult<()>>;
     fn poll_reserve_frame(
         &'static self,
         lane: usize,
@@ -686,24 +638,6 @@ impl<const N: usize, const M: usize, const Q: usize> LanePool for RpcLaneStorage
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
         }
-    }
-
-    fn poll_encode_frame(
-        &self,
-        lane: usize,
-        direction: RpcDirection,
-        context: &mut Context<'_>,
-        kind: LaneFrameKind,
-        encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
-    ) -> Poll<RpcResult<()>> {
-        let Some(pipe) = self.pipe(lane, direction) else {
-            return Poll::Ready(Err(RpcError::InvalidLaneState));
-        };
-        let (poll, waker) = pipe.poll_encode_frame(context, kind, encode);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        poll
     }
 
     fn poll_reserve_frame(
@@ -935,20 +869,6 @@ impl LaneWriter {
             lane,
             direction,
         }
-    }
-
-    pub(crate) fn close(&mut self) {
-        self.pool.close_writer(self.lane, self.direction);
-    }
-
-    pub(crate) fn poll_encode_frame(
-        &mut self,
-        context: &mut Context<'_>,
-        kind: LaneFrameKind,
-        encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
-    ) -> Poll<RpcResult<()>> {
-        self.pool
-            .poll_encode_frame(self.lane, self.direction, context, kind, encode)
     }
 
     pub(crate) fn poll_reserve_frame(

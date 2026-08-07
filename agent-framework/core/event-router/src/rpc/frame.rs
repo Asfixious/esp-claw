@@ -6,7 +6,7 @@ use core::task::{Context, Poll};
 use futures_core::Stream;
 
 use super::lane::{LaneFrameKind, LaneReader, LaneWriter};
-use super::payload::{PayloadReaderStream, RpcPayloadFrame};
+use super::payload::RpcPayloadFrame;
 use super::{RpcError, RpcMessage, RpcResult};
 
 /// A typed, zero-copy view over one RPC frame.
@@ -84,25 +84,24 @@ where
     T: RpcMessage,
 {
     let payload = message.as_bytes();
-    let mut encode = |buffer: &mut [u8]| {
-        let destination = buffer
-            .get_mut(..payload.len())
-            .ok_or(RpcError::InvalidLaneState)?;
-        destination.copy_from_slice(payload);
-        Ok(payload.len())
-    };
-    core::future::poll_fn(|context| writer.poll_encode_frame(context, kind, &mut encode)).await
+    let mut frame = core::future::poll_fn(|context| writer.poll_reserve_frame(context))
+        .await?
+        .limit(payload.len())?;
+    frame.as_mut().copy_from_slice(payload);
+    frame.commit(payload.len(), kind)
 }
 
 pub(crate) struct FramedReader<T> {
-    payloads: PayloadReaderStream,
+    reader: LaneReader,
+    finished: bool,
     message: PhantomData<fn() -> T>,
 }
 
 impl<T> FramedReader<T> {
     pub(crate) fn new(reader: LaneReader) -> Self {
         Self {
-            payloads: PayloadReaderStream::new(reader),
+            reader,
+            finished: false,
             message: PhantomData,
         }
     }
@@ -117,11 +116,28 @@ where
     type Item = RpcResult<RpcFrame<T>>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.get_mut().payloads).poll_next(context) {
-            Poll::Ready(Some(Ok(payload))) => Poll::Ready(Some(RpcFrame::from_payload(payload))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
-            Poll::Ready(None) => Poll::Ready(None),
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        match this.reader.poll_borrow_frame(context) {
             Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Ok(Some(frame))) if frame.kind() == LaneFrameKind::Message => {
+                let payload = RpcPayloadFrame::from_frame(frame);
+                Poll::Ready(Some(RpcFrame::from_payload(payload)))
+            }
+            Poll::Ready(Ok(Some(_))) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(RpcError::InvalidFrameState)))
+            }
+            Poll::Ready(Ok(None)) => {
+                this.finished = true;
+                Poll::Ready(None)
+            }
         }
     }
 }

@@ -59,7 +59,7 @@ async fn receive_image(mut reader: RpcPayloadReader) -> RpcResult<()> {
 }
 
 async fn run() -> RpcResult<()> {
-    let registry = Rc::new(RpcRegistry::new(RPC_LANES.take())?);
+    let registry = Rc::new(RpcRegistry::new(RPC_LANES.take()));
     registry.register::<TransferImage, _>(transfer_image)?;
 
     // The two handles are independent so full-duplex Methods can apply

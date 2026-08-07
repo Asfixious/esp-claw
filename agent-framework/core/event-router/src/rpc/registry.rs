@@ -55,23 +55,20 @@ pub struct RpcRegistry<const N: usize, const M: usize, const Q: usize> {
 impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// Creates an empty registry backed by fixed-capacity lane storage.
     ///
-    /// # Errors
-    ///
-    /// Returns [`RpcError::InvalidLaneConfiguration`] when the storage has no
-    /// active lanes or no bytes in each request/response direction.
-    pub fn new(lanes: &'static RpcLaneStorage<N, M, Q>) -> RpcResult<Self> {
-        if N == 0 {
-            return Err(RpcError::InvalidLaneConfiguration { field: "N" });
+    /// `N` and `M` must both be nonzero; invalid const-generic configurations
+    /// fail at compile time.
+    #[must_use]
+    pub fn new(lanes: &'static RpcLaneStorage<N, M, Q>) -> Self {
+        const {
+            assert!(N > 0, "RPC lane count must be nonzero");
+            assert!(M > 0, "RPC lane frame capacity must be nonzero");
         }
-        if M == 0 {
-            return Err(RpcError::InvalidLaneConfiguration { field: "M" });
-        }
-        Ok(Self {
+        Self {
             endpoints: RefCell::new(HashMap::new()),
             next_endpoint_id: Cell::new(1),
             next_call_id: Cell::new(1),
             lanes,
-        })
+        }
     }
 
     /// Creates an external client for this registry.
@@ -149,7 +146,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     ///
     /// static LANES: ConstStaticCell<RpcLaneStorage<1, 64, 1>> =
     ///     ConstStaticCell::new(RpcLaneStorage::new());
-    /// let registry = RpcRegistry::new(LANES.take())?;
+    /// let registry = RpcRegistry::new(LANES.take());
     /// let _ = registry.register::<TooLargeError, _>(
     ///     |_context, _request: RpcFrame<[u8; 1]>| async move { Ok(Ok([0])) },
     /// )?;
@@ -183,7 +180,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     ///
     /// static LANES: ConstStaticCell<RpcLaneStorage<1, 64, 1>> =
     ///     ConstStaticCell::new(RpcLaneStorage::new());
-    /// let registry = RpcRegistry::new(LANES.take())?;
+    /// let registry = RpcRegistry::new(LANES.take());
     /// let _ = registry.register::<InvalidAlignment, _>(
     ///     |_context, _request: RpcFrame<[u8; 1]>| async move { Ok(Ok([0])) },
     /// )?;
@@ -422,25 +419,11 @@ pub(crate) struct PreparedCall {
 }
 
 impl PreparedCall {
-    pub(crate) async fn acquire(self) -> RpcResult<AcquiredCall> {
-        let lane = self.lane.await?;
-        Ok(AcquiredCall {
-            endpoint: self.endpoint,
-            context: self.context,
-            lane: Some(lane),
-        })
-    }
-}
-
-pub(crate) struct AcquiredCall {
-    endpoint: EndpointEntry,
-    context: RpcContext,
-    lane: Option<LaneIo>,
-}
-
-impl AcquiredCall {
-    pub(crate) fn take_lane(&mut self) -> RpcResult<LaneIo> {
-        self.lane.take().ok_or(RpcError::InvalidLaneState)
+    pub(crate) fn poll_acquire(
+        &mut self,
+        context: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<RpcResult<LaneIo>> {
+        Pin::new(&mut self.lane).poll(context)
     }
 
     pub(crate) fn start(self, input: LaneReader, output: LaneWriter) -> RpcFuture<'static> {
@@ -587,12 +570,6 @@ pub enum RpcError {
     /// Fixed lane state became internally inconsistent.
     #[error("invalid RPC lane state")]
     InvalidLaneState,
-    /// Fixed lane storage has zero active lanes or zero frame bytes.
-    #[error("invalid RPC lane configuration: {field} must be nonzero")]
-    InvalidLaneConfiguration {
-        /// Invalid const generic field.
-        field: &'static str,
-    },
     /// An RPC frame writer was already closed.
     #[error("RPC frame writer is closed")]
     FrameWriterClosed,

@@ -13,7 +13,7 @@ use futures_util::{future, stream};
 
 fn registry<const N: usize, const M: usize, const Q: usize>() -> Rc<RpcRegistry<N, M, Q>> {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<N, M, Q>::new()));
-    Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"))
+    Rc::new(RpcRegistry::new(lanes))
 }
 
 async fn send_payloads(mut writer: RpcPayloadWriter, payloads: Vec<Vec<u8>>) -> RpcResult<()> {

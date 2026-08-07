@@ -59,7 +59,7 @@ fn success<T, E>(outcome: Result<T, E>) -> RpcResult<T> {
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
-    let registry = Rc::new(RpcRegistry::new(lanes)?);
+    let registry = Rc::new(RpcRegistry::new(lanes));
 
     let increment_registration = registry.register::<Increment, _>(
         |context: RpcContext, request: RpcFrame<Number>| async move {

@@ -35,7 +35,7 @@ async fn run() -> RpcResult<()> {
     // bytes, and at most two root calls can wait without allocating a queue.
     let lanes = RPC_LANES.take();
 
-    let registry = Rc::new(RpcRegistry::new(lanes)?);
+    let registry = Rc::new(RpcRegistry::new(lanes));
     registry.register::<YieldingEcho, _>(|_context, request: RpcFrame<Number>| async move {
         // Let the second root call observe the occupied lane and enter the
         // fixed waiter table before this call returns its lane.

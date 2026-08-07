@@ -1,15 +1,11 @@
 //! Asynchronous wire-level RPC payload IO over fixed lane frames.
 
-use core::future::Future;
 use core::marker::PhantomData;
-use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use futures_core::Stream;
-
-use super::lane::{BorrowedFrame, LaneFrameKind, LaneReader, LaneWriter, ReservedFrame};
+use super::lane::{BorrowedFrame, LaneFrameKind, LaneIo, LaneReader, LaneWriter, ReservedFrame};
 use super::registry::{PreparedCall, RpcFuture};
 use super::{RpcError, RpcResult};
 
@@ -79,26 +75,23 @@ impl core::fmt::Debug for RpcPayloadWriteFrame<'_> {
     }
 }
 
-struct ActivePayloadCall {
-    request: LaneWriter,
-    response: LaneReader,
-    handler: RpcFuture<'static>,
-}
-
-type PayloadSetupFuture = Pin<Box<dyn Future<Output = RpcResult<ActivePayloadCall>> + 'static>>;
-
 #[derive(Clone, Copy)]
 enum PayloadSide {
     Writer,
     Reader,
 }
 
+enum PayloadCallPhase {
+    Acquiring(PreparedCall),
+    Active(RpcFuture<'static>),
+    Complete,
+    Failed(RpcError),
+}
+
 struct PayloadCallState {
-    setup: Option<PayloadSetupFuture>,
+    phase: PayloadCallPhase,
     request: Option<LaneWriter>,
     response: Option<LaneReader>,
-    handler: Option<RpcFuture<'static>>,
-    error: Option<RpcError>,
     writer_alive: bool,
     reader_alive: bool,
     writer_waker: Option<Waker>,
@@ -133,23 +126,11 @@ struct PayloadCallShared {
 
 impl PayloadCallShared {
     fn new(prepared: PreparedCall) -> Self {
-        let setup = Box::pin(async move {
-            let mut acquired = prepared.acquire().await?;
-            let lane = acquired.take_lane()?;
-            let handler = acquired.start(lane.request_reader, lane.response_writer);
-            Ok(ActivePayloadCall {
-                request: lane.request_writer,
-                response: lane.response_reader,
-                handler,
-            })
-        });
         Self {
             state: RefCell::new(PayloadCallState {
-                setup: Some(setup),
+                phase: PayloadCallPhase::Acquiring(prepared),
                 request: None,
                 response: None,
-                handler: None,
-                error: None,
                 writer_alive: true,
                 reader_alive: true,
                 writer_waker: None,
@@ -163,27 +144,39 @@ impl PayloadCallShared {
         let (result, peer_waker) = {
             let mut state = self.state.borrow_mut();
             state.update_waker(side, context.waker());
-            if let Some(error) = state.error.clone() {
-                return Poll::Ready(Err(error));
+            if let PayloadCallPhase::Failed(error) = &state.phase {
+                return Poll::Ready(Err(error.clone()));
             }
 
-            let setup_poll = state
-                .setup
-                .as_mut()
-                .map(|setup| setup.as_mut().poll(context));
-            match setup_poll {
+            let acquire_poll = match &mut state.phase {
+                PayloadCallPhase::Acquiring(prepared) => Some(prepared.poll_acquire(context)),
+                PayloadCallPhase::Active(_)
+                | PayloadCallPhase::Complete
+                | PayloadCallPhase::Failed(_) => None,
+            };
+            match acquire_poll {
                 Some(Poll::Pending) => return Poll::Pending,
                 Some(Poll::Ready(Err(error))) => {
-                    state.setup = None;
-                    state.error = Some(error.clone());
+                    state.phase = PayloadCallPhase::Failed(error.clone());
                     let peer = state.take_peer_waker(side);
                     (Poll::Ready(Err(error)), peer)
                 }
-                Some(Poll::Ready(Ok(active))) => {
-                    state.setup = None;
-                    state.request = state.writer_alive.then_some(active.request);
-                    state.response = state.reader_alive.then_some(active.response);
-                    state.handler = Some(active.handler);
+                Some(Poll::Ready(Ok(lane))) => {
+                    let PayloadCallPhase::Acquiring(prepared) =
+                        core::mem::replace(&mut state.phase, PayloadCallPhase::Complete)
+                    else {
+                        return Poll::Ready(Err(RpcError::InvalidLaneState));
+                    };
+                    let LaneIo {
+                        request_reader,
+                        request_writer,
+                        response_reader,
+                        response_writer,
+                    } = lane;
+                    let handler = prepared.start(request_reader, response_writer);
+                    state.request = state.writer_alive.then_some(request_writer);
+                    state.response = state.reader_alive.then_some(response_reader);
+                    state.phase = PayloadCallPhase::Active(handler);
                     let peer = state.take_peer_waker(side);
                     let (result, handler, _completed) = Self::poll_handler(&mut state, context);
                     completed_handler = handler;
@@ -208,18 +201,29 @@ impl PayloadCallShared {
         state: &mut PayloadCallState,
         context: &mut Context<'_>,
     ) -> (Poll<RpcResult<()>>, Option<RpcFuture<'static>>, bool) {
-        let handler_poll = state
-            .handler
-            .as_mut()
-            .map(|handler| handler.as_mut().poll(context));
+        let handler_poll = match &mut state.phase {
+            PayloadCallPhase::Active(handler) => Some(handler.as_mut().poll(context)),
+            PayloadCallPhase::Failed(error) => {
+                return (Poll::Ready(Err(error.clone())), None, false)
+            }
+            PayloadCallPhase::Acquiring(_) | PayloadCallPhase::Complete => None,
+        };
         match handler_poll {
             Some(Poll::Ready(Ok(()))) => {
-                let handler = state.handler.take();
+                let phase = core::mem::replace(&mut state.phase, PayloadCallPhase::Complete);
+                let handler = match phase {
+                    PayloadCallPhase::Active(handler) => Some(handler),
+                    _ => None,
+                };
                 (Poll::Ready(Ok(())), handler, true)
             }
             Some(Poll::Ready(Err(error))) => {
-                let handler = state.handler.take();
-                state.error = Some(error.clone());
+                let phase =
+                    core::mem::replace(&mut state.phase, PayloadCallPhase::Failed(error.clone()));
+                let handler = match phase {
+                    PayloadCallPhase::Active(handler) => Some(handler),
+                    _ => None,
+                };
                 (Poll::Ready(Err(error)), handler, true)
             }
             Some(Poll::Pending) | None => (Poll::Ready(Ok(())), None, false),
@@ -505,51 +509,4 @@ pub(crate) fn make_payload_call(prepared: PreparedCall) -> (RpcPayloadWriter, Rp
             finished: false,
         },
     )
-}
-
-pub(crate) struct PayloadReaderStream {
-    reader: LaneReader,
-    finished: bool,
-}
-
-impl PayloadReaderStream {
-    pub(crate) fn new(reader: LaneReader) -> Self {
-        Self {
-            reader,
-            finished: false,
-        }
-    }
-
-    fn fail(&mut self, error: RpcError) -> Poll<Option<RpcResult<RpcPayloadFrame>>> {
-        self.finished = true;
-        Poll::Ready(Some(Err(error)))
-    }
-}
-
-impl Unpin for PayloadReaderStream {}
-
-impl Stream for PayloadReaderStream {
-    type Item = RpcResult<RpcPayloadFrame>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(None);
-        }
-        match this.reader.poll_borrow_frame(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => this.fail(error),
-            Poll::Ready(Ok(Some(frame))) => {
-                if frame.kind() == LaneFrameKind::Message {
-                    Poll::Ready(Some(Ok(RpcPayloadFrame::from_frame(frame))))
-                } else {
-                    this.fail(RpcError::InvalidFrameState)
-                }
-            }
-            Poll::Ready(Ok(None)) => {
-                this.finished = true;
-                Poll::Ready(None)
-            }
-        }
-    }
 }

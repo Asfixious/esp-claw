@@ -63,15 +63,15 @@ Registry 必须显式接收 application-lifetime lane storage：
 
 ```rust
 use std::rc::Rc;
-use claw_event_router::rpc::{RpcLaneStorage, RpcRegistry, RpcResult};
+use claw_event_router::rpc::{RpcLaneStorage, RpcRegistry};
 use static_cell::ConstStaticCell;
 
 static RPC_LANES: ConstStaticCell<RpcLaneStorage<4, 4096, 8>> =
     ConstStaticCell::new(RpcLaneStorage::new());
 
-fn build_registry() -> RpcResult<Rc<RpcRegistry<4, 4096, 8>>> {
+fn build_registry() -> Rc<RpcRegistry<4, 4096, 8>> {
     let lanes = RPC_LANES.take();
-    Ok(Rc::new(RpcRegistry::new(lanes)?))
+    Rc::new(RpcRegistry::new(lanes))
 }
 ```
 

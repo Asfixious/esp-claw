@@ -26,6 +26,6 @@ pub use payload::{RpcPayloadFrame, RpcPayloadReader, RpcPayloadWriteFrame, RpcPa
 pub(crate) use registry::RpcDirection;
 pub use registry::{RpcClient, RpcError, RpcRegistration, RpcRegistry, RpcResult};
 pub use typed::{
-    RpcCardinality, RpcHandler, RpcHandlerFuture, RpcHandlerInput, RpcHandlerOutput, RpcInputMode,
-    RpcMessage, RpcMethod, RpcOutputMode, RpcStream, RpcUnaryCall, Streaming, Unary,
+    RpcHandler, RpcHandlerFuture, RpcHandlerInput, RpcHandlerOutput, RpcInputMode, RpcMessage,
+    RpcMethod, RpcOutputMode, RpcStream, RpcUnaryCall, Streaming, Unary,
 };

@@ -61,7 +61,7 @@ impl RpcMethod for DomainFailure {
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
-    let registry = Rc::new(RpcRegistry::new(lanes)?);
+    let registry = Rc::new(RpcRegistry::new(lanes));
     registry.register::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
         Ok(Ok(*request.view()?))
     })?;

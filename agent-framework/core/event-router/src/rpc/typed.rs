@@ -16,7 +16,88 @@ use super::registry::{ErasedRpcHandler, PreparedCall, RpcFuture};
 use super::{RpcAddress, RpcContext, RpcError, RpcResult};
 
 mod private {
+    use super::{RpcFrame, RpcHandlerFuture, RpcInputMode, RpcMessage, RpcOutputMode, RpcStream};
+
     pub trait Sealed {}
+
+    pub trait InputMode<T, ClientInput, HandlerInput>
+    where
+        T: RpcMessage,
+    {
+        fn into_stream(input: ClientInput) -> RpcStream<T>;
+
+        fn decode_stream(input: RpcStream<RpcFrame<T>>) -> RpcHandlerFuture<'static, HandlerInput>;
+    }
+
+    pub trait OutputMode<T, E, HandlerOutput, ClientCall>
+    where
+        T: RpcMessage,
+        E: RpcMessage,
+    {
+        fn into_stream(output: HandlerOutput) -> RpcStream<Result<T, E>>;
+
+        fn make_client_call(responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>) -> ClientCall;
+    }
+
+    pub(super) fn into_input_stream<Mode, T>(
+        input: <Mode as RpcInputMode<T>>::ClientInput,
+    ) -> RpcStream<T>
+    where
+        Mode: RpcInputMode<T>,
+        T: RpcMessage,
+    {
+        <Mode as InputMode<
+            T,
+            <Mode as RpcInputMode<T>>::ClientInput,
+            <Mode as RpcInputMode<T>>::HandlerInput,
+        >>::into_stream(input)
+    }
+
+    pub(super) fn decode_input_stream<Mode, T>(
+        input: RpcStream<RpcFrame<T>>,
+    ) -> RpcHandlerFuture<'static, <Mode as RpcInputMode<T>>::HandlerInput>
+    where
+        Mode: RpcInputMode<T>,
+        T: RpcMessage,
+    {
+        <Mode as InputMode<
+            T,
+            <Mode as RpcInputMode<T>>::ClientInput,
+            <Mode as RpcInputMode<T>>::HandlerInput,
+        >>::decode_stream(input)
+    }
+
+    pub(super) fn into_output_stream<Mode, T, E>(
+        output: <Mode as RpcOutputMode<T, E>>::HandlerOutput,
+    ) -> RpcStream<Result<T, E>>
+    where
+        Mode: RpcOutputMode<T, E>,
+        T: RpcMessage,
+        E: RpcMessage,
+    {
+        <Mode as OutputMode<
+            T,
+            E,
+            <Mode as RpcOutputMode<T, E>>::HandlerOutput,
+            <Mode as RpcOutputMode<T, E>>::ClientCall,
+        >>::into_stream(output)
+    }
+
+    pub(super) fn make_client_call<Mode, T, E>(
+        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
+    ) -> <Mode as RpcOutputMode<T, E>>::ClientCall
+    where
+        Mode: RpcOutputMode<T, E>,
+        T: RpcMessage,
+        E: RpcMessage,
+    {
+        <Mode as OutputMode<
+            T,
+            E,
+            <Mode as RpcOutputMode<T, E>>::HandlerOutput,
+            <Mode as RpcOutputMode<T, E>>::ClientCall,
+        >>::make_client_call(responses)
+    }
 }
 
 /// A fixed-layout value that may be viewed directly in a typed RPC frame.
@@ -29,15 +110,6 @@ pub trait RpcMessage: TryFromBytes + IntoBytes + KnownLayout + Immutable + 'stat
 
 impl<T> RpcMessage for T where T: TryFromBytes + IntoBytes + KnownLayout + Immutable + 'static {}
 
-/// Whether one side of a typed method carries one message or a message stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RpcCardinality {
-    /// Exactly one typed message.
-    Unary,
-    /// Zero or more typed messages until EOF.
-    Streaming,
-}
-
 /// Marker selecting exactly one typed message.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Unary;
@@ -47,7 +119,70 @@ pub struct Unary;
 pub struct Streaming;
 
 impl private::Sealed for Unary {}
+
+impl<T> private::InputMode<T, T, RpcFrame<T>> for Unary
+where
+    T: RpcMessage,
+{
+    fn into_stream(input: T) -> RpcStream<T> {
+        RpcStream::new(OnceStream::new(input))
+    }
+
+    fn decode_stream(mut input: RpcStream<RpcFrame<T>>) -> RpcHandlerFuture<'static, RpcFrame<T>> {
+        Box::pin(async move { input.next().await.ok_or(RpcError::MissingUnaryFrame)? })
+    }
+}
+
+impl<T, E> private::OutputMode<T, E, Result<T, E>, RpcUnaryCall<T, E>> for Unary
+where
+    T: RpcMessage,
+    E: RpcMessage,
+{
+    fn into_stream(output: Result<T, E>) -> RpcStream<Result<T, E>> {
+        RpcStream::new(OnceStream::new(output))
+    }
+
+    fn make_client_call(
+        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
+    ) -> RpcUnaryCall<T, E> {
+        RpcUnaryCall::new(responses)
+    }
+}
+
 impl private::Sealed for Streaming {}
+
+impl<T> private::InputMode<T, RpcStream<T>, RpcStream<RpcFrame<T>>> for Streaming
+where
+    T: RpcMessage,
+{
+    fn into_stream(input: RpcStream<T>) -> RpcStream<T> {
+        input
+    }
+
+    fn decode_stream(
+        input: RpcStream<RpcFrame<T>>,
+    ) -> RpcHandlerFuture<'static, RpcStream<RpcFrame<T>>> {
+        Box::pin(async move { Ok(input) })
+    }
+}
+
+impl<T, E>
+    private::OutputMode<T, E, RpcStream<Result<T, E>>, RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>>
+    for Streaming
+where
+    T: RpcMessage,
+    E: RpcMessage,
+{
+    fn into_stream(output: RpcStream<Result<T, E>>) -> RpcStream<Result<T, E>> {
+        output
+    }
+
+    fn make_client_call(
+        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
+    ) -> RpcStream<Result<RpcFrame<T>, RpcFrame<E>>> {
+        responses
+    }
+}
 
 /// A task-local RPC stream whose outer [`RpcResult`] reports transport failures.
 pub struct RpcStream<T> {
@@ -116,16 +251,8 @@ pub(crate) struct RpcMethodDescriptor {
     method_type_id: TypeId,
     #[getset(get_copy = "pub(crate)")]
     method_type_name: &'static str,
-    request_type_id: TypeId,
-    request_type_name: &'static str,
     #[getset(get_copy = "pub(crate)")]
     request_frame_size: usize,
-    response_type_id: TypeId,
-    response_type_name: &'static str,
-    error_type_id: TypeId,
-    error_type_name: &'static str,
-    input_cardinality: RpcCardinality,
-    output_cardinality: RpcCardinality,
 }
 
 impl RpcMethodDescriptor {
@@ -152,15 +279,7 @@ impl RpcMethodDescriptor {
             address,
             method_type_id: TypeId::of::<M>(),
             method_type_name: type_name::<M>(),
-            request_type_id: TypeId::of::<M::Request>(),
-            request_type_name: type_name::<M::Request>(),
             request_frame_size: size_of::<M::Request>(),
-            response_type_id: TypeId::of::<M::Response>(),
-            response_type_name: type_name::<M::Response>(),
-            error_type_id: TypeId::of::<M::Error>(),
-            error_type_name: type_name::<M::Error>(),
-            input_cardinality: M::Input::CARDINALITY,
-            output_cardinality: M::Output::CARDINALITY,
         })
     }
 }
@@ -173,9 +292,12 @@ where
     M: RpcMethod,
 {
     let (writer, reader) = make_payload_call(prepared);
-    let input = encode_stream(M::Input::into_stream(input), writer);
+    let input = encode_stream(
+        private::into_input_stream::<M::Input, M::Request>(input),
+        writer,
+    );
     let responses = RpcStream::new(TypedCallDriver::<M::Response, M::Error>::new(input, reader));
-    M::Output::make_client_call(responses)
+    private::make_client_call::<M::Output, M::Response, M::Error>(responses)
 }
 
 /// Boxed task-local future returned by a handler implementation.
@@ -225,7 +347,8 @@ where
 /// Type-level request cardinality behavior.
 ///
 /// This trait is sealed; use [`Unary`] or [`Streaming`].
-pub trait RpcInputMode<T>: private::Sealed
+pub trait RpcInputMode<T>:
+    private::Sealed + private::InputMode<T, Self::ClientInput, Self::HandlerInput>
 where
     T: RpcMessage,
 {
@@ -234,23 +357,13 @@ where
 
     /// Value delivered to [`RpcHandler`].
     type HandlerInput;
-
-    /// Runtime cardinality value.
-    const CARDINALITY: RpcCardinality;
-
-    #[doc(hidden)]
-    fn into_stream(input: Self::ClientInput) -> RpcStream<T>;
-
-    #[doc(hidden)]
-    fn decode_stream(
-        input: RpcStream<RpcFrame<T>>,
-    ) -> RpcHandlerFuture<'static, Self::HandlerInput>;
 }
 
 /// Type-level typed-result and response-cardinality behavior.
 ///
 /// This trait is sealed; use [`Unary`] or [`Streaming`].
-pub trait RpcOutputMode<T, E>: private::Sealed
+pub trait RpcOutputMode<T, E>:
+    private::Sealed + private::OutputMode<T, E, Self::HandlerOutput, Self::ClientCall>
 where
     T: RpcMessage,
     E: RpcMessage,
@@ -260,16 +373,6 @@ where
 
     /// Self-driving call returned by [`RpcClient::call`](crate::rpc::RpcClient::call).
     type ClientCall;
-
-    /// Runtime cardinality value.
-    const CARDINALITY: RpcCardinality;
-
-    #[doc(hidden)]
-    fn into_stream(output: Self::HandlerOutput) -> RpcStream<Result<T, E>>;
-
-    #[doc(hidden)]
-    fn make_client_call(responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>)
-        -> Self::ClientCall;
 }
 
 impl<T> RpcInputMode<T> for Unary
@@ -278,18 +381,6 @@ where
 {
     type ClientInput = T;
     type HandlerInput = RpcFrame<T>;
-
-    const CARDINALITY: RpcCardinality = RpcCardinality::Unary;
-
-    fn into_stream(input: Self::ClientInput) -> RpcStream<T> {
-        RpcStream::new(OnceStream::new(input))
-    }
-
-    fn decode_stream(
-        mut input: RpcStream<RpcFrame<T>>,
-    ) -> RpcHandlerFuture<'static, Self::HandlerInput> {
-        Box::pin(async move { input.next().await.ok_or(RpcError::MissingUnaryFrame)? })
-    }
 }
 
 impl<T> RpcInputMode<T> for Streaming
@@ -298,18 +389,6 @@ where
 {
     type ClientInput = RpcStream<T>;
     type HandlerInput = RpcStream<RpcFrame<T>>;
-
-    const CARDINALITY: RpcCardinality = RpcCardinality::Streaming;
-
-    fn into_stream(input: Self::ClientInput) -> RpcStream<T> {
-        input
-    }
-
-    fn decode_stream(
-        input: RpcStream<RpcFrame<T>>,
-    ) -> RpcHandlerFuture<'static, Self::HandlerInput> {
-        Box::pin(async move { Ok(input) })
-    }
 }
 
 impl<T, E> RpcOutputMode<T, E> for Unary
@@ -319,18 +398,6 @@ where
 {
     type HandlerOutput = Result<T, E>;
     type ClientCall = RpcUnaryCall<T, E>;
-
-    const CARDINALITY: RpcCardinality = RpcCardinality::Unary;
-
-    fn into_stream(output: Self::HandlerOutput) -> RpcStream<Result<T, E>> {
-        RpcStream::new(OnceStream::new(output))
-    }
-
-    fn make_client_call(
-        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
-    ) -> Self::ClientCall {
-        RpcUnaryCall::new(responses)
-    }
 }
 
 impl<T, E> RpcOutputMode<T, E> for Streaming
@@ -340,18 +407,6 @@ where
 {
     type HandlerOutput = RpcStream<Result<T, E>>;
     type ClientCall = RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>;
-
-    const CARDINALITY: RpcCardinality = RpcCardinality::Streaming;
-
-    fn into_stream(output: Self::HandlerOutput) -> RpcStream<Result<T, E>> {
-        output
-    }
-
-    fn make_client_call(
-        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
-    ) -> Self::ClientCall {
-        responses
-    }
 }
 
 struct OnceStream<T> {
@@ -493,7 +548,7 @@ where
                 }
             }
         }
-        writer.close();
+        drop(writer);
         Ok(())
     })
 }
@@ -525,9 +580,11 @@ where
     ) -> RpcFuture<'a> {
         Box::pin(async move {
             let input = RpcStream::new(FramedReader::new(input));
-            let input = M::Input::decode_stream(input).await?;
+            let input = private::decode_input_stream::<M::Input, M::Request>(input).await?;
             let output_value = self.handler.call(context, input).await?;
-            encode_outcome_stream(M::Output::into_stream(output_value), output).await
+            let output_value =
+                private::into_output_stream::<M::Output, M::Response, M::Error>(output_value);
+            encode_outcome_stream(output_value, output).await
         })
     }
 }

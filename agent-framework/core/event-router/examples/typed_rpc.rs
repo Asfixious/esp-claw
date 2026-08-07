@@ -120,7 +120,7 @@ async fn collect(
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
-    let registry = Rc::new(RpcRegistry::new(lanes)?);
+    let registry = Rc::new(RpcRegistry::new(lanes));
 
     registry.register::<UnaryUnary, _>(AddOffset { offset: 1 })?;
 

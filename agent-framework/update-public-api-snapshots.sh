@@ -17,6 +17,7 @@ crates=(
     claw-persistence
     claw-context
     claw-core
+    claw-event-router
     claw-interface
     claw-log
     claw-memory
@@ -29,7 +30,11 @@ crates=(
 )
 
 for crate in "${crates[@]}"; do
+    manifest="crates/${crate}/Cargo.toml"
+    if [[ "$crate" == "claw-event-router" ]]; then
+        manifest="core/event-router/Cargo.toml"
+    fi
     echo "updating public API snapshot: ${crate}"
-    cargo public-api --manifest-path "crates/${crate}/Cargo.toml" --color never -sss \
+    cargo public-api --manifest-path "${manifest}" --color never -sss \
         >"snapshots/${crate}.txt"
 done

@@ -36,18 +36,132 @@ WorkflowRuntime
 * `WorkflowRuntime` 管理并解释执行 Workflow JSON；
 * `WorkflowRuntime` 本身也是一个 Component，并在 EventRouter 构造时注册到 `RpcRegistry`。
 
+## Rust package 和 module 边界
+
+当前实现保持一个 library crate：
+
+```text
+claw-event-router
+├── rpc/          # typed/raw RPC、registry、framing、binary IO
+├── workflow/     # Workflow 定义、匹配和解释执行
+├── event/        # Event 数据模型与 emit 入口
+├── component/    # Component 生命周期与 registration
+└── runtime       # EventRouter 组合根
+```
+
+这些首先是同一个 crate 内的领域 module，而不是五个独立 crate。这样既可以通过 module visibility 保持依赖方向，也不会过早引入跨 crate error、feature、version 和构建管理成本。
+
+`EventRouter` 是 runtime 的公开组合根类型，不再额外建立一个含义重叠的 `router` module。未来只有当某一层需要被其他 crate 独立依赖、需要独立 feature/平台构建，或需要用 crate boundary 强制单向依赖时，才将它提取成独立 library crate。例如 RPC 真正出现 EventRouter 之外的消费者后，可以独立为 `claw-rpc`。
+
+当前已实现的 RPC API 位于：
+
+```rust
+use claw_event_router::rpc::{RpcMethod, RpcRegistry};
+```
+
 ---
 
 # 2. RPC
 
 RPC 只负责通信与调用。
 
-支持：
+RPC 的 transport kernel 只有一种统一调用形态：
 
 ```text
-Unary
-Stream
+BinaryReader → RPC Provider → BinaryWriter
 ```
+
+输入和输出分别、独立地支持 Unary 和 Stream，因此同一个 `call` 可以表达四种组合：
+
+```text
+Unary  → Unary
+Unary  → Stream
+Stream → Unary
+Stream → Stream
+```
+
+Rust 组件通常不直接处理这些 bytes，而使用 typed RPC layer：
+
+```text
+Request struct
+    ↓ Postcard length-delimited frames
+BinaryReader → RPC Provider → BinaryWriter
+    ↓ Postcard length-delimited frames
+Response struct
+```
+
+`RpcMethod` 同时声明 address、request/response struct 和两侧 cardinality。`RpcRegistry` 不提供 `call_unary` / `call_stream` 两套分发接口；所有 typed 调用统一写成 `client.call::<Method>(input)`，其返回类型由 Method 的 output cardinality 决定。
+
+底层 raw binary API 仍然保留为 `register_raw` / `call_raw`，用于 Lua、C ABI、网络 wire adapter 和自定义 codec。Typed layer 是建立在 raw kernel 上的安全 facade，不会把 registry 与某个业务 struct 耦合。
+
+## Typed method
+
+概念接口：
+
+```rust
+use claw_event_router::rpc::{RpcMethod, Streaming, Unary};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct SearchRequest {
+    query: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchResult {
+    title: String,
+}
+
+struct Search;
+
+impl RpcMethod for Search {
+    const ADDRESS: &'static str = "search.query";
+
+    type Request = SearchRequest;
+    type Response = SearchResult;
+    type Input = Unary;
+    type Output = Streaming;
+}
+```
+
+Provider 收到的已经是 struct，返回的也是 struct 或 `RpcStream<struct>`：
+
+```rust
+registry.register_typed::<Search, _>(|context, request: SearchRequest| async move {
+    // business logic; no binary parsing here
+    Ok(results)
+})?;
+
+let mut results = client.call::<Search>(request)?;
+while let Some(result) = results.next().await {
+    consume(result?);
+}
+```
+
+四种组合仍然通过同一个 `call` 表达：
+
+| Input | Output | Handler input | Handler output | Client result |
+| --- | --- | --- | --- | --- |
+| Unary | Unary | `Request` | `Response` | `RpcUnaryCall<Response>` |
+| Unary | Stream | `Request` | `RpcStream<Response>` | `RpcStream<Response>` |
+| Stream | Unary | `RpcStream<Request>` | `Response` | `RpcUnaryCall<Response>` |
+| Stream | Stream | `RpcStream<Request>` | `RpcStream<Response>` | `RpcStream<Response>` |
+
+Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 request encoder、provider future 和 response decoder；即使 frame 大于 bounded pipe capacity，也不要求调用者额外 spawn 或 `join!` 一个 raw call future。
+
+## Typed framing 和限制
+
+每个 typed message 使用独立 frame：
+
+```text
+u32 little-endian payload length | Postcard payload
+```
+
+Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。每个 Method 分别声明 request/response 最大 frame size，并在分配 payload buffer 前检查 wire length；internal pipe capacity 也必须非零。
+
+Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response type、两侧 cardinality 和 limits，防止同一 address 上发生错误解析。Raw client 不做 typed signature 校验，因为它是显式选择的 escape hatch。
+
+Postcard 是默认 codec，因为它支持普通的 owned Rust data model（包括 `String`、`Vec` 和 enum），适合当前会经过 bounded pipe 的消息。`zerocopy` 不作为默认 codec：固定布局 view 对 alignment、endianness、padding、borrow lifetime 和可表达的数据类型有更严格约束，而且当前 pipe 本身会复制 bytes。未来如 profiling 证明固定布局消息值得优化，可以在 raw kernel 上增加 opt-in codec，而不改变 typed method/call 模型。
 
 RPC 不关心：
 
@@ -96,7 +210,7 @@ HTTP response body
 实时数据流
 ```
 
-只要底层对象实现统一的 `BinaryReader` 和 `BinaryWriter`，就可以接入 RPC stream。
+只要底层对象实现统一的 `BinaryReader` 和 `BinaryWriter`，就可以接入 RPC。Unary 与 Stream 不属于不同的调用类型，只由输入输出何时到达 EOF 决定。
 
 Stream 不只是“大对象传输”，也可以用于小块但持续产生的数据，例如 LLM token、日志和实时消息。
 
@@ -269,7 +383,7 @@ RPC Provider
 * 注册；
 * 注销；
 * RPC 地址解析；
-* unary 和 stream dispatch；
+* 统一 binary reader / writer dispatch；
 * 分组；
 * visibility；
 * schema；

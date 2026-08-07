@@ -20,6 +20,7 @@ crates=(
     claw-persistence
     claw-context
     claw-core
+    claw-event-router
     claw-interface
     claw-log
     claw-memory
@@ -34,7 +35,11 @@ crates=(
 for crate in "${crates[@]}"; do
     snapshot="snapshots/${crate}.txt"
     current="${tmpdir}/${crate}.txt"
+    manifest="crates/${crate}/Cargo.toml"
+    if [[ "$crate" == "claw-event-router" ]]; then
+        manifest="core/event-router/Cargo.toml"
+    fi
     echo "checking public API snapshot: ${crate}"
-    cargo public-api --manifest-path "crates/${crate}/Cargo.toml" --color never -sss >"${current}"
+    cargo public-api --manifest-path "${manifest}" --color never -sss >"${current}"
     diff -u "${snapshot}" "${current}"
 done

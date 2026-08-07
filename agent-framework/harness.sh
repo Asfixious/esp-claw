@@ -17,6 +17,7 @@ feature_packages=(
     claw-agent
     claw-api
     claw-core
+    claw-event-router
     claw-persistence
     claw-context
     claw-interface

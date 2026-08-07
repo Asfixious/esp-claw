@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/*",
+    "core/*",
     "c-legacy/*",
     "bench/*",
     # Device-only (`#![cfg(target_os = "espidf")]`) staticlib crates that back

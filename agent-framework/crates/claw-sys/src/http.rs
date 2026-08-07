@@ -6,6 +6,161 @@
 //! target.
 
 use claw_interface::http::HttpStatusCode;
+use serde_json::{json, Value};
+
+/// Rewrite an LLM streaming request into a regular JSON request. This helper
+/// is used only by the ESP-IDF transport; host transports keep real SSE.
+#[cfg_attr(not(target_os = "espidf"), allow(dead_code))]
+fn non_streaming_request_body(body: &str) -> Option<String> {
+    let mut root = serde_json::from_str::<Value>(body).ok()?;
+    let object = root.as_object_mut()?;
+    object.insert("stream".to_string(), Value::Bool(false));
+    object.remove("stream_options");
+    serde_json::to_string(&root).ok()
+}
+
+fn push_sse_data(out: &mut String, value: &Value) -> Option<()> {
+    out.push_str("data: ");
+    out.push_str(&serde_json::to_string(value).ok()?);
+    out.push_str("\n\n");
+    Some(())
+}
+
+/// Convert one complete OpenAI-compatible response into a single local SSE
+/// delta followed by `[DONE]`. No SSE bytes cross the network.
+fn openai_response_to_local_sse(mut root: Value) -> Option<String> {
+    let choice = root
+        .get_mut("choices")?
+        .as_array_mut()?
+        .first_mut()?
+        .as_object_mut()?;
+    let message = choice.remove("message")?;
+    choice.insert("delta".to_string(), message);
+
+    let mut out = String::new();
+    push_sse_data(&mut out, &root)?;
+    out.push_str("data: [DONE]\n\n");
+    Some(out)
+}
+
+/// Convert one complete Anthropic Messages response into local content-block
+/// events understood by the existing parser. No SSE bytes cross the network.
+fn anthropic_response_to_local_sse(root: &Value) -> Option<String> {
+    let content = root.get("content")?.as_array()?;
+    let mut out = String::new();
+
+    if let Some(usage) = root.get("usage") {
+        push_sse_data(
+            &mut out,
+            &json!({ "type": "message_start", "message": { "usage": usage } }),
+        )?;
+    }
+
+    for (index, block) in content.iter().enumerate() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                push_sse_data(
+                    &mut out,
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": { "type": "thinking" },
+                    }),
+                )?;
+                push_sse_data(
+                    &mut out,
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "thinking_delta",
+                            "thinking": block.get("thinking").and_then(Value::as_str).unwrap_or_default(),
+                        },
+                    }),
+                )?;
+            }
+            Some("text") => {
+                push_sse_data(
+                    &mut out,
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                )?;
+                push_sse_data(
+                    &mut out,
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": block.get("text").and_then(Value::as_str).unwrap_or_default(),
+                        },
+                    }),
+                )?;
+            }
+            Some("tool_use") => {
+                push_sse_data(
+                    &mut out,
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": block.get("id").and_then(Value::as_str).unwrap_or_default(),
+                            "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        },
+                    }),
+                )?;
+                let arguments = match block.get("input") {
+                    Some(input) => serde_json::to_string(input).ok()?,
+                    None => "{}".to_string(),
+                };
+                push_sse_data(
+                    &mut out,
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "input_json_delta", "partial_json": arguments },
+                    }),
+                )?;
+            }
+            _ => continue,
+        }
+        push_sse_data(
+            &mut out,
+            &json!({ "type": "content_block_stop", "index": index }),
+        )?;
+    }
+
+    let mut stop = json!({ "type": "message_stop" });
+    if let Some(usage) = root.get("usage") {
+        stop["usage"] = usage.clone();
+    }
+    push_sse_data(&mut out, &stop)?;
+    Some(out)
+}
+
+/// Adapt one complete non-streaming provider response to the existing local
+/// parser contract. Unknown or malformed shapes are passed through as one data
+/// frame so the upper parser reports its normal typed parse/empty error.
+#[cfg_attr(not(target_os = "espidf"), allow(dead_code))]
+fn response_to_local_sse(body: &str) -> Vec<u8> {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let converted = parsed.as_ref().and_then(|root| {
+        if root.get("choices").is_some() {
+            openai_response_to_local_sse(root.clone())
+        } else if root.get("content").is_some() {
+            anthropic_response_to_local_sse(root)
+        } else {
+            None
+        }
+    });
+    converted
+        .unwrap_or_else(|| format!("data: {body}\n\ndata: [DONE]\n\n"))
+        .into_bytes()
+}
 
 /// Build the error message for a non-200 response, mirroring
 /// `parse_error_message_body`: prefer `error.message`, then top-level
@@ -53,13 +208,14 @@ pub use espidf_driver::{EspHttpByteStream, EspIdfHttp};
 
 #[cfg(target_os = "espidf")]
 mod espidf_driver {
-    use super::parse_error_message_body;
+    use super::{non_streaming_request_body, parse_error_message_body, response_to_local_sse};
     use claw_interface::http::{
         blocking, Cancel, ClawHttp, HttpError, HttpGetRequest, HttpJsonRequest, HttpRequestFailure,
         HttpResponse, HttpResponseFuture, HttpStatusCode, StreamingHttp,
     };
     use core::ffi::{c_char, c_int, c_void};
     use core::future::Future;
+    use core::marker::PhantomData;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use core::task::{Context, Poll};
@@ -78,31 +234,16 @@ mod espidf_driver {
     const ERRNO_NONE: c_int = 0;
     const ERRNO_EAGAIN: c_int = 11;
     const ERRNO_EINPROGRESS: c_int = 115;
-    const TLS_WANT_READ: c_int = -0x6900;
-    const TLS_WANT_WRITE: c_int = -0x6880;
     const ESP_LOG_ERROR: c_int = 1;
 
-    /// Give ESP-IDF's first async TCP-connect poll enough time to complete.
-    /// Its TLS transport reuses an `fd_set` after `select`; a timeout clears
-    /// that set, so an unrealistically tiny first poll can never make progress.
-    /// One second remains safely below the task watchdog window.
-    const HTTP_CONNECT_IO_TIMEOUT_MS: u32 = 1_000;
-    /// Once connected, each manual write/fetch/read step gets only a small
-    /// slice. `esp_http_client_read` preserves a no-data timeout as `-EAGAIN`,
-    /// so the stream can return `Pending` and let the Session rotate agents.
-    const HTTP_BODY_IO_SLICE_TIMEOUT_MS: u32 = 10;
     /// Give FreeRTOS's idle and system tasks a real scheduling window after a
     /// native async step reports that it would block.
     const HTTP_RETRY_DELAY_MS: u64 = 1;
-    const MAX_REDIRECTS: u8 = 10;
-    /// ESP-IDF's TLS/lwIP path becomes unstable when multiple long-lived LLM
-    /// SSE responses are driven concurrently on this target: sockets are reset
-    /// underneath otherwise independent `esp_http_client` handles. Keep the
-    /// Agents themselves concurrent, but admit one Rust LLM stream at a time.
-    /// Waiting is cooperative (`yield_once`), so the Session can continue to
-    /// poll every Agent and capability while the active stream makes progress.
-    const STREAM_LIMIT: usize = 1;
-    static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+    /// Bound simultaneous LLM HTTP requests on the embedded target. Responses
+    /// are ordinary buffered JSON; waiting remains cooperative.
+    const REQUEST_LIMIT: usize = 2;
+    static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+    static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
     static HTTP_POLL_LOGS_FILTERED: AtomicBool = AtomicBool::new(false);
 
     // --- esp_http_client FFI ------------------------------------------------
@@ -121,7 +262,6 @@ mod espidf_driver {
     // ON_HEADERS_COMPLETE and ON_STATUS_CODE between ON_HEADER and ON_DATA.
     // `claw_rs_idf_compat.c` asserts every value consumed here so an SDK enum
     // change fails the firmware build instead of silently dropping body data.
-    const HTTP_EVENT_ON_CONNECTED: c_int = 1;
     const HTTP_EVENT_ON_HEADER: c_int = 3;
     const HTTP_EVENT_ON_STATUS_CODE: c_int = 5;
     const HTTP_EVENT_ON_DATA: c_int = 6;
@@ -210,15 +350,9 @@ mod espidf_driver {
             len: c_int,
         ) -> c_int;
         fn esp_http_client_set_timeout_ms(client: *mut c_void, timeout_ms: c_int) -> c_int;
-        fn esp_http_client_set_redirection(client: *mut c_void) -> c_int;
         fn esp_http_client_delete_header(client: *mut c_void, key: *const c_char) -> c_int;
         fn esp_http_client_reset_redirect_counter(client: *mut c_void) -> c_int;
         fn esp_http_client_perform(client: *mut c_void) -> c_int;
-        fn esp_http_client_open(client: *mut c_void, write_len: c_int) -> c_int;
-        fn esp_http_client_write(client: *mut c_void, data: *const c_char, len: c_int) -> c_int;
-        fn esp_http_client_fetch_headers(client: *mut c_void) -> i64;
-        fn esp_http_client_read(client: *mut c_void, data: *mut c_char, len: c_int) -> c_int;
-        fn esp_http_client_is_complete_data_received(client: *mut c_void) -> bool;
         fn esp_http_client_get_errno(client: *mut c_void) -> c_int;
         fn esp_http_client_get_status_code(client: *mut c_void) -> c_int;
         fn esp_http_client_close(client: *mut c_void) -> c_int;
@@ -233,8 +367,8 @@ mod espidf_driver {
             return;
         }
         unsafe {
-            // The manual state machine intentionally converts these native
-            // timeout paths to EAGAIN/Pending. ESP-IDF logs every such poll at
+            // Async `perform` intentionally converts these native timeout
+            // paths to EAGAIN/Pending. ESP-IDF logs every such poll at
             // WARN; suppress only those two tags while retaining real errors.
             esp_log_level_set(c"HTTP_CLIENT".as_ptr(), ESP_LOG_ERROR);
             esp_log_level_set(c"transport_base".as_ptr(), ESP_LOG_ERROR);
@@ -244,11 +378,6 @@ mod espidf_driver {
     struct RequestCtx {
         body: Vec<u8>,
         abort: *const AtomicBool,
-        body_io_timeout_ms: c_int,
-        // Status observed by a callback belonging to the current response.
-        // `esp_http_client_get_status_code` itself may retain the previous
-        // request's value while a reused connection is still sending headers.
-        response_status: c_int,
     }
 
     extern "C" fn http_event_handler(evt: *mut esp_http_client_event_t) -> c_int {
@@ -262,18 +391,11 @@ mod espidf_driver {
             if !ctx.abort.is_null() && (*ctx.abort).load(Ordering::Relaxed) {
                 return ESP_FAIL;
             }
-            if evt.event_id == HTTP_EVENT_ON_CONNECTED {
-                // The connect phase needs a wider first poll because of
-                // ESP-IDF's async-select behavior. Tighten subsequent request
-                // send/read operations as soon as that phase is complete.
-                let _ = esp_http_client_set_timeout_ms(evt.client, ctx.body_io_timeout_ms);
-            }
             if matches!(
                 evt.event_id,
                 HTTP_EVENT_ON_HEADER | HTTP_EVENT_ON_STATUS_CODE | HTTP_EVENT_ON_DATA
             ) {
                 let status = esp_http_client_get_status_code(evt.client);
-                ctx.response_status = status;
                 if evt.event_id == HTTP_EVENT_ON_DATA
                     && evt.data_len > 0
                     && !evt.data.is_null()
@@ -290,9 +412,6 @@ mod espidf_driver {
                 let status = esp_http_client_get_status_code(evt.client);
                 if is_intermediate_status(status) {
                     ctx.body.clear();
-                    ctx.response_status = 0;
-                } else {
-                    ctx.response_status = status;
                 }
             }
         }
@@ -345,22 +464,6 @@ mod espidf_driver {
         })
     }
 
-    fn connect_io_timeout_ms(request_timeout_ms: u32) -> u32 {
-        if request_timeout_ms == 0 {
-            HTTP_CONNECT_IO_TIMEOUT_MS
-        } else {
-            request_timeout_ms.min(HTTP_CONNECT_IO_TIMEOUT_MS)
-        }
-    }
-
-    fn body_io_timeout_ms(request_timeout_ms: u32) -> u32 {
-        if request_timeout_ms == 0 {
-            HTTP_BODY_IO_SLICE_TIMEOUT_MS
-        } else {
-            request_timeout_ms.min(HTTP_BODY_IO_SLICE_TIMEOUT_MS)
-        }
-    }
-
     fn status_code_from_c_int(status: c_int) -> Result<HttpStatusCode, HttpError> {
         let status = u16::try_from(status).map_err(|_| {
             HttpError::RequestFailed(HttpRequestFailure::InvalidStatusCode { status })
@@ -368,9 +471,8 @@ mod espidf_driver {
         Ok(HttpStatusCode::new(status))
     }
 
-    /// Overall wall-clock request deadline. The ESP-IDF client receives a much
-    /// shorter per-operation timeout so one TLS/socket step cannot monopolize a
-    /// FreeRTOS core for this entire duration.
+    /// Overall wall-clock request deadline, matching the timeout configured on
+    /// the ESP-IDF client.
     struct Deadline {
         limit: Option<Instant>,
     }
@@ -469,9 +571,10 @@ mod espidf_driver {
     /// Created when [`EspIdfHttp`] is constructed and reused by subsequent requests
     /// (`keep_alive_enable` + `is_async` are set at init). Each request updates
     /// URL, method, headers, timeout, and body before driving either the
-    /// blocking compatibility path or the manual async state machine; the raw
+    /// blocking compatibility path or async `perform`; the raw
     /// handle itself is torn down only on `Drop`.
     struct EspClient {
+        id: usize,
         raw: *mut c_void,
         // `config.user_data` points at this box for the client's whole life; the
         // event handler writes the response body here through that raw pointer,
@@ -504,8 +607,6 @@ mod espidf_driver {
             let mut ctx = Box::new(RequestCtx {
                 body: Vec::with_capacity(4096),
                 abort: core::ptr::null(),
-                body_io_timeout_ms: HTTP_BODY_IO_SLICE_TIMEOUT_MS as c_int,
-                response_status: 0,
             });
 
             let mut config: esp_http_client_config_t = unsafe { core::mem::zeroed() };
@@ -525,7 +626,10 @@ mod espidf_driver {
             if raw.is_null() {
                 return Err(HttpError::ClientInitFailed);
             }
+            let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+            log::debug!("HTTP diagnostic client={id} created");
             Ok(EspClient {
+                id,
                 raw,
                 ctx,
                 applied_headers: Vec::new(),
@@ -610,18 +714,11 @@ mod espidf_driver {
         ) -> Result<(), HttpError> {
             self.ctx.body.clear();
             self.ctx.abort = abort;
-            self.ctx.response_status = 0;
 
             // `set_url` copies the string internally; it only needs to live for
             // the duration of the call.
             let url = CString::new(url).map_err(|_| HttpError::InvalidUrl)?;
-            // Preserve the API's range validation, but never hand the entire
-            // request lifetime to one native socket/TLS operation. In ESP-IDF
-            // async mode this timeout still governs individual transport
-            // reads and TLS-handshake polls.
-            let _ = timeout_to_c_int(timeout_ms)?;
-            let connect_timeout_ms = timeout_to_c_int(connect_io_timeout_ms(timeout_ms))?;
-            self.ctx.body_io_timeout_ms = timeout_to_c_int(body_io_timeout_ms(timeout_ms))?;
+            let timeout_ms = timeout_to_c_int(timeout_ms)?;
 
             unsafe {
                 check_client_call(
@@ -629,7 +726,7 @@ mod espidf_driver {
                     "esp_http_client_set_url",
                 )?;
                 check_client_call(
-                    esp_http_client_set_timeout_ms(self.raw, connect_timeout_ms),
+                    esp_http_client_set_timeout_ms(self.raw, timeout_ms),
                     "esp_http_client_set_timeout_ms",
                 )?;
                 check_client_call(
@@ -795,6 +892,28 @@ mod espidf_driver {
             }
         }
 
+        /// Drive a regular buffered request with ESP-IDF's native async
+        /// `perform` API. Each `EAGAIN` yields to the cooperative executor.
+        async fn perform_prepared_async(
+            &mut self,
+            timeout_ms: u32,
+            deadline: &Deadline,
+            cancel: Cancel<'_>,
+        ) -> Result<HttpResponse, HttpError> {
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(HttpError::Aborted);
+                }
+                if deadline.expired() {
+                    return Err(timeout_error(timeout_ms));
+                }
+                match self.perform_step()? {
+                    Some(response) => return Ok(response),
+                    None => yield_once().await,
+                }
+            }
+        }
+
         async fn execute_async(
             &mut self,
             request: &HttpJsonRequest<'_>,
@@ -816,7 +935,7 @@ mod espidf_driver {
                 let mut active = ActiveRequestGuard::new(self.raw);
                 active.mark_started();
                 let result = self
-                    .execute_prepared_async(body.as_bytes(), request.timeout_ms, &deadline, cancel)
+                    .perform_prepared_async(request.timeout_ms, &deadline, cancel)
                     .await;
                 match result {
                     Ok(response) => {
@@ -871,7 +990,7 @@ mod espidf_driver {
                 let mut active = ActiveRequestGuard::new(self.raw);
                 active.mark_started();
                 let result = self
-                    .execute_prepared_async(&[], request.timeout_ms, &deadline, cancel)
+                    .perform_prepared_async(request.timeout_ms, &deadline, cancel)
                     .await;
                 match result {
                     Ok(response) => {
@@ -902,291 +1021,43 @@ mod espidf_driver {
         }
     }
 
-    fn stream_driver_error(operation: &'static str, message: impl Into<String>) -> HttpError {
-        HttpError::RequestFailed(HttpRequestFailure::driver(operation, message))
+    /// RAII slot for one complete LLM request. Waiting is cooperative, so a
+    /// queued Agent never blocks the executor thread.
+    struct RequestPermit {
+        client_id: usize,
     }
 
-    /// RAII slot for one complete streaming request, from connection setup
-    /// through the final SSE body byte. The Session retries acquisition
-    /// cooperatively, so waiting for the target's TLS budget never blocks the
-    /// executor thread.
-    struct StreamPermit;
-
-    impl StreamPermit {
-        fn try_acquire() -> Option<Self> {
-            let active = ACTIVE_STREAMS.load(Ordering::Acquire);
-            if active < STREAM_LIMIT
-                && ACTIVE_STREAMS
+    impl RequestPermit {
+        fn try_acquire(client_id: usize) -> Option<Self> {
+            let active = ACTIVE_REQUESTS.load(Ordering::Acquire);
+            if active < REQUEST_LIMIT
+                && ACTIVE_REQUESTS
                     .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                Some(Self)
+                Some(Self { client_id })
             } else {
                 None
             }
         }
     }
 
-    impl Drop for StreamPermit {
+    impl Drop for RequestPermit {
         fn drop(&mut self) {
-            let previous = ACTIVE_STREAMS.fetch_sub(1, Ordering::AcqRel);
+            let previous = ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
             debug_assert!(previous > 0);
+            log::debug!(
+                "HTTP buffered diagnostic client={} permit released active={}",
+                self.client_id,
+                previous.saturating_sub(1)
+            );
         }
     }
 
     impl EspClient {
-        fn response_status(&self) -> Result<Option<HttpStatusCode>, HttpError> {
-            let status = self.ctx.response_status;
-            if status <= 0 || is_intermediate_status(status) {
-                return Ok(None);
-            }
-            status_code_from_c_int(status).map(Some)
-        }
-
-        fn buffered_response_status(&self) -> Result<Option<HttpStatusCode>, HttpError> {
-            let status = self.ctx.response_status;
-            if status <= 0 || matches!(status, 100..=199) {
-                return Ok(None);
-            }
-            status_code_from_c_int(status).map(Some)
-        }
-
-        fn take_body_chunk(&mut self) -> Option<Vec<u8>> {
-            if self.ctx.body.is_empty() {
-                return None;
-            }
-            Some(std::mem::replace(
-                &mut self.ctx.body,
-                Vec::with_capacity(4096),
-            ))
-        }
-
-        /// Send one already-prepared request through ESP-IDF's bounded native
-        /// operations and stop after the final response headers. Unlike
-        /// `esp_http_client_perform`, temporary body-read timeouts are not
-        /// interpreted here, so the caller can handle them as cooperative
-        /// `EAGAIN` polls.
-        async fn open_write_fetch(
-            &mut self,
-            body_bytes: &[u8],
-            timeout_ms: u32,
-            deadline: &Deadline,
-            cancel: Cancel<'_>,
-            accept_redirect_status: bool,
-        ) -> Result<HttpStatusCode, HttpError> {
-            let body_len = body_len_to_c_int(body_bytes.len())?;
-            loop {
-                if cancel.is_cancelled() {
-                    return Err(HttpError::Aborted);
-                }
-                if deadline.expired() {
-                    return Err(timeout_error(timeout_ms));
-                }
-                let result = unsafe { esp_http_client_open(self.raw, body_len) };
-                if result == ESP_OK {
-                    check_client_call(
-                        unsafe {
-                            esp_http_client_set_timeout_ms(self.raw, self.ctx.body_io_timeout_ms)
-                        },
-                        "esp_http_client_set_timeout_ms",
-                    )?;
-                    break;
-                }
-                if result != ESP_ERR_HTTP_EAGAIN {
-                    return Err(stream_driver_error(
-                        "esp_http_client_open",
-                        err_name(result),
-                    ));
-                }
-                yield_once().await;
-            }
-
-            let mut body_offset = 0usize;
-            while body_offset < body_bytes.len() {
-                if cancel.is_cancelled() {
-                    return Err(HttpError::Aborted);
-                }
-                if deadline.expired() {
-                    return Err(timeout_error(timeout_ms));
-                }
-                let remaining = body_bytes.len() - body_offset;
-                let remaining = c_int::try_from(remaining).map_err(|_| {
-                    HttpError::RequestFailed(HttpRequestFailure::BodyTooLarge {
-                        len: body_bytes.len(),
-                    })
-                })?;
-                let written = unsafe {
-                    esp_http_client_write(
-                        self.raw,
-                        body_bytes.as_ptr().add(body_offset).cast(),
-                        remaining,
-                    )
-                };
-                if written > 0 {
-                    body_offset += written as usize;
-                    continue;
-                }
-                if written == 0
-                    || written == -ESP_ERR_HTTP_EAGAIN
-                    || written == TLS_WANT_READ
-                    || written == TLS_WANT_WRITE
-                {
-                    yield_once().await;
-                    continue;
-                }
-                return Err(stream_driver_error(
-                    "esp_http_client_write",
-                    format!("write returned {written}"),
-                ));
-            }
-            loop {
-                if cancel.is_cancelled() {
-                    return Err(HttpError::Aborted);
-                }
-                if deadline.expired() {
-                    return Err(timeout_error(timeout_ms));
-                }
-                let result = unsafe { esp_http_client_fetch_headers(self.raw) };
-                if result >= 0 {
-                    break;
-                }
-                if result != -i64::from(ESP_ERR_HTTP_EAGAIN) {
-                    return Err(stream_driver_error(
-                        "esp_http_client_fetch_headers",
-                        format!("fetch returned {result}"),
-                    ));
-                }
-                yield_once().await;
-            }
-
-            let status = if accept_redirect_status {
-                self.buffered_response_status()
-            } else {
-                self.response_status()
-            }?
-            .ok_or_else(|| {
-                stream_driver_error(
-                    "esp_http_client_fetch_headers",
-                    "response headers completed without a final HTTP status",
-                )
-            })?;
-            Ok(status)
-        }
-
-        /// Read a buffered response with short native reads. A timeout from one
-        /// read becomes `EAGAIN` and yields to the cooperative executor; EOF is
-        /// accepted only when ESP-IDF confirms that Content-Length or the final
-        /// chunk was received.
-        async fn execute_prepared_async(
-            &mut self,
-            body_bytes: &[u8],
-            timeout_ms: u32,
-            deadline: &Deadline,
-            cancel: Cancel<'_>,
-        ) -> Result<HttpResponse, HttpError> {
-            let mut redirect_count = 0_u8;
-            let mut read_buffer = [0_u8; 4096];
-
-            loop {
-                let status = self
-                    .open_write_fetch(body_bytes, timeout_ms, deadline, cancel, true)
-                    .await?;
-
-                loop {
-                    if cancel.is_cancelled() {
-                        return Err(HttpError::Aborted);
-                    }
-                    if deadline.expired() {
-                        return Err(timeout_error(timeout_ms));
-                    }
-                    if unsafe { esp_http_client_is_complete_data_received(self.raw) } {
-                        break;
-                    }
-
-                    let read = unsafe {
-                        esp_http_client_read(
-                            self.raw,
-                            read_buffer.as_mut_ptr().cast(),
-                            read_buffer.len() as c_int,
-                        )
-                    };
-                    if read > 0 {
-                        continue;
-                    }
-                    if read == -ESP_ERR_HTTP_EAGAIN {
-                        yield_once().await;
-                        continue;
-                    }
-                    if read == 0 && unsafe { esp_http_client_is_complete_data_received(self.raw) } {
-                        break;
-                    }
-                    let transport_errno = unsafe { esp_http_client_get_errno(self.raw) };
-                    return Err(stream_driver_error(
-                        "esp_http_client_read",
-                        format!(
-                            "read returned {read} before completion (transport errno={transport_errno})"
-                        ),
-                    ));
-                }
-
-                if is_redirect_status(status.as_i32()) {
-                    if redirect_count >= MAX_REDIRECTS {
-                        return Err(stream_driver_error(
-                            "esp_http_client_set_redirection",
-                            format!("exceeded {MAX_REDIRECTS} redirects"),
-                        ));
-                    }
-                    check_client_call(
-                        unsafe { esp_http_client_set_redirection(self.raw) },
-                        "esp_http_client_set_redirection",
-                    )?;
-                    redirect_count = redirect_count.saturating_add(1);
-                    // The public redirect helper updates the URL but leaves the
-                    // completed response state in place. Closing resets that
-                    // state; the reusable handle reconnects lazily, and the
-                    // request body remains alive for replay.
-                    close_raw_connection(self.raw);
-                    self.ctx.body.clear();
-                    self.ctx.response_status = 0;
-                    continue;
-                }
-
-                let body = String::from_utf8_lossy(&self.ctx.body).into_owned();
-                if !status.is_success() {
-                    // Avoid the perform finalizer's automatic authentication
-                    // branch changing a completed error response into another
-                    // opaque transport exchange.
-                    close_raw_connection(self.raw);
-                    return Err(HttpError::UnexpectedStatus {
-                        status,
-                        message: parse_error_message_body(&body, status),
-                    });
-                }
-
-                // No socket read remains here. This final `perform` invocation
-                // only dispatches ON_FINISH and returns the reusable handle to
-                // CONNECTED (or closes it when the peer disabled keep-alive).
-                match self.perform_raw_step()? {
-                    true => {
-                        return Ok(HttpResponse {
-                            status_code: status,
-                            body,
-                        });
-                    }
-                    false => {
-                        return Err(stream_driver_error(
-                            "esp_http_client_perform",
-                            "complete buffered response finalization returned EAGAIN",
-                        ));
-                    }
-                }
-            }
-        }
-
-        /// Drive open/write/fetch as bounded native operations. EAGAIN yields to
-        /// the Session; the returned stream continues with one bounded read per
-        /// `poll_next` and keeps this client exclusively borrowed.
-        async fn begin_streaming<'a>(
+        /// Execute a normal non-SSE LLM request and expose the completed JSON
+        /// through the existing local byte-stream contract.
+        async fn begin_buffered_response<'a>(
             &'a mut self,
             request: &HttpJsonRequest<'_>,
             cancel: Cancel<'a>,
@@ -1195,199 +1066,91 @@ mod espidf_driver {
                 return Err(HttpError::Aborted);
             }
 
-            let mut stream_permit = None;
-            while stream_permit.is_none() {
+            let request_body =
+                non_streaming_request_body(request.body).ok_or(HttpError::InvalidBody)?;
+            let buffered_request = HttpJsonRequest {
+                url: request.url,
+                body: &request_body,
+                auth: request.auth,
+                timeout_ms: request.timeout_ms,
+                headers: request.headers,
+            };
+
+            let queued_at = Instant::now();
+            let request_permit = loop {
                 if cancel.is_cancelled() {
                     return Err(HttpError::Aborted);
                 }
-                stream_permit = StreamPermit::try_acquire();
-                if stream_permit.is_none() {
-                    yield_once().await;
+                if let Some(permit) = RequestPermit::try_acquire(self.id) {
+                    break permit;
                 }
-            }
-            // Admission wait is bounded by the owning Agent/subagent cancel
-            // token. Start the per-request network deadline only after this
-            // request owns the single hardware stream slot; otherwise a queued
-            // Agent could consume its whole HTTP timeout without touching the
-            // network.
-            let deadline = Deadline::new(request.timeout_ms);
-            let mut retried_after_close = false;
-            'connection: loop {
-                let request_body = self.prepare_request(request, core::ptr::null())?;
-                let mut active = ActiveRequestGuard::new(self.raw);
-                active.mark_started();
+                yield_once().await;
+            };
+            log::debug!(
+                "HTTP buffered diagnostic client={} permit acquired active={} wait_ms={}",
+                self.id,
+                ACTIVE_REQUESTS.load(Ordering::Acquire),
+                queued_at.elapsed().as_millis()
+            );
 
-                let begin_result = self
-                    .open_write_fetch(
-                        request_body.as_bytes(),
-                        request.timeout_ms,
-                        &deadline,
-                        cancel,
-                        false,
-                    )
-                    .await;
+            let started = Instant::now();
+            let response = self.execute_async(&buffered_request, cancel).await;
+            drop(request_permit);
+            let response = response?;
+            log::debug!(
+                "HTTP buffered diagnostic client={} complete elapsed_ms={} response_bytes={}",
+                self.id,
+                started.elapsed().as_millis(),
+                response.body.len()
+            );
 
-                match begin_result {
-                    Ok(status) => {
-                        active.finish();
-                        return Ok((
-                            status,
-                            EspHttpByteStream {
-                                conn: self,
-                                _request_body: request_body,
-                                _stream_permit: stream_permit
-                                    .take()
-                                    .expect("stream permit held until body completion"),
-                                deadline,
-                                timeout_ms: request.timeout_ms,
-                                cancel,
-                                transfer_complete: false,
-                                terminated: false,
-                                read_buffer: [0; 4096],
-                            },
-                        ));
-                    }
-                    Err(error) => {
-                        self.close_failed_connection(&error);
-                        active.finish();
-                        drop(active);
-                        drop(request_body);
-                        if !retried_after_close
-                            && matches!(error, HttpError::RequestFailed(_))
-                            && !deadline.expired()
-                        {
-                            retried_after_close = true;
-                            continue 'connection;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
+            let status = response.status_code;
+            Ok((
+                status,
+                EspHttpByteStream {
+                    chunk: Some(response_to_local_sse(&response.body)),
+                    cancel,
+                    terminated: false,
+                    _transport: PhantomData,
+                },
+            ))
         }
     }
 
-    /// ESP-IDF response-body stream borrowing the Agent's persistent client.
+    /// One local compatibility chunk produced after a complete ordinary JSON
+    /// response. The lifetime keeps the transport exclusively borrowed until
+    /// the caller consumes or drops the chunk.
     pub struct EspHttpByteStream<'a> {
-        conn: &'a mut EspClient,
-        // `esp_http_client_set_post_field` retains this allocation's pointer
-        // until the request has finished or its connection is closed.
-        _request_body: CString,
-        // Retain hardware admission until success, error, cancellation, or
-        // early stream drop releases the complete SSE request.
-        _stream_permit: StreamPermit,
-        deadline: Deadline,
-        timeout_ms: u32,
+        chunk: Option<Vec<u8>>,
         cancel: Cancel<'a>,
-        transfer_complete: bool,
         terminated: bool,
-        read_buffer: [u8; 4096],
-    }
-
-    impl EspHttpByteStream<'_> {
-        fn fail(&mut self, error: HttpError) -> Poll<Option<Result<Vec<u8>, HttpError>>> {
-            close_raw_connection(self.conn.raw);
-            self.transfer_complete = true;
-            self.terminated = true;
-            Poll::Ready(Some(Err(error)))
-        }
-
-        fn finish_transfer(&mut self) -> Result<(), HttpError> {
-            match self.conn.perform_raw_step()? {
-                true => {
-                    self.transfer_complete = true;
-                    Ok(())
-                }
-                false => Err(stream_driver_error(
-                    "esp_http_client_perform",
-                    "response was complete but finalization returned EAGAIN",
-                )),
-            }
-        }
+        _transport: PhantomData<&'a mut ()>,
     }
 
     impl Stream for EspHttpByteStream<'_> {
         type Item = Result<Vec<u8>, HttpError>;
 
-        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
             if this.terminated {
                 return Poll::Ready(None);
             }
             if this.cancel.is_cancelled() {
-                return this.fail(HttpError::Aborted);
-            }
-            if let Some(chunk) = this.conn.take_body_chunk() {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            if this.transfer_complete {
                 this.terminated = true;
-                return Poll::Ready(None);
+                return Poll::Ready(Some(Err(HttpError::Aborted)));
             }
-            if this.deadline.expired() {
-                return this.fail(timeout_error(this.timeout_ms));
-            }
-
-            if unsafe { esp_http_client_is_complete_data_received(this.conn.raw) } {
-                if let Err(error) = this.finish_transfer() {
-                    return this.fail(error);
+            match this.chunk.take() {
+                Some(chunk) => Poll::Ready(Some(Ok(chunk))),
+                None => {
+                    this.terminated = true;
+                    Poll::Ready(None)
                 }
-                this.terminated = true;
-                return Poll::Ready(None);
-            }
-
-            // One call drains up to 4 KiB but waits at most the 10 ms body I/O
-            // slice. A no-data timeout becomes -EAGAIN, so this poll returns
-            // Pending and the Session can poll another Agent.
-            let read = unsafe {
-                esp_http_client_read(
-                    this.conn.raw,
-                    this.read_buffer.as_mut_ptr().cast(),
-                    this.read_buffer.len() as c_int,
-                )
-            };
-            if read > 0 {
-                if let Some(chunk) = this.conn.take_body_chunk() {
-                    return Poll::Ready(Some(Ok(chunk)));
-                }
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            if read == -ESP_ERR_HTTP_EAGAIN {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            if read == 0 && unsafe { esp_http_client_is_complete_data_received(this.conn.raw) } {
-                if let Err(error) = this.finish_transfer() {
-                    return this.fail(error);
-                }
-                this.terminated = true;
-                return Poll::Ready(None);
-            }
-            let transport_errno = unsafe { esp_http_client_get_errno(this.conn.raw) };
-            this.fail(stream_driver_error(
-                "esp_http_client_read",
-                format!(
-                    "read returned {read} before completion (transport errno={transport_errno})"
-                ),
-            ))
-        }
-    }
-
-    impl Drop for EspHttpByteStream<'_> {
-        fn drop(&mut self) {
-            if !self.transfer_complete {
-                close_raw_connection(self.conn.raw);
             }
         }
     }
 
-    /// `esp_http_client`-backed transport implementing [`blocking::ClawHttp`]
-    /// (blocking), [`ClawHttp`] (async buffered responses), and [`StreamingHttp`]
-    /// (async response chunks).
-    ///
-    /// The transport owns one persistent keep-alive [`EspClient`] created at
-    /// construction and reused until `EspIdfHttp` is dropped. Async cancellation
-    /// cancels the active request/socket, not the client handle.
+    /// Persistent ESP-IDF HTTP client. Streaming calls use ordinary buffered
+    /// provider responses and expose only a local compatibility stream.
     pub struct EspIdfHttp {
         conn: EspClient,
     }
@@ -1474,7 +1237,98 @@ mod espidf_driver {
             request: &'r HttpJsonRequest<'r>,
             cancel: Cancel<'a>,
         ) -> Result<(HttpStatusCode, Self::ByteStream<'a>), HttpError> {
-            self.conn.begin_streaming(request, cancel).await
+            self.conn.begin_buffered_response(request, cancel).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_request_is_rewritten_as_regular_json() {
+        let body = r#"{"model":"test","stream":true,"stream_options":{"include_usage":true},"messages":[]}"#;
+        let rewritten = non_streaming_request_body(body).expect("valid request JSON");
+        let root: Value = serde_json::from_str(&rewritten).expect("rewritten request JSON");
+
+        assert_eq!(root.get("stream"), Some(&Value::Bool(false)));
+        assert!(root.get("stream_options").is_none());
+        assert_eq!(root.get("model").and_then(Value::as_str), Some("test"));
+        assert!(root.get("messages").is_some_and(Value::is_array));
+    }
+
+    #[test]
+    fn openai_regular_response_becomes_one_local_delta() {
+        let body = json!({
+            "id": "chat-1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "think",
+                    "content": "answer",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": "files", "arguments": "{}" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2 },
+        })
+        .to_string();
+
+        let local = String::from_utf8(response_to_local_sse(&body)).expect("local SSE is UTF-8");
+        let payload = local
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("data: "))
+            .expect("first local data frame");
+        let root: Value = serde_json::from_str(payload).expect("local OpenAI frame JSON");
+        let delta = &root["choices"][0]["delta"];
+
+        assert_eq!(delta["content"], "answer");
+        assert_eq!(delta["reasoning_content"], "think");
+        assert_eq!(delta["tool_calls"][0]["function"]["name"], "files");
+        assert!(root["choices"][0].get("message").is_none());
+        assert!(local.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn anthropic_regular_response_becomes_local_content_events() {
+        let body = json!({
+            "type": "message",
+            "content": [
+                { "type": "thinking", "thinking": "think" },
+                { "type": "text", "text": "answer" },
+                {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "files",
+                    "input": { "path": "/system" },
+                },
+            ],
+            "usage": { "input_tokens": 3, "output_tokens": 4 },
+        })
+        .to_string();
+
+        let local = String::from_utf8(response_to_local_sse(&body)).expect("local SSE is UTF-8");
+
+        assert!(local.contains("\"type\":\"thinking_delta\""));
+        assert!(local.contains("\"type\":\"text_delta\""));
+        assert!(local.contains("\"type\":\"input_json_delta\""));
+        assert!(local.contains("tool-1"));
+        assert!(local.contains("message_stop"));
+        assert!(!local.contains("[DONE]"));
+    }
+
+    #[test]
+    fn malformed_regular_response_is_preserved_for_upper_parser_error() {
+        let body = "not-json";
+        let local = String::from_utf8(response_to_local_sse(body)).expect("local SSE is UTF-8");
+
+        assert_eq!(local, "data: not-json\n\ndata: [DONE]\n\n");
     }
 }

@@ -1,4 +1,4 @@
-//! Demonstrates expected registration, signature, framing, and provider errors.
+//! Demonstrates expected registration, signature, capacity, and provider errors.
 
 use std::rc::Rc;
 
@@ -36,30 +36,6 @@ impl RpcMethod for IncompatibleEcho {
     type Output = Streaming;
 }
 
-struct TinyRequestFrame;
-
-impl RpcMethod for TinyRequestFrame {
-    const ADDRESS: &'static str = "errors.tiny_frame";
-    const MAX_REQUEST_FRAME: usize = 1;
-
-    type Request = Number;
-    type Response = Number;
-    type Input = Unary;
-    type Output = Unary;
-}
-
-struct InvalidConfiguration;
-
-impl RpcMethod for InvalidConfiguration {
-    const ADDRESS: &'static str = "errors.invalid_configuration";
-    const MAX_REQUEST_FRAME: usize = 0;
-
-    type Request = Number;
-    type Response = Number;
-    type Input = Unary;
-    type Output = Unary;
-}
-
 struct DomainFailure;
 
 impl RpcMethod for DomainFailure {
@@ -91,25 +67,16 @@ async fn run() -> RpcResult<()> {
         .call::<IncompatibleEcho>(Number { value: 1 });
     assert!(matches!(mismatch, Err(RpcError::SignatureMismatch { .. })));
 
-    registry.register_typed::<TinyRequestFrame, _>(
-        |_context, request: RpcFrame<Number>| async move { Ok(*request.view()?) },
-    )?;
-    let oversized = registry
-        .client()
-        .call::<TinyRequestFrame>(Number { value: u32::MAX })?
-        .await;
-    assert!(matches!(
-        oversized,
-        Err(RpcError::FrameTooLarge { limit: 1, .. })
-    ));
-
-    let invalid = registry.register_typed::<InvalidConfiguration, _>(
+    let small_lanes = Box::leak(Box::new(RpcLaneStorage::<1, 2, 1>::new()));
+    let small_registry = RpcRegistry::new(small_lanes)?;
+    let oversized = small_registry.register_typed::<Echo, _>(
         |_context, request: RpcFrame<Number>| async move { Ok(*request.view()?) },
     );
     assert!(matches!(
-        invalid,
-        Err(RpcError::InvalidMethodConfiguration {
-            field: "MAX_REQUEST_FRAME",
+        oversized,
+        Err(RpcError::MethodFrameExceedsLane {
+            frame_size: 4,
+            lane_capacity: 2,
             ..
         })
     ));
@@ -140,7 +107,7 @@ async fn run() -> RpcResult<()> {
         }
     }
 
-    println!("registration, signature, limit, configuration, and provider errors completed");
+    println!("registration, signature, capacity, and provider errors completed");
     Ok(())
 }
 

@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcDirection, RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry,
-    RpcResult, RpcStream, Streaming, Unary,
+    RpcContext, RpcDirection, RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod,
+    RpcRegistry, RpcResult, RpcStream, Streaming, Unary,
 };
 use futures_lite::future::{block_on, poll_once};
 use futures_util::stream;
@@ -240,38 +240,6 @@ fn typed_signature_mismatch_is_rejected_before_starting_io() {
     ));
 }
 
-struct TinyFrameMethod;
-
-impl RpcMethod for TinyFrameMethod {
-    const ADDRESS: &'static str = "typed.tiny_frame";
-    const MAX_REQUEST_FRAME: usize = 1;
-    type Request = Number;
-    type Response = Total;
-    type Input = Unary;
-    type Output = Unary;
-}
-
-#[test]
-fn typed_request_frame_limit_is_enforced() {
-    let registry = registry();
-    registry
-        .register_typed::<TinyFrameMethod, _>(|_context, request: RpcFrame<Number>| async move {
-            Ok(Total {
-                value: request.view()?.value,
-            })
-        })
-        .expect("register typed endpoint");
-    let call = registry
-        .client()
-        .call::<TinyFrameMethod>(number(1))
-        .expect("start typed call");
-
-    assert!(matches!(
-        block_on(call),
-        Err(RpcError::FrameTooLarge { limit: 1, .. })
-    ));
-}
-
 struct EmptyFrameMethod;
 
 impl RpcMethod for EmptyFrameMethod {
@@ -317,10 +285,10 @@ fn typed_registration_requires_method_frames_to_fit_the_lane_capacity() {
         result,
         Err(RpcError::MethodFrameExceedsLane {
             direction: RpcDirection::Request,
-            frame_limit: 4_096,
+            frame_size,
             lane_capacity: 8,
             ..
-        })
+        }) if frame_size == size_of::<Number>()
     ));
 }
 
@@ -328,8 +296,6 @@ struct LeaseMethod;
 
 impl RpcMethod for LeaseMethod {
     const ADDRESS: &'static str = "typed.frame_lease";
-    const MAX_REQUEST_FRAME: usize = 64;
-    const MAX_RESPONSE_FRAME: usize = 64;
 
     type Request = Number;
     type Response = Number;
@@ -354,7 +320,7 @@ fn response_frame_retains_an_aligned_lane_until_drop() {
             .expect("start first call")
             .await
             .expect("finish first call");
-        let address = first.as_bytes().expect("borrow response bytes").as_ptr() as usize;
+        let address = first.view().expect("borrow typed response") as *const Number as usize;
         assert_eq!(address % align_of::<Number>(), 0);
 
         let mut second = Box::pin(
@@ -395,5 +361,233 @@ fn message_alignment_larger_than_lane_alignment_is_rejected() {
             available: 16,
             ..
         })
+    ));
+}
+
+struct DirectSelfMethod;
+
+impl RpcMethod for DirectSelfMethod {
+    const ADDRESS: &'static str = "typed.direct_self";
+
+    type Request = Number;
+    type Response = Total;
+    type Input = Unary;
+    type Output = Unary;
+}
+
+#[test]
+fn typed_direct_self_call_is_rejected() {
+    let registry = registry();
+    registry
+        .register_typed::<DirectSelfMethod, _>(
+            |context: RpcContext, request: RpcFrame<Number>| async move {
+                let nested = context.client().call::<DirectSelfMethod>(*request.view()?);
+                match nested {
+                    Err(RpcError::DirectSelfCall(_)) => Ok(Total { value: 1 }),
+                    Err(error) => Err(error),
+                    Ok(_) => Err(RpcError::Provider(RpcFailure::new(
+                        "self_call_started",
+                        "a direct self-call unexpectedly started",
+                    ))),
+                }
+            },
+        )
+        .expect("register self-call endpoint");
+
+    let response = block_on(
+        registry
+            .client()
+            .call::<DirectSelfMethod>(number(0))
+            .expect("start outer call"),
+    )
+    .expect("complete outer call");
+    assert_eq!(response.view(), Ok(&Total { value: 1 }));
+}
+
+struct IndirectA;
+
+impl RpcMethod for IndirectA {
+    const ADDRESS: &'static str = "typed.indirect_a";
+
+    type Request = Number;
+    type Response = Total;
+    type Input = Unary;
+    type Output = Unary;
+}
+
+struct IndirectB;
+
+impl RpcMethod for IndirectB {
+    const ADDRESS: &'static str = "typed.indirect_b";
+
+    type Request = Number;
+    type Response = Total;
+    type Input = Unary;
+    type Output = Unary;
+}
+
+#[test]
+fn typed_indirect_call_may_return_to_an_earlier_endpoint() {
+    let registry = registry();
+    registry
+        .register_typed::<IndirectA, _>(
+            |context: RpcContext, request: RpcFrame<Number>| async move {
+                let value = request.view()?.value;
+                drop(request);
+                if value == 0 {
+                    let response = context.client().call::<IndirectB>(number(1))?.await?;
+                    Ok(*response.view()?)
+                } else {
+                    Ok(Total { value })
+                }
+            },
+        )
+        .expect("register endpoint A");
+    registry
+        .register_typed::<IndirectB, _>(
+            |context: RpcContext, request: RpcFrame<Number>| async move {
+                let value = request.view()?.value;
+                drop(request);
+                let response = context
+                    .client()
+                    .call::<IndirectA>(number(value + 1))?
+                    .await?;
+                Ok(*response.view()?)
+            },
+        )
+        .expect("register endpoint B");
+
+    let response = block_on(
+        registry
+            .client()
+            .call::<IndirectA>(number(0))
+            .expect("start indirect call chain"),
+    )
+    .expect("complete indirect call chain");
+    assert_eq!(response.view(), Ok(&Total { value: 2 }));
+}
+
+#[test]
+fn unregister_keeps_a_prepared_typed_call_alive() {
+    let registry = registry();
+    let registration = registry
+        .register_typed::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Total {
+                value: request.view()?.value + 1,
+            })
+        })
+        .expect("register typed endpoint");
+    let client = registry.client();
+    let in_flight = client
+        .call::<UnaryUnaryMethod>(number(10))
+        .expect("prepare typed call");
+
+    registry
+        .unregister(&registration)
+        .expect("unregister exact endpoint");
+    let response = block_on(in_flight).expect("prepared call retains provider");
+    assert_eq!(response.view(), Ok(&Total { value: 11 }));
+    drop(response);
+
+    assert!(matches!(
+        client.call::<UnaryUnaryMethod>(number(20)),
+        Err(RpcError::NotFound(_))
+    ));
+    assert!(matches!(
+        registry.unregister(&registration),
+        Err(RpcError::StaleRegistration(_))
+    ));
+}
+
+#[test]
+fn dropping_a_reserved_typed_waiter_hands_the_lane_to_the_next_call() {
+    block_on(async {
+        let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 2>::new()));
+        let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
+        registry
+            .register_typed::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
+                Ok(*request.view()?)
+            })
+            .expect("register lease endpoint");
+        let client = registry.client();
+
+        let first = client
+            .call::<LeaseMethod>(number(1))
+            .expect("start first call")
+            .await
+            .expect("finish first call");
+        let mut second = Box::pin(
+            client
+                .call::<LeaseMethod>(number(2))
+                .expect("start second call"),
+        );
+        let mut third = Box::pin(
+            client
+                .call::<LeaseMethod>(number(3))
+                .expect("start third call"),
+        );
+        assert!(poll_once(second.as_mut()).await.is_none());
+        assert!(poll_once(third.as_mut()).await.is_none());
+
+        drop(first);
+        drop(second);
+        let third = third.await.expect("third call receives transferred lane");
+        assert_eq!(third.view(), Ok(&number(3)));
+    });
+}
+
+struct InnerMethod;
+
+impl RpcMethod for InnerMethod {
+    const ADDRESS: &'static str = "typed.inner";
+
+    type Request = Number;
+    type Response = Total;
+    type Input = Unary;
+    type Output = Unary;
+}
+
+struct OuterMethod;
+
+impl RpcMethod for OuterMethod {
+    const ADDRESS: &'static str = "typed.outer";
+
+    type Request = Number;
+    type Response = Total;
+    type Input = Unary;
+    type Output = Unary;
+}
+
+#[test]
+fn typed_nested_call_fails_instead_of_waiting_for_its_own_lane() {
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 1>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
+    registry
+        .register_typed::<InnerMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Total {
+                value: request.view()?.value,
+            })
+        })
+        .expect("register inner endpoint");
+    registry
+        .register_typed::<OuterMethod, _>(
+            |context: RpcContext, request: RpcFrame<Number>| async move {
+                let request_value = *request.view()?;
+                drop(request);
+                let response = context.client().call::<InnerMethod>(request_value)?.await?;
+                Ok(*response.view()?)
+            },
+        )
+        .expect("register outer endpoint");
+
+    let result = block_on(
+        registry
+            .client()
+            .call::<OuterMethod>(number(1))
+            .expect("start outer call"),
+    );
+    assert!(matches!(
+        result,
+        Err(RpcError::NestedLaneExhausted { limit: 1 })
     ));
 }

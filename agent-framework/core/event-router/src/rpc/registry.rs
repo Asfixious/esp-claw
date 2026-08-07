@@ -1,5 +1,6 @@
 use core::cell::Cell;
 use core::future::Future;
+use core::mem::size_of;
 use core::pin::Pin;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -7,8 +8,7 @@ use std::rc::{Rc, Weak};
 
 use super::address::{RpcAddress, RpcAddressError};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
-use super::io::{BinaryIoError, BoxBinaryReader, BoxBinaryWriter};
-use super::lane::{LaneAcquire, LaneIo, LanePool, RpcLaneStorage};
+use super::lane::{LaneAcquire, LaneIo, LanePool, LaneReader, LaneWriter, RpcLaneStorage};
 use super::typed::{
     RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode, TypedProvider, TypedRpcHandler,
 };
@@ -34,25 +34,14 @@ impl core::fmt::Display for RpcDirection {
 /// Result returned by RPC operations.
 pub type RpcResult<T> = Result<T, RpcError>;
 
-/// Dynamically dispatched, task-local RPC execution.
-pub type RpcFuture<'a> = Pin<Box<dyn Future<Output = RpcResult<()>> + 'a>>;
+pub(crate) type RpcFuture<'a> = Pin<Box<dyn Future<Output = RpcResult<()>> + 'a>>;
 
-/// One implementation registered at an [`RpcAddress`].
-///
-/// Input and output always use the same binary interfaces. A provider chooses
-/// unary behavior by consuming or producing a finite body and chooses streaming
-/// behavior by keeping the corresponding side open while data is produced.
-pub trait RawRpcProvider {
-    /// Handles one invocation.
-    ///
-    /// Implementations must close `output` after producing the final byte. The
-    /// returned future must be driven concurrently with streaming producers and
-    /// consumers so bounded pipes can apply backpressure without deadlocking.
+pub(crate) trait RpcProvider {
     fn call<'a>(
         &'a self,
         context: RpcContext,
-        input: BoxBinaryReader,
-        output: BoxBinaryWriter,
+        input: LaneReader,
+        output: LaneWriter,
     ) -> RpcFuture<'a>;
 }
 
@@ -106,20 +95,6 @@ impl RpcRegistry {
         }
     }
 
-    /// Registers an untyped binary provider at an address.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RpcError::AlreadyRegistered`] if the address is occupied or
-    /// [`RpcError::IdentifierExhausted`] if no endpoint identity remains.
-    pub fn register_raw(
-        &self,
-        address: RpcAddress,
-        provider: impl RawRpcProvider + 'static,
-    ) -> RpcResult<RpcRegistration> {
-        self.register_provider(address, Rc::new(provider), None)
-    }
-
     /// Registers a typed provider for method `M`.
     ///
     /// The method descriptor is retained with the endpoint so typed clients can
@@ -128,7 +103,7 @@ impl RpcRegistry {
     /// # Errors
     ///
     /// Returns an error if the method configuration or address is invalid, the
-    /// address is occupied, either frame limit exceeds the lane capacity, or
+    /// address is occupied, either message type exceeds the lane capacity, or
     /// no endpoint identity remains.
     pub fn register_typed<M, H>(&self, handler: H) -> RpcResult<RpcRegistration>
     where
@@ -136,20 +111,20 @@ impl RpcRegistry {
         H: TypedRpcHandler<M> + 'static,
     {
         let descriptor = RpcMethodDescriptor::for_method::<M>()?;
-        self.validate_method_capacity(&descriptor)?;
+        self.validate_method_capacity::<M>(&descriptor)?;
         let address = descriptor.address().clone();
         self.register_provider(
             address,
             Rc::new(TypedProvider::<M, H>::new(handler)),
-            Some(descriptor),
+            descriptor,
         )
     }
 
     fn register_provider(
         &self,
         address: RpcAddress,
-        provider: Rc<dyn RawRpcProvider>,
-        descriptor: Option<RpcMethodDescriptor>,
+        provider: Rc<dyn RpcProvider>,
+        descriptor: RpcMethodDescriptor,
     ) -> RpcResult<RpcRegistration> {
         if self.endpoints.borrow().contains_key(&address) {
             return Err(RpcError::AlreadyRegistered(address));
@@ -207,7 +182,7 @@ impl RpcRegistry {
         registry: Weak<Self>,
         caller: &RpcClient,
         address: &RpcAddress,
-        expected: Option<&RpcMethodDescriptor>,
+        expected: &RpcMethodDescriptor,
     ) -> RpcResult<PreparedCall> {
         let endpoint = self
             .endpoints
@@ -215,17 +190,12 @@ impl RpcRegistry {
             .get(address)
             .cloned()
             .ok_or_else(|| RpcError::NotFound(address.clone()))?;
-        if let Some(expected) = expected {
-            if endpoint.descriptor.as_ref() != Some(expected) {
-                return Err(RpcError::SignatureMismatch {
-                    address: address.clone(),
-                    expected: expected.method_type_name(),
-                    registered: endpoint
-                        .descriptor
-                        .as_ref()
-                        .map(RpcMethodDescriptor::method_type_name),
-                });
-            }
+        if &endpoint.descriptor != expected {
+            return Err(RpcError::SignatureMismatch {
+                address: address.clone(),
+                expected: expected.method_type_name(),
+                registered: endpoint.descriptor.method_type_name(),
+            });
         }
         if caller.caller_endpoint_id == Some(endpoint.endpoint_id) {
             return Err(RpcError::DirectSelfCall(address.clone()));
@@ -262,21 +232,26 @@ impl RpcRegistry {
         take_identifier(&self.next_call_id)
     }
 
-    fn validate_method_capacity(&self, descriptor: &RpcMethodDescriptor) -> RpcResult<()> {
+    fn validate_method_capacity<M>(&self, descriptor: &RpcMethodDescriptor) -> RpcResult<()>
+    where
+        M: RpcMethod,
+    {
         let lane_capacity = self.lanes.frame_capacity();
-        if descriptor.max_request_frame() > lane_capacity {
+        let request_size = size_of::<M::Request>();
+        if request_size > lane_capacity {
             return Err(RpcError::MethodFrameExceedsLane {
                 address: descriptor.address().clone(),
                 direction: RpcDirection::Request,
-                frame_limit: descriptor.max_request_frame(),
+                frame_size: request_size,
                 lane_capacity,
             });
         }
-        if descriptor.max_response_frame() > lane_capacity {
+        let response_size = size_of::<M::Response>();
+        if response_size > lane_capacity {
             return Err(RpcError::MethodFrameExceedsLane {
                 address: descriptor.address().clone(),
                 direction: RpcDirection::Response,
-                frame_limit: descriptor.max_response_frame(),
+                frame_size: response_size,
                 lane_capacity,
             });
         }
@@ -294,8 +269,8 @@ fn take_identifier(next: &Cell<u64>) -> RpcResult<u64> {
 #[derive(Clone)]
 struct EndpointEntry {
     endpoint_id: RpcEndpointId,
-    provider: Rc<dyn RawRpcProvider>,
-    descriptor: Option<RpcMethodDescriptor>,
+    provider: Rc<dyn RpcProvider>,
+    descriptor: RpcMethodDescriptor,
 }
 
 pub(crate) struct PreparedCall {
@@ -326,11 +301,7 @@ impl AcquiredCall {
         self.lane.take().ok_or(RpcError::InvalidLaneState)
     }
 
-    pub(crate) fn start(
-        self,
-        input: BoxBinaryReader,
-        output: BoxBinaryWriter,
-    ) -> RpcFuture<'static> {
+    pub(crate) fn start(self, input: LaneReader, output: LaneWriter) -> RpcFuture<'static> {
         let endpoint = self.endpoint;
         let context = self.context;
         Box::pin(async move { endpoint.provider.call(context, input, output).await })
@@ -356,11 +327,11 @@ impl RpcClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the method configuration is invalid, the registry
-    /// was dropped, the endpoint does not exist, its typed signature differs,
-    /// either frame limit exceeds the lane capacity, identifiers are
-    /// exhausted, or this is a direct synchronous self-call. The returned
-    /// future or stream may later report lane acquisition or framing errors.
+    /// Returns an error when the registry was dropped, the endpoint does not
+    /// exist, its typed signature differs, either message type exceeds the lane
+    /// capacity, identifiers are exhausted, or this is a direct synchronous
+    /// self-call. The returned future or stream may later report lane
+    /// acquisition or framing errors.
     pub fn call<M>(
         &self,
         input: <M::Input as RpcInputMode<M::Request>>::ClientInput,
@@ -370,47 +341,15 @@ impl RpcClient {
     {
         let descriptor = RpcMethodDescriptor::for_method::<M>()?;
         let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
-        registry.validate_method_capacity(&descriptor)?;
+        registry.validate_method_capacity::<M>(&descriptor)?;
         let prepared = registry.prepare_call(
             self.registry.clone(),
             self,
             descriptor.address(),
-            Some(&descriptor),
+            &descriptor,
         )?;
         let setup = super::typed::setup_call::<M>(prepared, input);
-        Ok(M::Output::make_client_call(setup, M::MAX_RESPONSE_FRAME))
-    }
-
-    /// Starts an untyped call with caller-provided binary input and output.
-    ///
-    /// This method does not distinguish unary and streaming calls. Either side
-    /// may be finite or incremental, independently of the other side.
-    ///
-    /// The returned future owns the selected provider, so unregistering the
-    /// endpoint does not cancel an invocation that has already started.
-    /// Polling it may wait for a root-call lane or return
-    /// [`RpcError::NestedLaneExhausted`] for a nested call.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry was dropped, the endpoint does not
-    /// exist, identifiers are exhausted, or this client attempts a direct
-    /// synchronous self-call.
-    pub fn call_raw(
-        &self,
-        address: &RpcAddress,
-        input: BoxBinaryReader,
-        output: BoxBinaryWriter,
-    ) -> RpcResult<RpcFuture<'static>> {
-        let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
-        let prepared = registry.prepare_call(self.registry.clone(), self, address, None)?;
-        Ok(Box::pin(async move {
-            let mut acquired = prepared.acquire().await?;
-            let lane = acquired.take_lane()?;
-            let result = acquired.start(input, output).await;
-            drop(lane);
-            result
-        }))
+        Ok(super::typed::make_client_call::<M>(setup))
     }
 }
 
@@ -490,14 +429,6 @@ pub enum RpcError {
     /// An unregister token no longer identifies the current endpoint instance.
     #[error("stale RPC registration: {0}")]
     StaleRegistration(RpcAddress),
-    /// A typed method declared a zero frame limit.
-    #[error("invalid RPC method configuration for {address}: {field} must be nonzero")]
-    InvalidMethodConfiguration {
-        /// Method address.
-        address: RpcAddress,
-        /// Invalid associated constant.
-        field: &'static str,
-    },
     /// The client method marker does not match the registered typed endpoint.
     #[error("RPC signature mismatch at {address}: expected {expected}, registered {registered:?}")]
     SignatureMismatch {
@@ -505,29 +436,15 @@ pub enum RpcError {
         address: RpcAddress,
         /// Client method marker name.
         expected: &'static str,
-        /// Registered method marker name, or `None` for a raw endpoint.
-        registered: Option<&'static str>,
+        /// Registered method marker name.
+        registered: &'static str,
     },
-    /// One encoded or declared frame exceeds its method limit.
-    #[error("RPC frame size {size} exceeds limit {limit}")]
-    FrameTooLarge {
-        /// Encoded or declared frame size.
-        size: usize,
-        /// Configured maximum frame size.
-        limit: usize,
-    },
-    /// A peer closed its stream in the middle of a frame.
-    #[error("RPC stream ended in the middle of a frame")]
-    IncompleteFrame,
     /// Internal framing state became inconsistent.
     #[error("invalid RPC frame decoder state")]
     InvalidFrameState,
     /// A unary side reached EOF without carrying a message.
     #[error("unary RPC side did not contain a message")]
     MissingUnaryFrame,
-    /// A unary side carried more than one message.
-    #[error("unary RPC side contained more than one message")]
-    ExtraUnaryFrame,
     /// A completed unary call future was polled again.
     #[error("completed unary RPC call was polled again")]
     CompletedCallPolled,
@@ -552,26 +469,26 @@ pub enum RpcError {
         /// Invalid const generic field.
         field: &'static str,
     },
-    /// A method frame limit is larger than the configured lane direction.
+    /// A method message is larger than the configured lane direction.
     #[error(
-        "RPC {direction} frame limit {frame_limit} for {address} exceeds lane capacity {lane_capacity}"
+        "RPC {direction} message size {frame_size} for {address} exceeds lane capacity {lane_capacity}"
     )]
     MethodFrameExceedsLane {
         /// Method address.
         address: RpcAddress,
         /// Request or response direction.
         direction: RpcDirection,
-        /// Method-declared frame limit.
-        frame_limit: usize,
+        /// Fixed-layout message size.
+        frame_size: usize,
         /// Lane direction capacity.
         lane_capacity: usize,
     },
-    /// A fixed-layout message could not fit in the lane frame.
-    #[error("typed RPC message exceeds the fixed {limit}-byte frame buffer")]
-    FrameBufferFull {
-        /// Available fixed frame bytes.
-        limit: usize,
-    },
+    /// A typed frame writer was already closed.
+    #[error("typed RPC frame writer is closed")]
+    FrameWriterClosed,
+    /// The typed frame receiver was dropped before the writer completed.
+    #[error("typed RPC frame reader is closed")]
+    FrameReaderClosed,
     /// Frame bytes do not satisfy a message's size, alignment, or validity.
     #[error("invalid fixed-layout RPC frame for {message_type}")]
     InvalidMessageFrame {
@@ -590,9 +507,6 @@ pub enum RpcError {
         /// Alignment guaranteed by every lane frame.
         available: usize,
     },
-    /// A binary input or output operation failed.
-    #[error(transparent)]
-    BinaryIo(#[from] BinaryIoError),
     /// A provider returned a domain-specific failure.
     #[error("RPC provider failed ({code}): {message}", code = .0.code(), message = .0.message())]
     Provider(RpcFailure),

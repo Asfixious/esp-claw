@@ -1,20 +1,5 @@
 pub mod claw_event_router
 pub mod claw_event_router::rpc
-#[non_exhaustive] pub enum claw_event_router::rpc::BinaryIoError
-pub claw_event_router::rpc::BinaryIoError::BrokenPipe
-pub claw_event_router::rpc::BinaryIoError::InvalidPipeState
-pub claw_event_router::rpc::BinaryIoError::InvalidReadCount
-pub claw_event_router::rpc::BinaryIoError::InvalidReadCount::available: usize
-pub claw_event_router::rpc::BinaryIoError::InvalidReadCount::reported: usize
-pub claw_event_router::rpc::BinaryIoError::InvalidReadPosition
-pub claw_event_router::rpc::BinaryIoError::InvalidWriteCount
-pub claw_event_router::rpc::BinaryIoError::InvalidWriteCount::available: usize
-pub claw_event_router::rpc::BinaryIoError::InvalidWriteCount::reported: usize
-pub claw_event_router::rpc::BinaryIoError::LimitExceeded
-pub claw_event_router::rpc::BinaryIoError::LimitExceeded::limit: usize
-pub claw_event_router::rpc::BinaryIoError::WriteZero
-pub claw_event_router::rpc::BinaryIoError::WriterClosed
-pub claw_event_router::rpc::BinaryIoError::ZeroCapacity
 #[non_exhaustive] pub enum claw_event_router::rpc::RpcAddressError
 pub claw_event_router::rpc::RpcAddressError::InvalidFormat(alloc::boxed::Box<str>)
 pub enum claw_event_router::rpc::RpcCardinality
@@ -28,26 +13,17 @@ pub fn claw_event_router::rpc::RpcDirection::fmt(&self, &mut core::fmt::Formatte
 #[non_exhaustive] pub enum claw_event_router::rpc::RpcError
 pub claw_event_router::rpc::RpcError::Address(claw_event_router::rpc::RpcAddressError)
 pub claw_event_router::rpc::RpcError::AlreadyRegistered(claw_event_router::rpc::RpcAddress)
-pub claw_event_router::rpc::RpcError::BinaryIo(claw_event_router::rpc::BinaryIoError)
 pub claw_event_router::rpc::RpcError::CompletedCallPolled
 pub claw_event_router::rpc::RpcError::DirectSelfCall(claw_event_router::rpc::RpcAddress)
-pub claw_event_router::rpc::RpcError::ExtraUnaryFrame
-pub claw_event_router::rpc::RpcError::FrameBufferFull
-pub claw_event_router::rpc::RpcError::FrameBufferFull::limit: usize
-pub claw_event_router::rpc::RpcError::FrameTooLarge
-pub claw_event_router::rpc::RpcError::FrameTooLarge::limit: usize
-pub claw_event_router::rpc::RpcError::FrameTooLarge::size: usize
+pub claw_event_router::rpc::RpcError::FrameReaderClosed
+pub claw_event_router::rpc::RpcError::FrameWriterClosed
 pub claw_event_router::rpc::RpcError::IdentifierExhausted
-pub claw_event_router::rpc::RpcError::IncompleteFrame
 pub claw_event_router::rpc::RpcError::InvalidFrameState
 pub claw_event_router::rpc::RpcError::InvalidLaneConfiguration
 pub claw_event_router::rpc::RpcError::InvalidLaneConfiguration::field: &'static str
 pub claw_event_router::rpc::RpcError::InvalidLaneState
 pub claw_event_router::rpc::RpcError::InvalidMessageFrame
 pub claw_event_router::rpc::RpcError::InvalidMessageFrame::message_type: &'static str
-pub claw_event_router::rpc::RpcError::InvalidMethodConfiguration
-pub claw_event_router::rpc::RpcError::InvalidMethodConfiguration::address: claw_event_router::rpc::RpcAddress
-pub claw_event_router::rpc::RpcError::InvalidMethodConfiguration::field: &'static str
 pub claw_event_router::rpc::RpcError::LaneWaiterCapacityExceeded
 pub claw_event_router::rpc::RpcError::LaneWaiterCapacityExceeded::limit: usize
 pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane
@@ -57,7 +33,7 @@ pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::required: usi
 pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane
 pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::address: claw_event_router::rpc::RpcAddress
 pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::direction: claw_event_router::rpc::RpcDirection
-pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::frame_limit: usize
+pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::frame_size: usize
 pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::lane_capacity: usize
 pub claw_event_router::rpc::RpcError::MissingUnaryFrame
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted
@@ -68,26 +44,8 @@ pub claw_event_router::rpc::RpcError::RegistryDropped
 pub claw_event_router::rpc::RpcError::SignatureMismatch
 pub claw_event_router::rpc::RpcError::SignatureMismatch::address: claw_event_router::rpc::RpcAddress
 pub claw_event_router::rpc::RpcError::SignatureMismatch::expected: &'static str
-pub claw_event_router::rpc::RpcError::SignatureMismatch::registered: core::option::Option<&'static str>
+pub claw_event_router::rpc::RpcError::SignatureMismatch::registered: &'static str
 pub claw_event_router::rpc::RpcError::StaleRegistration(claw_event_router::rpc::RpcAddress)
-pub struct claw_event_router::rpc::BinaryPipeReader
-impl claw_event_router::rpc::BinaryReader for claw_event_router::rpc::BinaryPipeReader
-pub fn claw_event_router::rpc::BinaryPipeReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut [u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-impl core::ops::drop::Drop for claw_event_router::rpc::BinaryPipeReader
-pub fn claw_event_router::rpc::BinaryPipeReader::drop(&mut self)
-pub struct claw_event_router::rpc::BinaryPipeWriter
-impl claw_event_router::rpc::BinaryWriter for claw_event_router::rpc::BinaryPipeWriter
-pub fn claw_event_router::rpc::BinaryPipeWriter::poll_close(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), claw_event_router::rpc::BinaryIoError>>
-pub fn claw_event_router::rpc::BinaryPipeWriter::poll_flush(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), claw_event_router::rpc::BinaryIoError>>
-pub fn claw_event_router::rpc::BinaryPipeWriter::poll_write(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &[u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-impl core::ops::drop::Drop for claw_event_router::rpc::BinaryPipeWriter
-pub fn claw_event_router::rpc::BinaryPipeWriter::drop(&mut self)
-pub struct claw_event_router::rpc::BytesReader
-impl claw_event_router::rpc::BytesReader
-pub fn claw_event_router::rpc::BytesReader::boxed(self) -> claw_event_router::rpc::BoxBinaryReader
-pub fn claw_event_router::rpc::BytesReader::new(impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
-impl claw_event_router::rpc::BinaryReader for claw_event_router::rpc::BytesReader
-pub fn claw_event_router::rpc::BytesReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut [u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
 pub struct claw_event_router::rpc::RpcAddress(_)
 impl claw_event_router::rpc::RpcAddress
 pub fn claw_event_router::rpc::RpcAddress::as_str(&self) -> &str
@@ -105,7 +63,6 @@ pub fn claw_event_router::rpc::RpcCallId::value(self) -> u64
 pub struct claw_event_router::rpc::RpcClient
 impl claw_event_router::rpc::RpcClient
 pub fn claw_event_router::rpc::RpcClient::call<M>(&self, <<M as claw_event_router::rpc::RpcMethod>::Input as claw_event_router::rpc::RpcInputMode<<M as claw_event_router::rpc::RpcMethod>::Request>>::ClientInput) -> claw_event_router::rpc::RpcResult<<<M as claw_event_router::rpc::RpcMethod>::Output as claw_event_router::rpc::RpcOutputMode<<M as claw_event_router::rpc::RpcMethod>::Response>>::ClientCall> where M: claw_event_router::rpc::RpcMethod
-pub fn claw_event_router::rpc::RpcClient::call_raw(&self, &claw_event_router::rpc::RpcAddress, claw_event_router::rpc::BoxBinaryReader, claw_event_router::rpc::BoxBinaryWriter) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcFuture<'static>>
 pub struct claw_event_router::rpc::RpcContext
 impl claw_event_router::rpc::RpcContext
 pub fn claw_event_router::rpc::RpcContext::call_id(&self) -> claw_event_router::rpc::RpcCallId
@@ -124,7 +81,6 @@ pub fn claw_event_router::rpc::RpcFailure::message(&self) -> &str
 pub fn claw_event_router::rpc::RpcFailure::new(impl core::convert::Into<alloc::boxed::Box<str>>, impl core::convert::Into<alloc::boxed::Box<str>>) -> Self
 pub struct claw_event_router::rpc::RpcFrame<T>
 impl<T> claw_event_router::rpc::RpcFrame<T> where T: claw_event_router::rpc::RpcMessage
-pub fn claw_event_router::rpc::RpcFrame<T>::as_bytes(&self) -> claw_event_router::rpc::RpcResult<&[u8]>
 pub fn claw_event_router::rpc::RpcFrame<T>::view(&self) -> claw_event_router::rpc::RpcResult<&T>
 impl<T> core::fmt::Debug for claw_event_router::rpc::RpcFrame<T> where T: claw_event_router::rpc::RpcMessage + core::fmt::Debug
 pub fn claw_event_router::rpc::RpcFrame<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -140,8 +96,6 @@ pub struct claw_event_router::rpc::RpcMethodDescriptor
 impl claw_event_router::rpc::RpcMethodDescriptor
 pub fn claw_event_router::rpc::RpcMethodDescriptor::address(&self) -> &claw_event_router::rpc::RpcAddress
 pub fn claw_event_router::rpc::RpcMethodDescriptor::input_cardinality(&self) -> claw_event_router::rpc::RpcCardinality
-pub fn claw_event_router::rpc::RpcMethodDescriptor::max_request_frame(&self) -> usize
-pub fn claw_event_router::rpc::RpcMethodDescriptor::max_response_frame(&self) -> usize
 pub fn claw_event_router::rpc::RpcMethodDescriptor::method_type_name(&self) -> &'static str
 pub fn claw_event_router::rpc::RpcMethodDescriptor::output_cardinality(&self) -> claw_event_router::rpc::RpcCardinality
 pub fn claw_event_router::rpc::RpcMethodDescriptor::request_type_name(&self) -> &'static str
@@ -156,7 +110,6 @@ pub fn claw_event_router::rpc::RpcRegistry::client(&alloc::rc::Rc<Self>) -> claw
 pub fn claw_event_router::rpc::RpcRegistry::is_empty(&self) -> bool
 pub fn claw_event_router::rpc::RpcRegistry::len(&self) -> usize
 pub fn claw_event_router::rpc::RpcRegistry::new<const N: usize, const M: usize, const Q: usize>(&'static claw_event_router::rpc::RpcLaneStorage<N, M, Q>) -> claw_event_router::rpc::RpcResult<Self>
-pub fn claw_event_router::rpc::RpcRegistry::register_raw(&self, claw_event_router::rpc::RpcAddress, impl claw_event_router::rpc::RawRpcProvider + 'static) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcRegistration>
 pub fn claw_event_router::rpc::RpcRegistry::register_typed<M, H>(&self, H) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcRegistration> where M: claw_event_router::rpc::RpcMethod, H: claw_event_router::rpc::TypedRpcHandler<M> + 'static
 pub fn claw_event_router::rpc::RpcRegistry::unregister(&self, &claw_event_router::rpc::RpcRegistration) -> claw_event_router::rpc::RpcResult<()>
 pub struct claw_event_router::rpc::RpcStream<T>
@@ -190,22 +143,6 @@ impl<T> claw_event_router::rpc::RpcOutputMode<T> for claw_event_router::rpc::Una
 pub type claw_event_router::rpc::Unary::ClientCall = claw_event_router::rpc::RpcUnaryCall<T>
 pub type claw_event_router::rpc::Unary::HandlerOutput = T
 pub const claw_event_router::rpc::Unary::CARDINALITY: claw_event_router::rpc::RpcCardinality
-pub trait claw_event_router::rpc::BinaryReader
-pub fn claw_event_router::rpc::BinaryReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut [u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-impl claw_event_router::rpc::BinaryReader for claw_event_router::rpc::BinaryPipeReader
-pub fn claw_event_router::rpc::BinaryPipeReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut [u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-impl claw_event_router::rpc::BinaryReader for claw_event_router::rpc::BytesReader
-pub fn claw_event_router::rpc::BytesReader::poll_read(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &mut [u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-pub trait claw_event_router::rpc::BinaryWriter
-pub fn claw_event_router::rpc::BinaryWriter::poll_close(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), claw_event_router::rpc::BinaryIoError>>
-pub fn claw_event_router::rpc::BinaryWriter::poll_flush(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), claw_event_router::rpc::BinaryIoError>>
-pub fn claw_event_router::rpc::BinaryWriter::poll_write(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &[u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-impl claw_event_router::rpc::BinaryWriter for claw_event_router::rpc::BinaryPipeWriter
-pub fn claw_event_router::rpc::BinaryPipeWriter::poll_close(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), claw_event_router::rpc::BinaryIoError>>
-pub fn claw_event_router::rpc::BinaryPipeWriter::poll_flush(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), claw_event_router::rpc::BinaryIoError>>
-pub fn claw_event_router::rpc::BinaryPipeWriter::poll_write(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>, &[u8]) -> core::task::poll::Poll<core::result::Result<usize, claw_event_router::rpc::BinaryIoError>>
-pub trait claw_event_router::rpc::RawRpcProvider
-pub fn claw_event_router::rpc::RawRpcProvider::call<'a>(&'a self, claw_event_router::rpc::RpcContext, claw_event_router::rpc::BoxBinaryReader, claw_event_router::rpc::BoxBinaryWriter) -> claw_event_router::rpc::RpcFuture<'a>
 pub trait claw_event_router::rpc::RpcInputMode<T> where T: claw_event_router::rpc::RpcMessage: claw_event_router::rpc::typed::private::Sealed
 pub type claw_event_router::rpc::RpcInputMode::ClientInput
 pub type claw_event_router::rpc::RpcInputMode::HandlerInput
@@ -226,8 +163,6 @@ pub type claw_event_router::rpc::RpcMethod::Output: claw_event_router::rpc::RpcO
 pub type claw_event_router::rpc::RpcMethod::Request: claw_event_router::rpc::RpcMessage
 pub type claw_event_router::rpc::RpcMethod::Response: claw_event_router::rpc::RpcMessage
 pub const claw_event_router::rpc::RpcMethod::ADDRESS: &'static str
-pub const claw_event_router::rpc::RpcMethod::MAX_REQUEST_FRAME: usize
-pub const claw_event_router::rpc::RpcMethod::MAX_RESPONSE_FRAME: usize
 pub trait claw_event_router::rpc::RpcOutputMode<T> where T: claw_event_router::rpc::RpcMessage: claw_event_router::rpc::typed::private::Sealed
 pub type claw_event_router::rpc::RpcOutputMode::ClientCall
 pub type claw_event_router::rpc::RpcOutputMode::HandlerOutput
@@ -244,16 +179,6 @@ pub trait claw_event_router::rpc::TypedRpcHandler<M> where M: claw_event_router:
 pub fn claw_event_router::rpc::TypedRpcHandler::call<'a>(&'a self, claw_event_router::rpc::RpcContext, claw_event_router::rpc::RpcHandlerInput<M>) -> claw_event_router::rpc::RpcHandlerFuture<'a, claw_event_router::rpc::RpcHandlerOutput<M>>
 impl<M, H, Fut> claw_event_router::rpc::TypedRpcHandler<M> for H where M: claw_event_router::rpc::RpcMethod, H: core::ops::function::Fn(claw_event_router::rpc::RpcContext, claw_event_router::rpc::RpcHandlerInput<M>) -> Fut, Fut: core::future::future::Future<Output = claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcHandlerOutput<M>>> + 'static
 pub fn H::call<'a>(&'a self, claw_event_router::rpc::RpcContext, claw_event_router::rpc::RpcHandlerInput<M>) -> claw_event_router::rpc::RpcHandlerFuture<'a, claw_event_router::rpc::RpcHandlerOutput<M>>
-pub fn claw_event_router::rpc::binary_pipe(usize) -> core::result::Result<(claw_event_router::rpc::BinaryPipeReader, claw_event_router::rpc::BinaryPipeWriter), claw_event_router::rpc::BinaryIoError>
-pub async fn claw_event_router::rpc::close<W>(core::pin::Pin<&mut W>) -> core::result::Result<(), claw_event_router::rpc::BinaryIoError> where W: claw_event_router::rpc::BinaryWriter + ?core::marker::Sized
-pub async fn claw_event_router::rpc::flush<W>(core::pin::Pin<&mut W>) -> core::result::Result<(), claw_event_router::rpc::BinaryIoError> where W: claw_event_router::rpc::BinaryWriter + ?core::marker::Sized
-pub async fn claw_event_router::rpc::read<R>(core::pin::Pin<&mut R>, &mut [u8]) -> core::result::Result<usize, claw_event_router::rpc::BinaryIoError> where R: claw_event_router::rpc::BinaryReader + ?core::marker::Sized
-pub async fn claw_event_router::rpc::read_to_end<R>(core::pin::Pin<&mut R>, usize) -> core::result::Result<alloc::vec::Vec<u8>, claw_event_router::rpc::BinaryIoError> where R: claw_event_router::rpc::BinaryReader + ?core::marker::Sized
-pub async fn claw_event_router::rpc::write<W>(core::pin::Pin<&mut W>, &[u8]) -> core::result::Result<usize, claw_event_router::rpc::BinaryIoError> where W: claw_event_router::rpc::BinaryWriter + ?core::marker::Sized
-pub async fn claw_event_router::rpc::write_all<W>(core::pin::Pin<&mut W>, &[u8]) -> core::result::Result<(), claw_event_router::rpc::BinaryIoError> where W: claw_event_router::rpc::BinaryWriter + ?core::marker::Sized
-pub type claw_event_router::rpc::BoxBinaryReader = core::pin::Pin<alloc::boxed::Box<dyn claw_event_router::rpc::BinaryReader>>
-pub type claw_event_router::rpc::BoxBinaryWriter = core::pin::Pin<alloc::boxed::Box<dyn claw_event_router::rpc::BinaryWriter>>
-pub type claw_event_router::rpc::RpcFuture<'a> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = claw_event_router::rpc::RpcResult<()>> + 'a)>>
 pub type claw_event_router::rpc::RpcHandlerFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = claw_event_router::rpc::RpcResult<T>> + 'a)>>
 pub type claw_event_router::rpc::RpcHandlerInput<M> = <<M as claw_event_router::rpc::RpcMethod>::Input as claw_event_router::rpc::RpcInputMode<<M as claw_event_router::rpc::RpcMethod>::Request>>::HandlerInput
 pub type claw_event_router::rpc::RpcHandlerOutput<M> = <<M as claw_event_router::rpc::RpcMethod>::Output as claw_event_router::rpc::RpcOutputMode<<M as claw_event_router::rpc::RpcMethod>::Response>>::HandlerOutput

@@ -18,8 +18,6 @@ struct YieldingEcho;
 
 impl RpcMethod for YieldingEcho {
     const ADDRESS: &'static str = "lanes.yielding_echo";
-    const MAX_REQUEST_FRAME: usize = 64;
-    const MAX_RESPONSE_FRAME: usize = 64;
 
     type Request = Number;
     type Response = Number;

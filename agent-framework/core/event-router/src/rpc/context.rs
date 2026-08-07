@@ -32,7 +32,7 @@ impl RpcEndpointId {
     }
 }
 
-/// Metadata and nested-call client supplied to a raw or typed RPC provider.
+/// Metadata and nested-call client supplied to a typed RPC provider.
 #[derive(Clone)]
 pub struct RpcContext {
     call_id: RpcCallId,

@@ -42,7 +42,7 @@ WorkflowRuntime
 
 ```text
 claw-event-router
-├── rpc/          # typed/raw RPC、registry、framing、binary IO
+├── rpc/          # typed RPC、registry、static lanes
 ├── workflow/     # Workflow 定义、匹配和解释执行
 ├── event/        # Event 数据模型与 emit 入口
 ├── component/    # Component 生命周期与 registration
@@ -78,13 +78,7 @@ fn build_registry() -> RpcResult<Rc<RpcRegistry>> {
 
 RPC 只负责通信与调用。
 
-RPC 的 transport kernel 只有一种统一调用形态：
-
-```text
-BinaryReader → RPC Provider → BinaryWriter
-```
-
-输入和输出分别、独立地支持 Unary 和 Stream，因此同一个 `call` 可以表达四种组合：
+输入和输出分别、独立地支持 Unary 和 Stream，因此同一个 typed `call` 可以表达四种组合：
 
 ```text
 Unary  → Unary
@@ -98,14 +92,12 @@ Rust 组件通常不直接处理这些 bytes，而使用 typed RPC layer：
 ```text
 fixed-layout Request struct
     ↓ IntoBytes，直接写入 request lane
-BinaryReader → RPC Provider → BinaryWriter
+typed RPC Provider
     ↓ RpcFrame<Response>，直接借用 response lane
 &Response
 ```
 
 `RpcMethod` 同时声明 address、request/response struct 和两侧 cardinality。`RpcRegistry` 不提供 `call_unary` / `call_stream` 两套分发接口；所有 typed 调用统一写成 `client.call::<Method>(input)`，其返回类型由 Method 的 output cardinality 决定。
-
-底层 raw binary API 仍然保留为 `register_raw` / `call_raw`，用于 Lua、C ABI、网络 wire adapter 和自定义 codec。Typed layer 是建立在 raw kernel 上的安全 facade，不会把 registry 与某个业务 struct 耦合。
 
 ## Typed method
 
@@ -166,7 +158,7 @@ while let Some(frame) = results.next().await {
 | Stream | Unary | `RpcStream<RpcFrame<Request>>` | `Response` | `RpcUnaryCall<Response>` → `RpcFrame<Response>` |
 | Stream | Stream | `RpcStream<RpcFrame<Request>>` | `RpcStream<Response>` | `RpcStream<RpcFrame<Response>>` |
 
-Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、provider future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 raw call future。
+Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、provider future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 call future。
 
 ## Static lanes、framing 和限制
 
@@ -189,21 +181,13 @@ Lane-backed typed request 通过 `IntoBytes::as_bytes()` 直接复制到 request
 
 `RpcFrame<T>` drop 前，对应 pipe 不会被覆盖；drop 时 frame 才被消费并唤醒等待的 writer/reader。Unary response frame 还会保留整个 lane，因此调用者应在用完 view 后尽快 drop frame。若需要跨越后续调用长期保存结果，应把所需字段复制到自己的 fixed-layout storage，再释放 frame。Streaming 同样要求消费并释放当前 frame 后，下一帧才能复用该方向的 buffer。
 
-通过普通 raw byte reader/writer 调用 typed provider 时，兼容路径使用：
+Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。Request/Response 都是固定布局，因此 frame size 直接等于 `size_of::<Request/Response>()`，Method 不再声明重复的大小配置。Typed provider 注册和 typed client 调用都会在 acquisition 和 payload IO 之前检查两种消息均能放入 lane 的 `M` bytes。消息 alignment 大于 lane 保证的 16 bytes 时，在注册或调用前返回 `MessageAlignmentExceedsLane`。
 
-```text
-u32 little-endian payload length | fixed-layout message bytes
-```
+Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed provider/future 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
 
-这个 fallback 会先收集一个 frame，再用 `TryFromBytes::try_read_from_bytes()` 得到 owned message；真正的 lane path 才提供借用式 zero-copy view。
+Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response type、两侧 cardinality 和 limits，防止同一 address 上发生错误解析。
 
-Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。每个 Method 分别声明 request/response 最大 frame size（默认 4096 bytes）；typed provider 注册和 typed client 调用都会在 acquisition 和 payload IO 之前检查两侧限制均不大于 `M`。消息大小超过 Method limit 时返回 `FrameTooLarge`。消息 alignment 大于 lane 保证的 16 bytes 时，在注册或调用前返回 `MessageAlignmentExceedsLane`。
-
-Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed provider/future/IO handle 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
-
-Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response type、两侧 cardinality 和 limits，防止同一 address 上发生错误解析。Raw client 不做 typed signature 校验，因为它是显式选择的 escape hatch。
-
-Zerocopy 是 typed RPC 的唯一 codec；固定布局、alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。需要动态数据模型或其他 wire format 的调用方应显式使用 raw kernel，并在 adapter 中定义自己的 codec。
+Zerocopy 是 RPC 的唯一 codec；固定布局、alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。
 
 RPC 不关心：
 
@@ -252,7 +236,7 @@ HTTP response body
 实时数据流
 ```
 
-只要底层对象实现统一的 `BinaryReader` 和 `BinaryWriter`，就可以接入 RPC。Unary 与 Stream 不属于不同的调用类型，只由输入输出何时到达 EOF 决定。
+Unary 与 Stream 不属于不同的调用入口，而是由 `RpcMethod` 的输入输出 cardinality 决定。
 
 Stream 不只是“大对象传输”，也可以用于小块但持续产生的数据，例如 LLM token、日志和实时消息。
 
@@ -425,7 +409,7 @@ RPC Provider
 * 注册；
 * 注销；
 * RPC 地址解析；
-* 统一 binary reader / writer dispatch；
+* 统一 typed frame dispatch；
 * 分组；
 * visibility；
 * schema；

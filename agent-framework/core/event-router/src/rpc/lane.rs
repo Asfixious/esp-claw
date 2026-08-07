@@ -1,11 +1,9 @@
 use core::cell::{Ref, RefCell};
-use core::cmp;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use super::io::{BinaryReader, BinaryWriter, BoxBinaryReader, BoxBinaryWriter};
-use super::{BinaryIoError, RpcDirection, RpcError, RpcResult};
+use super::{RpcDirection, RpcError, RpcResult};
 
 pub(crate) const LANE_FRAME_ALIGNMENT: usize = 16;
 
@@ -29,7 +27,6 @@ impl<const M: usize> AlignedFrame<M> {
 
 struct StaticPipeState {
     len: usize,
-    offset: usize,
     occupied: bool,
     frame_borrowed: bool,
     reader_open: bool,
@@ -42,7 +39,6 @@ impl StaticPipeState {
     const fn new() -> Self {
         Self {
             len: 0,
-            offset: 0,
             occupied: false,
             frame_borrowed: false,
             reader_open: true,
@@ -69,7 +65,6 @@ impl<const M: usize> StaticPipe<M> {
     fn reset(&self) {
         let mut state = self.state.borrow_mut();
         state.len = 0;
-        state.offset = 0;
         state.occupied = false;
         state.frame_borrowed = false;
         state.reader_open = true;
@@ -78,118 +73,31 @@ impl<const M: usize> StaticPipe<M> {
         state.writer_waker = None;
     }
 
-    fn poll_read(
-        &self,
-        context: &mut Context<'_>,
-        destination: &mut [u8],
-    ) -> (Poll<Result<usize, BinaryIoError>>, Option<Waker>) {
-        if destination.is_empty() {
-            return (Poll::Ready(Ok(0)), None);
-        }
-        let mut state = self.state.borrow_mut();
-        if state.frame_borrowed {
-            update_waker(&mut state.reader_waker, context.waker());
-            return (Poll::Pending, None);
-        }
-        if !state.occupied {
-            if !state.writer_open {
-                return (Poll::Ready(Ok(0)), None);
-            }
-            update_waker(&mut state.reader_waker, context.waker());
-            return (Poll::Pending, None);
-        }
-        let bytes = self.bytes.borrow();
-        let Some(remaining) = bytes.bytes.get(state.offset..state.len) else {
-            return (Poll::Ready(Err(BinaryIoError::InvalidPipeState)), None);
-        };
-        let count = cmp::min(remaining.len(), destination.len());
-        let Some(source) = remaining.get(..count) else {
-            return (Poll::Ready(Err(BinaryIoError::InvalidPipeState)), None);
-        };
-        let Some(output) = destination.get_mut(..count) else {
-            return (Poll::Ready(Err(BinaryIoError::InvalidPipeState)), None);
-        };
-        output.copy_from_slice(source);
-        let Some(offset) = state.offset.checked_add(count) else {
-            return (Poll::Ready(Err(BinaryIoError::InvalidPipeState)), None);
-        };
-        state.offset = offset;
-        let writer_waker = if state.offset == state.len {
-            state.offset = 0;
-            state.len = 0;
-            state.occupied = false;
-            state.writer_waker.take()
-        } else {
-            None
-        };
-        (Poll::Ready(Ok(count)), writer_waker)
-    }
-
-    fn poll_write(
-        &self,
-        context: &mut Context<'_>,
-        source: &[u8],
-    ) -> (Poll<Result<usize, BinaryIoError>>, Option<Waker>) {
-        if source.is_empty() {
-            return (Poll::Ready(Ok(0)), None);
-        }
-        let mut state = self.state.borrow_mut();
-        if !state.writer_open {
-            return (Poll::Ready(Err(BinaryIoError::WriterClosed)), None);
-        }
-        if !state.reader_open {
-            return (Poll::Ready(Err(BinaryIoError::BrokenPipe)), None);
-        }
-        if state.occupied {
-            update_waker(&mut state.writer_waker, context.waker());
-            return (Poll::Pending, None);
-        }
-        let count = cmp::min(M, source.len());
-        let Some(input) = source.get(..count) else {
-            return (Poll::Ready(Err(BinaryIoError::InvalidPipeState)), None);
-        };
-        let mut bytes = self.bytes.borrow_mut();
-        let Some(destination) = bytes.bytes.get_mut(..count) else {
-            return (Poll::Ready(Err(BinaryIoError::InvalidPipeState)), None);
-        };
-        destination.copy_from_slice(input);
-        state.offset = 0;
-        state.len = count;
-        state.occupied = true;
-        (Poll::Ready(Ok(count)), state.reader_waker.take())
-    }
-
     fn poll_encode_frame(
         &self,
         context: &mut Context<'_>,
-        limit: usize,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> (Poll<RpcResult<()>>, Option<Waker>) {
         let mut state = self.state.borrow_mut();
         if !state.writer_open {
-            return (Poll::Ready(Err(BinaryIoError::WriterClosed.into())), None);
+            return (Poll::Ready(Err(RpcError::FrameWriterClosed)), None);
         }
         if !state.reader_open {
-            return (Poll::Ready(Err(BinaryIoError::BrokenPipe.into())), None);
+            return (Poll::Ready(Err(RpcError::FrameReaderClosed)), None);
         }
         if state.occupied {
             update_waker(&mut state.writer_waker, context.waker());
             return (Poll::Pending, None);
         }
 
-        let capacity = cmp::min(M, limit);
         let mut bytes = self.bytes.borrow_mut();
-        let Some(destination) = bytes.bytes.get_mut(..capacity) else {
-            return (Poll::Ready(Err(RpcError::InvalidLaneState)), None);
-        };
-        let length = match encode(destination) {
+        let length = match encode(&mut bytes.bytes) {
             Ok(length) => length,
             Err(error) => return (Poll::Ready(Err(error)), None),
         };
-        if length > capacity {
+        if length > M {
             return (Poll::Ready(Err(RpcError::InvalidFrameState)), None);
         }
-        state.offset = 0;
         state.len = length;
         state.occupied = true;
         (Poll::Ready(Ok(())), state.reader_waker.take())
@@ -211,9 +119,6 @@ impl<const M: usize> StaticPipe<M> {
             update_waker(&mut state.reader_waker, context.waker());
             return Poll::Pending;
         }
-        if state.offset != 0 {
-            return Poll::Ready(Err(RpcError::InvalidFrameState));
-        }
         let length = state.len;
         state.frame_borrowed = true;
         drop(state);
@@ -233,7 +138,6 @@ impl<const M: usize> StaticPipe<M> {
             return (None, None);
         };
         state.frame_borrowed = false;
-        state.offset = 0;
         state.len = 0;
         state.occupied = false;
         (state.writer_waker.take(), state.reader_waker.take())
@@ -481,20 +385,6 @@ pub(crate) trait LanePool {
         context: &mut Context<'_>,
     ) -> Poll<RpcResult<usize>>;
     fn cancel_waiter(&self, token: u64);
-    fn poll_read(
-        &self,
-        lane: usize,
-        direction: RpcDirection,
-        context: &mut Context<'_>,
-        destination: &mut [u8],
-    ) -> Poll<Result<usize, BinaryIoError>>;
-    fn poll_write(
-        &self,
-        lane: usize,
-        direction: RpcDirection,
-        context: &mut Context<'_>,
-        source: &[u8],
-    ) -> Poll<Result<usize, BinaryIoError>>;
     fn poll_borrow_frame(
         &'static self,
         lane: usize,
@@ -506,7 +396,6 @@ pub(crate) trait LanePool {
         lane: usize,
         direction: RpcDirection,
         context: &mut Context<'_>,
-        limit: usize,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> Poll<RpcResult<()>>;
     fn close_reader(&self, lane: usize, direction: RpcDirection);
@@ -593,40 +482,6 @@ impl<const N: usize, const M: usize, const Q: usize> LanePool for RpcLaneStorage
         }
     }
 
-    fn poll_read(
-        &self,
-        lane: usize,
-        direction: RpcDirection,
-        context: &mut Context<'_>,
-        destination: &mut [u8],
-    ) -> Poll<Result<usize, BinaryIoError>> {
-        let Some(pipe) = self.pipe(lane, direction) else {
-            return Poll::Ready(Err(BinaryIoError::InvalidPipeState));
-        };
-        let (poll, waker) = pipe.poll_read(context, destination);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        poll
-    }
-
-    fn poll_write(
-        &self,
-        lane: usize,
-        direction: RpcDirection,
-        context: &mut Context<'_>,
-        source: &[u8],
-    ) -> Poll<Result<usize, BinaryIoError>> {
-        let Some(pipe) = self.pipe(lane, direction) else {
-            return Poll::Ready(Err(BinaryIoError::InvalidPipeState));
-        };
-        let (poll, waker) = pipe.poll_write(context, source);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        poll
-    }
-
     fn poll_borrow_frame(
         &'static self,
         lane: usize,
@@ -656,13 +511,12 @@ impl<const N: usize, const M: usize, const Q: usize> LanePool for RpcLaneStorage
         lane: usize,
         direction: RpcDirection,
         context: &mut Context<'_>,
-        limit: usize,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> Poll<RpcResult<()>> {
         let Some(pipe) = self.pipe(lane, direction) else {
             return Poll::Ready(Err(RpcError::InvalidLaneState));
         };
-        let (poll, waker) = pipe.poll_encode_frame(context, limit, encode);
+        let (poll, waker) = pipe.poll_encode_frame(context, encode);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -793,24 +647,24 @@ impl Drop for LaneAcquire {
 }
 
 pub(crate) struct LaneIo {
-    pub(crate) request_reader: BoxBinaryReader,
-    pub(crate) request_writer: BoxBinaryWriter,
-    pub(crate) response_reader: BoxBinaryReader,
-    pub(crate) response_writer: BoxBinaryWriter,
+    pub(crate) request_reader: LaneReader,
+    pub(crate) request_writer: LaneWriter,
+    pub(crate) response_reader: LaneReader,
+    pub(crate) response_writer: LaneWriter,
 }
 
 impl LaneIo {
     fn new(pool: &'static dyn LanePool, lane: usize) -> Self {
         Self {
-            request_reader: Box::pin(LaneReader::new(pool, lane, RpcDirection::Request)),
-            request_writer: Box::pin(LaneWriter::new(pool, lane, RpcDirection::Request)),
-            response_reader: Box::pin(LaneReader::new(pool, lane, RpcDirection::Response)),
-            response_writer: Box::pin(LaneWriter::new(pool, lane, RpcDirection::Response)),
+            request_reader: LaneReader::new(pool, lane, RpcDirection::Request),
+            request_writer: LaneWriter::new(pool, lane, RpcDirection::Request),
+            response_reader: LaneReader::new(pool, lane, RpcDirection::Response),
+            response_writer: LaneWriter::new(pool, lane, RpcDirection::Response),
         }
     }
 }
 
-struct LaneReader {
+pub(crate) struct LaneReader {
     pool: &'static dyn LanePool,
     lane: usize,
     direction: RpcDirection,
@@ -824,29 +678,13 @@ impl LaneReader {
             direction,
         }
     }
-}
 
-impl BinaryReader for LaneReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
+    pub(crate) fn poll_borrow_frame(
+        &mut self,
         context: &mut Context<'_>,
-        buffer: &mut [u8],
-    ) -> Poll<Result<usize, BinaryIoError>> {
-        self.pool
-            .poll_read(self.lane, self.direction, context, buffer)
-    }
-
-    fn supports_borrowed_frames(&self) -> bool {
-        true
-    }
-
-    fn poll_borrow_frame(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<RpcResult<Option<super::frame::RpcFrameBuffer>>> {
+    ) -> Poll<RpcResult<Option<BorrowedFrame>>> {
         self.pool
             .poll_borrow_frame(self.lane, self.direction, context)
-            .map(|result| result.map(|frame| frame.map(super::frame::RpcFrameBuffer::borrowed)))
     }
 }
 
@@ -857,7 +695,7 @@ impl Drop for LaneReader {
     }
 }
 
-struct LaneWriter {
+pub(crate) struct LaneWriter {
     pool: &'static dyn LanePool,
     lane: usize,
     direction: RpcDirection,
@@ -871,42 +709,18 @@ impl LaneWriter {
             direction,
         }
     }
-}
 
-impl BinaryWriter for LaneWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<Result<usize, BinaryIoError>> {
-        self.pool
-            .poll_write(self.lane, self.direction, context, buffer)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-    ) -> Poll<Result<(), BinaryIoError>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-    ) -> Poll<Result<(), BinaryIoError>> {
+    pub(crate) fn close(&mut self) {
         self.pool.close_writer(self.lane, self.direction);
-        Poll::Ready(Ok(()))
     }
 
-    fn poll_encode_frame(
-        self: Pin<&mut Self>,
+    pub(crate) fn poll_encode_frame(
+        &mut self,
         context: &mut Context<'_>,
-        limit: usize,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
-    ) -> Poll<RpcResult<bool>> {
+    ) -> Poll<RpcResult<()>> {
         self.pool
-            .poll_encode_frame(self.lane, self.direction, context, limit, encode)
-            .map(|result| result.map(|()| true))
+            .poll_encode_frame(self.lane, self.direction, context, encode)
     }
 }
 

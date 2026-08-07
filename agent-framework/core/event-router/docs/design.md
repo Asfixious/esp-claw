@@ -42,7 +42,7 @@ WorkflowRuntime
 
 ```text
 claw-event-router
-├── rpc/          # typed RPC、registry、static lanes
+├── rpc/          # typed RPC、runtime wire calls、registry、static lanes
 ├── workflow/     # Workflow 定义、匹配和解释执行
 ├── event/        # Event 数据模型与 emit 入口
 ├── component/    # Component 生命周期与 registration
@@ -171,7 +171,68 @@ while let Some(outcome) = results.next().await {
 | Stream | Unary | `RpcStream<RpcFrame<Request>>` | `Result<Response, Error>` | `RpcUnaryCall<Response, Error>` → `RpcResult<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
 | Stream | Stream | `RpcStream<RpcFrame<Request>>` | `RpcStream<Result<Response, Error>>` | `RpcStream<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
 
-Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、handler future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 call future。
+Typed call 是 self-driving 的。poll 返回的 future/stream 时，会公平推进公共 wire call、request encoder 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 call future。
+
+## Runtime-addressed writer/reader call
+
+所有 RPC 都必须由 `RpcMethod` 静态定义并通过 `register::<Method, _>()` 注册。Workflow
+只有运行时的 `address + args`，没有可用于 `call::<Method>()` 的编译期 Method 类型，
+因此通过同一个 `RpcClient` 的 wire-level 入口调用已经注册的 typed endpoint：
+
+```rust
+let (mut writer, mut reader) = registry.client().call_payload(&address)?;
+
+let written = writer.write(bytes).await?;
+writer.write_all(&bytes[written..]).await?;
+writer.close().await?;
+
+while let Some(outcome) = reader.read().await? {
+    match outcome {
+        Ok(frame) => consume(frame.as_ref()),
+        Err(error) => consume_method_error(error.as_ref()),
+    }
+}
+```
+
+`call_payload()` 返回独立的异步 writer/reader，可以在同一 executor 上并发推进
+full-duplex RPC。`write().await` 等待 request lane 可写，一次最多发布一个 Method
+request frame，并返回实际写入长度；输入更大时 caller 可以继续传入剩余 slice，或直接
+使用 `write_all().await` 自动分帧。调用者不声明 limit：每帧容量来自已注册 Method 的
+固定 `Request` wire size，而它在编译期保证不超过 lane 的 `M`。`close().await` 发布
+request EOF。
+
+不知道输入大小、需要让文件或设备直接填充 lane 时，caller 可以使用
+`reserve().await`，通过 `AsMut<[u8]>` 得到完整 request frame，最后
+`commit(actual_size)`；未 commit 的 reservation 在 drop 时自动取消且不发布数据。
+`RpcPayloadReader::read().await` 等待 response，并返回持有 response lane lease 的
+`RpcPayloadFrame`；frame 通过 `AsRef<[u8]>` 原地借用 `Response` 或 `Error` wire bytes：
+
+```text
+caller RpcPayloadWriter.write().await / reserve().await
+    → request lane backpressure
+    → RpcFrame<Method::Request> 校验
+    → typed handler
+
+typed Method::Response / Method::Error
+    → 直接写入 response lane
+    → caller RpcPayloadReader.read().await
+    → RpcPayloadFrame.as_ref() 得到 &[u8]
+```
+
+Runtime caller 可以根据 catalog/schema 将动态参数直接编码进 lane，不需要先构造中间
+`Vec<u8>`。文件、图片等大数据由 Streaming Method 定义固定布局的 chunk frame（通常
+包含有效长度和 fixed byte array），caller 并发执行 write/read；整个文件不需要进入
+内存。`write(&[u8])` 只发生一次 bytes-to-lane copy；`reserve()` 允许数据源直接填充
+lane。成功 response 使用普通 frame，typed method error 使用 pipe metadata 标记并终止
+response stream，payload 内不增加 header。
+
+Registry 只保存 typed endpoint，不存在 payload registration、payload handler 或第二种
+endpoint kind。`call::<Method>()` 在 IO 前严格校验完整 Method descriptor；
+`call_payload()` 只按 address 解析同一个 endpoint，wire bytes 随后仍由 typed handler 的
+`RpcFrame<Request>` 校验。两种入口先创建同一对内部 `RpcPayloadWriter` / `RpcPayloadReader`，
+并共用唯一的 wire call 状态机、`RpcClient`、`RpcContext`、call ID、lane acquisition、
+公平等待、取消和嵌套死锁保护。`call_payload()` 直接返回这对 handle；`call::<Method>()`
+只在其上增加固定布局 request encoder 与 response decoder，不再维护第二套 call driver。
 
 ## Static lanes、framing 和限制
 
@@ -186,7 +247,7 @@ N lanes
 Q fixed root-call waiter slots
 ```
 
-`N` 是同时 active 的 call/retained response 数量；每个 lane 有独立的 request/response buffer，所以 payload 静态占用约为 `N * 2 * M`，再加 lane metadata 和 `Q` 个 waiter slot。`M` 同时是一个 typed frame 的硬上限。Streaming 不会占用更大的 buffer，而是逐 frame 复用同一个 lane，并通过 `Pending` 提供 backpressure。
+`N` 是同时 active 的 call/retained response 数量；每个 lane 有独立的 request/response buffer，所以 payload 静态占用约为 `N * 2 * M`，再加 lane metadata 和 `Q` 个 waiter slot。`M` 是 typed frame 和 wire-level writer 的共同硬上限；runtime writer 的可写 frame 进一步收敛为目标 Method 的 `Request` wire size。`write()` 遇到更大的输入只写一帧并返回实际长度；`reserve().commit()` 的长度超过该 Method frame 时返回 `FrameTooLarge`。Streaming 不会占用更大的 buffer，而是逐 frame 复用同一个 lane，并通过 `Pending` 提供 backpressure。
 
 根调用在 `N` 个 lane 全部占用时进入固定 waiter table，按 ticket 顺序等待；超过 `Q` 返回 `LaneWaiterCapacityExceeded`。嵌套调用不能在持有外层 lane 时无限等待：若没有空 lane，立即返回 `NestedLaneExhausted`，避免 `N` 条调用链互相持有 lane 形成死锁。取消 active call 会释放 lane；取消 waiter（包括已经获得 reservation、尚未再次 poll 的 waiter）会把 reservation 交给下一个 waiter。
 
@@ -200,7 +261,7 @@ Typed message 和 transport payload 已经完全固定布局：消息不能携�
 
 Registry 在注册 handler 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response/error type 和两侧 cardinality，防止同一 address 上发生错误解析。
 
-Zerocopy 是 RPC 的唯一 codec；固定布局、alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。
+Zerocopy fixed layout 是 RPC endpoint 的 wire contract；alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。`call_payload()` 不改变这个协议，只允许在没有 Rust Method 类型时直接写入和读取相同的 wire frames。
 
 RPC 不关心：
 
@@ -422,7 +483,7 @@ RPC Handler
 * 注册；
 * 注销；
 * RPC 地址解析；
-* 统一 typed frame dispatch；
+* typed 与 runtime-addressed call 的统一 frame dispatch；
 * 分组；
 * visibility；
 * schema；
@@ -440,9 +501,9 @@ for group in registry.groups() {
 }
 ```
 
-`groups()` 返回当前非空 group，`rpcs(&group)` 返回该 group 当前注册的完整
-`RpcAddress`；两者均按字典序排列。后续 register/unregister 不会修改已经返回的
-snapshot，调用方需要重新查询以观察新状态。
+`groups()` 返回包含 typed endpoint 的非空 group，`rpcs(&group)` 返回该 group 当前
+注册的完整 `RpcAddress`；两者均按字典序排列。后续 register/unregister 不会修改已经
+返回的 snapshot，调用方需要重新查询以观察新状态。
 
 例如：
 

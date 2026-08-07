@@ -1,7 +1,7 @@
 use core::any::{type_name, TypeId};
 use core::future::Future;
 use core::marker::PhantomData;
-use core::mem::align_of;
+use core::mem::{align_of, size_of};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -9,8 +9,9 @@ use futures_core::Stream;
 use getset::{CopyGetters, Getters};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use super::frame::{write_frame, write_method_error_frame, FramedReader, OutcomeReader, RpcFrame};
+use super::frame::{write_frame, write_method_error_frame, FramedReader, RpcFrame};
 use super::lane::{LaneReader, LaneWriter, LANE_FRAME_ALIGNMENT};
+use super::payload::{make_payload_call, RpcPayloadReader, RpcPayloadWriter};
 use super::registry::{ErasedRpcHandler, PreparedCall, RpcFuture};
 use super::{RpcAddress, RpcContext, RpcError, RpcResult};
 
@@ -48,13 +49,13 @@ pub struct Streaming;
 impl private::Sealed for Unary {}
 impl private::Sealed for Streaming {}
 
-/// A task-local stream whose outer [`RpcResult`] reports transport failures.
+/// A task-local RPC stream whose outer [`RpcResult`] reports transport failures.
 pub struct RpcStream<T> {
     inner: Pin<Box<dyn Stream<Item = RpcResult<T>> + 'static>>,
 }
 
 impl<T> RpcStream<T> {
-    /// Boxes a typed message stream for use as RPC input or output.
+    /// Boxes a stream for use as RPC input or output.
     #[must_use]
     pub fn new<S>(stream: S) -> Self
     where
@@ -117,6 +118,8 @@ pub(crate) struct RpcMethodDescriptor {
     method_type_name: &'static str,
     request_type_id: TypeId,
     request_type_name: &'static str,
+    #[getset(get_copy = "pub(crate)")]
+    request_frame_size: usize,
     response_type_id: TypeId,
     response_type_name: &'static str,
     error_type_id: TypeId,
@@ -151,6 +154,7 @@ impl RpcMethodDescriptor {
             method_type_name: type_name::<M>(),
             request_type_id: TypeId::of::<M::Request>(),
             request_type_name: type_name::<M::Request>(),
+            request_frame_size: size_of::<M::Request>(),
             response_type_id: TypeId::of::<M::Response>(),
             response_type_name: type_name::<M::Response>(),
             error_type_id: TypeId::of::<M::Error>(),
@@ -161,39 +165,17 @@ impl RpcMethodDescriptor {
     }
 }
 
-struct ActiveCall {
-    input: RpcFuture<'static>,
-    handler: RpcFuture<'static>,
-    response: LaneReader,
-}
-
-type SetupFuture = Pin<Box<dyn Future<Output = RpcResult<ActiveCall>> + 'static>>;
-
-pub(crate) struct RpcCallSetup {
-    future: SetupFuture,
-}
-
-pub(crate) fn setup_call<M>(
+pub(crate) fn make_typed_call<M>(
     prepared: PreparedCall,
     input: <M::Input as RpcInputMode<M::Request>>::ClientInput,
-) -> RpcCallSetup
+) -> <M::Output as RpcOutputMode<M::Response, M::Error>>::ClientCall
 where
     M: RpcMethod,
 {
-    let input = M::Input::into_stream(input);
-    RpcCallSetup {
-        future: Box::pin(async move {
-            let mut acquired = prepared.acquire().await?;
-            let lane = acquired.take_lane()?;
-            let input = encode_stream(input, lane.request_writer);
-            let handler = acquired.start(lane.request_reader, lane.response_writer);
-            Ok(ActiveCall {
-                input,
-                handler,
-                response: lane.response_reader,
-            })
-        }),
-    }
+    let (writer, reader) = make_payload_call(prepared);
+    let input = encode_stream(M::Input::into_stream(input), writer);
+    let responses = RpcStream::new(TypedCallDriver::<M::Response, M::Error>::new(input, reader));
+    M::Output::make_client_call(responses)
 }
 
 /// Boxed task-local future returned by a handler implementation.
@@ -392,17 +374,105 @@ impl<T> Stream for OnceStream<T> {
     }
 }
 
-fn encode_stream<T>(mut messages: RpcStream<T>, mut writer: LaneWriter) -> RpcFuture<'static>
+fn encode_stream<T>(mut messages: RpcStream<T>, mut writer: RpcPayloadWriter) -> RpcFuture<'static>
 where
     T: RpcMessage,
 {
     Box::pin(async move {
         while let Some(message) = messages.next().await {
-            write_frame(&mut writer, &message?).await?;
+            writer.write_frame(message?.as_bytes()).await?;
         }
-        writer.close();
-        Ok(())
+        writer.close().await
     })
+}
+
+struct TypedCallDriver<T, E> {
+    input: Option<RpcFuture<'static>>,
+    reader: RpcPayloadReader,
+    response_eof: bool,
+    finished: bool,
+    message: PhantomData<fn() -> (T, E)>,
+}
+
+impl<T, E> TypedCallDriver<T, E> {
+    fn new(input: RpcFuture<'static>, reader: RpcPayloadReader) -> Self {
+        Self {
+            input: Some(input),
+            reader,
+            response_eof: false,
+            finished: false,
+            message: PhantomData,
+        }
+    }
+}
+
+impl<T, E> Unpin for TypedCallDriver<T, E> {}
+
+impl<T, E> Stream for TypedCallDriver<T, E>
+where
+    T: RpcMessage,
+    E: RpcMessage,
+{
+    type Item = RpcResult<Result<RpcFrame<T>, RpcFrame<E>>>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+
+        let mut request_reader_closed = false;
+        if let Some(input) = this.input.as_mut() {
+            match input.as_mut().poll(context) {
+                Poll::Ready(Ok(())) => this.input = None,
+                Poll::Ready(Err(RpcError::FrameReaderClosed)) => {
+                    this.input = None;
+                    request_reader_closed = true;
+                }
+                Poll::Ready(Err(error)) => {
+                    this.input = None;
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if !this.response_eof {
+            match this.reader.poll_read(context) {
+                Poll::Ready(Ok(Some(Ok(payload)))) => {
+                    return Poll::Ready(Some(RpcFrame::from_payload(payload).map(Ok)));
+                }
+                Poll::Ready(Ok(Some(Err(payload)))) => {
+                    this.input = None;
+                    this.response_eof = true;
+                    return Poll::Ready(Some(RpcFrame::from_payload(payload).map(Err)));
+                }
+                Poll::Ready(Ok(None)) => {
+                    this.input = None;
+                    this.response_eof = true;
+                }
+                Poll::Ready(Err(error)) => {
+                    this.input = None;
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if request_reader_closed && !this.response_eof {
+            this.finished = true;
+            return Poll::Ready(Some(Err(RpcError::FrameReaderClosed)));
+        }
+
+        if this.input.is_none() && this.response_eof {
+            this.finished = true;
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 fn encode_outcome_stream<T, E>(
@@ -462,72 +532,6 @@ where
     }
 }
 
-struct CallDriver {
-    setup: Option<SetupFuture>,
-    input: Option<RpcFuture<'static>>,
-    handler: Option<RpcFuture<'static>>,
-}
-
-enum CallProgress {
-    Response(LaneReader),
-    Complete,
-}
-
-impl CallDriver {
-    fn new(setup: RpcCallSetup) -> Self {
-        Self {
-            setup: Some(setup.future),
-            input: None,
-            handler: None,
-        }
-    }
-
-    fn poll_call(&mut self, context: &mut Context<'_>) -> Poll<RpcResult<CallProgress>> {
-        if let Some(setup) = self.setup.as_mut() {
-            match setup.as_mut().poll(context) {
-                Poll::Ready(Ok(active)) => {
-                    self.setup = None;
-                    self.input = Some(active.input);
-                    self.handler = Some(active.handler);
-                    context.waker().wake_by_ref();
-                    return Poll::Ready(Ok(CallProgress::Response(active.response)));
-                }
-                Poll::Ready(Err(error)) => {
-                    self.setup = None;
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        let Some(handler) = self.handler.as_mut() else {
-            return Poll::Ready(Ok(CallProgress::Complete));
-        };
-        match handler.as_mut().poll(context) {
-            Poll::Ready(result) => {
-                self.handler = None;
-                self.input = None;
-                return Poll::Ready(result.map(|()| CallProgress::Complete));
-            }
-            Poll::Pending => {}
-        }
-
-        let Some(input) = self.input.as_mut() else {
-            return Poll::Pending;
-        };
-        match input.as_mut().poll(context) {
-            Poll::Ready(Ok(())) => self.input = None,
-            Poll::Ready(Err(error)) => {
-                self.input = None;
-                self.handler = None;
-                return Poll::Ready(Err(error));
-            }
-            Poll::Pending => {}
-        }
-        Poll::Pending
-    }
-}
-
 /// Self-driving unary typed RPC returned by [`RpcClient::call`](crate::rpc::RpcClient::call).
 ///
 /// Polling this future concurrently advances request encoding, handler work,
@@ -575,82 +579,5 @@ where
             }
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-pub(crate) fn make_client_call<M>(
-    setup: RpcCallSetup,
-) -> <M::Output as RpcOutputMode<M::Response, M::Error>>::ClientCall
-where
-    M: RpcMethod,
-{
-    let responses = RpcStream::new(RpcResponseDriverStream::<M::Response, M::Error>::new(setup));
-    M::Output::make_client_call(responses)
-}
-
-struct RpcResponseDriverStream<T, E> {
-    driver: CallDriver,
-    response: Option<OutcomeReader<T, E>>,
-    response_eof: bool,
-    driver_done: bool,
-    finished: bool,
-}
-
-impl<T, E> RpcResponseDriverStream<T, E> {
-    fn new(setup: RpcCallSetup) -> Self {
-        Self {
-            driver: CallDriver::new(setup),
-            response: None,
-            response_eof: false,
-            driver_done: false,
-            finished: false,
-        }
-    }
-}
-
-impl<T, E> Unpin for RpcResponseDriverStream<T, E> {}
-
-impl<T, E> Stream for RpcResponseDriverStream<T, E>
-where
-    T: RpcMessage,
-    E: RpcMessage,
-{
-    type Item = RpcResult<Result<RpcFrame<T>, RpcFrame<E>>>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(None);
-        }
-
-        if !this.driver_done {
-            match this.driver.poll_call(context) {
-                Poll::Ready(Ok(CallProgress::Response(reader))) => {
-                    this.response = Some(OutcomeReader::new(reader));
-                }
-                Poll::Ready(Ok(CallProgress::Complete)) => this.driver_done = true,
-                Poll::Ready(Err(error)) => {
-                    this.finished = true;
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Pending => {}
-            }
-        }
-
-        if !this.response_eof {
-            if let Some(response) = this.response.as_mut() {
-                match Pin::new(response).poll_next(context) {
-                    Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
-                    Poll::Ready(None) => this.response_eof = true,
-                    Poll::Pending => {}
-                }
-            }
-        }
-
-        if this.driver_done && this.response_eof {
-            this.finished = true;
-            return Poll::Ready(None);
-        }
-        Poll::Pending
     }
 }

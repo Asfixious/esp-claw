@@ -5,6 +5,7 @@ These examples cover the complete RPC baseline exposed by `claw-event-router`.
 | Example | What it demonstrates |
 | --- | --- |
 | `typed_rpc` | Fixed-layout Zerocopy RPC, registry group/RPC discovery, lane-backed `RpcFrame<T>` views, and all four unary/streaming combinations through one `RpcClient::call::<M>()` API |
+| `payload_rpc` | Calling one typed streaming RPC by runtime address with async `write`/`write_all`/`close` and `read`, including full-duplex file/image chunk backpressure and zero-copy response frames |
 | `nested_and_lifecycle` | Calls made through `RpcContext`, call-chain metadata, direct self-call rejection, registration tokens, and unregister behavior |
 | `errors` | Duplicate registration, typed signature validation, and fixed-layout method errors |
 | `static_lanes` | Fixed `N x M` lane storage, bounded root waiters, lane backpressure, and lane reuse |
@@ -13,6 +14,7 @@ Run one example from the `agent-framework` workspace root:
 
 ```console
 cargo run -p claw-event-router --example typed_rpc
+cargo run -p claw-event-router --example payload_rpc
 cargo run -p claw-event-router --example nested_and_lifecycle
 cargo run -p claw-event-router --example errors
 cargo run -p claw-event-router --example static_lanes

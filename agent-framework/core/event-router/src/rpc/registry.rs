@@ -6,9 +6,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
+use getset::CopyGetters;
+
 use super::address::{RpcAddress, RpcAddressError, RpcGroup};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
 use super::lane::{LaneAcquire, LaneIo, LaneReader, LaneWriter, RpcLaneStorage};
+use super::payload::{RpcPayloadReader, RpcPayloadWriter};
 use super::typed::{
     HandlerAdapter, RpcHandler, RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode,
 };
@@ -36,7 +39,7 @@ pub(crate) trait ErasedRpcHandler {
     ) -> RpcFuture<'a>;
 }
 
-/// Task-local registry that resolves RPC addresses to handlers.
+/// Task-local registry that resolves typed RPC addresses.
 ///
 /// The registry uses [`Rc`] and deliberately does not require handlers or
 /// futures to be `Send`. It is intended to run inside Event Router's
@@ -85,7 +88,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         }
     }
 
-    /// Returns a sorted snapshot of groups that currently contain RPCs.
+    /// Returns a sorted snapshot of groups that contain RPCs.
     ///
     /// Each group appears once. Registering or unregistering an RPC does not
     /// mutate a previously returned snapshot; call this method again to observe
@@ -95,19 +98,13 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         let endpoints = self.endpoints.borrow();
         let mut groups = Vec::new();
         for address in endpoints.keys() {
-            let group = address.group();
-            if !groups
-                .iter()
-                .any(|registered: &RpcGroup| registered.as_ref() == group)
-            {
-                groups.push(RpcGroup::from_validated(group));
-            }
+            push_group(&mut groups, address);
         }
         groups.sort_unstable();
         groups
     }
 
-    /// Returns a sorted snapshot of RPC addresses registered in `group`.
+    /// Returns a sorted snapshot of RPC addresses in `group`.
     ///
     /// An unknown group produces an empty snapshot. Registering or
     /// unregistering an RPC does not mutate a previously returned snapshot.
@@ -274,7 +271,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         Ok(())
     }
 
-    fn prepare_call(
+    fn prepare_typed_call(
         &self,
         registry: Weak<dyn RegistryAccess>,
         caller: &RpcClient,
@@ -294,6 +291,31 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
                 registered: endpoint.descriptor.method_type_name(),
             });
         }
+        self.prepare_resolved_call(registry, caller, address, endpoint)
+    }
+
+    fn prepare_payload_call(
+        &self,
+        registry: Weak<dyn RegistryAccess>,
+        caller: &RpcClient,
+        address: &RpcAddress,
+    ) -> RpcResult<PreparedCall> {
+        let endpoint = self
+            .endpoints
+            .borrow()
+            .get(address)
+            .cloned()
+            .ok_or_else(|| RpcError::NotFound(address.clone()))?;
+        self.prepare_resolved_call(registry, caller, address, endpoint)
+    }
+
+    fn prepare_resolved_call(
+        &self,
+        registry: Weak<dyn RegistryAccess>,
+        caller: &RpcClient,
+        address: &RpcAddress,
+        endpoint: EndpointEntry,
+    ) -> RpcResult<PreparedCall> {
         if caller.caller_endpoint_id == Some(endpoint.endpoint_id) {
             return Err(RpcError::DirectSelfCall(address.clone()));
         }
@@ -315,6 +337,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
             nested_client,
         );
         Ok(PreparedCall {
+            request_frame_size: endpoint.descriptor.request_frame_size(),
             endpoint,
             context,
             lane: LaneAcquire::new(self.lanes, caller.caller_endpoint_id.is_some()),
@@ -331,24 +354,47 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
 }
 
 trait RegistryAccess {
-    fn prepare_call(
+    fn prepare_typed_call(
         &self,
         registry: Weak<dyn RegistryAccess>,
         caller: &RpcClient,
         address: &RpcAddress,
         expected: &RpcMethodDescriptor,
     ) -> RpcResult<PreparedCall>;
+
+    fn prepare_payload_call(
+        &self,
+        registry: Weak<dyn RegistryAccess>,
+        caller: &RpcClient,
+        address: &RpcAddress,
+    ) -> RpcResult<PreparedCall>;
 }
 
 impl<const N: usize, const M: usize, const Q: usize> RegistryAccess for RpcRegistry<N, M, Q> {
-    fn prepare_call(
+    fn prepare_typed_call(
         &self,
         registry: Weak<dyn RegistryAccess>,
         caller: &RpcClient,
         address: &RpcAddress,
         expected: &RpcMethodDescriptor,
     ) -> RpcResult<PreparedCall> {
-        self.prepare_call(registry, caller, address, expected)
+        self.prepare_typed_call(registry, caller, address, expected)
+    }
+
+    fn prepare_payload_call(
+        &self,
+        registry: Weak<dyn RegistryAccess>,
+        caller: &RpcClient,
+        address: &RpcAddress,
+    ) -> RpcResult<PreparedCall> {
+        self.prepare_payload_call(registry, caller, address)
+    }
+}
+
+fn push_group(groups: &mut Vec<RpcGroup>, address: &RpcAddress) {
+    let group = address.group();
+    if !groups.iter().any(|registered| registered.as_ref() == group) {
+        groups.push(RpcGroup::from_validated(group));
     }
 }
 
@@ -366,7 +412,10 @@ struct EndpointEntry {
     descriptor: RpcMethodDescriptor,
 }
 
+#[derive(CopyGetters)]
 pub(crate) struct PreparedCall {
+    #[getset(get_copy = "pub(crate)")]
+    request_frame_size: usize,
     endpoint: EndpointEntry,
     context: RpcContext,
     lane: LaneAcquire,
@@ -434,15 +483,35 @@ impl RpcClient {
         M: RpcMethod,
     {
         let descriptor = RpcMethodDescriptor::for_method::<M>()?;
+        let address = descriptor.address().clone();
         let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
-        let prepared = registry.prepare_call(
-            self.registry.clone(),
-            self,
-            descriptor.address(),
-            &descriptor,
-        )?;
-        let setup = super::typed::setup_call::<M>(prepared, input);
-        Ok(super::typed::make_client_call::<M>(setup))
+        let prepared =
+            registry.prepare_typed_call(self.registry.clone(), self, &address, &descriptor)?;
+        Ok(super::typed::make_typed_call::<M>(prepared, input))
+    }
+
+    /// Starts an untyped wire-level call to the typed endpoint at `address`.
+    ///
+    /// The returned [`RpcPayloadWriter`] and [`RpcPayloadReader`] expose
+    /// full-duplex asynchronous frame IO. Each written frame must match the
+    /// registered [`RpcMethod::Request`] wire layout. Response and method-error
+    /// frames remain borrowed from the lane until dropped. This entry point
+    /// intentionally cannot perform compile-time signature or cardinality
+    /// checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry was dropped, the endpoint does not
+    /// exist, identifiers are exhausted, or this is a direct synchronous
+    /// self-call. The returned stream may later report lane, frame, or typed
+    /// request validation failures.
+    pub fn call_payload(
+        &self,
+        address: &RpcAddress,
+    ) -> RpcResult<(RpcPayloadWriter, RpcPayloadReader)> {
+        let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
+        let prepared = registry.prepare_payload_call(self.registry.clone(), self, address)?;
+        Ok(super::payload::make_payload_call(prepared))
     }
 }
 
@@ -457,8 +526,9 @@ pub struct RpcRegistration {
 
 /// Transport/runtime error returned while registering or invoking RPC endpoints.
 ///
-/// Method-specific business errors are fixed-layout [`RpcMethod::Error`]
-/// frames and are not represented by this enum.
+/// Method-specific business errors are carried as typed method-error frames
+/// and are not represented by this enum. Wire-level callers receive the same
+/// frame through [`RpcPayloadReader`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcError {
@@ -488,9 +558,9 @@ pub enum RpcError {
     SignatureMismatch {
         /// Invoked address.
         address: RpcAddress,
-        /// Client method marker name.
+        /// Signature requested by the client.
         expected: &'static str,
-        /// Registered method marker name.
+        /// Signature registered at the address.
         registered: &'static str,
     },
     /// Internal framing state became inconsistent.
@@ -523,11 +593,11 @@ pub enum RpcError {
         /// Invalid const generic field.
         field: &'static str,
     },
-    /// A typed frame writer was already closed.
-    #[error("typed RPC frame writer is closed")]
+    /// An RPC frame writer was already closed.
+    #[error("RPC frame writer is closed")]
     FrameWriterClosed,
-    /// The typed frame receiver was dropped before the writer completed.
-    #[error("typed RPC frame reader is closed")]
+    /// An RPC frame receiver was dropped before the writer completed.
+    #[error("RPC frame reader is closed")]
     FrameReaderClosed,
     /// Frame bytes do not satisfy a message's size, alignment, or validity.
     #[error("invalid fixed-layout RPC frame for {message_type}")]
@@ -535,4 +605,15 @@ pub enum RpcError {
         /// Rust message type that rejected the bytes.
         message_type: &'static str,
     },
+    /// A runtime-sized payload exceeds the available bytes for its write.
+    #[error("RPC frame size {size} exceeds available capacity {capacity}")]
+    FrameTooLarge {
+        /// Requested payload size.
+        size: usize,
+        /// Available bytes for this write.
+        capacity: usize,
+    },
+    /// A non-empty `write_all` operation could not make forward progress.
+    #[error("RPC payload writer accepted zero bytes")]
+    PayloadWriteZero,
 }

@@ -3,12 +3,11 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use super::lane::{BorrowedFrame, LaneFrameKind, LaneReader, LaneWriter};
-use super::{RpcError, RpcMessage, RpcResult};
 use futures_core::Stream;
 
-type FrameOutcome<T, E> = Result<RpcFrame<T>, RpcFrame<E>>;
-type FrameOutcomePoll<T, E> = Poll<Option<RpcResult<FrameOutcome<T, E>>>>;
+use super::lane::{LaneFrameKind, LaneReader, LaneWriter};
+use super::payload::{PayloadReaderStream, RpcPayloadFrame};
+use super::{RpcError, RpcMessage, RpcResult};
 
 /// A typed, zero-copy view over one RPC frame.
 ///
@@ -16,7 +15,7 @@ type FrameOutcomePoll<T, E> = Poll<Option<RpcResult<FrameOutcome<T, E>>>>;
 /// is not reused until this value is dropped. Use [`view`](Self::view) to
 /// borrow the validated message in place.
 pub struct RpcFrame<T> {
-    frame: BorrowedFrame,
+    payload: RpcPayloadFrame,
     message: PhantomData<fn() -> T>,
 }
 
@@ -39,12 +38,12 @@ impl<T> RpcFrame<T>
 where
     T: RpcMessage,
 {
-    pub(crate) fn from_frame(frame: BorrowedFrame) -> RpcResult<Self> {
-        T::try_ref_from_bytes(frame.as_bytes()?).map_err(|_| RpcError::InvalidMessageFrame {
+    pub(crate) fn from_payload(payload: RpcPayloadFrame) -> RpcResult<Self> {
+        T::try_ref_from_bytes(payload.as_ref()).map_err(|_| RpcError::InvalidMessageFrame {
             message_type: type_name::<T>(),
         })?;
         Ok(Self {
-            frame,
+            payload,
             message: PhantomData,
         })
     }
@@ -56,7 +55,7 @@ where
     /// Returns [`RpcError::InvalidMessageFrame`] if the bytes no longer satisfy
     /// the message's size, alignment, or bit-validity requirements.
     pub fn view(&self) -> RpcResult<&T> {
-        T::try_ref_from_bytes(self.frame.as_bytes()?).map_err(|_| RpcError::InvalidMessageFrame {
+        T::try_ref_from_bytes(self.payload.as_ref()).map_err(|_| RpcError::InvalidMessageFrame {
             message_type: type_name::<T>(),
         })
     }
@@ -96,23 +95,16 @@ where
 }
 
 pub(crate) struct FramedReader<T> {
-    reader: LaneReader,
-    finished: bool,
+    payloads: PayloadReaderStream,
     message: PhantomData<fn() -> T>,
 }
 
 impl<T> FramedReader<T> {
     pub(crate) fn new(reader: LaneReader) -> Self {
         Self {
-            reader,
-            finished: false,
+            payloads: PayloadReaderStream::new(reader),
             message: PhantomData,
         }
-    }
-
-    fn fail(&mut self, error: RpcError) -> Poll<Option<RpcResult<RpcFrame<T>>>> {
-        self.finished = true;
-        Poll::Ready(Some(Err(error)))
     }
 }
 
@@ -125,79 +117,11 @@ where
     type Item = RpcResult<RpcFrame<T>>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(None);
-        }
-
-        match this.reader.poll_borrow_frame(context) {
+        match Pin::new(&mut self.get_mut().payloads).poll_next(context) {
+            Poll::Ready(Some(Ok(payload))) => Poll::Ready(Some(RpcFrame::from_payload(payload))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => this.fail(error),
-            Poll::Ready(Ok(Some(frame))) => {
-                if frame.kind() == LaneFrameKind::Message {
-                    Poll::Ready(Some(RpcFrame::from_frame(frame)))
-                } else {
-                    this.fail(RpcError::InvalidFrameState)
-                }
-            }
-            Poll::Ready(Ok(None)) => {
-                this.finished = true;
-                Poll::Ready(None)
-            }
-        }
-    }
-}
-
-pub(crate) struct OutcomeReader<T, E> {
-    reader: LaneReader,
-    finished: bool,
-    message: PhantomData<fn() -> (T, E)>,
-}
-
-impl<T, E> OutcomeReader<T, E> {
-    pub(crate) fn new(reader: LaneReader) -> Self {
-        Self {
-            reader,
-            finished: false,
-            message: PhantomData,
-        }
-    }
-
-    fn fail(&mut self, error: RpcError) -> FrameOutcomePoll<T, E> {
-        self.finished = true;
-        Poll::Ready(Some(Err(error)))
-    }
-}
-
-impl<T, E> Unpin for OutcomeReader<T, E> {}
-
-impl<T, E> Stream for OutcomeReader<T, E>
-where
-    T: RpcMessage,
-    E: RpcMessage,
-{
-    type Item = RpcResult<FrameOutcome<T, E>>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(None);
-        }
-
-        match this.reader.poll_borrow_frame(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => this.fail(error),
-            Poll::Ready(Ok(Some(frame))) => match frame.kind() {
-                LaneFrameKind::Message => Poll::Ready(Some(RpcFrame::from_frame(frame).map(Ok))),
-                LaneFrameKind::MethodError => {
-                    this.finished = true;
-                    Poll::Ready(Some(RpcFrame::from_frame(frame).map(Err)))
-                }
-            },
-            Poll::Ready(Ok(None)) => {
-                this.finished = true;
-                Poll::Ready(None)
-            }
         }
     }
 }

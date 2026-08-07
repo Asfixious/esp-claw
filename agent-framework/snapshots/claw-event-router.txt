@@ -11,6 +11,9 @@ pub claw_event_router::rpc::RpcError::AlreadyRegistered(claw_event_router::rpc::
 pub claw_event_router::rpc::RpcError::CompletedCallPolled
 pub claw_event_router::rpc::RpcError::DirectSelfCall(claw_event_router::rpc::RpcAddress)
 pub claw_event_router::rpc::RpcError::FrameReaderClosed
+pub claw_event_router::rpc::RpcError::FrameTooLarge
+pub claw_event_router::rpc::RpcError::FrameTooLarge::capacity: usize
+pub claw_event_router::rpc::RpcError::FrameTooLarge::size: usize
 pub claw_event_router::rpc::RpcError::FrameWriterClosed
 pub claw_event_router::rpc::RpcError::IdentifierExhausted
 pub claw_event_router::rpc::RpcError::InvalidFrameState
@@ -25,6 +28,7 @@ pub claw_event_router::rpc::RpcError::MissingUnaryFrame
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted::limit: usize
 pub claw_event_router::rpc::RpcError::NotFound(claw_event_router::rpc::RpcAddress)
+pub claw_event_router::rpc::RpcError::PayloadWriteZero
 pub claw_event_router::rpc::RpcError::RegistryDropped
 pub claw_event_router::rpc::RpcError::SignatureMismatch
 pub claw_event_router::rpc::RpcError::SignatureMismatch::address: claw_event_router::rpc::RpcAddress
@@ -47,6 +51,7 @@ pub fn claw_event_router::rpc::RpcCallId::value(&self) -> u64
 pub struct claw_event_router::rpc::RpcClient
 impl claw_event_router::rpc::RpcClient
 pub fn claw_event_router::rpc::RpcClient::call<M>(&self, <<M as claw_event_router::rpc::RpcMethod>::Input as claw_event_router::rpc::RpcInputMode<<M as claw_event_router::rpc::RpcMethod>::Request>>::ClientInput) -> claw_event_router::rpc::RpcResult<<<M as claw_event_router::rpc::RpcMethod>::Output as claw_event_router::rpc::RpcOutputMode<<M as claw_event_router::rpc::RpcMethod>::Response, <M as claw_event_router::rpc::RpcMethod>::Error>>::ClientCall> where M: claw_event_router::rpc::RpcMethod
+pub fn claw_event_router::rpc::RpcClient::call_payload(&self, &claw_event_router::rpc::RpcAddress) -> claw_event_router::rpc::RpcResult<(claw_event_router::rpc::RpcPayloadWriter, claw_event_router::rpc::RpcPayloadReader)>
 pub struct claw_event_router::rpc::RpcContext
 impl claw_event_router::rpc::RpcContext
 pub fn claw_event_router::rpc::RpcContext::call_id(&self) -> claw_event_router::rpc::RpcCallId
@@ -77,6 +82,35 @@ impl<const N: usize, const M: usize, const Q: usize> claw_event_router::rpc::Rpc
 pub const fn claw_event_router::rpc::RpcLaneStorage<N, M, Q>::new() -> Self
 impl<const N: usize, const M: usize, const Q: usize> core::default::Default for claw_event_router::rpc::RpcLaneStorage<N, M, Q>
 pub fn claw_event_router::rpc::RpcLaneStorage<N, M, Q>::default() -> Self
+pub struct claw_event_router::rpc::RpcPayloadFrame
+impl core::convert::AsRef<[u8]> for claw_event_router::rpc::RpcPayloadFrame
+pub fn claw_event_router::rpc::RpcPayloadFrame::as_ref(&self) -> &[u8]
+impl core::fmt::Debug for claw_event_router::rpc::RpcPayloadFrame
+pub fn claw_event_router::rpc::RpcPayloadFrame::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct claw_event_router::rpc::RpcPayloadReader
+impl claw_event_router::rpc::RpcPayloadReader
+pub async fn claw_event_router::rpc::RpcPayloadReader::read(&mut self) -> claw_event_router::rpc::RpcResult<core::option::Option<core::result::Result<claw_event_router::rpc::RpcPayloadFrame, claw_event_router::rpc::RpcPayloadFrame>>>
+impl core::fmt::Debug for claw_event_router::rpc::RpcPayloadReader
+pub fn claw_event_router::rpc::RpcPayloadReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for claw_event_router::rpc::RpcPayloadReader
+pub fn claw_event_router::rpc::RpcPayloadReader::drop(&mut self)
+pub struct claw_event_router::rpc::RpcPayloadWriteFrame<'a>
+impl claw_event_router::rpc::RpcPayloadWriteFrame<'_>
+pub fn claw_event_router::rpc::RpcPayloadWriteFrame<'_>::commit(self, usize) -> claw_event_router::rpc::RpcResult<()>
+impl core::convert::AsMut<[u8]> for claw_event_router::rpc::RpcPayloadWriteFrame<'_>
+pub fn claw_event_router::rpc::RpcPayloadWriteFrame<'_>::as_mut(&mut self) -> &mut [u8]
+impl core::fmt::Debug for claw_event_router::rpc::RpcPayloadWriteFrame<'_>
+pub fn claw_event_router::rpc::RpcPayloadWriteFrame<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct claw_event_router::rpc::RpcPayloadWriter
+impl claw_event_router::rpc::RpcPayloadWriter
+pub async fn claw_event_router::rpc::RpcPayloadWriter::close(&mut self) -> claw_event_router::rpc::RpcResult<()>
+pub async fn claw_event_router::rpc::RpcPayloadWriter::reserve(&mut self) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcPayloadWriteFrame<'_>>
+pub async fn claw_event_router::rpc::RpcPayloadWriter::write(&mut self, &[u8]) -> claw_event_router::rpc::RpcResult<usize>
+pub async fn claw_event_router::rpc::RpcPayloadWriter::write_all(&mut self, &[u8]) -> claw_event_router::rpc::RpcResult<()>
+impl core::fmt::Debug for claw_event_router::rpc::RpcPayloadWriter
+pub fn claw_event_router::rpc::RpcPayloadWriter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for claw_event_router::rpc::RpcPayloadWriter
+pub fn claw_event_router::rpc::RpcPayloadWriter::drop(&mut self)
 pub struct claw_event_router::rpc::RpcRegistration
 pub struct claw_event_router::rpc::RpcRegistry<const N: usize, const M: usize, const Q: usize>
 impl<const N: usize, const M: usize, const Q: usize> claw_event_router::rpc::RpcRegistry<N, M, Q>

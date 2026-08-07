@@ -355,6 +355,38 @@ fn typed_stream_input_and_stream_output_are_self_driving() {
     );
 }
 
+#[test]
+fn terminal_response_cancels_unconsumed_typed_input() {
+    let registry = registry();
+    registry
+        .register::<StreamStreamMethod, _>(
+            |_context, mut requests: RpcStream<RpcFrame<Number>>| async move {
+                requests.next().await.expect("first request")?.view()?;
+                Ok(RpcStream::new(stream::iter([Ok(Err(MethodFailure {
+                    code: 9,
+                }))])))
+            },
+        )
+        .expect("register early-terminal endpoint");
+
+    block_on(async {
+        let mut responses = registry
+            .client()
+            .call::<StreamStreamMethod>(input_stream([1, 2, 3]))
+            .expect("start typed call");
+
+        let failure = responses
+            .next()
+            .await
+            .expect("terminal response")
+            .expect("transport success")
+            .expect_err("method failure");
+        assert_eq!(failure.view(), Ok(&MethodFailure { code: 9 }));
+        drop(failure);
+        assert!(responses.next().await.is_none());
+    });
+}
+
 struct IncompatibleMethod;
 
 impl RpcMethod for IncompatibleMethod {

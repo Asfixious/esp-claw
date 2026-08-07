@@ -12,7 +12,7 @@ mod lane;
 mod registry;
 mod typed;
 
-pub use address::{RpcAddress, RpcAddressError};
+pub use address::{RpcAddress, RpcAddressError, RpcGroup, RpcGroupError};
 pub use context::{RpcCallId, RpcContext, RpcEndpointId};
 pub use frame::RpcFrame;
 pub use lane::RpcLaneStorage;

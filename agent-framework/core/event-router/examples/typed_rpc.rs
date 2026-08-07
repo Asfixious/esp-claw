@@ -165,6 +165,15 @@ async fn run() -> RpcResult<()> {
         },
     )?;
 
+    // Registry discovery returns stable, sorted snapshots. Each discovered
+    // group can be used to list its currently registered RPC addresses.
+    for group in registry.groups() {
+        println!("RPC group: {group}");
+        for address in registry.rpcs(&group) {
+            println!("  {address}");
+        }
+    }
+
     let client = registry.client();
 
     // Unary -> Unary returns a self-driving future.

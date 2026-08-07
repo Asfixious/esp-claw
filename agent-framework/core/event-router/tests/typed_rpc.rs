@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcContext, RpcError, RpcFrame, RpcLaneStorage, RpcMessage, RpcMethod, RpcRegistry, RpcResult,
-    RpcStream, Streaming, Unary,
+    RpcContext, RpcError, RpcFrame, RpcGroup, RpcLaneStorage, RpcMessage, RpcMethod, RpcRegistry,
+    RpcResult, RpcStream, Streaming, Unary,
 };
 use futures_lite::future::{block_on, poll_once};
 use futures_util::stream;
@@ -79,6 +79,17 @@ impl RpcMethod for StreamStreamMethod {
     type Output = Streaming;
 }
 
+struct OtherGroupMethod;
+
+impl RpcMethod for OtherGroupMethod {
+    const ADDRESS: &'static str = "other.status";
+    type Request = Number;
+    type Response = Total;
+    type Error = MethodFailure;
+    type Input = Unary;
+    type Output = Unary;
+}
+
 fn number(value: u32) -> Number {
     Number {
         value,
@@ -115,6 +126,66 @@ where
         Ok(response) => Ok(Ok(*response.view()?)),
         Err(error) => Ok(Err(*error.view()?)),
     }
+}
+
+#[test]
+fn registry_discovers_sorted_groups_and_rpcs_as_snapshots() {
+    let registry = registry();
+    let unary = registry
+        .register::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(Total {
+                value: request.view()?.value,
+            }))
+        })
+        .expect("register typed unary endpoint");
+    let lease = registry
+        .register::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(*request.view()?))
+        })
+        .expect("register typed lease endpoint");
+    registry
+        .register::<OtherGroupMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(Total {
+                value: request.view()?.value,
+            }))
+        })
+        .expect("register other endpoint");
+
+    let groups = registry.groups();
+    assert_eq!(
+        groups.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+        vec!["other", "typed"]
+    );
+
+    let typed = RpcGroup::try_from("typed").expect("valid group");
+    let typed_rpcs = registry.rpcs(&typed);
+    assert_eq!(
+        typed_rpcs.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+        vec!["typed.frame_lease", "typed.unary_unary"]
+    );
+
+    let missing = RpcGroup::try_from("missing").expect("valid group");
+    assert!(registry.rpcs(&missing).is_empty());
+
+    registry
+        .unregister(&unary)
+        .expect("unregister unary endpoint");
+    registry
+        .unregister(&lease)
+        .expect("unregister lease endpoint");
+    assert_eq!(
+        registry
+            .groups()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>(),
+        vec!["other"]
+    );
+
+    assert_eq!(
+        groups.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+        vec!["other", "typed"]
+    );
 }
 
 #[test]

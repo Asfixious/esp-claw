@@ -430,6 +430,20 @@ RPC Handler
 * 调用上下文传播；
 * 直接自调用检查。
 
+Registry 的 catalog discovery 是同步只读快照：
+
+```rust
+for group in registry.groups() {
+    for address in registry.rpcs(&group) {
+        println!("{group}: {address}");
+    }
+}
+```
+
+`groups()` 返回当前非空 group，`rpcs(&group)` 返回该 group 当前注册的完整
+`RpcAddress`；两者均按字典序排列。后续 register/unregister 不会修改已经返回的
+snapshot，调用方需要重新查询以观察新状态。
+
 例如：
 
 ```text

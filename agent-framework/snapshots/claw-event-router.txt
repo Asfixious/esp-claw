@@ -31,6 +31,8 @@ pub claw_event_router::rpc::RpcError::SignatureMismatch::address: claw_event_rou
 pub claw_event_router::rpc::RpcError::SignatureMismatch::expected: &'static str
 pub claw_event_router::rpc::RpcError::SignatureMismatch::registered: &'static str
 pub claw_event_router::rpc::RpcError::StaleRegistration(claw_event_router::rpc::RpcAddress)
+#[non_exhaustive] pub enum claw_event_router::rpc::RpcGroupError
+pub claw_event_router::rpc::RpcGroupError::InvalidFormat(alloc::boxed::Box<str>)
 pub struct claw_event_router::rpc::RpcAddress(_)
 impl core::convert::AsRef<str> for claw_event_router::rpc::RpcAddress
 pub fn claw_event_router::rpc::RpcAddress::as_ref(&self) -> &str
@@ -62,6 +64,14 @@ impl<T> claw_event_router::rpc::RpcFrame<T> where T: claw_event_router::rpc::Rpc
 pub fn claw_event_router::rpc::RpcFrame<T>::view(&self) -> claw_event_router::rpc::RpcResult<&T>
 impl<T> core::fmt::Debug for claw_event_router::rpc::RpcFrame<T> where T: claw_event_router::rpc::RpcMessage + core::fmt::Debug
 pub fn claw_event_router::rpc::RpcFrame<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct claw_event_router::rpc::RpcGroup(_)
+impl core::convert::AsRef<str> for claw_event_router::rpc::RpcGroup
+pub fn claw_event_router::rpc::RpcGroup::as_ref(&self) -> &str
+impl core::convert::TryFrom<&str> for claw_event_router::rpc::RpcGroup
+pub type claw_event_router::rpc::RpcGroup::Error = claw_event_router::rpc::RpcGroupError
+pub fn claw_event_router::rpc::RpcGroup::try_from(&str) -> core::result::Result<Self, Self::Error>
+impl core::fmt::Display for claw_event_router::rpc::RpcGroup
+pub fn claw_event_router::rpc::RpcGroup::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct claw_event_router::rpc::RpcLaneStorage<const N: usize, const M: usize, const Q: usize>
 impl<const N: usize, const M: usize, const Q: usize> claw_event_router::rpc::RpcLaneStorage<N, M, Q>
 pub const fn claw_event_router::rpc::RpcLaneStorage<N, M, Q>::new() -> Self
@@ -71,8 +81,10 @@ pub struct claw_event_router::rpc::RpcRegistration
 pub struct claw_event_router::rpc::RpcRegistry<const N: usize, const M: usize, const Q: usize>
 impl<const N: usize, const M: usize, const Q: usize> claw_event_router::rpc::RpcRegistry<N, M, Q>
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::client(&alloc::rc::Rc<Self>) -> claw_event_router::rpc::RpcClient
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::groups(&self) -> alloc::vec::Vec<claw_event_router::rpc::RpcGroup>
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::new(&'static claw_event_router::rpc::RpcLaneStorage<N, M, Q>) -> claw_event_router::rpc::RpcResult<Self>
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::register<Method, H>(&self, H) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcRegistration> where Method: claw_event_router::rpc::RpcMethod, H: claw_event_router::rpc::RpcHandler<Method> + 'static
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::rpcs(&self, &claw_event_router::rpc::RpcGroup) -> alloc::vec::Vec<claw_event_router::rpc::RpcAddress>
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::unregister(&self, &claw_event_router::rpc::RpcRegistration) -> claw_event_router::rpc::RpcResult<()>
 pub struct claw_event_router::rpc::RpcStream<T>
 impl<T> claw_event_router::rpc::RpcStream<T>

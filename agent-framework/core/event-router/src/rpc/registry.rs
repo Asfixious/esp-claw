@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
-use super::address::{RpcAddress, RpcAddressError};
+use super::address::{RpcAddress, RpcAddressError, RpcGroup};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
 use super::lane::{LaneAcquire, LaneIo, LaneReader, LaneWriter, RpcLaneStorage};
 use super::typed::{
@@ -83,6 +83,45 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
             parent_call_id: None,
             root_call_id: None,
         }
+    }
+
+    /// Returns a sorted snapshot of groups that currently contain RPCs.
+    ///
+    /// Each group appears once. Registering or unregistering an RPC does not
+    /// mutate a previously returned snapshot; call this method again to observe
+    /// the new registry state.
+    #[must_use]
+    pub fn groups(&self) -> Vec<RpcGroup> {
+        let endpoints = self.endpoints.borrow();
+        let mut groups = Vec::new();
+        for address in endpoints.keys() {
+            let group = address.group();
+            if !groups
+                .iter()
+                .any(|registered: &RpcGroup| registered.as_ref() == group)
+            {
+                groups.push(RpcGroup::from_validated(group));
+            }
+        }
+        groups.sort_unstable();
+        groups
+    }
+
+    /// Returns a sorted snapshot of RPC addresses registered in `group`.
+    ///
+    /// An unknown group produces an empty snapshot. Registering or
+    /// unregistering an RPC does not mutate a previously returned snapshot.
+    #[must_use]
+    pub fn rpcs(&self, group: &RpcGroup) -> Vec<RpcAddress> {
+        let mut addresses: Vec<_> = self
+            .endpoints
+            .borrow()
+            .keys()
+            .filter(|address| address.group() == group.as_ref())
+            .cloned()
+            .collect();
+        addresses.sort_unstable();
+        addresses
     }
 
     /// Registers a handler for method `M`.

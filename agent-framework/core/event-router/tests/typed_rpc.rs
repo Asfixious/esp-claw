@@ -1,8 +1,6 @@
 #![allow(clippy::expect_used)]
 #![allow(missing_docs)]
 
-use std::rc::Rc;
-
 use claw_event_router::rpc::{
     RpcContext, RpcError, RpcFrame, RpcGroup, RpcLaneStorage, RpcMessage, RpcMethod, RpcRegistry,
     RpcResult, RpcStream, Streaming, Unary,
@@ -30,9 +28,9 @@ struct MethodFailure {
     code: u32,
 }
 
-fn registry() -> Rc<RpcRegistry<4, 4_096, 8>> {
+fn registry() -> RpcRegistry<4, 4_096, 8> {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4_096, 8>::new()));
-    Rc::new(RpcRegistry::new(lanes))
+    RpcRegistry::new(lanes)
 }
 
 struct UnaryUnaryMethod;
@@ -126,6 +124,19 @@ where
         Ok(response) => Ok(Ok(*response.view()?)),
         Err(error) => Ok(Err(*error.view()?)),
     }
+}
+
+#[test]
+fn client_does_not_retain_the_registry() {
+    let client = {
+        let registry = registry();
+        registry.client()
+    };
+
+    assert!(matches!(
+        client.call::<UnaryUnaryMethod>(number(1)),
+        Err(RpcError::RegistryDropped)
+    ));
 }
 
 #[test]
@@ -467,7 +478,7 @@ impl RpcMethod for LeaseMethod {
 fn response_frame_retains_an_aligned_lane_until_drop() {
     block_on(async {
         let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 2>::new()));
-        let registry = Rc::new(RpcRegistry::new(lanes));
+        let registry = RpcRegistry::new(lanes);
         registry
             .register::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
                 Ok(Ok(*request.view()?))
@@ -643,7 +654,7 @@ fn unregister_keeps_a_prepared_typed_call_alive() {
 fn dropping_a_reserved_typed_waiter_hands_the_lane_to_the_next_call() {
     block_on(async {
         let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 2>::new()));
-        let registry = Rc::new(RpcRegistry::new(lanes));
+        let registry = RpcRegistry::new(lanes);
         registry
             .register::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
                 Ok(Ok(*request.view()?))
@@ -707,7 +718,7 @@ impl RpcMethod for OuterMethod {
 #[test]
 fn typed_nested_call_fails_instead_of_waiting_for_its_own_lane() {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 1>::new()));
-    let registry = Rc::new(RpcRegistry::new(lanes));
+    let registry = RpcRegistry::new(lanes);
     registry
         .register::<InnerMethod, _>(|_context, request: RpcFrame<Number>| async move {
             Ok(Ok(Total {

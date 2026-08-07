@@ -62,18 +62,22 @@ use claw_event_router::rpc::{RpcMethod, RpcRegistry};
 Registry 必须显式接收 application-lifetime lane storage：
 
 ```rust
-use std::rc::Rc;
 use claw_event_router::rpc::{RpcLaneStorage, RpcRegistry};
 use static_cell::ConstStaticCell;
 
 static RPC_LANES: ConstStaticCell<RpcLaneStorage<4, 4096, 8>> =
     ConstStaticCell::new(RpcLaneStorage::new());
 
-fn build_registry() -> Rc<RpcRegistry<4, 4096, 8>> {
+fn build_registry() -> RpcRegistry<4, 4096, 8> {
     let lanes = RPC_LANES.take();
-    Rc::new(RpcRegistry::new(lanes))
+    RpcRegistry::new(lanes)
 }
 ```
+
+`RpcRegistry` 由 EventRouter 普通拥有；它在内部用一个 task-local `Rc` 保存非泛型
+registry core，`RpcClient` 只持有对应的 `Weak`。因此 client 不携带 lane const generic，
+也不会延长 EventRouter/registry 的生命周期，调用方不需要手动给 `RpcRegistry` 包一层
+`Rc`。
 
 ---
 

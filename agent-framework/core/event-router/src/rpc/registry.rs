@@ -1,5 +1,6 @@
 use core::cell::Cell;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::mem::size_of;
 use core::pin::Pin;
 use std::cell::RefCell;
@@ -10,7 +11,7 @@ use getset::CopyGetters;
 
 use super::address::{RpcAddress, RpcAddressError, RpcGroup};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
-use super::lane::{LaneAcquire, LaneIo, LaneReader, LaneWriter, RpcLaneStorage};
+use super::lane::{LaneAcquire, LaneIo, LanePool, LaneReader, LaneWriter, RpcLaneStorage};
 use super::payload::{RpcPayloadReader, RpcPayloadWriter};
 use super::typed::{
     HandlerAdapter, RpcHandler, RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode,
@@ -41,15 +42,20 @@ pub(crate) trait ErasedRpcHandler {
 
 /// Task-local registry that resolves typed RPC addresses.
 ///
-/// The registry uses [`Rc`] and deliberately does not require handlers or
-/// futures to be `Send`. It is intended to run inside Event Router's
-/// cooperative executor thread. Root calls wait when every lane is active;
-/// nested calls fail instead of waiting when doing so could deadlock.
+/// The registry internally shares its task-local core with clients and does
+/// not require handlers or futures to be `Send`. It is intended to run inside
+/// Event Router's cooperative executor thread. Root calls wait when every lane
+/// is active; nested calls fail instead of waiting when doing so could deadlock.
 pub struct RpcRegistry<const N: usize, const M: usize, const Q: usize> {
+    core: Rc<RegistryCore>,
+    storage: PhantomData<&'static RpcLaneStorage<N, M, Q>>,
+}
+
+struct RegistryCore {
     endpoints: RefCell<HashMap<RpcAddress, EndpointEntry>>,
     next_endpoint_id: Cell<u64>,
     next_call_id: Cell<u64>,
-    lanes: &'static RpcLaneStorage<N, M, Q>,
+    lanes: &'static dyn LanePool,
 }
 
 impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
@@ -64,10 +70,13 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
             assert!(M > 0, "RPC lane frame capacity must be nonzero");
         }
         Self {
-            endpoints: RefCell::new(HashMap::new()),
-            next_endpoint_id: Cell::new(1),
-            next_call_id: Cell::new(1),
-            lanes,
+            core: Rc::new(RegistryCore {
+                endpoints: RefCell::new(HashMap::new()),
+                next_endpoint_id: Cell::new(1),
+                next_call_id: Cell::new(1),
+                lanes,
+            }),
+            storage: PhantomData,
         }
     }
 
@@ -75,10 +84,9 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     ///
     /// Calls from the returned client start new root call chains.
     #[must_use]
-    pub fn client(self: &Rc<Self>) -> RpcClient {
-        let registry: Rc<dyn RegistryAccess> = self.clone();
+    pub fn client(&self) -> RpcClient {
         RpcClient {
-            registry: Rc::downgrade(&registry),
+            registry: Rc::downgrade(&self.core),
             caller_endpoint_id: None,
             parent_call_id: None,
             root_call_id: None,
@@ -92,7 +100,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// the new registry state.
     #[must_use]
     pub fn groups(&self) -> Vec<RpcGroup> {
-        let endpoints = self.endpoints.borrow();
+        let endpoints = self.core.endpoints.borrow();
         let mut groups = Vec::new();
         for address in endpoints.keys() {
             push_group(&mut groups, address);
@@ -108,6 +116,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     #[must_use]
     pub fn rpcs(&self, group: &RpcGroup) -> Vec<RpcAddress> {
         let mut addresses: Vec<_> = self
+            .core
             .endpoints
             .borrow()
             .keys()
@@ -216,13 +225,35 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         }
         let descriptor = RpcMethodDescriptor::for_method::<Method>()?;
         let address = descriptor.address().clone();
-        self.insert_handler(
+        self.core.insert_handler(
             address,
             Rc::new(HandlerAdapter::<Method, H>::new(handler)),
             descriptor,
         )
     }
 
+    /// Unregisters the exact endpoint instance represented by `registration`.
+    ///
+    /// Calls already in flight retain their handler and may finish normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::StaleRegistration`] when the address is absent or
+    /// now belongs to a different endpoint instance.
+    pub fn unregister(&self, registration: &RpcRegistration) -> RpcResult<()> {
+        let mut endpoints = self.core.endpoints.borrow_mut();
+        let is_current = endpoints
+            .get(&registration.address)
+            .is_some_and(|entry| entry.endpoint_id == registration.endpoint_id);
+        if !is_current {
+            return Err(RpcError::StaleRegistration(registration.address.clone()));
+        }
+        endpoints.remove(&registration.address);
+        Ok(())
+    }
+}
+
+impl RegistryCore {
     fn insert_handler(
         &self,
         address: RpcAddress,
@@ -248,29 +279,8 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         Ok(registration)
     }
 
-    /// Unregisters the exact endpoint instance represented by `registration`.
-    ///
-    /// Calls already in flight retain their handler and may finish normally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RpcError::StaleRegistration`] when the address is absent or
-    /// now belongs to a different endpoint instance.
-    pub fn unregister(&self, registration: &RpcRegistration) -> RpcResult<()> {
-        let mut endpoints = self.endpoints.borrow_mut();
-        let is_current = endpoints
-            .get(&registration.address)
-            .is_some_and(|entry| entry.endpoint_id == registration.endpoint_id);
-        if !is_current {
-            return Err(RpcError::StaleRegistration(registration.address.clone()));
-        }
-        endpoints.remove(&registration.address);
-        Ok(())
-    }
-
     fn prepare_typed_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
+        self: &Rc<Self>,
         caller: &RpcClient,
         address: &RpcAddress,
         expected: &RpcMethodDescriptor,
@@ -288,12 +298,11 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
                 registered: endpoint.descriptor.method_type_name(),
             });
         }
-        self.prepare_resolved_call(registry, caller, address, endpoint)
+        self.prepare_resolved_call(caller, address, endpoint)
     }
 
     fn prepare_payload_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
+        self: &Rc<Self>,
         caller: &RpcClient,
         address: &RpcAddress,
     ) -> RpcResult<PreparedCall> {
@@ -303,12 +312,11 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
             .get(address)
             .cloned()
             .ok_or_else(|| RpcError::NotFound(address.clone()))?;
-        self.prepare_resolved_call(registry, caller, address, endpoint)
+        self.prepare_resolved_call(caller, address, endpoint)
     }
 
     fn prepare_resolved_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
+        self: &Rc<Self>,
         caller: &RpcClient,
         address: &RpcAddress,
         endpoint: EndpointEntry,
@@ -320,7 +328,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         let call_id = RpcCallId::new(self.take_call_id()?);
         let root_call_id = caller.root_call_id.unwrap_or(call_id);
         let nested_client = RpcClient {
-            registry,
+            registry: Rc::downgrade(self),
             caller_endpoint_id: Some(endpoint.endpoint_id),
             parent_call_id: Some(call_id),
             root_call_id: Some(root_call_id),
@@ -347,44 +355,6 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
 
     fn take_call_id(&self) -> RpcResult<u64> {
         take_identifier(&self.next_call_id)
-    }
-}
-
-trait RegistryAccess {
-    fn prepare_typed_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
-        caller: &RpcClient,
-        address: &RpcAddress,
-        expected: &RpcMethodDescriptor,
-    ) -> RpcResult<PreparedCall>;
-
-    fn prepare_payload_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
-        caller: &RpcClient,
-        address: &RpcAddress,
-    ) -> RpcResult<PreparedCall>;
-}
-
-impl<const N: usize, const M: usize, const Q: usize> RegistryAccess for RpcRegistry<N, M, Q> {
-    fn prepare_typed_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
-        caller: &RpcClient,
-        address: &RpcAddress,
-        expected: &RpcMethodDescriptor,
-    ) -> RpcResult<PreparedCall> {
-        self.prepare_typed_call(registry, caller, address, expected)
-    }
-
-    fn prepare_payload_call(
-        &self,
-        registry: Weak<dyn RegistryAccess>,
-        caller: &RpcClient,
-        address: &RpcAddress,
-    ) -> RpcResult<PreparedCall> {
-        self.prepare_payload_call(registry, caller, address)
     }
 }
 
@@ -436,7 +406,7 @@ impl PreparedCall {
 /// Handle used to invoke endpoints in one registry.
 #[derive(Clone)]
 pub struct RpcClient {
-    registry: Weak<dyn RegistryAccess>,
+    registry: Weak<RegistryCore>,
     caller_endpoint_id: Option<RpcEndpointId>,
     parent_call_id: Option<RpcCallId>,
     root_call_id: Option<RpcCallId>,
@@ -468,8 +438,7 @@ impl RpcClient {
         let descriptor = RpcMethodDescriptor::for_method::<M>()?;
         let address = descriptor.address().clone();
         let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
-        let prepared =
-            registry.prepare_typed_call(self.registry.clone(), self, &address, &descriptor)?;
+        let prepared = registry.prepare_typed_call(self, &address, &descriptor)?;
         Ok(super::typed::make_typed_call::<M>(prepared, input))
     }
 
@@ -493,7 +462,7 @@ impl RpcClient {
         address: &RpcAddress,
     ) -> RpcResult<(RpcPayloadWriter, RpcPayloadReader)> {
         let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
-        let prepared = registry.prepare_payload_call(self.registry.clone(), self, address)?;
+        let prepared = registry.prepare_payload_call(self, address)?;
         Ok(super::payload::make_payload_call(prepared))
     }
 }

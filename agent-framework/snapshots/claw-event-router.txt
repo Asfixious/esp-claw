@@ -109,7 +109,7 @@ pub fn claw_event_router::rpc::RpcPayloadWriter::drop(&mut self)
 pub struct claw_event_router::rpc::RpcRegistration
 pub struct claw_event_router::rpc::RpcRegistry<const N: usize, const M: usize, const Q: usize>
 impl<const N: usize, const M: usize, const Q: usize> claw_event_router::rpc::RpcRegistry<N, M, Q>
-pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::client(&alloc::rc::Rc<Self>) -> claw_event_router::rpc::RpcClient
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::client(&self) -> claw_event_router::rpc::RpcClient
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::groups(&self) -> alloc::vec::Vec<claw_event_router::rpc::RpcGroup>
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::new(&'static claw_event_router::rpc::RpcLaneStorage<N, M, Q>) -> Self
 pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::register<Method, H>(&self, H) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcRegistration> where Method: claw_event_router::rpc::RpcMethod, H: claw_event_router::rpc::RpcHandler<Method> + 'static

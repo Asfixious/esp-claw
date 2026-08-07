@@ -1,7 +1,5 @@
 //! Demonstrates nested call context, self-call protection, and registration lifecycle.
 
-use std::rc::Rc;
-
 use claw_event_router::rpc::{
     RpcContext, RpcError, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Unary,
 };
@@ -59,7 +57,7 @@ fn success<T, E>(outcome: Result<T, E>) -> RpcResult<T> {
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
-    let registry = Rc::new(RpcRegistry::new(lanes));
+    let registry = RpcRegistry::new(lanes);
 
     let increment_registration = registry.register::<Increment, _>(
         |context: RpcContext, request: RpcFrame<Number>| async move {

@@ -1,7 +1,5 @@
 //! Demonstrates all four typed RPC request/response cardinality combinations.
 
-use std::rc::Rc;
-
 use claw_event_router::rpc::{
     RpcContext, RpcError, RpcFrame, RpcHandler, RpcHandlerFuture, RpcHandlerInput,
     RpcHandlerOutput, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, RpcStream, Streaming,
@@ -120,7 +118,7 @@ async fn collect(
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
-    let registry = Rc::new(RpcRegistry::new(lanes));
+    let registry = RpcRegistry::new(lanes);
 
     registry.register::<UnaryUnary, _>(AddOffset { offset: 1 })?;
 

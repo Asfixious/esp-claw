@@ -1,7 +1,5 @@
 //! Demonstrates expected registration, signature, and typed method errors.
 
-use std::rc::Rc;
-
 use claw_event_router::rpc::{
     RpcError, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Streaming, Unary,
 };
@@ -61,7 +59,7 @@ impl RpcMethod for DomainFailure {
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
-    let registry = Rc::new(RpcRegistry::new(lanes));
+    let registry = RpcRegistry::new(lanes);
     registry.register::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
         Ok(Ok(*request.view()?))
     })?;

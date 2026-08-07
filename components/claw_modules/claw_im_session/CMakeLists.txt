@@ -9,4 +9,5 @@ idf_component_register(
         freertos
         agent-framework
         cjson
+        nvs_flash
 )

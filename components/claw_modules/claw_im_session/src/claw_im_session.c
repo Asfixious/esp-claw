@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "freertos/semphr.h"
+#include "nvs.h"
 
 static const char *TAG = "claw_im_session";
 
@@ -24,6 +25,11 @@ static const char *TAG = "claw_im_session";
 #define CLAW_IM_SESSION_CHANNEL_SIZE    32
 #define CLAW_IM_SESSION_CHAT_ID_SIZE    96
 #define CLAW_IM_SESSION_RPC_OUTPUT_SIZE 256
+#define CLAW_IM_SESSION_BINDING_MAGIC   UINT32_C(0x43494D42)
+#define CLAW_IM_SESSION_BINDING_VERSION 1
+
+static const char *CLAW_IM_SESSION_NVS_NAMESPACE = "claw_im";
+static const char *CLAW_IM_SESSION_NVS_KEY = "bindings";
 
 typedef struct {
     bool occupied;
@@ -35,9 +41,28 @@ typedef struct {
     uint32_t request_id;
 } claw_im_session_cursor_t;
 
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+} claw_im_session_binding_header_t;
+
+typedef struct {
+    uint32_t session_id;
+    char channel[CLAW_IM_SESSION_CHANNEL_SIZE];
+    char chat_id[CLAW_IM_SESSION_CHAT_ID_SIZE];
+} claw_im_session_binding_record_t;
+
+_Static_assert(sizeof(claw_im_session_binding_header_t) == 8,
+               "IM session binding header layout changed");
+_Static_assert(sizeof(claw_im_session_binding_record_t) == 132,
+               "IM session binding record layout changed");
+
 static claw_im_session_cursor_t s_cursors[CLAW_IM_SESSION_CURSOR_CAPACITY];
 static SemaphoreHandle_t s_cursor_mutex;
 static portMUX_TYPE s_cursor_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_bindings_loaded;
+static bool s_bindings_dirty;
 
 static bool claw_im_session_key_valid(const char *channel, const char *chat_id)
 {
@@ -45,6 +70,197 @@ static bool claw_im_session_key_valid(const char *channel, const char *chat_id)
            strlen(channel) < CLAW_IM_SESSION_CHANNEL_SIZE &&
            chat_id && chat_id[0] &&
            strlen(chat_id) < CLAW_IM_SESSION_CHAT_ID_SIZE;
+}
+
+/* Must be called with s_cursor_mutex held. */
+static esp_err_t claw_im_session_load_bindings_locked(void)
+{
+    claw_im_session_binding_header_t *header;
+    claw_im_session_binding_record_t *records;
+    nvs_handle_t handle;
+    void *blob = NULL;
+    size_t blob_size = 0;
+    size_t expected_size;
+    esp_err_t err;
+
+    if (s_bindings_loaded) {
+        return ESP_OK;
+    }
+
+    err = nvs_open(CLAW_IM_SESSION_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        s_bindings_loaded = true;
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "binding store open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_get_blob(handle, CLAW_IM_SESSION_NVS_KEY, NULL, &blob_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        s_bindings_loaded = true;
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "binding store size read failed: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
+    if (blob_size < sizeof(*header) ||
+            blob_size > sizeof(*header) +
+            CLAW_IM_SESSION_CURSOR_CAPACITY * sizeof(*records)) {
+        ESP_LOGE(TAG, "binding store has invalid size=%u", (unsigned)blob_size);
+        nvs_close(handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    blob = malloc(blob_size);
+    if (!blob) {
+        nvs_close(handle);
+        return ESP_ERR_NO_MEM;
+    }
+    err = nvs_get_blob(handle, CLAW_IM_SESSION_NVS_KEY, blob, &blob_size);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "binding store read failed: %s", esp_err_to_name(err));
+        free(blob);
+        return err;
+    }
+
+    header = blob;
+    if (header->magic != CLAW_IM_SESSION_BINDING_MAGIC ||
+            header->version != CLAW_IM_SESSION_BINDING_VERSION ||
+            header->count > CLAW_IM_SESSION_CURSOR_CAPACITY) {
+        ESP_LOGE(TAG,
+                 "binding store header invalid: magic=%" PRIx32 " version=%u count=%u",
+                 header->magic,
+                 (unsigned)header->version,
+                 (unsigned)header->count);
+        free(blob);
+        return ESP_ERR_INVALID_STATE;
+    }
+    expected_size = sizeof(*header) + header->count * sizeof(*records);
+    if (blob_size != expected_size) {
+        ESP_LOGE(TAG,
+                 "binding store length mismatch: actual=%u expected=%u",
+                 (unsigned)blob_size,
+                 (unsigned)expected_size);
+        free(blob);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    records = (claw_im_session_binding_record_t *)(header + 1);
+    memset(s_cursors, 0, sizeof(s_cursors));
+    for (size_t i = 0; i < header->count; i++) {
+        const claw_im_session_binding_record_t *record = &records[i];
+
+        if (record->session_id == 0 ||
+                !memchr(record->channel, '\0', sizeof(record->channel)) ||
+                !memchr(record->chat_id, '\0', sizeof(record->chat_id)) ||
+                !claw_im_session_key_valid(record->channel, record->chat_id)) {
+            ESP_LOGE(TAG, "binding store record %u is invalid", (unsigned)i);
+            memset(s_cursors, 0, sizeof(s_cursors));
+            free(blob);
+            return ESP_ERR_INVALID_STATE;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(s_cursors[j].channel, record->channel) == 0 &&
+                    strcmp(s_cursors[j].chat_id, record->chat_id) == 0) {
+                ESP_LOGE(TAG, "binding store record %u is duplicated", (unsigned)i);
+                memset(s_cursors, 0, sizeof(s_cursors));
+                free(blob);
+                return ESP_ERR_INVALID_STATE;
+            }
+        }
+        s_cursors[i].occupied = true;
+        s_cursors[i].session_id = record->session_id;
+        strlcpy(s_cursors[i].channel,
+                record->channel,
+                sizeof(s_cursors[i].channel));
+        strlcpy(s_cursors[i].chat_id,
+                record->chat_id,
+                sizeof(s_cursors[i].chat_id));
+    }
+
+    ESP_LOGI(TAG, "restored %u persistent IM session bindings", (unsigned)header->count);
+    free(blob);
+    s_bindings_loaded = true;
+    return ESP_OK;
+}
+
+/* Must be called with s_cursor_mutex held. */
+static esp_err_t claw_im_session_save_bindings_locked(void)
+{
+    claw_im_session_binding_header_t *header;
+    claw_im_session_binding_record_t *records;
+    nvs_handle_t handle;
+    void *blob;
+    size_t count = 0;
+    size_t blob_size;
+    bool nvs_opened = false;
+    esp_err_t err;
+
+    for (size_t i = 0; i < CLAW_IM_SESSION_CURSOR_CAPACITY; i++) {
+        if (s_cursors[i].occupied && s_cursors[i].session_id != 0) {
+            count++;
+        }
+    }
+    blob_size = sizeof(*header) + count * sizeof(*records);
+    blob = calloc(1, blob_size);
+    if (!blob) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    header = blob;
+    header->magic = CLAW_IM_SESSION_BINDING_MAGIC;
+    header->version = CLAW_IM_SESSION_BINDING_VERSION;
+    header->count = (uint16_t)count;
+    records = (claw_im_session_binding_record_t *)(header + 1);
+    count = 0;
+    for (size_t i = 0; i < CLAW_IM_SESSION_CURSOR_CAPACITY; i++) {
+        const claw_im_session_cursor_t *cursor = &s_cursors[i];
+
+        if (!cursor->occupied || cursor->session_id == 0) {
+            continue;
+        }
+        records[count].session_id = cursor->session_id;
+        strlcpy(records[count].channel,
+                cursor->channel,
+                sizeof(records[count].channel));
+        strlcpy(records[count].chat_id,
+                cursor->chat_id,
+                sizeof(records[count].chat_id));
+        count++;
+    }
+
+    err = nvs_open(CLAW_IM_SESSION_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        nvs_opened = true;
+        err = nvs_set_blob(handle, CLAW_IM_SESSION_NVS_KEY, blob, blob_size);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "binding store write failed: %s", esp_err_to_name(err));
+    }
+    if (nvs_opened) {
+        nvs_close(handle);
+    }
+    free(blob);
+    if (err == ESP_OK) {
+        s_bindings_dirty = false;
+    }
+    return err;
+}
+
+/* Must be called with s_cursor_mutex held. */
+static esp_err_t claw_im_session_persist_bindings_locked(void)
+{
+    s_bindings_dirty = true;
+    return claw_im_session_save_bindings_locked();
 }
 
 static esp_err_t claw_im_session_ensure_mutex(void)
@@ -78,7 +294,14 @@ static esp_err_t claw_im_session_lock(void)
         return err;
     }
     xSemaphoreTake(s_cursor_mutex, portMAX_DELAY);
-    return ESP_OK;
+    err = claw_im_session_load_bindings_locked();
+    if (err == ESP_OK && s_bindings_dirty) {
+        err = claw_im_session_save_bindings_locked();
+    }
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_cursor_mutex);
+    }
+    return err;
 }
 
 static void claw_im_session_unlock(void)
@@ -466,6 +689,29 @@ esp_err_t claw_im_session_prepare_input(
         return ESP_OK;
     }
 
+    if (cursor && cursor->session_id != 0 && !cursor->open) {
+        err = claw_im_session_agent_id_call("session.open", cursor->session_id);
+        if (err == ESP_OK) {
+            cursor->open = true;
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG,
+                     "discarding stale binding session=%" PRIu32 " channel=%s chat=%s",
+                     cursor->session_id,
+                     channel,
+                     chat_id);
+            cursor->session_id = 0;
+            cursor->open = false;
+            err = claw_im_session_persist_bindings_locked();
+            if (err != ESP_OK) {
+                claw_im_session_unlock();
+                return err;
+            }
+        } else {
+            claw_im_session_unlock();
+            return err;
+        }
+    }
+
     if (!cursor || cursor->session_id == 0) {
         claw_im_session_cursor_t *allocated = cursor;
 
@@ -505,18 +751,16 @@ esp_err_t claw_im_session_prepare_input(
         }
         cursor->session_id = session_id;
         cursor->open = true;
+        err = claw_im_session_persist_bindings_locked();
+        if (err != ESP_OK) {
+            claw_im_session_unlock();
+            return err;
+        }
         ESP_LOGI(TAG,
                  "created session=%" PRIu32 " channel=%s chat=%s",
                  session_id,
                  channel,
                  chat_id);
-    } else if (!cursor->open) {
-        err = claw_im_session_agent_id_call("session.open", cursor->session_id);
-        if (err != ESP_OK) {
-            claw_im_session_unlock();
-            return err;
-        }
-        cursor->open = true;
     }
 
     out_input->session_id = cursor->session_id;
@@ -554,8 +798,9 @@ esp_err_t claw_im_session_select(const char *channel,
     cursor->session_id = session_id;
     cursor->request_session_id = 0;
     cursor->request_id = 0;
+    err = claw_im_session_persist_bindings_locked();
     claw_im_session_unlock();
-    return ESP_OK;
+    return err;
 }
 
 bool claw_im_session_is_managed(uint32_t session_id)
@@ -630,6 +875,7 @@ esp_err_t claw_im_session_mark_closed(uint32_t session_id)
 
 esp_err_t claw_im_session_forget(uint32_t session_id)
 {
+    bool binding_changed = false;
     esp_err_t err;
 
     if (session_id == 0) {
@@ -648,6 +894,7 @@ esp_err_t claw_im_session_forget(uint32_t session_id)
         if (cursor->session_id == session_id) {
             cursor->session_id = 0;
             cursor->open = false;
+            binding_changed = true;
         }
         if (cursor->request_session_id == session_id) {
             cursor->request_session_id = 0;
@@ -657,8 +904,11 @@ esp_err_t claw_im_session_forget(uint32_t session_id)
             memset(cursor, 0, sizeof(*cursor));
         }
     }
+    if (binding_changed) {
+        err = claw_im_session_persist_bindings_locked();
+    }
     claw_im_session_unlock();
-    return ESP_OK;
+    return err;
 }
 
 esp_err_t claw_im_session_note_input_request(const char *channel,
@@ -666,6 +916,7 @@ esp_err_t claw_im_session_note_input_request(const char *channel,
                                              uint32_t session_id,
                                              uint32_t request_id)
 {
+    bool binding_changed = false;
     claw_im_session_cursor_t *cursor;
     esp_err_t err;
 
@@ -692,13 +943,17 @@ esp_err_t claw_im_session_note_input_request(const char *channel,
     if (cursor->session_id == 0) {
         cursor->session_id = session_id;
         cursor->open = true;
+        binding_changed = true;
     } else if (cursor->session_id == session_id) {
         cursor->open = true;
     }
     cursor->request_session_id = session_id;
     cursor->request_id = request_id;
+    if (binding_changed) {
+        err = claw_im_session_persist_bindings_locked();
+    }
     claw_im_session_unlock();
-    return ESP_OK;
+    return err;
 }
 
 esp_err_t claw_im_session_clear_input_request(uint32_t session_id,

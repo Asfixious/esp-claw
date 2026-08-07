@@ -23,8 +23,12 @@
 _Static_assert(sizeof(void *) == 4, "claw-sys requires 32-bit ESP-IDF pointers");
 
 /* These values are consumed by the Rust HTTP event callback. */
+_Static_assert(HTTP_EVENT_ON_CONNECTED == 1,
+               "ESP-IDF HTTP event ABI changed before ON_CONNECTED");
 _Static_assert(HTTP_EVENT_ON_HEADER == 3,
                "ESP-IDF HTTP event ABI changed before ON_HEADER");
+_Static_assert(HTTP_EVENT_ON_STATUS_CODE == 5,
+               "ESP-IDF HTTP event ABI changed before ON_STATUS_CODE");
 _Static_assert(HTTP_EVENT_ON_DATA == 6,
                "ESP-IDF HTTP event ABI changed before ON_DATA");
 _Static_assert(HTTP_EVENT_ON_FINISH == 7,

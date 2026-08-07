@@ -65,6 +65,40 @@ TEST_CASE("claw_sys StreamingHttp drop then reuses client", "[claw_sys][streamin
     TEST_ASSERT_EQUAL_INT(0, rc);
 }
 
+TEST_CASE("claw_sys StreamingHttp fairly drains 3 concurrent responses",
+          "[claw_sys][streaming][network]")
+{
+    int ok = claw_sys_selftest_run_three_streaming_posts(TEST_HTTPS_URL);
+    printf("concurrent streaming posts succeeded=%d\n", ok);
+    TEST_ASSERT_EQUAL_INT(3, ok);
+}
+
+TEST_CASE("claw_sys StreamingHttp scales through 1, 2, 4, 8, 12, 16 concurrent responses",
+          "[claw_sys][streaming][network][stress]")
+{
+    static const unsigned int counts[] = {1, 2, 4, 8, 12, 16};
+
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+        unsigned int count = counts[i];
+        int ok = claw_sys_selftest_run_streaming_posts(TEST_HTTPS_URL, count);
+        printf("concurrent streaming posts count=%u succeeded=%d\n", count, ok);
+        TEST_ASSERT_EQUAL_INT((int)count, ok);
+    }
+}
+
+TEST_CASE("claw_sys StreamingHttp boundary probes 24 and 32 concurrent responses",
+          "[claw_sys][streaming][network][stress][boundary]")
+{
+    static const unsigned int counts[] = {24, 32};
+
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+        unsigned int count = counts[i];
+        int ok = claw_sys_selftest_run_streaming_posts(TEST_HTTPS_URL, count);
+        printf("boundary streaming posts count=%u succeeded=%d\n", count, ok);
+        TEST_ASSERT_EQUAL_INT((int)count, ok);
+    }
+}
+
 /* ---------- Resource profiling ---------- */
 
 TEST_CASE("resource: heap baseline", "[resource]")

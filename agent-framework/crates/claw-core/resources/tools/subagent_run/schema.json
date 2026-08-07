@@ -20,7 +20,9 @@
         },
         "timeout_ms": {
           "type": "integer",
-          "description": "Maximum lifetime in milliseconds."
+          "minimum": 1,
+          "default": 300000,
+          "description": "Maximum lifetime in milliseconds. Use at least 300000 for multi-step tasks involving LLM calls, tools, network access, or device I/O; 120000 is often too short on embedded targets."
         }
       },
       "required": ["kind", "name", "goal", "timeout_ms"]

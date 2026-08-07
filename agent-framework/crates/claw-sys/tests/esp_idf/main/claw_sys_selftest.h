@@ -49,6 +49,12 @@ int claw_sys_selftest_streaming_cancel_reuse(const char *url);
 /* Drop after the first body chunk, then reuse the same EspIdfHttp. */
 int claw_sys_selftest_streaming_drop_reuse(const char *url);
 
+/* Run and fully drain three concurrent streaming POSTs. Returns successes. */
+int claw_sys_selftest_run_three_streaming_posts(const char *url);
+
+/* Run and fully drain 1..16 concurrent streaming POSTs. Returns successes. */
+int claw_sys_selftest_run_streaming_posts(const char *url, unsigned int count);
+
 /* ---------- Resource profiling ---------- */
 
 /* Print baseline heap snapshot (no HTTP). Always returns 0. */

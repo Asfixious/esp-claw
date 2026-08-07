@@ -468,6 +468,106 @@ pub unsafe extern "C" fn claw_sys_selftest_streaming_drop_reuse(url: *const c_ch
     })
 }
 
+/// Run `count` streaming POSTs concurrently on the single-thread local
+/// executor and drain every response. This is the scheduler-fairness and
+/// transport-scaling regression case: one quiet stream must not keep the other
+/// transports from progressing.
+///
+/// # Safety
+/// `url` must point to a valid NUL-terminated HTTPS URL.
+#[no_mangle]
+pub unsafe extern "C" fn claw_sys_selftest_run_streaming_posts(
+    url: *const c_char,
+    count: u32,
+) -> c_int {
+    let Some(url) = cstr(url) else {
+        return ERR_NULL_ARG;
+    };
+    if !(1..=32).contains(&count) {
+        return ERR_NULL_ARG;
+    }
+    let url = url.to_string();
+    let successes = Rc::new(Cell::new(0_u32));
+    let executor: edge_executor::LocalExecutor = Default::default();
+    let mut handles = Vec::with_capacity(count as usize);
+
+    for index in 0..count {
+        let url = url.clone();
+        let successes = Rc::clone(&successes);
+        handles.push(executor.spawn(async move {
+            let mut http = match EspIdfHttp::new(&url) {
+                Ok(http) => http,
+                Err(error) => {
+                    log_streaming(&format!("concurrent[{index}]: init failed: {error}"));
+                    return;
+                }
+            };
+            let cancel = AtomicBool::new(false);
+            let body = format!(r#"{{"selftest":"streaming_concurrent","index":{index}}}"#);
+            let request = HttpJsonRequest {
+                url: &url,
+                body: &body,
+                auth: HttpAuth::None,
+                // Public test endpoints occasionally have a >20 s tail even
+                // after TLS succeeds. Keep a finite whole-request deadline,
+                // but avoid turning endpoint jitter into a transport failure.
+                timeout_ms: 180_000,
+                headers: &[],
+            };
+            let (status, mut stream) = match http
+                .post_json_streaming(&request, Cancel::new(&cancel))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    log_streaming(&format!("concurrent[{index}]: start failed: {error}"));
+                    return;
+                }
+            };
+            if status != HttpStatusCode::OK {
+                log_streaming(&format!(
+                    "concurrent[{index}]: unexpected HTTP status {status}"
+                ));
+                return;
+            }
+
+            let mut bytes = 0_usize;
+            while let Some(item) = stream.next().await {
+                let chunk = match item {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        log_streaming(&format!("concurrent[{index}]: body failed: {error}"));
+                        return;
+                    }
+                };
+                bytes = bytes.saturating_add(chunk.len());
+            }
+            if bytes > 0 {
+                successes.set(successes.get().saturating_add(1));
+            } else {
+                log_streaming(&format!("concurrent[{index}]: empty response body"));
+            }
+        }));
+    }
+
+    edge_executor::block_on(executor.run(async {
+        for handle in handles {
+            handle.await;
+        }
+    }));
+
+    c_int::try_from(successes.get()).unwrap_or(c_int::MAX)
+}
+
+/// Backward-compatible three-stream entry point used by older test runners.
+///
+/// # Safety
+/// `url` must point to a valid NUL-terminated HTTPS URL.
+#[no_mangle]
+pub unsafe extern "C" fn claw_sys_selftest_run_three_streaming_posts(url: *const c_char) -> c_int {
+    claw_sys_selftest_run_streaming_posts(url, 3)
+}
+
 // ---------------------------------------------------------------------------
 // Resource profiling
 // ---------------------------------------------------------------------------

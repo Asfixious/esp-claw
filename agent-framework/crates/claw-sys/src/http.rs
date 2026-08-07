@@ -61,7 +61,7 @@ mod espidf_driver {
     use core::ffi::{c_char, c_int, c_void};
     use core::future::Future;
     use core::pin::Pin;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use core::task::{Context, Poll};
     use futures_lite::Stream;
     use std::ffi::CString;
@@ -72,23 +72,37 @@ mod espidf_driver {
     // `esp_err_t` sentinels from components/esp_common/include/esp_err.h.
     const ESP_OK: c_int = 0;
     const ESP_FAIL: c_int = -1;
-
     /// `esp_http_client_perform` return when the non-blocking request is still
     /// in progress (`ESP_ERR_HTTP_BASE + 7`, see `esp_http_client.h`).
     const ESP_ERR_HTTP_EAGAIN: c_int = 0x7007;
     const ERRNO_NONE: c_int = 0;
     const ERRNO_EAGAIN: c_int = 11;
     const ERRNO_EINPROGRESS: c_int = 115;
+    const TLS_WANT_READ: c_int = -0x6900;
+    const TLS_WANT_WRITE: c_int = -0x6880;
+    const ESP_LOG_ERROR: c_int = 1;
 
-    /// Per-`poll_next` drain caps for the streaming body. A single poll keeps
-    /// advancing `esp_http_client_perform` (non-blocking, so it never blocks the
-    /// cooperative executor) until the socket would block, the transfer
-    /// finishes, or one of these caps is hit. Draining more than one step per
-    /// poll keeps the SSE stream from being starved by the single-core
-    /// round-robin scheduler; the caps bound head-of-line blocking and the
-    /// transient body buffer so other tasks (other agents, UI, REPL) still run.
-    const MAX_STREAM_STEPS_PER_POLL: u32 = 8;
-    const MAX_STREAM_BYTES_PER_POLL: usize = 16 * 1024;
+    /// Give ESP-IDF's first async TCP-connect poll enough time to complete.
+    /// Its TLS transport reuses an `fd_set` after `select`; a timeout clears
+    /// that set, so an unrealistically tiny first poll can never make progress.
+    /// One second remains safely below the task watchdog window.
+    const HTTP_CONNECT_IO_TIMEOUT_MS: u32 = 1_000;
+    /// Once connected, each manual write/fetch/read step gets only a small
+    /// slice. `esp_http_client_read` preserves a no-data timeout as `-EAGAIN`,
+    /// so the stream can return `Pending` and let the Session rotate agents.
+    const HTTP_BODY_IO_SLICE_TIMEOUT_MS: u32 = 10;
+    /// Give FreeRTOS's idle and system tasks a real scheduling window after a
+    /// native async step reports that it would block.
+    const HTTP_RETRY_DELAY_MS: u64 = 1;
+    /// ESP-IDF's TLS/lwIP path becomes unstable when multiple long-lived LLM
+    /// SSE responses are driven concurrently on this target: sockets are reset
+    /// underneath otherwise independent `esp_http_client` handles. Keep the
+    /// Agents themselves concurrent, but admit one Rust LLM stream at a time.
+    /// Waiting is cooperative (`yield_once`), so the Session can continue to
+    /// poll every Agent and capability while the active stream makes progress.
+    const STREAM_LIMIT: usize = 1;
+    static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+    static HTTP_POLL_LOGS_FILTERED: AtomicBool = AtomicBool::new(false);
 
     // --- esp_http_client FFI ------------------------------------------------
     #[repr(C)]
@@ -106,7 +120,9 @@ mod espidf_driver {
     // ON_HEADERS_COMPLETE and ON_STATUS_CODE between ON_HEADER and ON_DATA.
     // `claw_rs_idf_compat.c` asserts every value consumed here so an SDK enum
     // change fails the firmware build instead of silently dropping body data.
+    const HTTP_EVENT_ON_CONNECTED: c_int = 1;
     const HTTP_EVENT_ON_HEADER: c_int = 3;
+    const HTTP_EVENT_ON_STATUS_CODE: c_int = 5;
     const HTTP_EVENT_ON_DATA: c_int = 6;
     const HTTP_EVENT_ON_FINISH: c_int = 7;
     const HTTP_METHOD_GET: c_int = 0;
@@ -195,19 +211,38 @@ mod espidf_driver {
         fn esp_http_client_set_timeout_ms(client: *mut c_void, timeout_ms: c_int) -> c_int;
         fn esp_http_client_delete_header(client: *mut c_void, key: *const c_char) -> c_int;
         fn esp_http_client_reset_redirect_counter(client: *mut c_void) -> c_int;
-        fn esp_http_client_cancel_request(client: *mut c_void) -> c_int;
         fn esp_http_client_perform(client: *mut c_void) -> c_int;
+        fn esp_http_client_open(client: *mut c_void, write_len: c_int) -> c_int;
+        fn esp_http_client_write(client: *mut c_void, data: *const c_char, len: c_int) -> c_int;
+        fn esp_http_client_fetch_headers(client: *mut c_void) -> i64;
+        fn esp_http_client_read(client: *mut c_void, data: *mut c_char, len: c_int) -> c_int;
+        fn esp_http_client_is_complete_data_received(client: *mut c_void) -> bool;
         fn esp_http_client_get_errno(client: *mut c_void) -> c_int;
         fn esp_http_client_get_status_code(client: *mut c_void) -> c_int;
         fn esp_http_client_close(client: *mut c_void) -> c_int;
         fn esp_http_client_cleanup(client: *mut c_void) -> c_int;
         fn esp_crt_bundle_attach(conf: *mut c_void) -> c_int;
         fn esp_err_to_name(err: c_int) -> *const c_char;
+        fn esp_log_level_set(tag: *const c_char, level: c_int);
+    }
+
+    fn filter_expected_poll_timeout_logs() {
+        if HTTP_POLL_LOGS_FILTERED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        unsafe {
+            // The manual state machine intentionally converts these native
+            // timeout paths to EAGAIN/Pending. ESP-IDF logs every such poll at
+            // WARN; suppress only those two tags while retaining real errors.
+            esp_log_level_set(c"HTTP_CLIENT".as_ptr(), ESP_LOG_ERROR);
+            esp_log_level_set(c"transport_base".as_ptr(), ESP_LOG_ERROR);
+        }
     }
 
     struct RequestCtx {
         body: Vec<u8>,
         abort: *const AtomicBool,
+        body_io_timeout_ms: c_int,
         // Status observed by a callback belonging to the current response.
         // `esp_http_client_get_status_code` itself may retain the previous
         // request's value while a reused connection is still sending headers.
@@ -225,9 +260,23 @@ mod espidf_driver {
             if !ctx.abort.is_null() && (*ctx.abort).load(Ordering::Relaxed) {
                 return ESP_FAIL;
             }
-            if matches!(evt.event_id, HTTP_EVENT_ON_HEADER | HTTP_EVENT_ON_DATA) {
-                ctx.response_status = esp_http_client_get_status_code(evt.client);
-                if evt.event_id == HTTP_EVENT_ON_DATA && evt.data_len > 0 {
+            if evt.event_id == HTTP_EVENT_ON_CONNECTED {
+                // The connect phase needs a wider first poll because of
+                // ESP-IDF's async-select behavior. Tighten subsequent request
+                // send/read operations as soon as that phase is complete.
+                let _ = esp_http_client_set_timeout_ms(evt.client, ctx.body_io_timeout_ms);
+            }
+            if matches!(
+                evt.event_id,
+                HTTP_EVENT_ON_HEADER | HTTP_EVENT_ON_STATUS_CODE | HTTP_EVENT_ON_DATA
+            ) {
+                let status = esp_http_client_get_status_code(evt.client);
+                ctx.response_status = status;
+                if evt.event_id == HTTP_EVENT_ON_DATA
+                    && evt.data_len > 0
+                    && !evt.data.is_null()
+                    && !is_intermediate_status(status)
+                {
                     let slice =
                         core::slice::from_raw_parts(evt.data as *const u8, evt.data_len as usize);
                     ctx.body.extend_from_slice(slice);
@@ -294,6 +343,22 @@ mod espidf_driver {
         })
     }
 
+    fn connect_io_timeout_ms(request_timeout_ms: u32) -> u32 {
+        if request_timeout_ms == 0 {
+            HTTP_CONNECT_IO_TIMEOUT_MS
+        } else {
+            request_timeout_ms.min(HTTP_CONNECT_IO_TIMEOUT_MS)
+        }
+    }
+
+    fn body_io_timeout_ms(request_timeout_ms: u32) -> u32 {
+        if request_timeout_ms == 0 {
+            HTTP_BODY_IO_SLICE_TIMEOUT_MS
+        } else {
+            request_timeout_ms.min(HTTP_BODY_IO_SLICE_TIMEOUT_MS)
+        }
+    }
+
     fn status_code_from_c_int(status: c_int) -> Result<HttpStatusCode, HttpError> {
         let status = u16::try_from(status).map_err(|_| {
             HttpError::RequestFailed(HttpRequestFailure::InvalidStatusCode { status })
@@ -303,12 +368,9 @@ mod espidf_driver {
 
     /// Wall-clock deadline for a whole `perform` loop.
     ///
-    /// `esp_http_client_set_timeout_ms` only bounds a single non-blocking poll,
-    /// not the overall request: after a mid-transfer transport failure (e.g. a
-    /// peer connection reset) `esp_http_client_perform` can keep reporting
-    /// `ESP_ERR_HTTP_EAGAIN` indefinitely, which would spin our step loop
-    /// forever. This deadline gives the loop an overall budget so it aborts
-    /// instead of hanging and flooding logs.
+    /// Overall wall-clock request deadline. The ESP-IDF client receives a much
+    /// shorter per-operation timeout so one TLS/socket step cannot monopolize a
+    /// FreeRTOS core for this entire duration.
     struct Deadline {
         limit: Option<Instant>,
     }
@@ -343,12 +405,12 @@ mod espidf_driver {
     }
 
     fn cancel_raw_request(client: *mut c_void) {
-        unsafe {
-            let err = esp_http_client_cancel_request(client);
-            if err != ESP_OK {
-                let _ = esp_http_client_close(client);
-            }
-        }
+        // ESP-IDF's `esp_http_client_cancel_request()` closes the socket and
+        // immediately starts a replacement connection. That is the opposite of
+        // what cancellation/drop needs and races TLS cleanup under multi-agent
+        // load. Closing is sufficient; the reusable handle reconnects lazily on
+        // the next request.
+        close_raw_connection(client);
     }
 
     fn close_raw_connection(client: *mut c_void) {
@@ -434,12 +496,14 @@ mod espidf_driver {
         /// Initialize a reusable async-mode keep-alive client. Per-request
         /// options are applied later by [`EspClient::prepare_request`].
         fn new(initial_url: &str) -> Result<EspClient, HttpError> {
+            filter_expected_poll_timeout_logs();
             // `url` is parsed/copied by `esp_http_client_init`; it only needs to
             // stay alive until that call returns.
             let url = CString::new(initial_url).map_err(|_| HttpError::InvalidUrl)?;
             let mut ctx = Box::new(RequestCtx {
                 body: Vec::with_capacity(4096),
                 abort: core::ptr::null(),
+                body_io_timeout_ms: HTTP_BODY_IO_SLICE_TIMEOUT_MS as c_int,
                 response_status: 0,
             });
 
@@ -451,9 +515,8 @@ mod espidf_driver {
             config.buffer_size_tx = 4096;
             config.crt_bundle_attach = Some(esp_crt_bundle_attach);
             // Reuse the underlying TCP/TLS connection across requests when the
-            // server allows it. `is_async` makes `perform` return EAGAIN between
-            // non-blocking steps; the blocking compatibility path below simply
-            // loops over those steps.
+            // server allows it. Async mode exposes EAGAIN between bounded native
+            // operations so the cooperative Session can rotate agents.
             config.keep_alive_enable = true;
             config.is_async = true;
 
@@ -551,7 +614,13 @@ mod espidf_driver {
             // `set_url` copies the string internally; it only needs to live for
             // the duration of the call.
             let url = CString::new(url).map_err(|_| HttpError::InvalidUrl)?;
-            let timeout_ms = timeout_to_c_int(timeout_ms)?;
+            // Preserve the API's range validation, but never hand the entire
+            // request lifetime to one native socket/TLS operation. In ESP-IDF
+            // async mode this timeout still governs individual transport
+            // reads and TLS-handshake polls.
+            let _ = timeout_to_c_int(timeout_ms)?;
+            let connect_timeout_ms = timeout_to_c_int(connect_io_timeout_ms(timeout_ms))?;
+            self.ctx.body_io_timeout_ms = timeout_to_c_int(body_io_timeout_ms(timeout_ms))?;
 
             unsafe {
                 check_client_call(
@@ -559,7 +628,7 @@ mod espidf_driver {
                     "esp_http_client_set_url",
                 )?;
                 check_client_call(
-                    esp_http_client_set_timeout_ms(self.raw, timeout_ms),
+                    esp_http_client_set_timeout_ms(self.raw, connect_timeout_ms),
                     "esp_http_client_set_timeout_ms",
                 )?;
                 check_client_call(
@@ -658,36 +727,6 @@ mod espidf_driver {
             }))
         }
 
-        /// Return the parsed response status once an event from this request's
-        /// final response has arrived. Reading the raw status directly is not
-        /// sufficient on a reused handle: it can briefly retain the previous
-        /// response's status during connect/send.
-        fn response_status(&self) -> Result<Option<HttpStatusCode>, HttpError> {
-            let status = self.ctx.response_status;
-            if status <= 0 || is_intermediate_status(status) {
-                return Ok(None);
-            }
-            status_code_from_c_int(status).map(Some)
-        }
-
-        /// Bytes currently accumulated by response-data callbacks but not yet
-        /// handed to the stream. Used to detect per-step progress while draining.
-        fn buffered_body_len(&self) -> usize {
-            self.ctx.body.len()
-        }
-
-        /// Move bytes collected by response-data callbacks out as one stream
-        /// item. The replacement buffer receives subsequent ESP-IDF callbacks.
-        fn take_body_chunk(&mut self) -> Option<Vec<u8>> {
-            if self.ctx.body.is_empty() {
-                return None;
-            }
-            Some(std::mem::replace(
-                &mut self.ctx.body,
-                Vec::with_capacity(4096),
-            ))
-        }
-
         /// Cancel the active transfer without destroying the reusable client
         /// handle. Best-effort: cancellation itself reports [`HttpError::Aborted`]
         /// to the caller even if the ESP-IDF helper says there was no active
@@ -742,7 +781,7 @@ mod espidf_driver {
                     Ok(Some(response)) => return Ok(response),
                     Ok(None) => {
                         started = true;
-                        std::thread::yield_now();
+                        std::thread::sleep(Duration::from_millis(HTTP_RETRY_DELAY_MS));
                     }
                     Err(error) => {
                         if abort.load(Ordering::Relaxed) {
@@ -868,11 +907,62 @@ mod espidf_driver {
                 }
             }
         }
+    }
 
-        /// Drive this persistent client through the send/header phase, then
-        /// lend it to [`EspHttpByteStream`] for the response body. The stream's
-        /// lifetime keeps the transport exclusively borrowed, so the same raw
-        /// `esp_http_client` handle serves both buffered and streaming requests.
+    fn stream_driver_error(operation: &'static str, message: impl Into<String>) -> HttpError {
+        HttpError::RequestFailed(HttpRequestFailure::driver(operation, message))
+    }
+
+    /// RAII slot for one complete streaming request, from connection setup
+    /// through the final SSE body byte. The Session retries acquisition
+    /// cooperatively, so waiting for the target's TLS budget never blocks the
+    /// executor thread.
+    struct StreamPermit;
+
+    impl StreamPermit {
+        fn try_acquire() -> Option<Self> {
+            let active = ACTIVE_STREAMS.load(Ordering::Acquire);
+            if active < STREAM_LIMIT
+                && ACTIVE_STREAMS
+                    .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                Some(Self)
+            } else {
+                None
+            }
+        }
+    }
+
+    impl Drop for StreamPermit {
+        fn drop(&mut self) {
+            let previous = ACTIVE_STREAMS.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
+        }
+    }
+
+    impl EspClient {
+        fn response_status(&self) -> Result<Option<HttpStatusCode>, HttpError> {
+            let status = self.ctx.response_status;
+            if status <= 0 || is_intermediate_status(status) {
+                return Ok(None);
+            }
+            status_code_from_c_int(status).map(Some)
+        }
+
+        fn take_body_chunk(&mut self) -> Option<Vec<u8>> {
+            if self.ctx.body.is_empty() {
+                return None;
+            }
+            Some(std::mem::replace(
+                &mut self.ctx.body,
+                Vec::with_capacity(4096),
+            ))
+        }
+
+        /// Drive open/write/fetch as bounded native operations. EAGAIN yields to
+        /// the Session; the returned stream continues with one bounded read per
+        /// `poll_next` and keeps this client exclusively borrowed.
         async fn begin_streaming<'a>(
             &'a mut self,
             request: &HttpJsonRequest<'_>,
@@ -882,101 +972,183 @@ mod espidf_driver {
                 return Err(HttpError::Aborted);
             }
 
-            let deadline = Deadline::new(request.timeout_ms);
-            let mut retried_after_close = false;
-
-            'connection: loop {
+            let mut stream_permit = None;
+            while stream_permit.is_none() {
                 if cancel.is_cancelled() {
                     return Err(HttpError::Aborted);
                 }
-                if deadline.expired() {
-                    return Err(timeout_error(request.timeout_ms));
-                }
-
-                let request_body = self.prepare_request(request, core::ptr::null())?;
-                let mut active = ActiveRequestGuard::new(self.raw);
-
-                loop {
-                    if cancel.is_cancelled() {
-                        active.cancel();
-                        return Err(HttpError::Aborted);
-                    }
-                    if deadline.expired() {
-                        active.cancel();
-                        return Err(timeout_error(request.timeout_ms));
-                    }
-
-                    match self.perform_raw_step() {
-                        Ok(complete) => {
-                            if !complete {
-                                active.mark_started();
-                            }
-
-                            if let Some(status) = self.response_status()? {
-                                active.finish();
-                                drop(active);
-                                return Ok((
-                                    status,
-                                    EspHttpByteStream {
-                                        conn: self,
-                                        _request_body: request_body,
-                                        deadline,
-                                        timeout_ms: request.timeout_ms,
-                                        cancel,
-                                        transfer_complete: complete,
-                                        terminated: false,
-                                    },
-                                ));
-                            }
-
-                            if complete {
-                                active.finish();
-                                return Err(HttpError::RequestFailed(HttpRequestFailure::driver(
-                                    "esp_http_client_perform",
-                                    "response completed without a final HTTP status",
-                                )));
-                            }
-                        }
-                        Err(error) => {
-                            if !retried_after_close && matches!(error, HttpError::RequestFailed(_))
-                            {
-                                // Recover a stale keep-alive socket without
-                                // allocating another client handle.
-                                self.close_failed_connection(&error);
-                                active.finish();
-                                drop(request_body);
-                                drop(active);
-                                retried_after_close = true;
-                                continue 'connection;
-                            }
-                            self.close_failed_connection(&error);
-                            active.finish();
-                            return Err(error);
-                        }
-                    }
-
+                stream_permit = StreamPermit::try_acquire();
+                if stream_permit.is_none() {
                     yield_once().await;
+                }
+            }
+
+            // Admission wait is bounded by the owning Agent/subagent cancel
+            // token. Start the per-request network deadline only after this
+            // request owns the single hardware stream slot; otherwise a queued
+            // Agent could consume its whole HTTP timeout without touching the
+            // network.
+            let deadline = Deadline::new(request.timeout_ms);
+            let mut retried_after_close = false;
+            'connection: loop {
+                let request_body = self.prepare_request(request, core::ptr::null())?;
+                let body_len = body_len_to_c_int(request.body.len())?;
+                let mut active = ActiveRequestGuard::new(self.raw);
+                active.mark_started();
+
+                let begin_result: Result<HttpStatusCode, HttpError> = async {
+                    loop {
+                        if cancel.is_cancelled() {
+                            return Err(HttpError::Aborted);
+                        }
+                        if deadline.expired() {
+                            return Err(timeout_error(request.timeout_ms));
+                        }
+                        let result = unsafe { esp_http_client_open(self.raw, body_len) };
+                        if result == ESP_OK {
+                            check_client_call(
+                                unsafe {
+                                    esp_http_client_set_timeout_ms(
+                                        self.raw,
+                                        self.ctx.body_io_timeout_ms,
+                                    )
+                                },
+                                "esp_http_client_set_timeout_ms",
+                            )?;
+                            break;
+                        }
+                        if result != ESP_ERR_HTTP_EAGAIN {
+                            return Err(stream_driver_error(
+                                "esp_http_client_open",
+                                err_name(result),
+                            ));
+                        }
+                        yield_once().await;
+                    }
+
+                    let body_bytes = request_body.as_bytes();
+                    let mut body_offset = 0usize;
+                    while body_offset < body_bytes.len() {
+                        if cancel.is_cancelled() {
+                            return Err(HttpError::Aborted);
+                        }
+                        if deadline.expired() {
+                            return Err(timeout_error(request.timeout_ms));
+                        }
+                        let remaining = body_bytes.len() - body_offset;
+                        let remaining = c_int::try_from(remaining).map_err(|_| {
+                            HttpError::RequestFailed(HttpRequestFailure::BodyTooLarge {
+                                len: body_bytes.len(),
+                            })
+                        })?;
+                        let written = unsafe {
+                            esp_http_client_write(
+                                self.raw,
+                                body_bytes.as_ptr().add(body_offset).cast(),
+                                remaining,
+                            )
+                        };
+                        if written > 0 {
+                            body_offset += written as usize;
+                            continue;
+                        }
+                        if written == 0
+                            || written == -ESP_ERR_HTTP_EAGAIN
+                            || written == TLS_WANT_READ
+                            || written == TLS_WANT_WRITE
+                        {
+                            yield_once().await;
+                            continue;
+                        }
+                        return Err(stream_driver_error(
+                            "esp_http_client_write",
+                            format!("write returned {written}"),
+                        ));
+                    }
+
+                    loop {
+                        if cancel.is_cancelled() {
+                            return Err(HttpError::Aborted);
+                        }
+                        if deadline.expired() {
+                            return Err(timeout_error(request.timeout_ms));
+                        }
+                        let result = unsafe { esp_http_client_fetch_headers(self.raw) };
+                        if result >= 0 {
+                            break;
+                        }
+                        if result != -i64::from(ESP_ERR_HTTP_EAGAIN) {
+                            return Err(stream_driver_error(
+                                "esp_http_client_fetch_headers",
+                                format!("fetch returned {result}"),
+                            ));
+                        }
+                        yield_once().await;
+                    }
+
+                    self.response_status()?.ok_or_else(|| {
+                        stream_driver_error(
+                            "esp_http_client_fetch_headers",
+                            "response headers completed without a final HTTP status",
+                        )
+                    })
+                }
+                .await;
+
+                match begin_result {
+                    Ok(status) => {
+                        active.finish();
+                        return Ok((
+                            status,
+                            EspHttpByteStream {
+                                conn: self,
+                                _request_body: request_body,
+                                _stream_permit: stream_permit
+                                    .take()
+                                    .expect("stream permit held until body completion"),
+                                deadline,
+                                timeout_ms: request.timeout_ms,
+                                cancel,
+                                transfer_complete: false,
+                                terminated: false,
+                                read_buffer: [0; 4096],
+                            },
+                        ));
+                    }
+                    Err(error) => {
+                        self.close_failed_connection(&error);
+                        active.finish();
+                        drop(active);
+                        drop(request_body);
+                        if !retried_after_close
+                            && matches!(error, HttpError::RequestFailed(_))
+                            && !deadline.expired()
+                        {
+                            retried_after_close = true;
+                            continue 'connection;
+                        }
+                        return Err(error);
+                    }
                 }
             }
         }
     }
 
-    /// ESP-IDF response-body stream borrowing [`EspIdfHttp`]'s sole client.
-    ///
-    /// Each poll advances `esp_http_client_perform` by one non-blocking step and
-    /// yields bytes delivered by its data callback. Dropping an unfinished
-    /// stream closes the active connection and releases the transport borrow.
+    /// ESP-IDF response-body stream borrowing the Agent's persistent client.
     pub struct EspHttpByteStream<'a> {
         conn: &'a mut EspClient,
-        // `esp_http_client_set_post_field` retains this allocation's pointer for
-        // the whole transfer. `Drop` closes the connection before this field is
-        // released.
+        // `esp_http_client_set_post_field` retains this allocation's pointer
+        // until the request has finished or its connection is closed.
         _request_body: CString,
+        // Retain hardware admission until success, error, cancellation, or
+        // early stream drop releases the complete SSE request.
+        _stream_permit: StreamPermit,
         deadline: Deadline,
         timeout_ms: u32,
         cancel: Cancel<'a>,
         transfer_complete: bool,
         terminated: bool,
+        read_buffer: [u8; 4096],
     }
 
     impl EspHttpByteStream<'_> {
@@ -985,6 +1157,19 @@ mod espidf_driver {
             self.transfer_complete = true;
             self.terminated = true;
             Poll::Ready(Some(Err(error)))
+        }
+
+        fn finish_transfer(&mut self) -> Result<(), HttpError> {
+            match self.conn.perform_raw_step()? {
+                true => {
+                    self.transfer_complete = true;
+                    Ok(())
+                }
+                false => Err(stream_driver_error(
+                    "esp_http_client_perform",
+                    "response was complete but finalization returned EAGAIN",
+                )),
+            }
         }
     }
 
@@ -1010,52 +1195,49 @@ mod espidf_driver {
                 return this.fail(timeout_error(this.timeout_ms));
             }
 
-            // Drain as much as the non-blocking transport currently offers,
-            // instead of a single step per poll. Stops when the transfer
-            // finishes, a step yields no new bytes (socket would block now), or
-            // a per-poll cap is reached. Cancel/deadline are re-checked each
-            // iteration so long drains stay responsive.
-            let mut steps: u32 = 0;
-            loop {
-                let before = this.conn.buffered_body_len();
-                match this.conn.perform_raw_step() {
-                    Ok(complete) => this.transfer_complete = complete,
-                    Err(error) => return this.fail(error),
+            if unsafe { esp_http_client_is_complete_data_received(this.conn.raw) } {
+                if let Err(error) = this.finish_transfer() {
+                    return this.fail(error);
                 }
-                steps += 1;
-                let buffered = this.conn.buffered_body_len();
-
-                if this.transfer_complete {
-                    break;
-                }
-                // No new bytes this step: the transport can make no further
-                // progress right now, so stop and yield.
-                if buffered == before {
-                    break;
-                }
-                if steps >= MAX_STREAM_STEPS_PER_POLL || buffered >= MAX_STREAM_BYTES_PER_POLL {
-                    break;
-                }
-                if this.cancel.is_cancelled() {
-                    return this.fail(HttpError::Aborted);
-                }
-                if this.deadline.expired() {
-                    return this.fail(timeout_error(this.timeout_ms));
-                }
-            }
-
-            if let Some(chunk) = this.conn.take_body_chunk() {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            if this.transfer_complete {
                 this.terminated = true;
                 return Poll::Ready(None);
             }
 
-            // The transport made as much progress as it currently allows.
-            // Cooperatively yield before the next drain.
-            cx.waker().wake_by_ref();
-            Poll::Pending
+            // One call drains up to 4 KiB but waits at most the 10 ms body I/O
+            // slice. A no-data timeout becomes -EAGAIN, so this poll returns
+            // Pending and the Session can poll another Agent.
+            let read = unsafe {
+                esp_http_client_read(
+                    this.conn.raw,
+                    this.read_buffer.as_mut_ptr().cast(),
+                    this.read_buffer.len() as c_int,
+                )
+            };
+            if read > 0 {
+                if let Some(chunk) = this.conn.take_body_chunk() {
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if read == -ESP_ERR_HTTP_EAGAIN {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if read == 0 && unsafe { esp_http_client_is_complete_data_received(this.conn.raw) } {
+                if let Err(error) = this.finish_transfer() {
+                    return this.fail(error);
+                }
+                this.terminated = true;
+                return Poll::Ready(None);
+            }
+            let transport_errno = unsafe { esp_http_client_get_errno(this.conn.raw) };
+            this.fail(stream_driver_error(
+                "esp_http_client_read",
+                format!(
+                    "read returned {read} before completion (transport errno={transport_errno})"
+                ),
+            ))
         }
     }
 

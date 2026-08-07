@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use claw_agent::{
     stream::StreamPart, AgentError, AgentPersistenceConfig, AgentSystem, ApiPurpose,
@@ -18,7 +18,7 @@ use claw_agent::{
     SessionPersistence, SessionStream, TurnEvent, TurnOrigin,
 };
 use claw_api::{BackendKind, ClawApiConfig};
-use claw_interface::{Cancel, ClawThread, ClawTimer, CoreAffinity, Priority};
+use claw_interface::{ClawThread, CoreAffinity, Priority};
 #[cfg(feature = "rich_logging")]
 use claw_log::TracingConfig;
 #[cfg(feature = "prod_logging")]
@@ -26,7 +26,6 @@ use claw_log::{LevelFilter, LogOutput};
 use claw_sys::{EspIdfExecutor, EspIdfFs, EspIdfHttp, EspIdfThread, EspIdfTimer};
 
 use futures_core::Stream;
-use futures_lite::StreamExt;
 
 use crate::abi::{
     ClawAgentApiConfig, ClawAgentConfig, ClawAgentErrorEvent, ClawAgentEvent, ClawAgentEventData,
@@ -48,7 +47,7 @@ use crate::abi::{
 };
 #[cfg(feature = "cache_profile")]
 use crate::abi::{ClawAgentUsageEvent, CLAW_AGENT_EVENT_KIND_USAGE};
-use crate::tool::capability_tool_groups;
+use crate::tool::{capability_tool_groups, CapabilityExecutor};
 
 /// The device agent runtime. `AgentSystem` is now backend-erased and
 /// `Send + Sync` (its `Orchestrator` handle owns the drive worker), so it is held
@@ -332,7 +331,8 @@ fn build_agent(
     api: Option<ClawApiConfig>,
     persistence: AgentPersistenceConfig,
 ) -> Result<DeviceAgent, CabiError> {
-    let tool_groups = capability_tool_groups(RUST_OWNED_CAPABILITY_GROUPS)?;
+    let capability_executor = CapabilityExecutor::new()?;
+    let tool_groups = capability_tool_groups(RUST_OWNED_CAPABILITY_GROUPS, capability_executor)?;
     let agent = DeviceAgent::with_tool_groups::<EspIdfThread, EspIdfExecutor>(
         EspIdfFs,
         persistence,
@@ -585,28 +585,28 @@ fn next_ready(stream: &mut SessionStream) -> Option<SessionStreamItem> {
 /// (the stream is retained for a later `receive`). An unexpected stream end is
 /// surfaced as the terminal [`SessionError::RuntimeStopped`].
 fn next_within(stream: &mut SessionStream, timeout_ms: u32) -> Option<SessionStreamItem> {
-    let abort = AtomicBool::new(false);
-    let mut timer = EspIdfTimer;
-    futures_lite::future::block_on(async {
-        let pull = async {
-            Some(
-                stream
-                    .next()
-                    .await
-                    .unwrap_or(Err(SessionError::RuntimeStopped)),
-            )
-        };
-        let timeout = async {
-            let _ = timer
-                .sleep(
-                    Duration::from_millis(u64::from(timeout_ms)),
-                    Cancel::new(&abort),
-                )
-                .await;
-            None::<SessionStreamItem>
-        };
-        futures_lite::future::or(pull, timeout).await
-    })
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let timeout = Duration::from_millis(u64::from(timeout_ms));
+    let started = Instant::now();
+    loop {
+        if let Some(event) = next_ready(stream) {
+            return Some(event);
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return None;
+        }
+
+        // This FFI entrypoint runs on one C event-pump task per open Session.
+        // Polling with a no-op waker avoids repeatedly racing and cancelling a
+        // `stream.next()` future against an ESP timer. It also keeps short-lived
+        // block_on/timer wake state out of async-channel's retained listener
+        // across FFI calls. Sleeping here blocks only this Session's C pump
+        // task; the Rust Session executor and other Agents continue.
+        std::thread::sleep(POLL_INTERVAL.min(timeout - elapsed));
+    }
 }
 
 fn get_open_session(session_id: u32) -> Result<Option<Arc<OpenSession>>, CabiError> {

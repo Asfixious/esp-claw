@@ -1,5 +1,9 @@
 # Name,   Type, SubType, Offset,   Size
-# Larger factory app: Rust std + TLS + Wi-Fi outgrow the default single-app layout.
-nvs,      data, nvs,     0x9000,   0x6000
-phy_init, data, phy,     0xf000,   0x1000
-factory,  app,  factory, 0x10000,  0x200000
+# Match edge_agent exactly. This lets the selftest image temporarily run from
+# ota_0 without treating edge_agent's 0x9000 partition table as its NVS.
+nvs,      data, nvs,     0xa000,   0x6000
+otadata,  data, ota,     0x10000,  0x2000
+phy_init, data, phy,     0x12000,  0x1000
+ota_0,    app,  ota_0,   0x20000,  0x3b6000
+system,   data, fat,     0x3d6000, 0x28a000
+storage,  data, fat,     0x660000, 0x1a0000

@@ -33,6 +33,9 @@ claw-interface = { path = "../claw-interface" }
 claw-log = { path = "../claw-log", default-features = false }
 claw-sys = { path = "../claw-sys" }
 claw-tool = { path = "../claw-tool" }
+# Capability calls execute on a dedicated worker and complete their async tool
+# futures through a one-shot result channel.
+futures-channel = "0.3"
 # The `Stream` trait so `receive` can poll a submission's event stream directly.
 futures-core = "0.3"
 # `block_on`, `StreamExt`, and `future::or` drive the bounded, timed drain of a

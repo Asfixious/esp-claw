@@ -2,15 +2,38 @@
 # main task for a while during a single Unity case.
 # CONFIG_ESP_TASK_WDT_INIT is not set
 
-# Custom partition table with a large factory app (Rust std + TLS + Wi-Fi).
+# Custom partition table matching edge_agent, with room for Rust std + TLS.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x9000
 
-# The partition table needs >2MB; use 4MB flash (matches most esp32s3 devkits).
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# Keep the hardware layout identical to edge_agent while running this image.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Use the board's USB-Serial/JTAG port as the primary console so automated
+# Unity runs can both read logs and submit test filters through /dev/ttyACM*.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Match the ESP32-S3 board used by edge_agent. Streaming HTTP workers need
+# external stacks so concurrent TLS handshakes do not exhaust internal RAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 
 # The Rust esp_http_client driver attaches the cert bundle for HTTPS.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# Streaming HTTP stress tests create multiple TLS clients concurrently. Match
+# edge_agent's mbedTLS locking configuration so PSA/key and allocator state are
+# protected across the worker threads.
+CONFIG_MBEDTLS_THREADING_C=y
+CONFIG_MBEDTLS_THREADING_PTHREAD=y
 
 # Unity cases (sync TLS POST, three concurrent async TLS POSTs) run on the main
 # task; give it headroom for the deepest mbedTLS call.

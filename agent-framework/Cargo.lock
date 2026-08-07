@@ -323,6 +323,7 @@ dependencies = [
  "claw-log",
  "claw-sys",
  "claw-tool",
+ "futures-channel",
  "futures-core",
  "futures-lite 2.6.1",
  "log",

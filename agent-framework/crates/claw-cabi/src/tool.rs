@@ -1,11 +1,17 @@
 use core::ffi::{c_char, CStr};
 use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
+use claw_interface::{ClawThread, CoreAffinity, Priority, WorkerHandle};
+use claw_sys::EspIdfThread;
 use claw_tool::{
-    RetryCount, SyncToolHandler, Tool, ToolError, ToolGroup, ToolInvocation, ToolInvokeError,
-    ToolOutput, ToolResult, ToolSpec,
+    AsyncToolHandler, RetryCount, Tool, ToolError, ToolFuture, ToolGroup, ToolInvocation,
+    ToolInvokeError, ToolOutput, ToolResult, ToolSpec,
 };
+use futures_channel::oneshot;
 use serde_json::json;
 
 use crate::abi::{
@@ -15,6 +21,11 @@ use crate::abi::{
     TOOL_OUTPUT_CAPACITY,
 };
 
+const CAPABILITY_EXECUTOR_STACK_SIZE: usize = 32 * 1024;
+const CAPABILITY_EXECUTOR_QUEUE_CAPACITY: usize = 8;
+
+type CapabilityJob = Box<dyn FnOnce() + Send + 'static>;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CapToolError {
     #[error("invalid capability registry list")]
@@ -23,10 +34,13 @@ pub(crate) enum CapToolError {
     InvalidDescriptor,
     #[error("invalid capability schema: {0}")]
     InvalidSchema(String),
+    #[error("failed to start capability executor: {0}")]
+    ExecutorSpawn(#[source] std::io::Error),
 }
 
 pub(crate) fn capability_tool_groups(
     filtered_group_ids: &[&str],
+    executor: CapabilityExecutor,
 ) -> Result<Vec<ToolGroup>, CapToolError> {
     let list = unsafe { claw_cap_list() };
     if list.count > 0 && list.items.is_null() {
@@ -50,7 +64,10 @@ pub(crate) fn capability_tool_groups(
         groups
             .entry(group_id)
             .or_default()
-            .push(Tool::from_sync(CapTool::try_from(descriptor)?));
+            .push(Tool::from_async(CapTool::try_from(
+                descriptor,
+                executor.clone(),
+            )?));
     }
     Ok(groups
         .into_iter()
@@ -97,14 +114,125 @@ fn descriptor_group_id(descriptor: &ClawCapDescriptor) -> Result<String, CapTool
         .ok_or(CapToolError::InvalidDescriptor)
 }
 
+/// Runs the synchronous C capability ABI away from the cooperative Session
+/// executor. Tool futures enqueue owned calls and await a one-shot result, so
+/// polling one capability can never park every Session/Agent behind a blocking
+/// `execute` implementation such as `esp_http_client_perform`.
+#[derive(Clone)]
+pub(crate) struct CapabilityExecutor {
+    inner: Arc<CapabilityExecutorInner>,
+}
+
+struct CapabilityExecutorInner {
+    sender: mpsc::SyncSender<CapabilityJob>,
+    stopping: Arc<AtomicBool>,
+    worker: Mutex<Option<WorkerHandle>>,
+}
+
+impl CapabilityExecutor {
+    pub(crate) fn new() -> Result<Self, CapToolError> {
+        let (sender, receiver) =
+            mpsc::sync_channel::<CapabilityJob>(CAPABILITY_EXECUTOR_QUEUE_CAPACITY);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
+        let worker = EspIdfThread::spawn_worker(
+            "claw_cap_exec",
+            CAPABILITY_EXECUTOR_STACK_SIZE,
+            Priority::Low,
+            CoreAffinity::Any,
+            move || {
+                log::info!("Capability executor started");
+                while let Ok(job) = receiver.recv() {
+                    if worker_stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    job();
+                }
+                log::info!("Capability executor stopped");
+            },
+        )
+        .map_err(CapToolError::ExecutorSpawn)?;
+
+        Ok(Self {
+            inner: Arc::new(CapabilityExecutorInner {
+                sender,
+                stopping,
+                worker: Mutex::new(Some(worker)),
+            }),
+        })
+    }
+
+    fn submit(&self, name: String, arguments_json: String) -> ToolFuture<'static> {
+        let executor = self.clone();
+        Box::pin(async move {
+            let (sender, receiver) = oneshot::channel();
+            let capability_name = name.clone();
+            let job: CapabilityJob = Box::new(move || {
+                if sender.is_canceled() {
+                    log::info!("Capability call skipped after cancellation: {capability_name}");
+                    return;
+                }
+                let started = Instant::now();
+                log::info!("Capability call started: {capability_name}");
+                let result = call_capability(&capability_name, &arguments_json);
+                log::info!(
+                    "Capability call finished: {capability_name} ok={} elapsed_ms={}",
+                    result.is_ok(),
+                    started.elapsed().as_millis()
+                );
+                let _ = sender.send(result);
+            });
+
+            executor
+                .inner
+                .sender
+                .try_send(job)
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => ToolError::InvokeRejected(format!(
+                        "capability executor queue is full for {name}"
+                    )),
+                    mpsc::TrySendError::Disconnected(_) => ToolError::InvokeRejected(format!(
+                        "capability executor is not available for {name}"
+                    )),
+                })?;
+
+            match receiver.await {
+                Ok(result) => result,
+                Err(_) => Err(ToolError::InvokeRejected(format!(
+                    "capability executor exited before {name} completed"
+                ))
+                .into()),
+            }
+        })
+    }
+}
+
+impl Drop for CapabilityExecutorInner {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        // Wake a worker blocked on `recv`; it observes `stopping` before
+        // executing this no-op or any call still queued behind the active one.
+        let _ = self.sender.try_send(Box::new(|| {}));
+        if let Ok(worker) = self.worker.get_mut() {
+            if let Some(worker) = worker.take() {
+                worker.join();
+            }
+        }
+    }
+}
+
 struct CapTool {
     name: String,
     schema: String,
     usage: Option<String>,
+    executor: CapabilityExecutor,
 }
 
 impl CapTool {
-    fn try_from(descriptor: &ClawCapDescriptor) -> Result<Self, CapToolError> {
+    fn try_from(
+        descriptor: &ClawCapDescriptor,
+        executor: CapabilityExecutor,
+    ) -> Result<Self, CapToolError> {
         let name = c_string(descriptor.name)
             .or_else(|| c_string(descriptor.id))
             .ok_or(CapToolError::InvalidDescriptor)?;
@@ -129,6 +257,7 @@ impl CapTool {
             name,
             schema,
             usage: description,
+            executor,
         })
     }
 }
@@ -151,12 +280,14 @@ impl ToolSpec for CapTool {
     }
 }
 
-impl SyncToolHandler for CapTool {
-    fn invoke(&self, call: &ToolInvocation) -> ToolResult<ToolOutput> {
+impl AsyncToolHandler for CapTool {
+    fn invoke<'a>(&'a self, call: &'a ToolInvocation) -> ToolFuture<'a> {
         if call.name() != self.name {
-            return Err(ToolError::NotFound(call.name().to_owned()).into());
+            let name = call.name().to_owned();
+            return Box::pin(async move { Err(ToolError::NotFound(name).into()) });
         }
-        call_capability(&self.name, call.arguments_json())
+        self.executor
+            .submit(self.name.clone(), call.arguments_json().to_owned())
     }
 }
 

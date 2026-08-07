@@ -10,15 +10,15 @@ use super::address::{RpcAddress, RpcAddressError};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
 use super::lane::{LaneAcquire, LaneIo, LaneReader, LaneWriter, RpcLaneStorage};
 use super::typed::{
-    RpcHandler, RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode, TypedProvider,
+    HandlerAdapter, RpcHandler, RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode,
 };
 
 /// Request or response side of one full-duplex RPC lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RpcDirection {
-    /// Data sent from caller to provider.
+    /// Data sent from caller to handler.
     Request,
-    /// Data sent from provider to caller.
+    /// Data sent from handler to caller.
     Response,
 }
 
@@ -27,7 +27,7 @@ pub type RpcResult<T> = Result<T, RpcError>;
 
 pub(crate) type RpcFuture<'a> = Pin<Box<dyn Future<Output = RpcResult<()>> + 'a>>;
 
-pub(crate) trait RpcProvider {
+pub(crate) trait ErasedRpcHandler {
     fn call<'a>(
         &'a self,
         context: RpcContext,
@@ -36,9 +36,9 @@ pub(crate) trait RpcProvider {
     ) -> RpcFuture<'a>;
 }
 
-/// Task-local registry that resolves RPC addresses to providers.
+/// Task-local registry that resolves RPC addresses to handlers.
 ///
-/// The registry uses [`Rc`] and deliberately does not require providers or
+/// The registry uses [`Rc`] and deliberately does not require handlers or
 /// futures to be `Send`. It is intended to run inside Event Router's
 /// cooperative executor thread. Root calls wait when every lane is active;
 /// nested calls fail instead of waiting when doing so could deadlock.
@@ -85,7 +85,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         }
     }
 
-    /// Registers a provider for method `M`.
+    /// Registers a handler for method `M`.
     ///
     /// The method descriptor is retained with the endpoint so typed clients can
     /// reject request, response, or cardinality mismatches before payload IO.
@@ -183,17 +183,17 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         }
         let descriptor = RpcMethodDescriptor::for_method::<Method>()?;
         let address = descriptor.address().clone();
-        self.register_provider(
+        self.insert_handler(
             address,
-            Rc::new(TypedProvider::<Method, H>::new(handler)),
+            Rc::new(HandlerAdapter::<Method, H>::new(handler)),
             descriptor,
         )
     }
 
-    fn register_provider(
+    fn insert_handler(
         &self,
         address: RpcAddress,
-        provider: Rc<dyn RpcProvider>,
+        handler: Rc<dyn ErasedRpcHandler>,
         descriptor: RpcMethodDescriptor,
     ) -> RpcResult<RpcRegistration> {
         if self.endpoints.borrow().contains_key(&address) {
@@ -208,7 +208,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
             address,
             EndpointEntry {
                 endpoint_id,
-                provider,
+                handler,
                 descriptor,
             },
         );
@@ -217,7 +217,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
 
     /// Unregisters the exact endpoint instance represented by `registration`.
     ///
-    /// Calls already in flight retain their provider and may finish normally.
+    /// Calls already in flight retain their handler and may finish normally.
     ///
     /// # Errors
     ///
@@ -323,7 +323,7 @@ fn take_identifier(next: &Cell<u64>) -> RpcResult<u64> {
 #[derive(Clone)]
 struct EndpointEntry {
     endpoint_id: RpcEndpointId,
-    provider: Rc<dyn RpcProvider>,
+    handler: Rc<dyn ErasedRpcHandler>,
     descriptor: RpcMethodDescriptor,
 }
 
@@ -358,7 +358,7 @@ impl AcquiredCall {
     pub(crate) fn start(self, input: LaneReader, output: LaneWriter) -> RpcFuture<'static> {
         let endpoint = self.endpoint;
         let context = self.context;
-        Box::pin(async move { endpoint.provider.call(context, input, output).await })
+        Box::pin(async move { endpoint.handler.call(context, input, output).await })
     }
 }
 
@@ -376,7 +376,7 @@ impl RpcClient {
     ///
     /// The one method selects its input and output shape through `M`; callers do
     /// not choose between separate unary and streaming entry points. The
-    /// returned future or stream drives request encoding, provider execution,
+    /// returned future or stream drives request encoding, handler execution,
     /// and response decoding together. Transport/runtime failures use the outer
     /// [`RpcResult`]; successful transport yields the Method's typed
     /// `Result<Response, Error>` as zero-copy frames.
@@ -426,10 +426,10 @@ pub enum RpcError {
     /// Address parsing failed at an API boundary.
     #[error(transparent)]
     Address(#[from] RpcAddressError),
-    /// A second provider attempted to occupy an existing address.
+    /// A second handler attempted to occupy an existing address.
     #[error("RPC endpoint is already registered: {0}")]
     AlreadyRegistered(RpcAddress),
-    /// No provider currently owns the requested address.
+    /// No handler currently owns the requested address.
     #[error("RPC endpoint not found: {0}")]
     NotFound(RpcAddress),
     /// An endpoint attempted to synchronously invoke itself.

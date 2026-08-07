@@ -93,7 +93,7 @@ async fn run() -> RpcResult<()> {
 
     registry.register::<CallsItself, _>(
         |context: RpcContext, request: RpcFrame<Number>| async move {
-            // This resolves to DirectSelfCall before another provider future starts.
+            // This resolves to DirectSelfCall before another handler future starts.
             let frame = success(
                 context
                     .client()
@@ -112,7 +112,7 @@ async fn run() -> RpcResult<()> {
     let self_call = client.call::<CallsItself>(Number { value: 1 })?.await;
     assert!(matches!(self_call, Err(RpcError::DirectSelfCall(_))));
 
-    // Starting a call retains its exact provider instance. Unregistering the
+    // Starting a call retains its exact handler instance. Unregistering the
     // endpoint rejects new calls but does not cancel the in-flight call.
     let in_flight = client.call::<Increment>(Number { value: 20 })?;
     registry.unregister(&increment_registration)?;

@@ -11,7 +11,7 @@ use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use super::frame::{write_frame, write_method_error_frame, FramedReader, OutcomeReader, RpcFrame};
 use super::lane::{LaneReader, LaneWriter, LANE_FRAME_ALIGNMENT};
-use super::registry::{PreparedCall, RpcFuture, RpcProvider};
+use super::registry::{ErasedRpcHandler, PreparedCall, RpcFuture};
 use super::{RpcAddress, RpcContext, RpcError, RpcResult};
 
 mod private {
@@ -91,13 +91,13 @@ pub trait RpcMethod: 'static {
     /// Stable runtime address in `group.method` form.
     const ADDRESS: &'static str;
 
-    /// Message carried from caller to provider.
+    /// Message carried from caller to handler.
     type Request: RpcMessage;
 
-    /// Message carried from provider to caller.
+    /// Message carried from handler to caller.
     type Response: RpcMessage;
 
-    /// Method-specific error carried from provider to caller.
+    /// Method-specific error carried from handler to caller.
     type Error: RpcMessage;
 
     /// Request-side cardinality.
@@ -107,7 +107,7 @@ pub trait RpcMethod: 'static {
     type Output: RpcOutputMode<Self::Response, Self::Error>;
 }
 
-/// Runtime descriptor used to reject typed client/provider mismatches before IO.
+/// Runtime descriptor used to reject client/handler mismatches before IO.
 #[derive(Clone, CopyGetters, Debug, Getters, PartialEq, Eq)]
 pub(crate) struct RpcMethodDescriptor {
     #[getset(get = "pub(crate)")]
@@ -163,7 +163,7 @@ impl RpcMethodDescriptor {
 
 struct ActiveCall {
     input: RpcFuture<'static>,
-    provider: RpcFuture<'static>,
+    handler: RpcFuture<'static>,
     response: LaneReader,
 }
 
@@ -186,17 +186,17 @@ where
             let mut acquired = prepared.acquire().await?;
             let lane = acquired.take_lane()?;
             let input = encode_stream(input, lane.request_writer);
-            let provider = acquired.start(lane.request_reader, lane.response_writer);
+            let handler = acquired.start(lane.request_reader, lane.response_writer);
             Ok(ActiveCall {
                 input,
-                provider,
+                handler,
                 response: lane.response_reader,
             })
         }),
     }
 }
 
-/// Boxed task-local future returned by a typed provider implementation.
+/// Boxed task-local future returned by a handler implementation.
 pub type RpcHandlerFuture<'a, T> = Pin<Box<dyn Future<Output = RpcResult<T>> + 'a>>;
 
 /// Input type received by a handler for method `M`.
@@ -428,12 +428,12 @@ where
     })
 }
 
-pub(crate) struct TypedProvider<M, H> {
+pub(crate) struct HandlerAdapter<M, H> {
     handler: H,
     method: PhantomData<fn() -> M>,
 }
 
-impl<M, H> TypedProvider<M, H> {
+impl<M, H> HandlerAdapter<M, H> {
     pub(crate) fn new(handler: H) -> Self {
         Self {
             handler,
@@ -442,7 +442,7 @@ impl<M, H> TypedProvider<M, H> {
     }
 }
 
-impl<M, H> RpcProvider for TypedProvider<M, H>
+impl<M, H> ErasedRpcHandler for HandlerAdapter<M, H>
 where
     M: RpcMethod,
     H: RpcHandler<M>,
@@ -465,7 +465,7 @@ where
 struct CallDriver {
     setup: Option<SetupFuture>,
     input: Option<RpcFuture<'static>>,
-    provider: Option<RpcFuture<'static>>,
+    handler: Option<RpcFuture<'static>>,
 }
 
 enum CallProgress {
@@ -478,7 +478,7 @@ impl CallDriver {
         Self {
             setup: Some(setup.future),
             input: None,
-            provider: None,
+            handler: None,
         }
     }
 
@@ -488,7 +488,7 @@ impl CallDriver {
                 Poll::Ready(Ok(active)) => {
                     self.setup = None;
                     self.input = Some(active.input);
-                    self.provider = Some(active.provider);
+                    self.handler = Some(active.handler);
                     context.waker().wake_by_ref();
                     return Poll::Ready(Ok(CallProgress::Response(active.response)));
                 }
@@ -500,12 +500,12 @@ impl CallDriver {
             }
         }
 
-        let Some(provider) = self.provider.as_mut() else {
+        let Some(handler) = self.handler.as_mut() else {
             return Poll::Ready(Ok(CallProgress::Complete));
         };
-        match provider.as_mut().poll(context) {
+        match handler.as_mut().poll(context) {
             Poll::Ready(result) => {
-                self.provider = None;
+                self.handler = None;
                 self.input = None;
                 return Poll::Ready(result.map(|()| CallProgress::Complete));
             }
@@ -519,7 +519,7 @@ impl CallDriver {
             Poll::Ready(Ok(())) => self.input = None,
             Poll::Ready(Err(error)) => {
                 self.input = None;
-                self.provider = None;
+                self.handler = None;
                 return Poll::Ready(Err(error));
             }
             Poll::Pending => {}
@@ -530,7 +530,7 @@ impl CallDriver {
 
 /// Self-driving unary typed RPC returned by [`RpcClient::call`](crate::rpc::RpcClient::call).
 ///
-/// Polling this future concurrently advances request encoding, provider work,
+/// Polling this future concurrently advances request encoding, handler work,
 /// and response decoding. Its outer [`RpcResult`] reports transport/runtime
 /// failures; its inner `Result` contains either a zero-copy response frame or
 /// the method's zero-copy typed error frame. No separate call task is required.

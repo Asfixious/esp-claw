@@ -24,7 +24,7 @@ Compile every example without running it:
 cargo test -p claw-event-router --examples
 ```
 
-The examples use Tokio's current-thread runtime so task-local `Rc` providers do
+The examples use Tokio's current-thread runtime so task-local `Rc` handlers do
 not need to implement `Send`. Tokio is a development-only dependency and is not
 linked into normal `claw-event-router` library or firmware builds.
 

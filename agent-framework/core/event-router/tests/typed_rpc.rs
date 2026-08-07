@@ -521,7 +521,7 @@ fn unregister_keeps_a_prepared_typed_call_alive() {
         .unregister(&registration)
         .expect("unregister exact endpoint");
     let response = block_on(in_flight)
-        .expect("prepared call retains provider")
+        .expect("prepared call retains handler")
         .expect("method success");
     assert_eq!(response.view(), Ok(&Total { value: 11 }));
     drop(response);

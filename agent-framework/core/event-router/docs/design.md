@@ -95,7 +95,7 @@ Rust 组件通常不直接处理这些 bytes，而使用 typed RPC layer：
 ```text
 fixed-layout Request struct
     ↓ IntoBytes，直接写入 request lane
-typed RPC Provider
+RPC Handler
     ↓ RpcFrame<Response>，直接借用 response lane
 &Response
 ```
@@ -145,7 +145,7 @@ impl RpcMethod for Search {
 
 Typed message 必须是固定布局，不能包含 `String`、`Vec`、指针或引用。`IntoBytes` derive 同时保证没有未初始化 padding；`TryFromBytes` 负责校验并建立借用 view。跨架构协议应使用明确的 byte-order field，而不是假设 native integer endian。
 
-Provider 收到 `RpcFrame<Request>`，业务代码通过 `view()` 借用 request。外层 `RpcResult` 表示 transport/runtime 错误；内层 `Result<Response, Error>` 表示 Method 自己的 typed 业务结果。Streaming output 是零个或多个成功 response，或以一个 method error 终止：
+Handler 收到 `RpcFrame<Request>`，业务代码通过 `view()` 借用 request。外层 `RpcResult` 表示 transport/runtime 错误；内层 `Result<Response, Error>` 表示 Method 自己的 typed 业务结果。Streaming output 是零个或多个成功 response，或以一个 method error 终止：
 
 ```rust
 registry.register::<Search, _>(|_context, request: RpcFrame<SearchRequest>| async move {
@@ -171,7 +171,7 @@ while let Some(outcome) = results.next().await {
 | Stream | Unary | `RpcStream<RpcFrame<Request>>` | `Result<Response, Error>` | `RpcUnaryCall<Response, Error>` → `RpcResult<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
 | Stream | Stream | `RpcStream<RpcFrame<Request>>` | `RpcStream<Result<Response, Error>>` | `RpcStream<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
 
-Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、provider future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 call future。
+Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、handler future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 call future。
 
 ## Static lanes、framing 和限制
 
@@ -196,9 +196,9 @@ Lane-backed typed request 通过 `IntoBytes::as_bytes()` 直接复制到 request
 
 Unary 必须恰好包含一个成功或错误 frame。Streaming 包含零个或多个成功 frame，并可用一个 Method Error frame 终止；error 后的 handler stream items 不再发送。Request/Response/Error 都是固定布局，frame size 直接等于对应消息的 `size_of`。`RpcRegistry<N, M, Q>` 和 Method descriptor 在 Method 单态化时通过 const assertion 验证三种消息均能放入 lane 的 `M` bytes 且 alignment 不大于 lane frame 的实际 alignment；不满足时编译失败，不产生运行时 Method layout 容量或 alignment 错误分支。
 
-Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed provider/future 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
+Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed handler/future 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
 
-Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response/error type 和两侧 cardinality，防止同一 address 上发生错误解析。
+Registry 在注册 handler 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response/error type 和两侧 cardinality，防止同一 address 上发生错误解析。
 
 Zerocopy 是 RPC 的唯一 codec；固定布局、alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。
 
@@ -384,14 +384,14 @@ router.emit(...).await;
 `run()` 持有 `&mut self`，因此在运行期间它是 Component 可变状态的唯一 owner。对于也需要访问同一份状态的 RPC，推荐使用 mailbox：
 
 ```text
-RPC Provider
+RPC Handler
     ↓ send command
 Component::run()
     ↓ receive command
     ↓ mutate component state
 ```
 
-mailbox 只是有状态 Component 的内部实现模式，不是 EventRouter 的全局要求。无状态 RPC 或持有独立 cloneable handle 的 RPC provider 可以直接执行。
+mailbox 只是有状态 Component 的内部实现模式，不是 EventRouter 的全局要求。无状态 RPC 或持有独立 cloneable handle 的 RPC handler 可以直接执行。
 
 ## unregister
 
@@ -414,7 +414,7 @@ mailbox 只是有状态 Component 的内部实现模式，不是 EventRouter 的
 ```text
 RPC Address
     ↓
-RPC Provider
+RPC Handler
 ```
 
 职责包括：
@@ -453,7 +453,7 @@ RpcRegistry
 它只知道：
 
 ```text
-RpcAddress → RpcProvider
+RpcAddress → RpcHandler
 ```
 
 ---
@@ -600,11 +600,9 @@ RpcRegistry.call("scheduler")
 
 Event 不是传统 Pub/Sub 消息。
 
-EventRouter 没有：
+Event matching 没有：
 
-* Handler；
 * Subscriber；
-* Callback；
 * Binding Table；
 * Route Table。
 
@@ -1062,7 +1060,7 @@ Gateway 与 Agent 完全解耦。
 
 # 16. Scheduler
 
-Scheduler也是普通 Component 和 RPC Provider。
+Scheduler也是普通 Component 和 RPC Handler。
 
 它的职责是：
 

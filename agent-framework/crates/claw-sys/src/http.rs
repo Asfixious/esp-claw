@@ -72,8 +72,8 @@ mod espidf_driver {
     // `esp_err_t` sentinels from components/esp_common/include/esp_err.h.
     const ESP_OK: c_int = 0;
     const ESP_FAIL: c_int = -1;
-    /// `esp_http_client_perform` return when the non-blocking request is still
-    /// in progress (`ESP_ERR_HTTP_BASE + 7`, see `esp_http_client.h`).
+    /// ESP-IDF's async HTTP sentinel when an operation is still in progress
+    /// (`ESP_ERR_HTTP_BASE + 7`, see `esp_http_client.h`).
     const ESP_ERR_HTTP_EAGAIN: c_int = 0x7007;
     const ERRNO_NONE: c_int = 0;
     const ERRNO_EAGAIN: c_int = 11;
@@ -94,6 +94,7 @@ mod espidf_driver {
     /// Give FreeRTOS's idle and system tasks a real scheduling window after a
     /// native async step reports that it would block.
     const HTTP_RETRY_DELAY_MS: u64 = 1;
+    const MAX_REDIRECTS: u8 = 10;
     /// ESP-IDF's TLS/lwIP path becomes unstable when multiple long-lived LLM
     /// SSE responses are driven concurrently on this target: sockets are reset
     /// underneath otherwise independent `esp_http_client` handles. Keep the
@@ -209,6 +210,7 @@ mod espidf_driver {
             len: c_int,
         ) -> c_int;
         fn esp_http_client_set_timeout_ms(client: *mut c_void, timeout_ms: c_int) -> c_int;
+        fn esp_http_client_set_redirection(client: *mut c_void) -> c_int;
         fn esp_http_client_delete_header(client: *mut c_void, key: *const c_char) -> c_int;
         fn esp_http_client_reset_redirect_counter(client: *mut c_void) -> c_int;
         fn esp_http_client_perform(client: *mut c_void) -> c_int;
@@ -366,8 +368,6 @@ mod espidf_driver {
         Ok(HttpStatusCode::new(status))
     }
 
-    /// Wall-clock deadline for a whole `perform` loop.
-    ///
     /// Overall wall-clock request deadline. The ESP-IDF client receives a much
     /// shorter per-operation timeout so one TLS/socket step cannot monopolize a
     /// FreeRTOS core for this entire duration.
@@ -390,7 +390,7 @@ mod espidf_driver {
 
     fn timeout_error(timeout_ms: u32) -> HttpError {
         HttpError::RequestFailed(HttpRequestFailure::driver(
-            "esp_http_client_perform",
+            "esp_http_client",
             format!("request timed out after {timeout_ms} ms"),
         ))
     }
@@ -468,7 +468,8 @@ mod espidf_driver {
     ///
     /// Created when [`EspIdfHttp`] is constructed and reused by subsequent requests
     /// (`keep_alive_enable` + `is_async` are set at init). Each request updates
-    /// URL, method, headers, timeout, and body before driving `perform`; the raw
+    /// URL, method, headers, timeout, and body before driving either the
+    /// blocking compatibility path or the manual async state machine; the raw
     /// handle itself is torn down only on `Drop`.
     struct EspClient {
         raw: *mut c_void,
@@ -813,41 +814,37 @@ mod espidf_driver {
                 }
                 let body = self.prepare_request(request, core::ptr::null())?;
                 let mut active = ActiveRequestGuard::new(self.raw);
-                loop {
-                    if cancel.is_cancelled() {
-                        active.cancel();
-                        return Err(HttpError::Aborted);
+                active.mark_started();
+                let result = self
+                    .execute_prepared_async(body.as_bytes(), request.timeout_ms, &deadline, cancel)
+                    .await;
+                match result {
+                    Ok(response) => {
+                        active.finish();
+                        return Ok(response);
                     }
-                    if deadline.expired() {
-                        active.cancel();
-                        return Err(timeout_error(request.timeout_ms));
-                    }
-                    match self.perform_step() {
-                        Ok(Some(response)) => {
-                            active.finish();
-                            return Ok(response);
-                        }
-                        Ok(None) => {
-                            active.mark_started();
-                            yield_once().await;
-                        }
-                        Err(error) => {
-                            if !retried_after_close && matches!(error, HttpError::RequestFailed(_))
-                            {
-                                // A stale keep-alive socket does not require a
-                                // second HTTP client. Close this handle's socket
-                                // and let the next `perform` reconnect it.
-                                self.close_failed_connection(&error);
-                                active.finish();
-                                drop(body);
-                                drop(active);
-                                retried_after_close = true;
-                                continue 'connection;
-                            }
-                            self.close_failed_connection(&error);
-                            active.finish();
+                    Err(error) => {
+                        if matches!(error, HttpError::Aborted) {
+                            active.cancel();
                             return Err(error);
                         }
+                        if !retried_after_close
+                            && matches!(error, HttpError::RequestFailed(_))
+                            && !deadline.expired()
+                        {
+                            // Recover a stale keep-alive connection using the
+                            // same handle. Preparation restores the original
+                            // URL if a failed exchange had followed redirects.
+                            self.close_failed_connection(&error);
+                            active.finish();
+                            drop(body);
+                            drop(active);
+                            retried_after_close = true;
+                            continue 'connection;
+                        }
+                        self.close_failed_connection(&error);
+                        active.finish();
+                        return Err(error);
                     }
                 }
             }
@@ -872,37 +869,33 @@ mod espidf_driver {
                 }
                 self.prepare_get_request(request)?;
                 let mut active = ActiveRequestGuard::new(self.raw);
-                loop {
-                    if cancel.is_cancelled() {
-                        active.cancel();
-                        return Err(HttpError::Aborted);
+                active.mark_started();
+                let result = self
+                    .execute_prepared_async(&[], request.timeout_ms, &deadline, cancel)
+                    .await;
+                match result {
+                    Ok(response) => {
+                        active.finish();
+                        return Ok(response);
                     }
-                    if deadline.expired() {
-                        active.cancel();
-                        return Err(timeout_error(request.timeout_ms));
-                    }
-                    match self.perform_step() {
-                        Ok(Some(response)) => {
-                            active.finish();
-                            return Ok(response);
-                        }
-                        Ok(None) => {
-                            active.mark_started();
-                            yield_once().await;
-                        }
-                        Err(error) => {
-                            if !retried_after_close && matches!(error, HttpError::RequestFailed(_))
-                            {
-                                self.close_failed_connection(&error);
-                                active.finish();
-                                drop(active);
-                                retried_after_close = true;
-                                continue 'connection;
-                            }
-                            self.close_failed_connection(&error);
-                            active.finish();
+                    Err(error) => {
+                        if matches!(error, HttpError::Aborted) {
+                            active.cancel();
                             return Err(error);
                         }
+                        if !retried_after_close
+                            && matches!(error, HttpError::RequestFailed(_))
+                            && !deadline.expired()
+                        {
+                            self.close_failed_connection(&error);
+                            active.finish();
+                            drop(active);
+                            retried_after_close = true;
+                            continue 'connection;
+                        }
+                        self.close_failed_connection(&error);
+                        active.finish();
+                        return Err(error);
                     }
                 }
             }
@@ -950,6 +943,14 @@ mod espidf_driver {
             status_code_from_c_int(status).map(Some)
         }
 
+        fn buffered_response_status(&self) -> Result<Option<HttpStatusCode>, HttpError> {
+            let status = self.ctx.response_status;
+            if status <= 0 || matches!(status, 100..=199) {
+                return Ok(None);
+            }
+            status_code_from_c_int(status).map(Some)
+        }
+
         fn take_body_chunk(&mut self) -> Option<Vec<u8>> {
             if self.ctx.body.is_empty() {
                 return None;
@@ -958,6 +959,228 @@ mod espidf_driver {
                 &mut self.ctx.body,
                 Vec::with_capacity(4096),
             ))
+        }
+
+        /// Send one already-prepared request through ESP-IDF's bounded native
+        /// operations and stop after the final response headers. Unlike
+        /// `esp_http_client_perform`, temporary body-read timeouts are not
+        /// interpreted here, so the caller can handle them as cooperative
+        /// `EAGAIN` polls.
+        async fn open_write_fetch(
+            &mut self,
+            body_bytes: &[u8],
+            timeout_ms: u32,
+            deadline: &Deadline,
+            cancel: Cancel<'_>,
+            accept_redirect_status: bool,
+        ) -> Result<HttpStatusCode, HttpError> {
+            let body_len = body_len_to_c_int(body_bytes.len())?;
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(HttpError::Aborted);
+                }
+                if deadline.expired() {
+                    return Err(timeout_error(timeout_ms));
+                }
+                let result = unsafe { esp_http_client_open(self.raw, body_len) };
+                if result == ESP_OK {
+                    check_client_call(
+                        unsafe {
+                            esp_http_client_set_timeout_ms(self.raw, self.ctx.body_io_timeout_ms)
+                        },
+                        "esp_http_client_set_timeout_ms",
+                    )?;
+                    break;
+                }
+                if result != ESP_ERR_HTTP_EAGAIN {
+                    return Err(stream_driver_error(
+                        "esp_http_client_open",
+                        err_name(result),
+                    ));
+                }
+                yield_once().await;
+            }
+
+            let mut body_offset = 0usize;
+            while body_offset < body_bytes.len() {
+                if cancel.is_cancelled() {
+                    return Err(HttpError::Aborted);
+                }
+                if deadline.expired() {
+                    return Err(timeout_error(timeout_ms));
+                }
+                let remaining = body_bytes.len() - body_offset;
+                let remaining = c_int::try_from(remaining).map_err(|_| {
+                    HttpError::RequestFailed(HttpRequestFailure::BodyTooLarge {
+                        len: body_bytes.len(),
+                    })
+                })?;
+                let written = unsafe {
+                    esp_http_client_write(
+                        self.raw,
+                        body_bytes.as_ptr().add(body_offset).cast(),
+                        remaining,
+                    )
+                };
+                if written > 0 {
+                    body_offset += written as usize;
+                    continue;
+                }
+                if written == 0
+                    || written == -ESP_ERR_HTTP_EAGAIN
+                    || written == TLS_WANT_READ
+                    || written == TLS_WANT_WRITE
+                {
+                    yield_once().await;
+                    continue;
+                }
+                return Err(stream_driver_error(
+                    "esp_http_client_write",
+                    format!("write returned {written}"),
+                ));
+            }
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(HttpError::Aborted);
+                }
+                if deadline.expired() {
+                    return Err(timeout_error(timeout_ms));
+                }
+                let result = unsafe { esp_http_client_fetch_headers(self.raw) };
+                if result >= 0 {
+                    break;
+                }
+                if result != -i64::from(ESP_ERR_HTTP_EAGAIN) {
+                    return Err(stream_driver_error(
+                        "esp_http_client_fetch_headers",
+                        format!("fetch returned {result}"),
+                    ));
+                }
+                yield_once().await;
+            }
+
+            let status = if accept_redirect_status {
+                self.buffered_response_status()
+            } else {
+                self.response_status()
+            }?
+            .ok_or_else(|| {
+                stream_driver_error(
+                    "esp_http_client_fetch_headers",
+                    "response headers completed without a final HTTP status",
+                )
+            })?;
+            Ok(status)
+        }
+
+        /// Read a buffered response with short native reads. A timeout from one
+        /// read becomes `EAGAIN` and yields to the cooperative executor; EOF is
+        /// accepted only when ESP-IDF confirms that Content-Length or the final
+        /// chunk was received.
+        async fn execute_prepared_async(
+            &mut self,
+            body_bytes: &[u8],
+            timeout_ms: u32,
+            deadline: &Deadline,
+            cancel: Cancel<'_>,
+        ) -> Result<HttpResponse, HttpError> {
+            let mut redirect_count = 0_u8;
+            let mut read_buffer = [0_u8; 4096];
+
+            loop {
+                let status = self
+                    .open_write_fetch(body_bytes, timeout_ms, deadline, cancel, true)
+                    .await?;
+
+                loop {
+                    if cancel.is_cancelled() {
+                        return Err(HttpError::Aborted);
+                    }
+                    if deadline.expired() {
+                        return Err(timeout_error(timeout_ms));
+                    }
+                    if unsafe { esp_http_client_is_complete_data_received(self.raw) } {
+                        break;
+                    }
+
+                    let read = unsafe {
+                        esp_http_client_read(
+                            self.raw,
+                            read_buffer.as_mut_ptr().cast(),
+                            read_buffer.len() as c_int,
+                        )
+                    };
+                    if read > 0 {
+                        continue;
+                    }
+                    if read == -ESP_ERR_HTTP_EAGAIN {
+                        yield_once().await;
+                        continue;
+                    }
+                    if read == 0 && unsafe { esp_http_client_is_complete_data_received(self.raw) } {
+                        break;
+                    }
+                    let transport_errno = unsafe { esp_http_client_get_errno(self.raw) };
+                    return Err(stream_driver_error(
+                        "esp_http_client_read",
+                        format!(
+                            "read returned {read} before completion (transport errno={transport_errno})"
+                        ),
+                    ));
+                }
+
+                if is_redirect_status(status.as_i32()) {
+                    if redirect_count >= MAX_REDIRECTS {
+                        return Err(stream_driver_error(
+                            "esp_http_client_set_redirection",
+                            format!("exceeded {MAX_REDIRECTS} redirects"),
+                        ));
+                    }
+                    check_client_call(
+                        unsafe { esp_http_client_set_redirection(self.raw) },
+                        "esp_http_client_set_redirection",
+                    )?;
+                    redirect_count = redirect_count.saturating_add(1);
+                    // The public redirect helper updates the URL but leaves the
+                    // completed response state in place. Closing resets that
+                    // state; the reusable handle reconnects lazily, and the
+                    // request body remains alive for replay.
+                    close_raw_connection(self.raw);
+                    self.ctx.body.clear();
+                    self.ctx.response_status = 0;
+                    continue;
+                }
+
+                let body = String::from_utf8_lossy(&self.ctx.body).into_owned();
+                if !status.is_success() {
+                    // Avoid the perform finalizer's automatic authentication
+                    // branch changing a completed error response into another
+                    // opaque transport exchange.
+                    close_raw_connection(self.raw);
+                    return Err(HttpError::UnexpectedStatus {
+                        status,
+                        message: parse_error_message_body(&body, status),
+                    });
+                }
+
+                // No socket read remains here. This final `perform` invocation
+                // only dispatches ON_FINISH and returns the reusable handle to
+                // CONNECTED (or closes it when the peer disabled keep-alive).
+                match self.perform_raw_step()? {
+                    true => {
+                        return Ok(HttpResponse {
+                            status_code: status,
+                            body,
+                        });
+                    }
+                    false => {
+                        return Err(stream_driver_error(
+                            "esp_http_client_perform",
+                            "complete buffered response finalization returned EAGAIN",
+                        ));
+                    }
+                }
+            }
         }
 
         /// Drive open/write/fetch as bounded native operations. EAGAIN yields to
@@ -982,7 +1205,6 @@ mod espidf_driver {
                     yield_once().await;
                 }
             }
-
             // Admission wait is bounded by the owning Agent/subagent cancel
             // token. Start the per-request network deadline only after this
             // request owns the single hardware stream slot; otherwise a queued
@@ -992,108 +1214,18 @@ mod espidf_driver {
             let mut retried_after_close = false;
             'connection: loop {
                 let request_body = self.prepare_request(request, core::ptr::null())?;
-                let body_len = body_len_to_c_int(request.body.len())?;
                 let mut active = ActiveRequestGuard::new(self.raw);
                 active.mark_started();
 
-                let begin_result: Result<HttpStatusCode, HttpError> = async {
-                    loop {
-                        if cancel.is_cancelled() {
-                            return Err(HttpError::Aborted);
-                        }
-                        if deadline.expired() {
-                            return Err(timeout_error(request.timeout_ms));
-                        }
-                        let result = unsafe { esp_http_client_open(self.raw, body_len) };
-                        if result == ESP_OK {
-                            check_client_call(
-                                unsafe {
-                                    esp_http_client_set_timeout_ms(
-                                        self.raw,
-                                        self.ctx.body_io_timeout_ms,
-                                    )
-                                },
-                                "esp_http_client_set_timeout_ms",
-                            )?;
-                            break;
-                        }
-                        if result != ESP_ERR_HTTP_EAGAIN {
-                            return Err(stream_driver_error(
-                                "esp_http_client_open",
-                                err_name(result),
-                            ));
-                        }
-                        yield_once().await;
-                    }
-
-                    let body_bytes = request_body.as_bytes();
-                    let mut body_offset = 0usize;
-                    while body_offset < body_bytes.len() {
-                        if cancel.is_cancelled() {
-                            return Err(HttpError::Aborted);
-                        }
-                        if deadline.expired() {
-                            return Err(timeout_error(request.timeout_ms));
-                        }
-                        let remaining = body_bytes.len() - body_offset;
-                        let remaining = c_int::try_from(remaining).map_err(|_| {
-                            HttpError::RequestFailed(HttpRequestFailure::BodyTooLarge {
-                                len: body_bytes.len(),
-                            })
-                        })?;
-                        let written = unsafe {
-                            esp_http_client_write(
-                                self.raw,
-                                body_bytes.as_ptr().add(body_offset).cast(),
-                                remaining,
-                            )
-                        };
-                        if written > 0 {
-                            body_offset += written as usize;
-                            continue;
-                        }
-                        if written == 0
-                            || written == -ESP_ERR_HTTP_EAGAIN
-                            || written == TLS_WANT_READ
-                            || written == TLS_WANT_WRITE
-                        {
-                            yield_once().await;
-                            continue;
-                        }
-                        return Err(stream_driver_error(
-                            "esp_http_client_write",
-                            format!("write returned {written}"),
-                        ));
-                    }
-
-                    loop {
-                        if cancel.is_cancelled() {
-                            return Err(HttpError::Aborted);
-                        }
-                        if deadline.expired() {
-                            return Err(timeout_error(request.timeout_ms));
-                        }
-                        let result = unsafe { esp_http_client_fetch_headers(self.raw) };
-                        if result >= 0 {
-                            break;
-                        }
-                        if result != -i64::from(ESP_ERR_HTTP_EAGAIN) {
-                            return Err(stream_driver_error(
-                                "esp_http_client_fetch_headers",
-                                format!("fetch returned {result}"),
-                            ));
-                        }
-                        yield_once().await;
-                    }
-
-                    self.response_status()?.ok_or_else(|| {
-                        stream_driver_error(
-                            "esp_http_client_fetch_headers",
-                            "response headers completed without a final HTTP status",
-                        )
-                    })
-                }
-                .await;
+                let begin_result = self
+                    .open_write_fetch(
+                        request_body.as_bytes(),
+                        request.timeout_ms,
+                        &deadline,
+                        cancel,
+                        false,
+                    )
+                    .await;
 
                 match begin_result {
                     Ok(status) => {
@@ -1265,8 +1397,8 @@ mod espidf_driver {
         ///
         /// ESP-IDF requires an initial URL (or host/path) at
         /// `esp_http_client_init` time. The URL is still overwritten from every
-        /// [`HttpJsonRequest`] before `perform`, so this does not bind the
-        /// transport to one endpoint.
+        /// request before transfer, so this does not bind the transport to one
+        /// endpoint.
         pub fn new(initial_url: &str) -> Result<Self, HttpError> {
             Ok(Self {
                 conn: EspClient::new(initial_url)?,

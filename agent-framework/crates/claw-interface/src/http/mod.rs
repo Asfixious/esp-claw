@@ -248,8 +248,8 @@ impl Cancel<'static> {
 /// calling task for the whole request.
 ///
 /// On ESP-IDF this maps onto `esp_http_client`'s non-blocking mode
-/// (`config.is_async = true`): each poll runs one `esp_http_client_perform`
-/// step and yields (`Poll::Pending`) while the call reports
+/// (`config.is_async = true`): the transport advances bounded
+/// open/write/fetch/read operations and yields while an operation reports
 /// `ESP_ERR_HTTP_EAGAIN`, letting other tasks run between steps.
 ///
 /// Thread-safety is intentionally not a property of this base trait. Host

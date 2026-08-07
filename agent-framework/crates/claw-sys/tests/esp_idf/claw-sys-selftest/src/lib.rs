@@ -21,8 +21,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use claw_interface::http::{
-    blocking::ClawHttp as BlockingClawHttp, Cancel, ClawHttp, HttpAuth, HttpError, HttpJsonRequest,
-    HttpStatusCode, StreamingHttp,
+    blocking::ClawHttp as BlockingClawHttp, Cancel, ClawHttp, HttpAuth, HttpError, HttpGetRequest,
+    HttpJsonRequest, HttpStatusCode, StreamingHttp,
 };
 use claw_interface::{ClawThread, ClawTimer, CoreAffinity, Priority};
 use claw_sys::{EspIdfHttp, EspIdfThread, EspIdfTimer};
@@ -191,10 +191,12 @@ pub unsafe extern "C" fn claw_sys_selftest_sync_http_post(
     }
 }
 
-/// Run three concurrent POSTs through the async `ClawHttp` seam, driven by
-/// `edge-executor`'s `LocalExecutor`. `LocalExecutor` accepts `!Send` futures
-/// (required because `esp_http_client` handles are thread-local). Returns the
-/// number of requests that returned HTTP 200 (expect 3), or a negative error.
+/// Run three concurrent clients through the async `ClawHttp` seam, with two
+/// sequential POSTs per client to verify that a fully buffered response leaves
+/// its handle reusable. `LocalExecutor` accepts `!Send` futures (required
+/// because `esp_http_client` handles are thread-local). Returns the number of
+/// clients whose two responses were HTTP 200 and non-empty (expect 3), or a
+/// negative error.
 ///
 /// `url` must be HTTPS: `esp_http_client`'s non-blocking mode (used by the async
 /// driver) is HTTPS-only.
@@ -229,11 +231,21 @@ pub unsafe extern "C" fn claw_sys_selftest_run_three_async_http_posts(url: *cons
             let Ok(mut http) = EspIdfHttp::new(&url) else {
                 return;
             };
-            let pending = ClawHttp::post_json(&mut http, &request, Cancel::new(&abort));
-            if let Ok(response) = pending.await {
-                if response.status_code == HttpStatusCode::OK {
-                    sink.set(sink.get().saturating_add(1));
-                }
+            let first = ClawHttp::post_json(&mut http, &request, Cancel::new(&abort)).await;
+            if !matches!(
+                first,
+                Ok(ref response)
+                    if response.status_code == HttpStatusCode::OK && !response.body.is_empty()
+            ) {
+                return;
+            }
+            let second = ClawHttp::post_json(&mut http, &request, Cancel::new(&abort)).await;
+            if matches!(
+                second,
+                Ok(ref response)
+                    if response.status_code == HttpStatusCode::OK && !response.body.is_empty()
+            ) {
+                sink.set(sink.get().saturating_add(1));
             }
         });
         handles.push(task);
@@ -247,6 +259,50 @@ pub unsafe extern "C" fn claw_sys_selftest_run_three_async_http_posts(url: *cons
 
     let count = successes.get();
     c_int::try_from(count).unwrap_or(c_int::MAX)
+}
+
+/// Buffer a HTTP/1.1 chunked GET response and require a non-empty complete
+/// body. POST and GET share the same manual body-read loop, so this isolates
+/// the chunk parser and final-chunk completeness path used by compaction APIs.
+///
+/// # Safety
+/// `url` must point to a valid NUL-terminated HTTPS URL.
+#[no_mangle]
+pub unsafe extern "C" fn claw_sys_selftest_async_chunked_get(url: *const c_char) -> c_int {
+    let Some(url) = cstr(url) else {
+        return ERR_NULL_ARG;
+    };
+    edge_executor::block_on(async {
+        let Ok(mut http) = EspIdfHttp::new(url) else {
+            return ERR_HTTP;
+        };
+        let cancel = AtomicBool::new(false);
+        let request = HttpGetRequest {
+            url,
+            auth: HttpAuth::None,
+            timeout_ms: 30_000,
+            headers: &[],
+        };
+        match ClawHttp::get_json(&mut http, &request, Cancel::new(&cancel)).await {
+            Ok(response)
+                if response.status_code == HttpStatusCode::OK && !response.body.is_empty() =>
+            {
+                OK
+            }
+            Ok(response) => {
+                log_streaming(&format!(
+                    "chunked GET unexpected status={} bytes={}",
+                    response.status_code,
+                    response.body.len()
+                ));
+                ERR_HTTP
+            }
+            Err(error) => {
+                log_streaming(&format!("chunked GET failed: {error}"));
+                ERR_HTTP
+            }
+        }
+    })
 }
 
 /// Log one streaming-test diagnostic through the device log sink.
@@ -566,6 +622,104 @@ pub unsafe extern "C" fn claw_sys_selftest_run_streaming_posts(
 #[no_mangle]
 pub unsafe extern "C" fn claw_sys_selftest_run_three_streaming_posts(url: *const c_char) -> c_int {
     claw_sys_selftest_run_streaming_posts(url, 3)
+}
+
+/// Run two streaming POSTs and one buffered POST concurrently. This reproduces
+/// the production shape where an Agent SSE response and compaction/helper LLM
+/// call share the ESP-IDF TLS/lwIP stack without sharing a client handle.
+///
+/// # Safety
+/// `url` must point to a valid NUL-terminated HTTPS URL.
+#[no_mangle]
+pub unsafe extern "C" fn claw_sys_selftest_run_mixed_http(url: *const c_char) -> c_int {
+    let Some(url) = cstr(url) else {
+        return ERR_NULL_ARG;
+    };
+    let url = url.to_string();
+    let successes = Rc::new(Cell::new(0_u32));
+    let executor: edge_executor::LocalExecutor = Default::default();
+    let mut handles = Vec::with_capacity(3);
+
+    for index in 0..2_u32 {
+        let url = url.clone();
+        let successes = Rc::clone(&successes);
+        handles.push(executor.spawn(async move {
+            let Ok(mut http) = EspIdfHttp::new(&url) else {
+                return;
+            };
+            let cancel = AtomicBool::new(false);
+            let body = format!(r#"{{"selftest":"mixed_stream","index":{index}}}"#);
+            let request = HttpJsonRequest {
+                url: &url,
+                body: &body,
+                auth: HttpAuth::None,
+                timeout_ms: 180_000,
+                headers: &[],
+            };
+            let (status, mut stream) = match http
+                .post_json_streaming(&request, Cancel::new(&cancel))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    log_streaming(&format!("mixed stream[{index}] start failed: {error}"));
+                    return;
+                }
+            };
+            let mut bytes = 0_usize;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => bytes = bytes.saturating_add(chunk.len()),
+                    Err(error) => {
+                        log_streaming(&format!("mixed stream[{index}] body failed: {error}"));
+                        return;
+                    }
+                }
+            }
+            if status == HttpStatusCode::OK && bytes > 0 {
+                successes.set(successes.get().saturating_add(1));
+            }
+        }));
+    }
+
+    {
+        let url = url.clone();
+        let successes = Rc::clone(&successes);
+        handles.push(executor.spawn(async move {
+            let Ok(mut http) = EspIdfHttp::new(&url) else {
+                return;
+            };
+            let cancel = AtomicBool::new(false);
+            let request = HttpJsonRequest {
+                url: &url,
+                body: r#"{"selftest":"mixed_buffered"}"#,
+                auth: HttpAuth::None,
+                timeout_ms: 180_000,
+                headers: &[],
+            };
+            match ClawHttp::post_json(&mut http, &request, Cancel::new(&cancel)).await {
+                Ok(response)
+                    if response.status_code == HttpStatusCode::OK && !response.body.is_empty() =>
+                {
+                    successes.set(successes.get().saturating_add(1));
+                }
+                Ok(response) => log_streaming(&format!(
+                    "mixed buffered unexpected status={} bytes={}",
+                    response.status_code,
+                    response.body.len()
+                )),
+                Err(error) => log_streaming(&format!("mixed buffered failed: {error}")),
+            }
+        }));
+    }
+
+    edge_executor::block_on(executor.run(async {
+        for handle in handles {
+            handle.await;
+        }
+    }));
+
+    c_int::try_from(successes.get()).unwrap_or(c_int::MAX)
 }
 
 // ---------------------------------------------------------------------------

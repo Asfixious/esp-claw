@@ -34,11 +34,14 @@ int claw_sys_selftest_timer_drop_race(void);
 int claw_sys_selftest_sync_http_post(const char *url, char *out, size_t out_len);
 
 /*
- * Run three concurrent POSTs via the async ClawHttp seam, driven by
- * edge-executor. Returns the number of HTTP-200 responses (expect 3), or a
- * negative selftest error. `url` must be HTTPS (async mode is HTTPS-only).
+ * Run three concurrent clients with two sequential POSTs each via the async
+ * ClawHttp seam. Returns the number whose two responses are HTTP 200 with
+ * non-empty bodies (expect 3). `url` must be HTTPS.
  */
 int claw_sys_selftest_run_three_async_http_posts(const char *url);
+
+/* Buffer a complete HTTP/1.1 chunked GET response. */
+int claw_sys_selftest_async_chunked_get(const char *url);
 
 /* Drain a streaming body to EOF, then reuse the same EspIdfHttp. */
 int claw_sys_selftest_streaming_drain_reuse(const char *url);
@@ -51,6 +54,9 @@ int claw_sys_selftest_streaming_drop_reuse(const char *url);
 
 /* Run and fully drain three concurrent streaming POSTs. Returns successes. */
 int claw_sys_selftest_run_three_streaming_posts(const char *url);
+
+/* Run two streaming POSTs and one buffered POST concurrently. */
+int claw_sys_selftest_run_mixed_http(const char *url);
 
 /* Run and fully drain 1..16 concurrent streaming POSTs. Returns successes. */
 int claw_sys_selftest_run_streaming_posts(const char *url, unsigned int count);

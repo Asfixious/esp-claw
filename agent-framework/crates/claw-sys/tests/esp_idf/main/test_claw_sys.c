@@ -37,11 +37,18 @@ TEST_CASE("claw_sys sync ClawHttp POST returns HTTP 200", "[claw_sys][network]")
     TEST_ASSERT_EQUAL_INT(200, status);
 }
 
-TEST_CASE("claw_sys async ClawHttp runs 3 posts via edge-executor", "[claw_sys][network]")
+TEST_CASE("claw_sys async ClawHttp buffers and reuses 3 clients", "[claw_sys][network]")
 {
     int ok = claw_sys_selftest_run_three_async_http_posts(TEST_HTTPS_URL);
     printf("async posts succeeded=%d\n", ok);
     TEST_ASSERT_EQUAL_INT(3, ok);
+}
+
+TEST_CASE("claw_sys async ClawHttp buffers a chunked response", "[claw_sys][network][chunked]")
+{
+    int rc = claw_sys_selftest_async_chunked_get(TEST_HTTPS_CHUNKED_URL);
+    printf("async chunked GET rc=%d\n", rc);
+    TEST_ASSERT_EQUAL_INT(0, rc);
 }
 
 TEST_CASE("claw_sys StreamingHttp drains body then reuses client", "[claw_sys][streaming][network]")
@@ -70,6 +77,14 @@ TEST_CASE("claw_sys StreamingHttp fairly drains 3 concurrent responses",
 {
     int ok = claw_sys_selftest_run_three_streaming_posts(TEST_HTTPS_URL);
     printf("concurrent streaming posts succeeded=%d\n", ok);
+    TEST_ASSERT_EQUAL_INT(3, ok);
+}
+
+TEST_CASE("claw_sys mixes 2 streaming requests with 1 buffered request",
+          "[claw_sys][streaming][network][mixed]")
+{
+    int ok = claw_sys_selftest_run_mixed_http(TEST_HTTPS_URL);
+    printf("mixed streaming/buffered requests succeeded=%d\n", ok);
     TEST_ASSERT_EQUAL_INT(3, ok);
 }
 

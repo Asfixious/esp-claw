@@ -10,9 +10,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 futures-core = { version = "0.3", default-features = false }
-postcard = { version = "1.1", default-features = false, features = ["alloc"] }
-serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
 futures-lite = "2"

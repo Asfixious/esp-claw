@@ -59,6 +59,19 @@ claw-event-router
 use claw_event_router::rpc::{RpcMethod, RpcRegistry};
 ```
 
+Registry 必须显式接收 application-lifetime lane storage：
+
+```rust
+use std::rc::Rc;
+use claw_event_router::rpc::{RpcLaneStorage, RpcRegistry, RpcResult};
+
+fn build_registry() -> RpcResult<Rc<RpcRegistry>> {
+    // Host 示例用 Box::leak 模拟 firmware 的 static-cell 放置。
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4096, 8>::new()));
+    Ok(Rc::new(RpcRegistry::new(lanes)?))
+}
+```
+
 ---
 
 # 2. RPC
@@ -83,11 +96,11 @@ Stream → Stream
 Rust 组件通常不直接处理这些 bytes，而使用 typed RPC layer：
 
 ```text
-Request struct
-    ↓ Postcard length-delimited frames
+fixed-layout Request struct
+    ↓ IntoBytes，直接写入 request lane
 BinaryReader → RPC Provider → BinaryWriter
-    ↓ Postcard length-delimited frames
-Response struct
+    ↓ RpcFrame<Response>，直接借用 response lane
+&Response
 ```
 
 `RpcMethod` 同时声明 address、request/response struct 和两侧 cardinality。`RpcRegistry` 不提供 `call_unary` / `call_stream` 两套分发接口；所有 typed 调用统一写成 `client.call::<Method>(input)`，其返回类型由 Method 的 output cardinality 决定。
@@ -99,17 +112,21 @@ Response struct
 概念接口：
 
 ```rust
-use claw_event_router::rpc::{RpcMethod, Streaming, Unary};
-use serde::{Deserialize, Serialize};
+use claw_event_router::rpc::{RpcFrame, RpcMethod, Streaming, Unary};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-#[derive(Serialize, Deserialize)]
+#[repr(C)]
+#[derive(Immutable, IntoBytes, KnownLayout, TryFromBytes)]
 struct SearchRequest {
-    query: String,
+    query_len: u16,
+    query: [u8; 126],
 }
 
-#[derive(Serialize, Deserialize)]
+#[repr(C)]
+#[derive(Immutable, IntoBytes, KnownLayout, TryFromBytes)]
 struct SearchResult {
-    title: String,
+    title_len: u16,
+    title: [u8; 126],
 }
 
 struct Search;
@@ -124,17 +141,19 @@ impl RpcMethod for Search {
 }
 ```
 
-Provider 收到的已经是 struct，返回的也是 struct 或 `RpcStream<struct>`：
+Typed message 必须是固定布局，不能包含 `String`、`Vec`、指针或引用。`IntoBytes` derive 同时保证没有未初始化 padding；`TryFromBytes` 负责校验并建立借用 view。跨架构协议应使用明确的 byte-order field，而不是假设 native integer endian。
+
+Provider 收到 `RpcFrame<Request>`，业务代码通过 `view()` 借用 request；返回值仍是 owned fixed-layout struct 或 `RpcStream<struct>`：
 
 ```rust
-registry.register_typed::<Search, _>(|context, request: SearchRequest| async move {
-    // business logic; no binary parsing here
+registry.register_typed::<Search, _>(|context, request: RpcFrame<SearchRequest>| async move {
+    let request: &SearchRequest = request.view()?;
     Ok(results)
 })?;
 
 let mut results = client.call::<Search>(request)?;
-while let Some(result) = results.next().await {
-    consume(result?);
+while let Some(frame) = results.next().await {
+    consume(frame?.view()?);
 }
 ```
 
@@ -142,26 +161,49 @@ while let Some(result) = results.next().await {
 
 | Input | Output | Handler input | Handler output | Client result |
 | --- | --- | --- | --- | --- |
-| Unary | Unary | `Request` | `Response` | `RpcUnaryCall<Response>` |
-| Unary | Stream | `Request` | `RpcStream<Response>` | `RpcStream<Response>` |
-| Stream | Unary | `RpcStream<Request>` | `Response` | `RpcUnaryCall<Response>` |
-| Stream | Stream | `RpcStream<Request>` | `RpcStream<Response>` | `RpcStream<Response>` |
+| Unary | Unary | `RpcFrame<Request>` | `Response` | `RpcUnaryCall<Response>` → `RpcFrame<Response>` |
+| Unary | Stream | `RpcFrame<Request>` | `RpcStream<Response>` | `RpcStream<RpcFrame<Response>>` |
+| Stream | Unary | `RpcStream<RpcFrame<Request>>` | `Response` | `RpcUnaryCall<Response>` → `RpcFrame<Response>` |
+| Stream | Stream | `RpcStream<RpcFrame<Request>>` | `RpcStream<Response>` | `RpcStream<RpcFrame<Response>>` |
 
-Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 request encoder、provider future 和 response decoder；即使 frame 大于 bounded pipe capacity，也不要求调用者额外 spawn 或 `join!` 一个 raw call future。
+Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、provider future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 raw call future。
 
-## Typed framing 和限制
+## Static lanes、framing 和限制
 
-每个 typed message 使用独立 frame：
+`RpcLaneStorage<N, M, Q>` 在初始化时确定 RPC transport 的 payload 上限：
 
 ```text
-u32 little-endian payload length | Postcard payload
+N lanes
+└── each lane
+    ├── request:  align(16) [u8; M]
+    └── response: align(16) [u8; M]
+
+Q fixed root-call waiter slots
 ```
 
-Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。每个 Method 分别声明 request/response 最大 frame size，并在分配 payload buffer 前检查 wire length；internal pipe capacity 也必须非零。
+`N` 是同时 active 的 call/retained response 数量；每个 lane 有独立的 request/response buffer，所以 payload 静态占用约为 `N * 2 * M`，再加 lane metadata 和 `Q` 个 waiter slot。`M` 同时是一个 typed frame 的硬上限。Streaming 不会占用更大的 buffer，而是逐 frame 复用同一个 lane，并通过 `Pending` 提供 backpressure。
+
+根调用在 `N` 个 lane 全部占用时进入固定 waiter table，按 ticket 顺序等待；超过 `Q` 返回 `LaneWaiterCapacityExceeded`。嵌套调用不能在持有外层 lane 时无限等待：若没有空 lane，立即返回 `NestedLaneExhausted`，避免 `N` 条调用链互相持有 lane 形成死锁。取消 active call 会释放 lane；取消 waiter（包括已经获得 reservation、尚未再次 poll 的 waiter）会把 reservation 交给下一个 waiter。
+
+Lane-backed typed request 通过 `IntoBytes::as_bytes()` 直接复制到 request lane；接收端和 response 端不反序列化，而是由 `RpcFrame<T>` 持有 frame lease，并通过 `TryFromBytes::try_ref_from_bytes()` 返回指向 lane 的 `&T`。frame boundary 由 lane metadata 表达，不创建中间 `Vec<u8>`，response payload 也不复制。
+
+`RpcFrame<T>` drop 前，对应 pipe 不会被覆盖；drop 时 frame 才被消费并唤醒等待的 writer/reader。Unary response frame 还会保留整个 lane，因此调用者应在用完 view 后尽快 drop frame。若需要跨越后续调用长期保存结果，应把所需字段复制到自己的 fixed-layout storage，再释放 frame。Streaming 同样要求消费并释放当前 frame 后，下一帧才能复用该方向的 buffer。
+
+通过普通 raw byte reader/writer 调用 typed provider 时，兼容路径使用：
+
+```text
+u32 little-endian payload length | fixed-layout message bytes
+```
+
+这个 fallback 会先收集一个 frame，再用 `TryFromBytes::try_read_from_bytes()` 得到 owned message；真正的 lane path 才提供借用式 zero-copy view。
+
+Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。每个 Method 分别声明 request/response 最大 frame size（默认 4096 bytes）；typed provider 注册和 typed client 调用都会在 acquisition 和 payload IO 之前检查两侧限制均不大于 `M`。消息大小超过 Method limit 时返回 `FrameTooLarge`。消息 alignment 大于 lane 保证的 16 bytes 时，在注册或调用前返回 `MessageAlignmentExceedsLane`。
+
+Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed provider/future/IO handle 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
 
 Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response type、两侧 cardinality 和 limits，防止同一 address 上发生错误解析。Raw client 不做 typed signature 校验，因为它是显式选择的 escape hatch。
 
-Postcard 是默认 codec，因为它支持普通的 owned Rust data model（包括 `String`、`Vec` 和 enum），适合当前会经过 bounded pipe 的消息。`zerocopy` 不作为默认 codec：固定布局 view 对 alignment、endianness、padding、borrow lifetime 和可表达的数据类型有更严格约束，而且当前 pipe 本身会复制 bytes。未来如 profiling 证明固定布局消息值得优化，可以在 raw kernel 上增加 opt-in codec，而不改变 typed method/call 模型。
+Zerocopy 是 typed RPC 的唯一 codec；固定布局、alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。需要动态数据模型或其他 wire format 的调用方应显式使用 raw kernel，并在 adapter 中定义自己的 codec。
 
 RPC 不关心：
 

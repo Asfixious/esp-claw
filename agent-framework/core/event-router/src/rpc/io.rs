@@ -6,6 +6,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use super::frame::RpcFrameBuffer;
+use super::RpcResult;
+
 /// A dynamically dispatched asynchronous binary reader.
 pub type BoxBinaryReader = Pin<Box<dyn BinaryReader>>;
 
@@ -24,6 +27,21 @@ pub trait BinaryReader {
         context: &mut Context<'_>,
         buffer: &mut [u8],
     ) -> Poll<Result<usize, BinaryIoError>>;
+
+    /// Returns whether this reader can lend complete frames without copying.
+    #[doc(hidden)]
+    fn supports_borrowed_frames(&self) -> bool {
+        false
+    }
+
+    /// Borrows one complete transport-owned frame, or returns `None` at EOF.
+    #[doc(hidden)]
+    fn poll_borrow_frame(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<RpcResult<Option<RpcFrameBuffer>>> {
+        Poll::Ready(Ok(None))
+    }
 }
 
 /// Push-based asynchronous byte output used by every RPC invocation.
@@ -46,6 +64,20 @@ pub trait BinaryWriter {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), BinaryIoError>>;
+
+    /// Lets a fixed-buffer transport encode one complete typed frame in place.
+    ///
+    /// `true` means the frame was written. `false` means this writer only
+    /// supports byte IO and the caller must use ordinary framing.
+    #[doc(hidden)]
+    fn poll_encode_frame(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        _limit: usize,
+        _encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
+    ) -> Poll<RpcResult<bool>> {
+        Poll::Ready(Ok(false))
+    }
 }
 
 /// Reads one available byte fragment.

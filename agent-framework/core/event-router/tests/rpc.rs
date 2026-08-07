@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 #![allow(missing_docs)]
 
+use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::rc::Rc;
@@ -8,12 +9,17 @@ use std::rc::Rc;
 use claw_event_router::rpc::{
     binary_pipe, close, read, read_to_end, write_all, BinaryIoError, BinaryWriter, BoxBinaryReader,
     BoxBinaryWriter, BytesReader, RawRpcProvider, RpcAddress, RpcContext, RpcError, RpcFuture,
-    RpcRegistry, RpcResult,
+    RpcLaneStorage, RpcRegistry, RpcResult,
 };
-use futures_lite::future::block_on;
+use futures_lite::future::{block_on, poll_once};
 use futures_util::join;
 
 const BODY_LIMIT: usize = 1024;
+
+fn registry() -> Rc<RpcRegistry> {
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 128, 8>::new()));
+    Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"))
+}
 
 struct UnaryUnary;
 
@@ -104,7 +110,7 @@ impl RawRpcProvider for StreamStream {
 
 #[test]
 fn one_call_supports_unary_input_and_unary_output() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("test.unary_unary").expect("valid address");
     registry
         .register_raw(address.clone(), UnaryUnary)
@@ -132,7 +138,7 @@ fn one_call_supports_unary_input_and_unary_output() {
 
 #[test]
 fn one_call_supports_unary_input_and_stream_output() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("test.unary_stream").expect("valid address");
     registry
         .register_raw(address.clone(), UnaryStream)
@@ -160,7 +166,7 @@ fn one_call_supports_unary_input_and_stream_output() {
 
 #[test]
 fn one_call_supports_stream_input_and_unary_output() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("test.stream_unary").expect("valid address");
     registry
         .register_raw(address.clone(), StreamUnary)
@@ -197,7 +203,7 @@ fn one_call_supports_stream_input_and_unary_output() {
 
 #[test]
 fn one_call_supports_stream_input_and_stream_output() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("test.stream_stream").expect("valid address");
     registry
         .register_raw(address.clone(), StreamStream)
@@ -280,7 +286,7 @@ impl RawRpcProvider for DirectSelfCaller {
 
 #[test]
 fn direct_self_call_is_rejected_by_endpoint_identity() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("cycle.direct").expect("valid address");
     registry
         .register_raw(
@@ -355,7 +361,7 @@ impl RawRpcProvider for IndirectB {
 
 #[test]
 fn indirect_a_to_b_to_a_call_is_allowed() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address_a = RpcAddress::parse("cycle.a").expect("valid address");
     let address_b = RpcAddress::parse("cycle.b").expect("valid address");
     registry
@@ -405,7 +411,7 @@ impl RawRpcProvider for Noop {
 
 #[test]
 fn unregister_does_not_cancel_an_in_flight_call() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("lifecycle.noop").expect("valid address");
     let registration = registry
         .register_raw(address.clone(), Noop)
@@ -450,9 +456,26 @@ impl RawRpcProvider for NeverCompletes {
     }
 }
 
+struct YieldsOnce;
+
+impl RawRpcProvider for YieldsOnce {
+    fn call<'a>(
+        &'a self,
+        _context: RpcContext,
+        _input: BoxBinaryReader,
+        mut output: BoxBinaryWriter,
+    ) -> RpcFuture<'a> {
+        Box::pin(async move {
+            futures_lite::future::yield_now().await;
+            close(output.as_mut()).await?;
+            Ok(())
+        })
+    }
+}
+
 #[test]
 fn dropping_call_future_cancels_both_stream_directions() {
-    let registry = Rc::new(RpcRegistry::new());
+    let registry = registry();
     let address = RpcAddress::parse("lifecycle.pending").expect("valid address");
     registry
         .register_raw(address.clone(), NeverCompletes)
@@ -478,4 +501,233 @@ fn dropping_call_future_cancels_both_stream_directions() {
         let mut byte = [0_u8; 1];
         assert_eq!(read(Pin::new(&mut response_reader), &mut byte).await, Ok(0));
     });
+}
+
+#[test]
+fn root_calls_wait_at_the_lane_limit_and_waiter_overflow_is_bounded() {
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 128, 1>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
+    let pending_address = RpcAddress::parse("lanes.pending").expect("valid address");
+    let ready_address = RpcAddress::parse("lanes.ready").expect("valid address");
+    registry
+        .register_raw(pending_address.clone(), NeverCompletes)
+        .expect("register pending endpoint");
+    registry
+        .register_raw(ready_address.clone(), Noop)
+        .expect("register ready endpoint");
+
+    block_on(async {
+        let mut active = registry
+            .client()
+            .call_raw(
+                &pending_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("start active call");
+        assert!(poll_once(active.as_mut()).await.is_none());
+
+        let mut waiter = registry
+            .client()
+            .call_raw(
+                &ready_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("start waiting call");
+        assert!(poll_once(waiter.as_mut()).await.is_none());
+
+        let mut overflow = registry
+            .client()
+            .call_raw(
+                &ready_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("construct overflow call");
+        assert_eq!(
+            poll_once(overflow.as_mut()).await,
+            Some(Err(RpcError::LaneWaiterCapacityExceeded { limit: 1 }))
+        );
+
+        drop(active);
+        assert_eq!(waiter.await, Ok(()));
+
+        let recovered = registry
+            .client()
+            .call_raw(
+                &ready_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("start recovered call");
+        assert_eq!(recovered.await, Ok(()));
+    });
+}
+
+#[test]
+fn many_root_calls_reuse_a_smaller_fixed_lane_pool() {
+    const CALL_COUNT: usize = 32;
+
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 128, 28>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
+    let address = RpcAddress::parse("lanes.stress").expect("valid address");
+    registry
+        .register_raw(address.clone(), YieldsOnce)
+        .expect("register yielding endpoint");
+
+    let client = registry.client();
+    let mut calls = (0..CALL_COUNT)
+        .map(|_| {
+            client
+                .call_raw(
+                    &address,
+                    BytesReader::new(Vec::new()).boxed(),
+                    Box::pin(NullWriter),
+                )
+                .expect("start stress call")
+        })
+        .map(Some)
+        .collect::<Vec<_>>();
+    let result = block_on(poll_fn(|context| {
+        let mut has_pending = false;
+        for slot in &mut calls {
+            let Some(call) = slot.as_mut() else {
+                continue;
+            };
+            match call.as_mut().poll(context) {
+                Poll::Ready(Ok(())) => *slot = None,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => has_pending = true,
+            }
+        }
+        if has_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }));
+
+    assert_eq!(result, Ok(()));
+    assert!(calls.into_iter().all(|call| call.is_none()));
+}
+
+#[test]
+fn cancelling_a_reserved_waiter_hands_the_lane_to_the_next_waiter() {
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 128, 2>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
+    let pending_address = RpcAddress::parse("lanes.reserved_pending").expect("valid address");
+    let ready_address = RpcAddress::parse("lanes.reserved_ready").expect("valid address");
+    registry
+        .register_raw(pending_address.clone(), NeverCompletes)
+        .expect("register pending endpoint");
+    registry
+        .register_raw(ready_address.clone(), Noop)
+        .expect("register ready endpoint");
+
+    block_on(async {
+        let mut active = registry
+            .client()
+            .call_raw(
+                &pending_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("start active call");
+        assert!(poll_once(active.as_mut()).await.is_none());
+
+        let mut first_waiter = registry
+            .client()
+            .call_raw(
+                &ready_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("start first waiter");
+        let mut second_waiter = registry
+            .client()
+            .call_raw(
+                &ready_address,
+                BytesReader::new(Vec::new()).boxed(),
+                Box::pin(NullWriter),
+            )
+            .expect("start second waiter");
+        assert!(poll_once(first_waiter.as_mut()).await.is_none());
+        assert!(poll_once(second_waiter.as_mut()).await.is_none());
+
+        drop(active);
+        drop(first_waiter);
+        assert_eq!(second_waiter.await, Ok(()));
+    });
+}
+
+struct CallsOther {
+    next: RpcAddress,
+}
+
+impl RawRpcProvider for CallsOther {
+    fn call<'a>(
+        &'a self,
+        context: RpcContext,
+        _input: BoxBinaryReader,
+        _output: BoxBinaryWriter,
+    ) -> RpcFuture<'a> {
+        Box::pin(async move {
+            context
+                .client()
+                .call_raw(
+                    &self.next,
+                    BytesReader::new(Vec::new()).boxed(),
+                    Box::pin(NullWriter),
+                )?
+                .await
+        })
+    }
+}
+
+#[test]
+fn nested_call_fails_instead_of_deadlocking_when_all_lanes_are_held() {
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 128, 1>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
+    let outer_address = RpcAddress::parse("lanes.outer").expect("valid address");
+    let inner_address = RpcAddress::parse("lanes.inner").expect("valid address");
+    registry
+        .register_raw(inner_address.clone(), Noop)
+        .expect("register inner endpoint");
+    registry
+        .register_raw(
+            outer_address.clone(),
+            CallsOther {
+                next: inner_address,
+            },
+        )
+        .expect("register outer endpoint");
+
+    let call = registry
+        .client()
+        .call_raw(
+            &outer_address,
+            BytesReader::new(Vec::new()).boxed(),
+            Box::pin(NullWriter),
+        )
+        .expect("start outer call");
+    assert_eq!(
+        block_on(call),
+        Err(RpcError::NestedLaneExhausted { limit: 1 })
+    );
+}
+
+#[test]
+fn zero_lane_dimensions_are_rejected() {
+    let zero_lanes = Box::leak(Box::new(RpcLaneStorage::<0, 1, 1>::new()));
+    assert!(matches!(
+        RpcRegistry::new(zero_lanes),
+        Err(RpcError::InvalidLaneConfiguration { field: "N" })
+    ));
+
+    let zero_bytes = Box::leak(Box::new(RpcLaneStorage::<1, 0, 1>::new()));
+    assert!(matches!(
+        RpcRegistry::new(zero_bytes),
+        Err(RpcError::InvalidLaneConfiguration { field: "M" })
+    ));
 }

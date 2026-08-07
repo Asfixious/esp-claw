@@ -3,18 +3,20 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcContext, RpcHandlerFuture, RpcHandlerInput, RpcHandlerOutput, RpcMethod, RpcRegistry,
-    RpcResult, RpcStream, Streaming, TypedRpcHandler, Unary,
+    RpcContext, RpcFrame, RpcHandlerFuture, RpcHandlerInput, RpcHandlerOutput, RpcLaneStorage,
+    RpcMethod, RpcRegistry, RpcResult, RpcStream, Streaming, TypedRpcHandler, Unary,
 };
 use futures_util::stream;
-use serde::{Deserialize, Serialize};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
 struct Number {
     value: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
 struct Total {
     value: u32,
 }
@@ -44,7 +46,7 @@ impl TypedRpcHandler<UnaryUnary> for AddOffset {
     ) -> RpcHandlerFuture<'a, RpcHandlerOutput<UnaryUnary>> {
         Box::pin(async move {
             Ok(Total {
-                value: request.value.saturating_add(self.offset),
+                value: request.view()?.value.saturating_add(self.offset),
             })
         })
     }
@@ -93,50 +95,57 @@ where
     ))
 }
 
-async fn collect(mut stream: RpcStream<Total>) -> RpcResult<Vec<Total>> {
+async fn collect(mut stream: RpcStream<RpcFrame<Total>>) -> RpcResult<Vec<Total>> {
     let mut values = Vec::new();
     while let Some(value) = stream.next().await {
-        values.push(value?);
+        values.push(*value?.view()?);
     }
     Ok(values)
 }
 
 async fn run() -> RpcResult<()> {
-    let registry = Rc::new(RpcRegistry::new());
+    // Firmware can place this value in platform static storage. Box::leak gives
+    // the host example the same application-lifetime placement.
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4_096, 8>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes)?);
 
     registry.register_typed::<UnaryUnary, _>(AddOffset { offset: 1 })?;
 
-    registry.register_typed::<UnaryStream, _>(|_context, request: Number| async move {
-        Ok(RpcStream::new(stream::iter([
-            Ok(Total {
-                value: request.value,
-            }),
-            Ok(Total {
-                value: request.value.saturating_add(1),
-            }),
-        ])))
-    })?;
+    registry.register_typed::<UnaryStream, _>(
+        |_context, request: RpcFrame<Number>| async move {
+            let value = request.view()?.value;
+            Ok(RpcStream::new(stream::iter([
+                Ok(Total { value }),
+                Ok(Total {
+                    value: value.saturating_add(1),
+                }),
+            ])))
+        },
+    )?;
 
     registry.register_typed::<StreamUnary, _>(
-        |_context, mut requests: RpcStream<Number>| async move {
+        |_context, mut requests: RpcStream<RpcFrame<Number>>| async move {
             let mut total = 0_u32;
             while let Some(request) = requests.next().await {
-                total = total.saturating_add(request?.value);
+                total = total.saturating_add(request?.view()?.value);
             }
             Ok(Total { value: total })
         },
     )?;
 
     registry.register_typed::<StreamStream, _>(
-        |_context, requests: RpcStream<Number>| async move {
+        |_context, requests: RpcStream<RpcFrame<Number>>| async move {
             let responses = stream::unfold(requests, |mut requests| async move {
                 match requests.next().await {
-                    Some(Ok(request)) => Some((
-                        Ok(Total {
-                            value: request.value.saturating_mul(2),
-                        }),
-                        requests,
-                    )),
+                    Some(Ok(request)) => match request.view() {
+                        Ok(request) => Some((
+                            Ok(Total {
+                                value: request.value.saturating_mul(2),
+                            }),
+                            requests,
+                        )),
+                        Err(error) => Some((Err(error), requests)),
+                    },
                     Some(Err(error)) => Some((Err(error), requests)),
                     None => None,
                 }
@@ -149,7 +158,7 @@ async fn run() -> RpcResult<()> {
 
     // Unary -> Unary returns a self-driving future.
     let unary = client.call::<UnaryUnary>(Number { value: 41 })?.await?;
-    assert_eq!(unary, Total { value: 42 });
+    assert_eq!(unary.view()?, &Total { value: 42 });
 
     // Unary -> Stream returns a self-driving RpcStream.
     let unary_stream = collect(client.call::<UnaryStream>(Number { value: 7 })?).await?;
@@ -159,7 +168,7 @@ async fn run() -> RpcResult<()> {
     let stream_unary = client
         .call::<StreamUnary>(request_stream([2, 3, 4]))?
         .await?;
-    assert_eq!(stream_unary, Total { value: 9 });
+    assert_eq!(stream_unary.view()?, &Total { value: 9 });
 
     // Stream -> Stream can transform requests incrementally without buffering
     // the complete request or response body.

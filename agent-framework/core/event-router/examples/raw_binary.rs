@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use claw_event_router::rpc::{
     binary_pipe, close, flush, read, read_to_end, write_all, BinaryIoError, BoxBinaryReader,
-    BoxBinaryWriter, BytesReader, RawRpcProvider, RpcAddress, RpcContext, RpcFuture, RpcRegistry,
-    RpcResult,
+    BoxBinaryWriter, BytesReader, RawRpcProvider, RpcAddress, RpcContext, RpcFuture,
+    RpcLaneStorage, RpcRegistry, RpcResult,
 };
 use futures_util::join;
 
@@ -88,7 +88,8 @@ async fn streaming_body_call(registry: &Rc<RpcRegistry>, address: &RpcAddress) -
 }
 
 async fn run() -> RpcResult<()> {
-    let registry = Rc::new(RpcRegistry::new());
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<2, 128, 8>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes)?);
     let address = RpcAddress::parse("raw.uppercase")?;
     registry.register_raw(address.clone(), Uppercase)?;
 

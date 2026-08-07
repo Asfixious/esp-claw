@@ -3,11 +3,13 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcError, RpcFailure, RpcMethod, RpcRegistry, RpcResult, Streaming, Unary,
+    RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Streaming,
+    Unary,
 };
-use serde::{Deserialize, Serialize};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
 struct Number {
     value: u32,
 }
@@ -39,7 +41,6 @@ struct TinyRequestFrame;
 impl RpcMethod for TinyRequestFrame {
     const ADDRESS: &'static str = "errors.tiny_frame";
     const MAX_REQUEST_FRAME: usize = 1;
-    const PIPE_CAPACITY: usize = 1;
 
     type Request = Number;
     type Response = Number;
@@ -51,7 +52,7 @@ struct InvalidConfiguration;
 
 impl RpcMethod for InvalidConfiguration {
     const ADDRESS: &'static str = "errors.invalid_configuration";
-    const PIPE_CAPACITY: usize = 0;
+    const MAX_REQUEST_FRAME: usize = 0;
 
     type Request = Number;
     type Response = Number;
@@ -71,11 +72,16 @@ impl RpcMethod for DomainFailure {
 }
 
 async fn run() -> RpcResult<()> {
-    let registry = Rc::new(RpcRegistry::new());
-    registry.register_typed::<Echo, _>(|_context, request: Number| async move { Ok(request) })?;
+    let lanes = Box::leak(Box::new(RpcLaneStorage::<2, 4_096, 8>::new()));
+    let registry = Rc::new(RpcRegistry::new(lanes)?);
+    registry.register_typed::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
+        Ok(*request.view()?)
+    })?;
 
     let duplicate =
-        registry.register_typed::<Echo, _>(|_context, request: Number| async move { Ok(request) });
+        registry.register_typed::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(*request.view()?)
+        });
     assert!(matches!(duplicate, Err(RpcError::AlreadyRegistered(_))));
 
     // The method descriptor is checked before request encoding starts. The
@@ -85,9 +91,9 @@ async fn run() -> RpcResult<()> {
         .call::<IncompatibleEcho>(Number { value: 1 });
     assert!(matches!(mismatch, Err(RpcError::SignatureMismatch { .. })));
 
-    registry.register_typed::<TinyRequestFrame, _>(|_context, request: Number| async move {
-        Ok(request)
-    })?;
+    registry.register_typed::<TinyRequestFrame, _>(
+        |_context, request: RpcFrame<Number>| async move { Ok(*request.view()?) },
+    )?;
     let oversized = registry
         .client()
         .call::<TinyRequestFrame>(Number { value: u32::MAX })?
@@ -98,22 +104,24 @@ async fn run() -> RpcResult<()> {
     ));
 
     let invalid = registry.register_typed::<InvalidConfiguration, _>(
-        |_context, request: Number| async move { Ok(request) },
+        |_context, request: RpcFrame<Number>| async move { Ok(*request.view()?) },
     );
     assert!(matches!(
         invalid,
         Err(RpcError::InvalidMethodConfiguration {
-            field: "PIPE_CAPACITY",
+            field: "MAX_REQUEST_FRAME",
             ..
         })
     ));
 
-    registry.register_typed::<DomainFailure, _>(|_context, _request: Number| async move {
-        Err(RpcError::Provider(RpcFailure::new(
-            "quota_exhausted",
-            "the provider has no remaining quota",
-        )))
-    })?;
+    registry.register_typed::<DomainFailure, _>(
+        |_context, _request: RpcFrame<Number>| async move {
+            Err(RpcError::Provider(RpcFailure::new(
+                "quota_exhausted",
+                "the provider has no remaining quota",
+            )))
+        },
+    )?;
     let failure = registry
         .client()
         .call::<DomainFailure>(Number { value: 1 })?

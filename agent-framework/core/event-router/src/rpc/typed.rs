@@ -5,24 +5,29 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use futures_core::Stream;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use super::frame::{decode_unary, write_frame, FramedReader};
+use super::frame::{decode_unary, write_frame, FramedReader, RpcFrame};
 use super::io::{close, BoxBinaryReader, BoxBinaryWriter};
+use super::lane::LANE_FRAME_ALIGNMENT;
+use super::registry::PreparedCall;
 use super::{RawRpcProvider, RpcAddress, RpcContext, RpcError, RpcFuture, RpcResult};
 
-const DEFAULT_FRAME_LIMIT: usize = 65_536;
-const DEFAULT_PIPE_CAPACITY: usize = 1_024;
+const DEFAULT_FRAME_LIMIT: usize = 4_096;
 
 mod private {
     pub trait Sealed {}
 }
 
-/// A serializable, owned value that may be carried in a typed RPC frame.
-pub trait RpcMessage: Serialize + DeserializeOwned + 'static {}
+/// A fixed-layout value that may be viewed directly in a typed RPC frame.
+///
+/// Deriving [`TryFromBytes`], [`IntoBytes`], [`KnownLayout`], and [`Immutable`]
+/// rejects pointers and uninitialized padding at compile time. Message types
+/// should use an explicit representation and explicit byte-order fields for a
+/// stable wire format.
+pub trait RpcMessage: TryFromBytes + IntoBytes + KnownLayout + Immutable + 'static {}
 
-impl<T> RpcMessage for T where T: Serialize + DeserializeOwned + 'static {}
+impl<T> RpcMessage for T where T: TryFromBytes + IntoBytes + KnownLayout + Immutable + 'static {}
 
 /// Whether one side of a typed method carries one message or a message stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -44,7 +49,7 @@ pub struct Streaming;
 impl private::Sealed for Unary {}
 impl private::Sealed for Streaming {}
 
-/// A task-local stream of decoded RPC messages.
+/// A task-local stream of RPC values or lane-backed frame views.
 pub struct RpcStream<T> {
     inner: Pin<Box<dyn Stream<Item = RpcResult<T>> + 'static>>,
 }
@@ -61,7 +66,7 @@ impl<T> RpcStream<T> {
         }
     }
 
-    /// Waits for the next decoded message.
+    /// Waits for the next stream item.
     ///
     /// `None` means that the peer closed this direction normally.
     pub async fn next(&mut self) -> Option<RpcResult<T>> {
@@ -99,14 +104,11 @@ pub trait RpcMethod: 'static {
     /// Response-side cardinality.
     type Output: RpcOutputMode<Self::Response>;
 
-    /// Maximum encoded request frame size.
+    /// Maximum encoded request frame size. Defaults to 4096 bytes.
     const MAX_REQUEST_FRAME: usize = DEFAULT_FRAME_LIMIT;
 
-    /// Maximum encoded response frame size.
+    /// Maximum encoded response frame size. Defaults to 4096 bytes.
     const MAX_RESPONSE_FRAME: usize = DEFAULT_FRAME_LIMIT;
-
-    /// Byte capacity of each internal request and response pipe.
-    const PIPE_CAPACITY: usize = DEFAULT_PIPE_CAPACITY;
 }
 
 /// Runtime descriptor used to reject typed client/provider mismatches before IO.
@@ -123,7 +125,6 @@ pub struct RpcMethodDescriptor {
     output: RpcCardinality,
     max_request_frame: usize,
     max_response_frame: usize,
-    pipe_capacity: usize,
 }
 
 impl RpcMethodDescriptor {
@@ -144,12 +145,8 @@ impl RpcMethodDescriptor {
                 field: "MAX_RESPONSE_FRAME",
             });
         }
-        if M::PIPE_CAPACITY == 0 {
-            return Err(RpcError::InvalidMethodConfiguration {
-                address,
-                field: "PIPE_CAPACITY",
-            });
-        }
+        validate_message_alignment::<M::Request>()?;
+        validate_message_alignment::<M::Response>()?;
         Ok(Self {
             address,
             method_type_id: TypeId::of::<M>(),
@@ -162,7 +159,6 @@ impl RpcMethodDescriptor {
             output: M::Output::CARDINALITY,
             max_request_frame: M::MAX_REQUEST_FRAME,
             max_response_frame: M::MAX_RESPONSE_FRAME,
-            pipe_capacity: M::PIPE_CAPACITY,
         })
     }
 
@@ -213,11 +209,59 @@ impl RpcMethodDescriptor {
     pub fn max_response_frame(&self) -> usize {
         self.max_response_frame
     }
+}
 
-    /// Returns the internal request and response pipe capacity.
-    #[must_use]
-    pub fn pipe_capacity(&self) -> usize {
-        self.pipe_capacity
+fn validate_message_alignment<T>() -> RpcResult<()>
+where
+    T: RpcMessage,
+{
+    let required = align_of::<T>();
+    if required > LANE_FRAME_ALIGNMENT {
+        return Err(RpcError::MessageAlignmentExceedsLane {
+            message_type: type_name::<T>(),
+            required,
+            available: LANE_FRAME_ALIGNMENT,
+        });
+    }
+    Ok(())
+}
+
+struct ActiveCall {
+    input: RpcFuture<'static>,
+    provider: RpcFuture<'static>,
+    response: BoxBinaryReader,
+}
+
+type SetupFuture = Pin<Box<dyn Future<Output = RpcResult<ActiveCall>> + 'static>>;
+
+/// Deferred acquisition and initialization of one fixed RPC lane.
+///
+/// This type is an implementation detail exposed only so the sealed
+/// [`RpcOutputMode`] trait can construct its self-driving client value.
+#[doc(hidden)]
+pub struct RpcCallSetup {
+    future: SetupFuture,
+}
+
+pub(crate) fn setup_call<M>(
+    prepared: PreparedCall,
+    input: <M::Input as RpcInputMode<M::Request>>::ClientInput,
+) -> RpcCallSetup
+where
+    M: RpcMethod,
+{
+    RpcCallSetup {
+        future: Box::pin(async move {
+            let mut acquired = prepared.acquire().await?;
+            let lane = acquired.take_lane()?;
+            let input = M::Input::encode_input(input, lane.request_writer, M::MAX_REQUEST_FRAME);
+            let provider = acquired.start(lane.request_reader, lane.response_writer);
+            Ok(ActiveCall {
+                input,
+                provider,
+                response: lane.response_reader,
+            })
+        }),
     }
 }
 
@@ -237,7 +281,7 @@ pub trait TypedRpcHandler<M>
 where
     M: RpcMethod,
 {
-    /// Handles one decoded request or request stream.
+    /// Handles one request frame or request-frame stream.
     fn call<'a>(
         &'a self,
         context: RpcContext,
@@ -314,12 +358,7 @@ where
     ) -> RpcFuture<'static>;
 
     #[doc(hidden)]
-    fn make_client_call(
-        input: RpcFuture<'static>,
-        provider: RpcFuture<'static>,
-        reader: BoxBinaryReader,
-        limit: usize,
-    ) -> Self::ClientCall;
+    fn make_client_call(setup: RpcCallSetup, limit: usize) -> Self::ClientCall;
 }
 
 impl<T> RpcInputMode<T> for Unary
@@ -327,7 +366,7 @@ where
     T: RpcMessage,
 {
     type ClientInput = T;
-    type HandlerInput = T;
+    type HandlerInput = RpcFrame<T>;
 
     const CARDINALITY: RpcCardinality = RpcCardinality::Unary;
 
@@ -356,7 +395,7 @@ where
     T: RpcMessage,
 {
     type ClientInput = RpcStream<T>;
-    type HandlerInput = RpcStream<T>;
+    type HandlerInput = RpcStream<RpcFrame<T>>;
 
     const CARDINALITY: RpcCardinality = RpcCardinality::Streaming;
 
@@ -403,13 +442,8 @@ where
         })
     }
 
-    fn make_client_call(
-        input: RpcFuture<'static>,
-        provider: RpcFuture<'static>,
-        reader: BoxBinaryReader,
-        limit: usize,
-    ) -> Self::ClientCall {
-        RpcUnaryCall::new(input, provider, reader, limit)
+    fn make_client_call(setup: RpcCallSetup, limit: usize) -> Self::ClientCall {
+        RpcUnaryCall::new(setup, limit)
     }
 }
 
@@ -418,7 +452,7 @@ where
     T: RpcMessage,
 {
     type HandlerOutput = RpcStream<T>;
-    type ClientCall = RpcStream<T>;
+    type ClientCall = RpcStream<RpcFrame<T>>;
 
     const CARDINALITY: RpcCardinality = RpcCardinality::Streaming;
 
@@ -436,13 +470,8 @@ where
         })
     }
 
-    fn make_client_call(
-        input: RpcFuture<'static>,
-        provider: RpcFuture<'static>,
-        reader: BoxBinaryReader,
-        limit: usize,
-    ) -> Self::ClientCall {
-        RpcStream::new(RpcResponseDriverStream::new(input, provider, reader, limit))
+    fn make_client_call(setup: RpcCallSetup, limit: usize) -> Self::ClientCall {
+        RpcStream::new(RpcResponseDriverStream::new(setup, limit))
     }
 }
 
@@ -480,27 +509,51 @@ where
 }
 
 struct CallDriver {
+    setup: Option<SetupFuture>,
     input: Option<RpcFuture<'static>>,
     provider: Option<RpcFuture<'static>>,
 }
 
+enum CallProgress {
+    Response(BoxBinaryReader),
+    Complete,
+}
+
 impl CallDriver {
-    fn new(input: RpcFuture<'static>, provider: RpcFuture<'static>) -> Self {
+    fn new(setup: RpcCallSetup) -> Self {
         Self {
-            input: Some(input),
-            provider: Some(provider),
+            setup: Some(setup.future),
+            input: None,
+            provider: None,
         }
     }
 
-    fn poll_call(&mut self, context: &mut Context<'_>) -> Poll<RpcResult<()>> {
+    fn poll_call(&mut self, context: &mut Context<'_>) -> Poll<RpcResult<CallProgress>> {
+        if let Some(setup) = self.setup.as_mut() {
+            match setup.as_mut().poll(context) {
+                Poll::Ready(Ok(active)) => {
+                    self.setup = None;
+                    self.input = Some(active.input);
+                    self.provider = Some(active.provider);
+                    context.waker().wake_by_ref();
+                    return Poll::Ready(Ok(CallProgress::Response(active.response)));
+                }
+                Poll::Ready(Err(error)) => {
+                    self.setup = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         let Some(provider) = self.provider.as_mut() else {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(CallProgress::Complete));
         };
         match provider.as_mut().poll(context) {
             Poll::Ready(result) => {
                 self.provider = None;
                 self.input = None;
-                return Poll::Ready(result);
+                return Poll::Ready(result.map(|()| CallProgress::Complete));
             }
             Poll::Pending => {}
         }
@@ -528,23 +581,20 @@ impl CallDriver {
 #[must_use = "futures do nothing unless polled or awaited"]
 pub struct RpcUnaryCall<T> {
     driver: CallDriver,
-    response: FramedReader<T>,
-    value: Option<T>,
+    response: Option<FramedReader<T>>,
+    response_limit: usize,
+    value: Option<RpcFrame<T>>,
     response_eof: bool,
     driver_done: bool,
     finished: bool,
 }
 
 impl<T> RpcUnaryCall<T> {
-    fn new(
-        input: RpcFuture<'static>,
-        provider: RpcFuture<'static>,
-        reader: BoxBinaryReader,
-        limit: usize,
-    ) -> Self {
+    fn new(setup: RpcCallSetup, limit: usize) -> Self {
         Self {
-            driver: CallDriver::new(input, provider),
-            response: FramedReader::new(reader, limit),
+            driver: CallDriver::new(setup),
+            response: None,
+            response_limit: limit,
             value: None,
             response_eof: false,
             driver_done: false,
@@ -552,7 +602,7 @@ impl<T> RpcUnaryCall<T> {
         }
     }
 
-    fn fail(&mut self, error: RpcError) -> Poll<RpcResult<T>> {
+    fn fail(&mut self, error: RpcError) -> Poll<RpcResult<RpcFrame<T>>> {
         self.finished = true;
         Poll::Ready(Err(error))
     }
@@ -564,7 +614,7 @@ impl<T> Future for RpcUnaryCall<T>
 where
     T: RpcMessage,
 {
-    type Output = RpcResult<T>;
+    type Output = RpcResult<RpcFrame<T>>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -574,22 +624,30 @@ where
 
         if !this.driver_done {
             match this.driver.poll_call(context) {
-                Poll::Ready(Ok(())) => this.driver_done = true,
+                Poll::Ready(Ok(CallProgress::Response(reader))) => {
+                    this.response = Some(FramedReader::new(reader, this.response_limit));
+                }
+                Poll::Ready(Ok(CallProgress::Complete)) => this.driver_done = true,
                 Poll::Ready(Err(error)) => return this.fail(error),
                 Poll::Pending => {}
             }
         }
 
         if !this.response_eof {
-            match Pin::new(&mut this.response).poll_next(context) {
-                Poll::Ready(Some(Ok(value))) if this.value.is_none() => {
-                    this.value = Some(value);
-                    context.waker().wake_by_ref();
+            if let Some(response) = this.response.as_mut() {
+                match Pin::new(response).poll_next(context) {
+                    Poll::Ready(Some(Ok(value))) if this.value.is_none() => {
+                        if value.is_borrowed() {
+                            this.response_eof = true;
+                        }
+                        this.value = Some(value);
+                        context.waker().wake_by_ref();
+                    }
+                    Poll::Ready(Some(Ok(_))) => return this.fail(RpcError::ExtraUnaryFrame),
+                    Poll::Ready(Some(Err(error))) => return this.fail(error),
+                    Poll::Ready(None) => this.response_eof = true,
+                    Poll::Pending => {}
                 }
-                Poll::Ready(Some(Ok(_))) => return this.fail(RpcError::ExtraUnaryFrame),
-                Poll::Ready(Some(Err(error))) => return this.fail(error),
-                Poll::Ready(None) => this.response_eof = true,
-                Poll::Pending => {}
             }
         }
 
@@ -603,22 +661,19 @@ where
 
 struct RpcResponseDriverStream<T> {
     driver: CallDriver,
-    response: FramedReader<T>,
+    response: Option<FramedReader<T>>,
+    response_limit: usize,
     response_eof: bool,
     driver_done: bool,
     finished: bool,
 }
 
 impl<T> RpcResponseDriverStream<T> {
-    fn new(
-        input: RpcFuture<'static>,
-        provider: RpcFuture<'static>,
-        reader: BoxBinaryReader,
-        limit: usize,
-    ) -> Self {
+    fn new(setup: RpcCallSetup, limit: usize) -> Self {
         Self {
-            driver: CallDriver::new(input, provider),
-            response: FramedReader::new(reader, limit),
+            driver: CallDriver::new(setup),
+            response: None,
+            response_limit: limit,
             response_eof: false,
             driver_done: false,
             finished: false,
@@ -632,7 +687,7 @@ impl<T> Stream for RpcResponseDriverStream<T>
 where
     T: RpcMessage,
 {
-    type Item = RpcResult<T>;
+    type Item = RpcResult<RpcFrame<T>>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -642,7 +697,10 @@ where
 
         if !this.driver_done {
             match this.driver.poll_call(context) {
-                Poll::Ready(Ok(())) => this.driver_done = true,
+                Poll::Ready(Ok(CallProgress::Response(reader))) => {
+                    this.response = Some(FramedReader::new(reader, this.response_limit));
+                }
+                Poll::Ready(Ok(CallProgress::Complete)) => this.driver_done = true,
                 Poll::Ready(Err(error)) => {
                     this.finished = true;
                     return Poll::Ready(Some(Err(error)));
@@ -652,10 +710,12 @@ where
         }
 
         if !this.response_eof {
-            match Pin::new(&mut this.response).poll_next(context) {
-                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
-                Poll::Ready(None) => this.response_eof = true,
-                Poll::Pending => {}
+            if let Some(response) = this.response.as_mut() {
+                match Pin::new(response).poll_next(context) {
+                    Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
+                    Poll::Ready(None) => this.response_eof = true,
+                    Poll::Pending => {}
+                }
             }
         }
 

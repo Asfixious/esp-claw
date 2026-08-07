@@ -1,6 +1,6 @@
 [package]
 name = "claw-sandbox"
-authors = ["Finn(Ziheng) Sheng"]
+authors = ["Finn(Ziheng) Sheng <zsheng2@ncsu.edu>", "Finn(Ziheng) Sheng <robcholz00@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 description = "Sandbox filesystem: confines agent file access to a fixed set of virtual roots (/sandbox, /shared, /system) and rejects any path outside them"

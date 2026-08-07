@@ -1,6 +1,6 @@
 [package]
 name = "claw-permission"
-authors = ["Finn(Ziheng) Sheng"]
+authors = ["Finn(Ziheng) Sheng <zsheng2@ncsu.edu>", "Finn(Ziheng) Sheng <robcholz00@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 description = "Permission policy layer: classifies tool actions into Allow/Ask/Deny decisions"

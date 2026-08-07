@@ -1,6 +1,6 @@
 [package]
 name = "claw-api-selftest"
-authors = ["Finn(Ziheng) Sheng"]
+authors = ["Finn(Ziheng) Sheng <zsheng2@ncsu.edu>", "Finn(Ziheng) Sheng <robcholz00@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 description = "Device-only C-ABI scenario runner that drives claw-api's ClawApi over claw-sys's EspIdfHttp against a live LLM from an ESP-IDF Unity test app"

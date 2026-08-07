@@ -1,6 +1,6 @@
 [package]
 name = "claw-c-legacy-skill"
-authors = ["Finn(Ziheng) Sheng"]
+authors = ["Finn(Ziheng) Sheng <zsheng2@ncsu.edu>", "Finn(Ziheng) Sheng <robcholz00@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 description = "Device-only Rust adapter over the pre-initialized C claw_skill registry"

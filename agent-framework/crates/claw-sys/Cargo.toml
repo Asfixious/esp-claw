@@ -1,6 +1,6 @@
 [package]
 name = "claw-sys"
-authors = ["Finn(Ziheng) Sheng"]
+authors = ["Finn(Ziheng) Sheng <zsheng2@ncsu.edu>", "Finn(Ziheng) Sheng <robcholz00@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 description = "Thin IDF shims std cannot express: the ESP_LOGx log backend and the esp_http_client ClawHttp driver"

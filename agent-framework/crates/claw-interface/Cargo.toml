@@ -1,6 +1,6 @@
 [package]
 name = "claw-interface"
-authors = ["Finn(Ziheng) Sheng"]
+authors = ["Finn(Ziheng) Sheng <zsheng2@ncsu.edu>", "Finn(Ziheng) Sheng <robcholz00@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 description = "Shared types and dependency-injection traits for the claw_modules Rust crates (esp_err, ClawEvent, EventPublisher, ClawHttp)"

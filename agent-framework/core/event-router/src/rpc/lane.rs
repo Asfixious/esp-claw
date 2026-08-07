@@ -1,11 +1,10 @@
 use core::cell::{Ref, RefCell};
 use core::future::Future;
+use core::mem::align_of;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use super::{RpcDirection, RpcError, RpcResult};
-
-pub(crate) const LANE_FRAME_ALIGNMENT: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaneOwner {
@@ -18,6 +17,8 @@ enum LaneOwner {
 struct AlignedFrame<const M: usize> {
     bytes: [u8; M],
 }
+
+pub(crate) const LANE_FRAME_ALIGNMENT: usize = align_of::<AlignedFrame<0>>();
 
 impl<const M: usize> AlignedFrame<M> {
     const fn new() -> Self {

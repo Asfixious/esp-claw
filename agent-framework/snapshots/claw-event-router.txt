@@ -26,10 +26,6 @@ pub claw_event_router::rpc::RpcError::InvalidMessageFrame
 pub claw_event_router::rpc::RpcError::InvalidMessageFrame::message_type: &'static str
 pub claw_event_router::rpc::RpcError::LaneWaiterCapacityExceeded
 pub claw_event_router::rpc::RpcError::LaneWaiterCapacityExceeded::limit: usize
-pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane
-pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::available: usize
-pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::message_type: &'static str
-pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::required: usize
 pub claw_event_router::rpc::RpcError::MissingUnaryFrame
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted::limit: usize

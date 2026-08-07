@@ -24,10 +24,6 @@ struct Total {
     value: u32,
 }
 
-#[repr(C, align(32))]
-#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
-struct OverAligned([u8; 32]);
-
 fn registry() -> Rc<RpcRegistry<4, 4_096, 8>> {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4_096, 8>::new()));
     Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"))
@@ -311,34 +307,6 @@ fn response_frame_retains_an_aligned_lane_until_drop() {
         let second = second.await.expect("finish second call after frame drop");
         assert_eq!(second.view(), Ok(&number(2)));
     });
-}
-
-struct OverAlignedMethod;
-
-impl RpcMethod for OverAlignedMethod {
-    const ADDRESS: &'static str = "typed.over_aligned";
-
-    type Request = OverAligned;
-    type Response = OverAligned;
-    type Input = Unary;
-    type Output = Unary;
-}
-
-#[test]
-fn message_alignment_larger_than_lane_alignment_is_rejected() {
-    let registry = registry();
-    let result = registry.register_typed::<OverAlignedMethod, _>(
-        |_context, request: RpcFrame<OverAligned>| async move { Ok(*request.view()?) },
-    );
-
-    assert!(matches!(
-        result,
-        Err(RpcError::MessageAlignmentExceedsLane {
-            required: 32,
-            available: 16,
-            ..
-        })
-    ));
 }
 
 struct DirectSelfMethod;

@@ -8,7 +8,7 @@ use std::rc::{Rc, Weak};
 
 use super::address::{RpcAddress, RpcAddressError};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
-use super::lane::{LaneAcquire, LaneIo, LanePool, LaneReader, LaneWriter, RpcLaneStorage};
+use super::lane::{LaneAcquire, LaneIo, LaneReader, LaneWriter, RpcLaneStorage};
 use super::typed::{
     RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode, TypedProvider, TypedRpcHandler,
 };
@@ -55,7 +55,7 @@ pub struct RpcRegistry<const N: usize, const M: usize, const Q: usize> {
     endpoints: RefCell<HashMap<RpcAddress, EndpointEntry>>,
     next_endpoint_id: Cell<u64>,
     next_call_id: Cell<u64>,
-    lanes: &'static dyn LanePool,
+    lanes: &'static RpcLaneStorage<N, M, Q>,
 }
 
 impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
@@ -99,7 +99,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// The method descriptor is retained with the endpoint so typed clients can
     /// reject request, response, or cardinality mismatches before payload IO.
     ///
-    /// # Compile-time capacity check
+    /// # Compile-time layout checks
     ///
     /// A Method whose fixed-layout message exceeds `M` does not compile:
     ///
@@ -128,13 +128,47 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// # Ok::<(), claw_event_router::rpc::RpcError>(())
     /// ```
     ///
+    /// A Method whose message requires stricter alignment than the lane frame
+    /// also does not compile:
+    ///
+    /// ```compile_fail
+    /// use claw_event_router::rpc::{
+    ///     RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, Unary,
+    /// };
+    /// use static_cell::ConstStaticCell;
+    /// use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+    ///
+    /// #[repr(C, align(32))]
+    /// #[derive(Immutable, IntoBytes, KnownLayout, TryFromBytes)]
+    /// struct TooAligned([u8; 32]);
+    ///
+    /// struct InvalidAlignment;
+    ///
+    /// impl RpcMethod for InvalidAlignment {
+    ///     const ADDRESS: &'static str = "static.invalid_alignment";
+    ///     type Request = TooAligned;
+    ///     type Response = [u8; 1];
+    ///     type Input = Unary;
+    ///     type Output = Unary;
+    /// }
+    ///
+    /// static LANES: ConstStaticCell<RpcLaneStorage<1, 64, 1>> =
+    ///     ConstStaticCell::new(RpcLaneStorage::new());
+    /// let registry = RpcRegistry::new(LANES.take())?;
+    /// let _ = registry.register_typed::<InvalidAlignment, _>(
+    ///     |_context, _request: RpcFrame<TooAligned>| async move { Ok([0]) },
+    /// )?;
+    /// # Ok::<(), claw_event_router::rpc::RpcError>(())
+    /// ```
+    ///
     /// # Errors
     ///
-    /// Returns an error if the method address or message alignment is invalid,
-    /// the address is occupied, or no endpoint identity remains.
+    /// Returns an error if the method address is invalid, the address is
+    /// occupied, or no endpoint identity remains.
     ///
     /// Compilation fails if the fixed request or response type is larger than
-    /// the registry's `M`-byte lane frames.
+    /// the registry's `M`-byte lane frames or requires stricter alignment than
+    /// the lane frame provides.
     pub fn register_typed<Method, H>(&self, handler: H) -> RpcResult<RpcRegistration>
     where
         Method: RpcMethod,
@@ -513,18 +547,6 @@ pub enum RpcError {
     InvalidMessageFrame {
         /// Rust message type that rejected the bytes.
         message_type: &'static str,
-    },
-    /// A message requires stricter alignment than fixed lanes provide.
-    #[error(
-        "RPC message {message_type} requires {required}-byte alignment, lane provides {available}"
-    )]
-    MessageAlignmentExceedsLane {
-        /// Rust message type whose alignment cannot be provided.
-        message_type: &'static str,
-        /// Alignment required by the message.
-        required: usize,
-        /// Alignment guaranteed by every lane frame.
-        available: usize,
     },
     /// A provider returned a domain-specific failure.
     #[error("RPC provider failed ({code}): {message}", code = .0.code(), message = .0.message())]

@@ -1,6 +1,7 @@
 use core::any::{type_name, TypeId};
 use core::future::Future;
 use core::marker::PhantomData;
+use core::mem::align_of;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -121,9 +122,17 @@ impl RpcMethodDescriptor {
     where
         M: RpcMethod,
     {
+        const {
+            assert!(
+                align_of::<M::Request>() <= LANE_FRAME_ALIGNMENT,
+                "RPC request message alignment exceeds lane frame alignment"
+            );
+            assert!(
+                align_of::<M::Response>() <= LANE_FRAME_ALIGNMENT,
+                "RPC response message alignment exceeds lane frame alignment"
+            );
+        }
         let address = RpcAddress::parse(M::ADDRESS)?;
-        validate_message_alignment::<M::Request>()?;
-        validate_message_alignment::<M::Response>()?;
         Ok(Self {
             address,
             method_type_id: TypeId::of::<M>(),
@@ -172,21 +181,6 @@ impl RpcMethodDescriptor {
     pub fn output_cardinality(&self) -> RpcCardinality {
         self.output
     }
-}
-
-fn validate_message_alignment<T>() -> RpcResult<()>
-where
-    T: RpcMessage,
-{
-    let required = align_of::<T>();
-    if required > LANE_FRAME_ALIGNMENT {
-        return Err(RpcError::MessageAlignmentExceedsLane {
-            message_type: type_name::<T>(),
-            required,
-            available: LANE_FRAME_ALIGNMENT,
-        });
-    }
-    Ok(())
 }
 
 struct ActiveCall {

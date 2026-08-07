@@ -72,7 +72,7 @@ esp_err_t http_server_start(void)
     config.server_port = 80;
     config.ctrl_port = HTTP_SERVER_CTRL_PORT;
     config.max_uri_handlers = 32;
-    config.stack_size = 8192;
+    config.stack_size = 12 * 1024;
     config.max_open_sockets = 12;
     config.lru_purge_enable = true;
 

@@ -1,45 +1,54 @@
 use super::registry::RpcClient;
+use getset::{CopyGetters, Getters};
 
 /// Identity of one RPC invocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RpcCallId(u64);
+#[derive(Clone, Copy, CopyGetters, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RpcCallId {
+    /// Numeric call identifier.
+    #[getset(get_copy = "pub")]
+    value: u64,
+}
 
 impl RpcCallId {
     pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the numeric identifier.
-    #[must_use]
-    pub fn value(self) -> u64 {
-        self.0
+        Self { value }
     }
 }
 
 /// Identity of one registered endpoint instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RpcEndpointId(u64);
+#[derive(Clone, Copy, CopyGetters, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RpcEndpointId {
+    /// Numeric endpoint identifier.
+    #[getset(get_copy = "pub")]
+    value: u64,
+}
 
 impl RpcEndpointId {
     pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the numeric identifier.
-    #[must_use]
-    pub fn value(self) -> u64 {
-        self.0
+        Self { value }
     }
 }
 
 /// Metadata and nested-call client supplied to a typed RPC provider.
-#[derive(Clone)]
+#[derive(Clone, CopyGetters, Getters)]
 pub struct RpcContext {
+    /// This invocation's identity.
+    #[getset(get_copy = "pub")]
     call_id: RpcCallId,
+    /// Root invocation identity shared by the nested call chain.
+    #[getset(get_copy = "pub")]
     root_call_id: RpcCallId,
+    /// Immediate parent invocation, if this is a nested call.
+    #[getset(get_copy = "pub")]
     parent_call_id: Option<RpcCallId>,
+    /// Endpoint that initiated this call, if any.
+    #[getset(get_copy = "pub")]
     caller_endpoint_id: Option<RpcEndpointId>,
+    /// Endpoint handling this invocation.
+    #[getset(get_copy = "pub")]
     endpoint_id: RpcEndpointId,
+    /// Client bound to the current endpoint and call lineage.
+    #[getset(get = "pub")]
     client: RpcClient,
 }
 
@@ -60,45 +69,5 @@ impl RpcContext {
             endpoint_id,
             client,
         }
-    }
-
-    /// Returns this invocation's identity.
-    #[must_use]
-    pub fn call_id(&self) -> RpcCallId {
-        self.call_id
-    }
-
-    /// Returns the root invocation identity shared by the nested call chain.
-    #[must_use]
-    pub fn root_call_id(&self) -> RpcCallId {
-        self.root_call_id
-    }
-
-    /// Returns the immediate parent invocation, if this is a nested call.
-    #[must_use]
-    pub fn parent_call_id(&self) -> Option<RpcCallId> {
-        self.parent_call_id
-    }
-
-    /// Returns the endpoint that initiated this call, if any.
-    #[must_use]
-    pub fn caller_endpoint_id(&self) -> Option<RpcEndpointId> {
-        self.caller_endpoint_id
-    }
-
-    /// Returns the endpoint handling this invocation.
-    #[must_use]
-    pub fn endpoint_id(&self) -> RpcEndpointId {
-        self.endpoint_id
-    }
-
-    /// Returns a client bound to the current endpoint and call lineage.
-    ///
-    /// Calls made through this client become children of the current call. A
-    /// direct call back into the same endpoint instance is rejected, while an
-    /// indirect `A -> B -> A` chain remains valid.
-    #[must_use]
-    pub fn client(&self) -> &RpcClient {
-        &self.client
     }
 }

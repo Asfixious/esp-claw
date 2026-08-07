@@ -10,25 +10,16 @@ use super::address::{RpcAddress, RpcAddressError};
 use super::context::{RpcCallId, RpcContext, RpcEndpointId};
 use super::lane::{LaneAcquire, LaneIo, LaneReader, LaneWriter, RpcLaneStorage};
 use super::typed::{
-    RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode, TypedProvider, TypedRpcHandler,
+    RpcHandler, RpcInputMode, RpcMethod, RpcMethodDescriptor, RpcOutputMode, TypedProvider,
 };
 
 /// Request or response side of one full-duplex RPC lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RpcDirection {
+pub(crate) enum RpcDirection {
     /// Data sent from caller to provider.
     Request,
     /// Data sent from provider to caller.
     Response,
-}
-
-impl core::fmt::Display for RpcDirection {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Request => formatter.write_str("request"),
-            Self::Response => formatter.write_str("response"),
-        }
-    }
 }
 
 /// Result returned by RPC operations.
@@ -94,7 +85,7 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
         }
     }
 
-    /// Registers a typed provider for method `M`.
+    /// Registers a provider for method `M`.
     ///
     /// The method descriptor is retained with the endpoint so typed clients can
     /// reject request, response, or cardinality mismatches before payload IO.
@@ -109,12 +100,13 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// };
     /// use static_cell::ConstStaticCell;
     ///
-    /// struct TooLarge;
+    /// struct TooLargeError;
     ///
-    /// impl RpcMethod for TooLarge {
+    /// impl RpcMethod for TooLargeError {
     ///     const ADDRESS: &'static str = "static.too_large";
-    ///     type Request = [u8; 65];
+    ///     type Request = [u8; 1];
     ///     type Response = [u8; 1];
+    ///     type Error = [u8; 65];
     ///     type Input = Unary;
     ///     type Output = Unary;
     /// }
@@ -122,8 +114,8 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// static LANES: ConstStaticCell<RpcLaneStorage<1, 64, 1>> =
     ///     ConstStaticCell::new(RpcLaneStorage::new());
     /// let registry = RpcRegistry::new(LANES.take())?;
-    /// let _ = registry.register_typed::<TooLarge, _>(
-    ///     |_context, _request: RpcFrame<[u8; 65]>| async move { Ok([0]) },
+    /// let _ = registry.register::<TooLargeError, _>(
+    ///     |_context, _request: RpcFrame<[u8; 1]>| async move { Ok(Ok([0])) },
     /// )?;
     /// # Ok::<(), claw_event_router::rpc::RpcError>(())
     /// ```
@@ -146,8 +138,9 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     ///
     /// impl RpcMethod for InvalidAlignment {
     ///     const ADDRESS: &'static str = "static.invalid_alignment";
-    ///     type Request = TooAligned;
+    ///     type Request = [u8; 1];
     ///     type Response = [u8; 1];
+    ///     type Error = TooAligned;
     ///     type Input = Unary;
     ///     type Output = Unary;
     /// }
@@ -155,8 +148,8 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// static LANES: ConstStaticCell<RpcLaneStorage<1, 64, 1>> =
     ///     ConstStaticCell::new(RpcLaneStorage::new());
     /// let registry = RpcRegistry::new(LANES.take())?;
-    /// let _ = registry.register_typed::<InvalidAlignment, _>(
-    ///     |_context, _request: RpcFrame<TooAligned>| async move { Ok([0]) },
+    /// let _ = registry.register::<InvalidAlignment, _>(
+    ///     |_context, _request: RpcFrame<[u8; 1]>| async move { Ok(Ok([0])) },
     /// )?;
     /// # Ok::<(), claw_event_router::rpc::RpcError>(())
     /// ```
@@ -166,13 +159,13 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// Returns an error if the method address is invalid, the address is
     /// occupied, or no endpoint identity remains.
     ///
-    /// Compilation fails if the fixed request or response type is larger than
-    /// the registry's `M`-byte lane frames or requires stricter alignment than
-    /// the lane frame provides.
-    pub fn register_typed<Method, H>(&self, handler: H) -> RpcResult<RpcRegistration>
+    /// Compilation fails if the fixed request, response, or method-error type is
+    /// larger than the registry's `M`-byte lane frames or requires stricter
+    /// alignment than the lane frame provides.
+    pub fn register<Method, H>(&self, handler: H) -> RpcResult<RpcRegistration>
     where
         Method: RpcMethod,
-        H: TypedRpcHandler<Method> + 'static,
+        H: RpcHandler<Method> + 'static,
     {
         const {
             assert!(
@@ -182,6 +175,10 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
             assert!(
                 size_of::<Method::Response>() <= M,
                 "RPC response message exceeds lane frame capacity"
+            );
+            assert!(
+                size_of::<Method::Error>() <= M,
+                "RPC method error exceeds lane frame capacity"
             );
         }
         let descriptor = RpcMethodDescriptor::for_method::<Method>()?;
@@ -229,25 +226,13 @@ impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     pub fn unregister(&self, registration: &RpcRegistration) -> RpcResult<()> {
         let mut endpoints = self.endpoints.borrow_mut();
         let is_current = endpoints
-            .get(registration.address())
-            .is_some_and(|entry| entry.endpoint_id == registration.endpoint_id());
+            .get(&registration.address)
+            .is_some_and(|entry| entry.endpoint_id == registration.endpoint_id);
         if !is_current {
-            return Err(RpcError::StaleRegistration(registration.address().clone()));
+            return Err(RpcError::StaleRegistration(registration.address.clone()));
         }
-        endpoints.remove(registration.address());
+        endpoints.remove(&registration.address);
         Ok(())
-    }
-
-    /// Returns the number of currently registered endpoints.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.endpoints.borrow().len()
-    }
-
-    /// Returns whether no endpoints are registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.endpoints.borrow().is_empty()
     }
 
     fn prepare_call(
@@ -392,7 +377,9 @@ impl RpcClient {
     /// The one method selects its input and output shape through `M`; callers do
     /// not choose between separate unary and streaming entry points. The
     /// returned future or stream drives request encoding, provider execution,
-    /// and response decoding together.
+    /// and response decoding together. Transport/runtime failures use the outer
+    /// [`RpcResult`]; successful transport yields the Method's typed
+    /// `Result<Response, Error>` as zero-copy frames.
     ///
     /// # Errors
     ///
@@ -403,7 +390,7 @@ impl RpcClient {
     pub fn call<M>(
         &self,
         input: <M::Input as RpcInputMode<M::Request>>::ClientInput,
-    ) -> RpcResult<<M::Output as RpcOutputMode<M::Response>>::ClientCall>
+    ) -> RpcResult<<M::Output as RpcOutputMode<M::Response, M::Error>>::ClientCall>
     where
         M: RpcMethod,
     {
@@ -423,55 +410,16 @@ impl RpcClient {
 /// Identity token for safely unregistering one endpoint instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcRegistration {
+    /// Registered address.
     address: RpcAddress,
+    /// Registered endpoint instance identity.
     endpoint_id: RpcEndpointId,
 }
 
-impl RpcRegistration {
-    /// Returns the registered address.
-    #[must_use]
-    pub fn address(&self) -> &RpcAddress {
-        &self.address
-    }
-
-    /// Returns the registered endpoint instance identity.
-    #[must_use]
-    pub fn endpoint_id(&self) -> RpcEndpointId {
-        self.endpoint_id
-    }
-}
-
-/// Structured provider failure suitable for an RPC protocol boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RpcFailure {
-    code: Box<str>,
-    message: Box<str>,
-}
-
-impl RpcFailure {
-    /// Creates a provider-defined failure with a stable machine code.
-    #[must_use]
-    pub fn new(code: impl Into<Box<str>>, message: impl Into<Box<str>>) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-        }
-    }
-
-    /// Returns the stable machine-readable code.
-    #[must_use]
-    pub fn code(&self) -> &str {
-        &self.code
-    }
-
-    /// Returns the human-readable detail.
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-/// Error returned while registering or invoking RPC endpoints.
+/// Transport/runtime error returned while registering or invoking RPC endpoints.
+///
+/// Method-specific business errors are fixed-layout [`RpcMethod::Error`]
+/// frames and are not represented by this enum.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcError {
@@ -548,7 +496,4 @@ pub enum RpcError {
         /// Rust message type that rejected the bytes.
         message_type: &'static str,
     },
-    /// A provider returned a domain-specific failure.
-    #[error("RPC provider failed ({code}): {message}", code = .0.code(), message = .0.message())]
-    Provider(RpcFailure),
 }

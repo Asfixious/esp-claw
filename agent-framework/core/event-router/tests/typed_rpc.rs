@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcContext, RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult,
+    RpcContext, RpcError, RpcFrame, RpcLaneStorage, RpcMessage, RpcMethod, RpcRegistry, RpcResult,
     RpcStream, Streaming, Unary,
 };
 use futures_lite::future::{block_on, poll_once};
@@ -24,6 +24,12 @@ struct Total {
     value: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
+struct MethodFailure {
+    code: u32,
+}
+
 fn registry() -> Rc<RpcRegistry<4, 4_096, 8>> {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4_096, 8>::new()));
     Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"))
@@ -35,6 +41,7 @@ impl RpcMethod for UnaryUnaryMethod {
     const ADDRESS: &'static str = "typed.unary_unary";
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -45,6 +52,7 @@ impl RpcMethod for UnaryStreamMethod {
     const ADDRESS: &'static str = "typed.unary_stream";
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Streaming;
 }
@@ -55,6 +63,7 @@ impl RpcMethod for StreamUnaryMethod {
     const ADDRESS: &'static str = "typed.stream_unary";
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Streaming;
     type Output = Unary;
 }
@@ -65,6 +74,7 @@ impl RpcMethod for StreamStreamMethod {
     const ADDRESS: &'static str = "typed.stream_stream";
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Streaming;
     type Output = Streaming;
 }
@@ -86,22 +96,35 @@ where
     ))
 }
 
-async fn collect(mut values: RpcStream<RpcFrame<Total>>) -> RpcResult<Vec<Total>> {
+async fn collect(
+    mut values: RpcStream<Result<RpcFrame<Total>, RpcFrame<MethodFailure>>>,
+) -> RpcResult<Vec<Total>> {
     let mut output = Vec::new();
     while let Some(value) = values.next().await {
-        output.push(*value?.view()?);
+        output.push(*value?.expect("method success").view()?);
     }
     Ok(output)
+}
+
+fn copy_outcome<T, E>(outcome: Result<RpcFrame<T>, RpcFrame<E>>) -> RpcResult<Result<T, E>>
+where
+    T: RpcMessage + Copy,
+    E: RpcMessage + Copy,
+{
+    match outcome {
+        Ok(response) => Ok(Ok(*response.view()?)),
+        Err(error) => Ok(Err(*error.view()?)),
+    }
 }
 
 #[test]
 fn typed_unary_input_and_unary_output_are_self_driving() {
     let registry = registry();
     registry
-        .register_typed::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
-            Ok(Total {
+        .register::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(Total {
                 value: request.view()?.value + 1,
-            })
+            }))
         })
         .expect("register typed endpoint");
 
@@ -110,7 +133,9 @@ fn typed_unary_input_and_unary_output_are_self_driving() {
         .call::<UnaryUnaryMethod>(number(41))
         .expect("start typed call");
 
-    let response = block_on(call).expect("complete unary call");
+    let response = block_on(call)
+        .expect("complete unary call")
+        .expect("method success");
     assert_eq!(response.view(), Ok(&Total { value: 42 }));
 }
 
@@ -118,11 +143,11 @@ fn typed_unary_input_and_unary_output_are_self_driving() {
 fn typed_unary_input_and_stream_output_are_self_driving() {
     let registry = registry();
     registry
-        .register_typed::<UnaryStreamMethod, _>(|_context, request: RpcFrame<Number>| async move {
+        .register::<UnaryStreamMethod, _>(|_context, request: RpcFrame<Number>| async move {
             let value = request.view()?.value;
             Ok(RpcStream::new(stream::iter(vec![
-                Ok(Total { value }),
-                Ok(Total { value: value + 1 }),
+                Ok(Ok(Total { value })),
+                Ok(Ok(Total { value: value + 1 })),
             ])))
         })
         .expect("register typed endpoint");
@@ -139,18 +164,60 @@ fn typed_unary_input_and_stream_output_are_self_driving() {
 }
 
 #[test]
+fn typed_stream_method_error_is_terminal_and_zero_copy() {
+    block_on(async {
+        let registry = registry();
+        registry
+            .register::<UnaryStreamMethod, _>(|_context, _request: RpcFrame<Number>| async move {
+                Ok(RpcStream::new(stream::iter([
+                    Ok(Ok(Total { value: 1 })),
+                    Ok(Err(MethodFailure { code: 7 })),
+                    Ok(Ok(Total { value: 2 })),
+                ])))
+            })
+            .expect("register typed endpoint");
+
+        let mut responses = registry
+            .client()
+            .call::<UnaryStreamMethod>(number(0))
+            .expect("start typed call");
+
+        let first = responses
+            .next()
+            .await
+            .expect("success response")
+            .expect("transport success")
+            .expect("method success");
+        assert_eq!(first.view(), Ok(&Total { value: 1 }));
+        drop(first);
+
+        let failure = responses
+            .next()
+            .await
+            .expect("method error response")
+            .expect("transport success")
+            .expect_err("typed method error");
+        assert_eq!(failure.view(), Ok(&MethodFailure { code: 7 }));
+        drop(failure);
+
+        assert!(responses.next().await.is_none());
+    });
+}
+
+#[test]
 fn typed_stream_input_and_unary_output_are_self_driving() {
     let registry = registry();
     registry
-        .register_typed::<StreamUnaryMethod, _>(
+        .register::<StreamUnaryMethod, _>(
             |_context, mut requests: RpcStream<RpcFrame<Number>>| async move {
                 let mut total = 0_u32;
                 while let Some(request) = requests.next().await {
-                    total = total.checked_add(request?.view()?.value).ok_or_else(|| {
-                        RpcError::Provider(RpcFailure::new("overflow", "sum overflowed"))
-                    })?;
+                    let Some(next) = total.checked_add(request?.view()?.value) else {
+                        return Ok(Err(MethodFailure { code: 1 }));
+                    };
+                    total = next;
                 }
-                Ok(Total { value: total })
+                Ok(Ok(Total { value: total }))
             },
         )
         .expect("register typed endpoint");
@@ -160,23 +227,35 @@ fn typed_stream_input_and_unary_output_are_self_driving() {
         .call::<StreamUnaryMethod>(input_stream([4, 5, 6]))
         .expect("start typed call");
 
-    let response = block_on(call).expect("complete stream-unary call");
+    let response = block_on(call)
+        .expect("complete stream-unary call")
+        .expect("method success");
     assert_eq!(response.view(), Ok(&Total { value: 15 }));
+
+    let failed = block_on(
+        registry
+            .client()
+            .call::<StreamUnaryMethod>(input_stream([u32::MAX, 1]))
+            .expect("start failing stream-unary call"),
+    )
+    .expect("complete failing stream-unary call")
+    .expect_err("typed method failure");
+    assert_eq!(failed.view(), Ok(&MethodFailure { code: 1 }));
 }
 
 #[test]
 fn typed_stream_input_and_stream_output_are_self_driving() {
     let registry = registry();
     registry
-        .register_typed::<StreamStreamMethod, _>(
+        .register::<StreamStreamMethod, _>(
             |_context, requests: RpcStream<RpcFrame<Number>>| async move {
                 let responses = stream::unfold(requests, |mut requests| async move {
                     match requests.next().await {
                         Some(Ok(request)) => match request.view() {
                             Ok(request) => Some((
-                                Ok(Total {
+                                Ok(Ok(Total {
                                     value: request.value + 10,
-                                }),
+                                })),
                                 requests,
                             )),
                             Err(error) => Some((Err(error), requests)),
@@ -212,6 +291,7 @@ impl RpcMethod for IncompatibleMethod {
 
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Streaming;
 }
@@ -220,10 +300,10 @@ impl RpcMethod for IncompatibleMethod {
 fn typed_signature_mismatch_is_rejected_before_starting_io() {
     let registry = registry();
     registry
-        .register_typed::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
-            Ok(Total {
+        .register::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(Total {
                 value: request.view()?.value,
-            })
+            }))
         })
         .expect("register typed endpoint");
 
@@ -232,7 +312,7 @@ fn typed_signature_mismatch_is_rejected_before_starting_io() {
     assert!(matches!(
         result,
         Err(RpcError::SignatureMismatch { address, .. })
-            if address.as_str() == UnaryUnaryMethod::ADDRESS
+            if address.as_ref() == UnaryUnaryMethod::ADDRESS
     ));
 }
 
@@ -243,6 +323,7 @@ impl RpcMethod for EmptyFrameMethod {
 
     type Request = ();
     type Response = ();
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
 }
@@ -251,9 +332,9 @@ impl RpcMethod for EmptyFrameMethod {
 fn zero_byte_zerocopy_frames_are_preserved_by_static_lanes() {
     let registry = registry();
     registry
-        .register_typed::<EmptyFrameMethod, _>(|_context, request: RpcFrame<()>| async move {
+        .register::<EmptyFrameMethod, _>(|_context, request: RpcFrame<()>| async move {
             request.view()?;
-            Ok(())
+            Ok(Ok(()))
         })
         .expect("register empty-frame endpoint");
 
@@ -261,7 +342,9 @@ fn zero_byte_zerocopy_frames_are_preserved_by_static_lanes() {
         .client()
         .call::<EmptyFrameMethod>(())
         .expect("start empty-frame call");
-    let response = block_on(call).expect("complete empty-frame call");
+    let response = block_on(call)
+        .expect("complete empty-frame call")
+        .expect("method success");
     assert_eq!(response.view(), Ok(&()));
 }
 
@@ -272,6 +355,7 @@ impl RpcMethod for LeaseMethod {
 
     type Request = Number;
     type Response = Number;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -282,8 +366,8 @@ fn response_frame_retains_an_aligned_lane_until_drop() {
         let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 2>::new()));
         let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
         registry
-            .register_typed::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
-                Ok(*request.view()?)
+            .register::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
+                Ok(Ok(*request.view()?))
             })
             .expect("register lease endpoint");
 
@@ -292,7 +376,8 @@ fn response_frame_retains_an_aligned_lane_until_drop() {
             .call::<LeaseMethod>(number(1))
             .expect("start first call")
             .await
-            .expect("finish first call");
+            .expect("finish first call")
+            .expect("method success");
         let address = first.view().expect("borrow typed response") as *const Number as usize;
         assert_eq!(address % align_of::<Number>(), 0);
 
@@ -304,7 +389,10 @@ fn response_frame_retains_an_aligned_lane_until_drop() {
         assert!(poll_once(second.as_mut()).await.is_none());
 
         drop(first);
-        let second = second.await.expect("finish second call after frame drop");
+        let second = second
+            .await
+            .expect("finish second call after frame drop")
+            .expect("method success");
         assert_eq!(second.view(), Ok(&number(2)));
     });
 }
@@ -316,6 +404,7 @@ impl RpcMethod for DirectSelfMethod {
 
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -324,16 +413,13 @@ impl RpcMethod for DirectSelfMethod {
 fn typed_direct_self_call_is_rejected() {
     let registry = registry();
     registry
-        .register_typed::<DirectSelfMethod, _>(
+        .register::<DirectSelfMethod, _>(
             |context: RpcContext, request: RpcFrame<Number>| async move {
                 let nested = context.client().call::<DirectSelfMethod>(*request.view()?);
                 match nested {
-                    Err(RpcError::DirectSelfCall(_)) => Ok(Total { value: 1 }),
+                    Err(RpcError::DirectSelfCall(_)) => Ok(Ok(Total { value: 1 })),
                     Err(error) => Err(error),
-                    Ok(_) => Err(RpcError::Provider(RpcFailure::new(
-                        "self_call_started",
-                        "a direct self-call unexpectedly started",
-                    ))),
+                    Ok(_) => Ok(Err(MethodFailure { code: 2 })),
                 }
             },
         )
@@ -345,7 +431,8 @@ fn typed_direct_self_call_is_rejected() {
             .call::<DirectSelfMethod>(number(0))
             .expect("start outer call"),
     )
-    .expect("complete outer call");
+    .expect("complete outer call")
+    .expect("method success");
     assert_eq!(response.view(), Ok(&Total { value: 1 }));
 }
 
@@ -356,6 +443,7 @@ impl RpcMethod for IndirectA {
 
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -367,6 +455,7 @@ impl RpcMethod for IndirectB {
 
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -375,29 +464,29 @@ impl RpcMethod for IndirectB {
 fn typed_indirect_call_may_return_to_an_earlier_endpoint() {
     let registry = registry();
     registry
-        .register_typed::<IndirectA, _>(
+        .register::<IndirectA, _>(
             |context: RpcContext, request: RpcFrame<Number>| async move {
                 let value = request.view()?.value;
                 drop(request);
                 if value == 0 {
-                    let response = context.client().call::<IndirectB>(number(1))?.await?;
-                    Ok(*response.view()?)
+                    let outcome = context.client().call::<IndirectB>(number(1))?.await?;
+                    copy_outcome(outcome)
                 } else {
-                    Ok(Total { value })
+                    Ok(Ok(Total { value }))
                 }
             },
         )
         .expect("register endpoint A");
     registry
-        .register_typed::<IndirectB, _>(
+        .register::<IndirectB, _>(
             |context: RpcContext, request: RpcFrame<Number>| async move {
                 let value = request.view()?.value;
                 drop(request);
-                let response = context
+                let outcome = context
                     .client()
                     .call::<IndirectA>(number(value + 1))?
                     .await?;
-                Ok(*response.view()?)
+                copy_outcome(outcome)
             },
         )
         .expect("register endpoint B");
@@ -408,7 +497,8 @@ fn typed_indirect_call_may_return_to_an_earlier_endpoint() {
             .call::<IndirectA>(number(0))
             .expect("start indirect call chain"),
     )
-    .expect("complete indirect call chain");
+    .expect("complete indirect call chain")
+    .expect("method success");
     assert_eq!(response.view(), Ok(&Total { value: 2 }));
 }
 
@@ -416,10 +506,10 @@ fn typed_indirect_call_may_return_to_an_earlier_endpoint() {
 fn unregister_keeps_a_prepared_typed_call_alive() {
     let registry = registry();
     let registration = registry
-        .register_typed::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
-            Ok(Total {
+        .register::<UnaryUnaryMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(Total {
                 value: request.view()?.value + 1,
-            })
+            }))
         })
         .expect("register typed endpoint");
     let client = registry.client();
@@ -430,7 +520,9 @@ fn unregister_keeps_a_prepared_typed_call_alive() {
     registry
         .unregister(&registration)
         .expect("unregister exact endpoint");
-    let response = block_on(in_flight).expect("prepared call retains provider");
+    let response = block_on(in_flight)
+        .expect("prepared call retains provider")
+        .expect("method success");
     assert_eq!(response.view(), Ok(&Total { value: 11 }));
     drop(response);
 
@@ -450,8 +542,8 @@ fn dropping_a_reserved_typed_waiter_hands_the_lane_to_the_next_call() {
         let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 2>::new()));
         let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
         registry
-            .register_typed::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
-                Ok(*request.view()?)
+            .register::<LeaseMethod, _>(|_context, request: RpcFrame<Number>| async move {
+                Ok(Ok(*request.view()?))
             })
             .expect("register lease endpoint");
         let client = registry.client();
@@ -460,7 +552,8 @@ fn dropping_a_reserved_typed_waiter_hands_the_lane_to_the_next_call() {
             .call::<LeaseMethod>(number(1))
             .expect("start first call")
             .await
-            .expect("finish first call");
+            .expect("finish first call")
+            .expect("method success");
         let mut second = Box::pin(
             client
                 .call::<LeaseMethod>(number(2))
@@ -476,7 +569,10 @@ fn dropping_a_reserved_typed_waiter_hands_the_lane_to_the_next_call() {
 
         drop(first);
         drop(second);
-        let third = third.await.expect("third call receives transferred lane");
+        let third = third
+            .await
+            .expect("third call receives transferred lane")
+            .expect("method success");
         assert_eq!(third.view(), Ok(&number(3)));
     });
 }
@@ -488,6 +584,7 @@ impl RpcMethod for InnerMethod {
 
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -499,6 +596,7 @@ impl RpcMethod for OuterMethod {
 
     type Request = Number;
     type Response = Total;
+    type Error = MethodFailure;
     type Input = Unary;
     type Output = Unary;
 }
@@ -508,19 +606,19 @@ fn typed_nested_call_fails_instead_of_waiting_for_its_own_lane() {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 1>::new()));
     let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
     registry
-        .register_typed::<InnerMethod, _>(|_context, request: RpcFrame<Number>| async move {
-            Ok(Total {
+        .register::<InnerMethod, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(Total {
                 value: request.view()?.value,
-            })
+            }))
         })
         .expect("register inner endpoint");
     registry
-        .register_typed::<OuterMethod, _>(
+        .register::<OuterMethod, _>(
             |context: RpcContext, request: RpcFrame<Number>| async move {
                 let request_value = *request.view()?;
                 drop(request);
-                let response = context.client().call::<InnerMethod>(request_value)?.await?;
-                Ok(*response.view()?)
+                let outcome = context.client().call::<InnerMethod>(request_value)?.await?;
+                copy_outcome(outcome)
             },
         )
         .expect("register outer endpoint");

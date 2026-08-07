@@ -6,9 +6,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use futures_core::Stream;
+use getset::{CopyGetters, Getters};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use super::frame::{write_frame, FramedReader, RpcFrame};
+use super::frame::{write_frame, write_method_error_frame, FramedReader, OutcomeReader, RpcFrame};
 use super::lane::{LaneReader, LaneWriter, LANE_FRAME_ALIGNMENT};
 use super::registry::{PreparedCall, RpcFuture, RpcProvider};
 use super::{RpcAddress, RpcContext, RpcError, RpcResult};
@@ -47,7 +48,7 @@ pub struct Streaming;
 impl private::Sealed for Unary {}
 impl private::Sealed for Streaming {}
 
-/// A task-local stream of RPC values or lane-backed frame views.
+/// A task-local stream whose outer [`RpcResult`] reports transport failures.
 pub struct RpcStream<T> {
     inner: Pin<Box<dyn Stream<Item = RpcResult<T>> + 'static>>,
 }
@@ -96,25 +97,32 @@ pub trait RpcMethod: 'static {
     /// Message carried from provider to caller.
     type Response: RpcMessage;
 
+    /// Method-specific error carried from provider to caller.
+    type Error: RpcMessage;
+
     /// Request-side cardinality.
     type Input: RpcInputMode<Self::Request>;
 
     /// Response-side cardinality.
-    type Output: RpcOutputMode<Self::Response>;
+    type Output: RpcOutputMode<Self::Response, Self::Error>;
 }
 
 /// Runtime descriptor used to reject typed client/provider mismatches before IO.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RpcMethodDescriptor {
+#[derive(Clone, CopyGetters, Debug, Getters, PartialEq, Eq)]
+pub(crate) struct RpcMethodDescriptor {
+    #[getset(get = "pub(crate)")]
     address: RpcAddress,
     method_type_id: TypeId,
+    #[getset(get_copy = "pub(crate)")]
     method_type_name: &'static str,
     request_type_id: TypeId,
     request_type_name: &'static str,
     response_type_id: TypeId,
     response_type_name: &'static str,
-    input: RpcCardinality,
-    output: RpcCardinality,
+    error_type_id: TypeId,
+    error_type_name: &'static str,
+    input_cardinality: RpcCardinality,
+    output_cardinality: RpcCardinality,
 }
 
 impl RpcMethodDescriptor {
@@ -131,8 +139,12 @@ impl RpcMethodDescriptor {
                 align_of::<M::Response>() <= LANE_FRAME_ALIGNMENT,
                 "RPC response message alignment exceeds lane frame alignment"
             );
+            assert!(
+                align_of::<M::Error>() <= LANE_FRAME_ALIGNMENT,
+                "RPC method error alignment exceeds lane frame alignment"
+            );
         }
-        let address = RpcAddress::parse(M::ADDRESS)?;
+        let address = RpcAddress::try_from(M::ADDRESS)?;
         Ok(Self {
             address,
             method_type_id: TypeId::of::<M>(),
@@ -141,45 +153,11 @@ impl RpcMethodDescriptor {
             request_type_name: type_name::<M::Request>(),
             response_type_id: TypeId::of::<M::Response>(),
             response_type_name: type_name::<M::Response>(),
-            input: M::Input::CARDINALITY,
-            output: M::Output::CARDINALITY,
+            error_type_id: TypeId::of::<M::Error>(),
+            error_type_name: type_name::<M::Error>(),
+            input_cardinality: M::Input::CARDINALITY,
+            output_cardinality: M::Output::CARDINALITY,
         })
-    }
-
-    /// Returns the registered method address.
-    #[must_use]
-    pub fn address(&self) -> &RpcAddress {
-        &self.address
-    }
-
-    /// Returns the Rust method marker name.
-    #[must_use]
-    pub fn method_type_name(&self) -> &'static str {
-        self.method_type_name
-    }
-
-    /// Returns the Rust request type name.
-    #[must_use]
-    pub fn request_type_name(&self) -> &'static str {
-        self.request_type_name
-    }
-
-    /// Returns the Rust response type name.
-    #[must_use]
-    pub fn response_type_name(&self) -> &'static str {
-        self.response_type_name
-    }
-
-    /// Returns the request cardinality.
-    #[must_use]
-    pub fn input_cardinality(&self) -> RpcCardinality {
-        self.input
-    }
-
-    /// Returns the response cardinality.
-    #[must_use]
-    pub fn output_cardinality(&self) -> RpcCardinality {
-        self.output
     }
 }
 
@@ -225,12 +203,17 @@ pub type RpcHandlerFuture<'a, T> = Pin<Box<dyn Future<Output = RpcResult<T>> + '
 pub type RpcHandlerInput<M> =
     <<M as RpcMethod>::Input as RpcInputMode<<M as RpcMethod>::Request>>::HandlerInput;
 
-/// Output type returned by a handler for method `M`.
-pub type RpcHandlerOutput<M> =
-    <<M as RpcMethod>::Output as RpcOutputMode<<M as RpcMethod>::Response>>::HandlerOutput;
+/// Typed business output returned by a handler for method `M`.
+///
+/// Unary output is `Result<Response, Error>`. Streaming output is a stream of
+/// those outcomes; a method error terminates the encoded response stream.
+pub type RpcHandlerOutput<M> = <<M as RpcMethod>::Output as RpcOutputMode<
+    <M as RpcMethod>::Response,
+    <M as RpcMethod>::Error,
+>>::HandlerOutput;
 
-/// Typed business-logic implementation for one [`RpcMethod`].
-pub trait TypedRpcHandler<M>
+/// Business-logic implementation for one [`RpcMethod`].
+pub trait RpcHandler<M>
 where
     M: RpcMethod,
 {
@@ -242,7 +225,7 @@ where
     ) -> RpcHandlerFuture<'a, RpcHandlerOutput<M>>;
 }
 
-impl<M, H, Fut> TypedRpcHandler<M> for H
+impl<M, H, Fut> RpcHandler<M> for H
 where
     M: RpcMethod,
     H: Fn(RpcContext, RpcHandlerInput<M>) -> Fut,
@@ -267,7 +250,7 @@ where
     /// Value accepted by [`RpcClient::call`](crate::rpc::RpcClient::call).
     type ClientInput;
 
-    /// Value delivered to [`TypedRpcHandler`].
+    /// Value delivered to [`RpcHandler`].
     type HandlerInput;
 
     /// Runtime cardinality value.
@@ -282,14 +265,15 @@ where
     ) -> RpcHandlerFuture<'static, Self::HandlerInput>;
 }
 
-/// Type-level response cardinality behavior.
+/// Type-level typed-result and response-cardinality behavior.
 ///
 /// This trait is sealed; use [`Unary`] or [`Streaming`].
-pub trait RpcOutputMode<T>: private::Sealed
+pub trait RpcOutputMode<T, E>: private::Sealed
 where
     T: RpcMessage,
+    E: RpcMessage,
 {
-    /// Value returned by [`TypedRpcHandler`].
+    /// Typed `Result<Response, Error>` value or stream returned by a handler.
     type HandlerOutput;
 
     /// Self-driving call returned by [`RpcClient::call`](crate::rpc::RpcClient::call).
@@ -299,10 +283,11 @@ where
     const CARDINALITY: RpcCardinality;
 
     #[doc(hidden)]
-    fn into_stream(output: Self::HandlerOutput) -> RpcStream<T>;
+    fn into_stream(output: Self::HandlerOutput) -> RpcStream<Result<T, E>>;
 
     #[doc(hidden)]
-    fn make_client_call(responses: RpcStream<RpcFrame<T>>) -> Self::ClientCall;
+    fn make_client_call(responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>)
+        -> Self::ClientCall;
 }
 
 impl<T> RpcInputMode<T> for Unary
@@ -345,38 +330,44 @@ where
     }
 }
 
-impl<T> RpcOutputMode<T> for Unary
+impl<T, E> RpcOutputMode<T, E> for Unary
 where
     T: RpcMessage,
+    E: RpcMessage,
 {
-    type HandlerOutput = T;
-    type ClientCall = RpcUnaryCall<T>;
+    type HandlerOutput = Result<T, E>;
+    type ClientCall = RpcUnaryCall<T, E>;
 
     const CARDINALITY: RpcCardinality = RpcCardinality::Unary;
 
-    fn into_stream(output: Self::HandlerOutput) -> RpcStream<T> {
+    fn into_stream(output: Self::HandlerOutput) -> RpcStream<Result<T, E>> {
         RpcStream::new(OnceStream::new(output))
     }
 
-    fn make_client_call(responses: RpcStream<RpcFrame<T>>) -> Self::ClientCall {
+    fn make_client_call(
+        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
+    ) -> Self::ClientCall {
         RpcUnaryCall::new(responses)
     }
 }
 
-impl<T> RpcOutputMode<T> for Streaming
+impl<T, E> RpcOutputMode<T, E> for Streaming
 where
     T: RpcMessage,
+    E: RpcMessage,
 {
-    type HandlerOutput = RpcStream<T>;
-    type ClientCall = RpcStream<RpcFrame<T>>;
+    type HandlerOutput = RpcStream<Result<T, E>>;
+    type ClientCall = RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>;
 
     const CARDINALITY: RpcCardinality = RpcCardinality::Streaming;
 
-    fn into_stream(output: Self::HandlerOutput) -> RpcStream<T> {
+    fn into_stream(output: Self::HandlerOutput) -> RpcStream<Result<T, E>> {
         output
     }
 
-    fn make_client_call(responses: RpcStream<RpcFrame<T>>) -> Self::ClientCall {
+    fn make_client_call(
+        responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
+    ) -> Self::ClientCall {
         responses
     }
 }
@@ -414,6 +405,29 @@ where
     })
 }
 
+fn encode_outcome_stream<T, E>(
+    mut outcomes: RpcStream<Result<T, E>>,
+    mut writer: LaneWriter,
+) -> RpcFuture<'static>
+where
+    T: RpcMessage,
+    E: RpcMessage,
+{
+    Box::pin(async move {
+        while let Some(outcome) = outcomes.next().await {
+            match outcome? {
+                Ok(message) => write_frame(&mut writer, &message).await?,
+                Err(error) => {
+                    write_method_error_frame(&mut writer, &error).await?;
+                    break;
+                }
+            }
+        }
+        writer.close();
+        Ok(())
+    })
+}
+
 pub(crate) struct TypedProvider<M, H> {
     handler: H,
     method: PhantomData<fn() -> M>,
@@ -431,7 +445,7 @@ impl<M, H> TypedProvider<M, H> {
 impl<M, H> RpcProvider for TypedProvider<M, H>
 where
     M: RpcMethod,
-    H: TypedRpcHandler<M>,
+    H: RpcHandler<M>,
 {
     fn call<'a>(
         &'a self,
@@ -443,7 +457,7 @@ where
             let input = RpcStream::new(FramedReader::new(input));
             let input = M::Input::decode_stream(input).await?;
             let output_value = self.handler.call(context, input).await?;
-            encode_stream(M::Output::into_stream(output_value), output).await
+            encode_outcome_stream(M::Output::into_stream(output_value), output).await
         })
     }
 }
@@ -517,15 +531,17 @@ impl CallDriver {
 /// Self-driving unary typed RPC returned by [`RpcClient::call`](crate::rpc::RpcClient::call).
 ///
 /// Polling this future concurrently advances request encoding, provider work,
-/// and response decoding. No separate call task is required.
+/// and response decoding. Its outer [`RpcResult`] reports transport/runtime
+/// failures; its inner `Result` contains either a zero-copy response frame or
+/// the method's zero-copy typed error frame. No separate call task is required.
 #[must_use = "futures do nothing unless polled or awaited"]
-pub struct RpcUnaryCall<T> {
-    responses: RpcStream<RpcFrame<T>>,
+pub struct RpcUnaryCall<T, E> {
+    responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>,
     finished: bool,
 }
 
-impl<T> RpcUnaryCall<T> {
-    fn new(responses: RpcStream<RpcFrame<T>>) -> Self {
+impl<T, E> RpcUnaryCall<T, E> {
+    fn new(responses: RpcStream<Result<RpcFrame<T>, RpcFrame<E>>>) -> Self {
         Self {
             responses,
             finished: false,
@@ -533,13 +549,14 @@ impl<T> RpcUnaryCall<T> {
     }
 }
 
-impl<T> Unpin for RpcUnaryCall<T> {}
+impl<T, E> Unpin for RpcUnaryCall<T, E> {}
 
-impl<T> Future for RpcUnaryCall<T>
+impl<T, E> Future for RpcUnaryCall<T, E>
 where
     T: RpcMessage,
+    E: RpcMessage,
 {
-    type Output = RpcResult<RpcFrame<T>>;
+    type Output = RpcResult<Result<RpcFrame<T>, RpcFrame<E>>>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -563,23 +580,23 @@ where
 
 pub(crate) fn make_client_call<M>(
     setup: RpcCallSetup,
-) -> <M::Output as RpcOutputMode<M::Response>>::ClientCall
+) -> <M::Output as RpcOutputMode<M::Response, M::Error>>::ClientCall
 where
     M: RpcMethod,
 {
-    let responses = RpcStream::new(RpcResponseDriverStream::new(setup));
+    let responses = RpcStream::new(RpcResponseDriverStream::<M::Response, M::Error>::new(setup));
     M::Output::make_client_call(responses)
 }
 
-struct RpcResponseDriverStream<T> {
+struct RpcResponseDriverStream<T, E> {
     driver: CallDriver,
-    response: Option<FramedReader<T>>,
+    response: Option<OutcomeReader<T, E>>,
     response_eof: bool,
     driver_done: bool,
     finished: bool,
 }
 
-impl<T> RpcResponseDriverStream<T> {
+impl<T, E> RpcResponseDriverStream<T, E> {
     fn new(setup: RpcCallSetup) -> Self {
         Self {
             driver: CallDriver::new(setup),
@@ -591,13 +608,14 @@ impl<T> RpcResponseDriverStream<T> {
     }
 }
 
-impl<T> Unpin for RpcResponseDriverStream<T> {}
+impl<T, E> Unpin for RpcResponseDriverStream<T, E> {}
 
-impl<T> Stream for RpcResponseDriverStream<T>
+impl<T, E> Stream for RpcResponseDriverStream<T, E>
 where
     T: RpcMessage,
+    E: RpcMessage,
 {
-    type Item = RpcResult<RpcFrame<T>>;
+    type Item = RpcResult<Result<RpcFrame<T>, RpcFrame<E>>>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -608,7 +626,7 @@ where
         if !this.driver_done {
             match this.driver.poll_call(context) {
                 Poll::Ready(Ok(CallProgress::Response(reader))) => {
-                    this.response = Some(FramedReader::new(reader));
+                    this.response = Some(OutcomeReader::new(reader));
                 }
                 Poll::Ready(Ok(CallProgress::Complete)) => this.driver_done = true,
                 Poll::Ready(Err(error)) => {

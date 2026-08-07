@@ -6,7 +6,7 @@ These examples cover the complete RPC baseline exposed by `claw-event-router`.
 | --- | --- |
 | `typed_rpc` | Fixed-layout Zerocopy RPC, lane-backed `RpcFrame<T>` views, and all four unary/streaming combinations through one `RpcClient::call::<M>()` API |
 | `nested_and_lifecycle` | Calls made through `RpcContext`, call-chain metadata, direct self-call rejection, registration tokens, and unregister behavior |
-| `errors` | Duplicate registration, typed signature validation, and structured provider failures |
+| `errors` | Duplicate registration, typed signature validation, and fixed-layout method errors |
 | `static_lanes` | Fixed `N x M` lane storage, bounded root waiters, lane backpressure, and lane reuse |
 
 Run one example from the `agent-framework` workspace root:
@@ -34,7 +34,7 @@ response frame, and `Q` bounds queued root calls. The examples place this
 zero-initialized storage directly in static memory with `ConstStaticCell`, the
 same no-heap placement model intended for firmware.
 
-Typed request and response structs derive Zerocopy's `TryFromBytes`,
+Typed request, response, and method-error structs derive Zerocopy's `TryFromBytes`,
 `IntoBytes`, `KnownLayout`, and `Immutable` traits. Handlers and clients receive
 `RpcFrame<T>` and call `view()` to borrow `&T` directly from the lane. A retained
 frame retains its lane, so examples copy any value that must outlive the frame

@@ -1,10 +1,9 @@
-//! Demonstrates expected registration, signature, and provider errors.
+//! Demonstrates expected registration, signature, and typed method errors.
 
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Streaming,
-    Unary,
+    RpcError, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Streaming, Unary,
 };
 use static_cell::ConstStaticCell;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
@@ -18,6 +17,12 @@ struct Number {
     value: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
+struct QuotaError {
+    remaining: u32,
+}
+
 struct Echo;
 
 impl RpcMethod for Echo {
@@ -25,6 +30,7 @@ impl RpcMethod for Echo {
 
     type Request = Number;
     type Response = Number;
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
 }
@@ -36,6 +42,7 @@ impl RpcMethod for IncompatibleEcho {
 
     type Request = Number;
     type Response = Number;
+    type Error = ();
     type Input = Unary;
     type Output = Streaming;
 }
@@ -47,6 +54,7 @@ impl RpcMethod for DomainFailure {
 
     type Request = Number;
     type Response = Number;
+    type Error = QuotaError;
     type Input = Unary;
     type Output = Unary;
 }
@@ -54,13 +62,13 @@ impl RpcMethod for DomainFailure {
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
     let registry = Rc::new(RpcRegistry::new(lanes)?);
-    registry.register_typed::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
-        Ok(*request.view()?)
+    registry.register::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
+        Ok(Ok(*request.view()?))
     })?;
 
     let duplicate =
-        registry.register_typed::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
-            Ok(*request.view()?)
+        registry.register::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
+            Ok(Ok(*request.view()?))
         });
     assert!(matches!(duplicate, Err(RpcError::AlreadyRegistered(_))));
 
@@ -71,33 +79,24 @@ async fn run() -> RpcResult<()> {
         .call::<IncompatibleEcho>(Number { value: 1 });
     assert!(matches!(mismatch, Err(RpcError::SignatureMismatch { .. })));
 
-    registry.register_typed::<DomainFailure, _>(
-        |_context, _request: RpcFrame<Number>| async move {
-            Err(RpcError::Provider(RpcFailure::new(
-                "quota_exhausted",
-                "the provider has no remaining quota",
-            )))
-        },
-    )?;
+    registry.register::<DomainFailure, _>(|_context, _request: RpcFrame<Number>| async move {
+        Ok(Err(QuotaError { remaining: 0 }))
+    })?;
     let failure = registry
         .client()
         .call::<DomainFailure>(Number { value: 1 })?
-        .await;
+        .await?;
     match failure {
-        Err(RpcError::Provider(failure)) => {
-            assert_eq!(failure.code(), "quota_exhausted");
-            assert_eq!(failure.message(), "the provider has no remaining quota");
+        Err(failure) => {
+            assert_eq!(failure.view()?, &QuotaError { remaining: 0 });
         }
-        other => {
-            println!("unexpected domain failure result: {other:?}");
-            return Err(RpcError::Provider(RpcFailure::new(
-                "unexpected_result",
-                "domain failure example returned an unexpected result",
-            )));
+        Ok(response) => {
+            println!("unexpected domain success: {response:?}");
+            return Err(RpcError::InvalidFrameState);
         }
     }
 
-    println!("registration, signature, and provider errors completed");
+    println!("registration, signature, and typed method errors completed");
     Ok(())
 }
 

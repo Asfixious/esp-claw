@@ -403,6 +403,7 @@ dependencies = [
  "futures-core",
  "futures-lite 2.6.1",
  "futures-util",
+ "getset",
  "static_cell",
  "thiserror",
  "tokio",

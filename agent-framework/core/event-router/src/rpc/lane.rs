@@ -20,6 +20,15 @@ struct AlignedFrame<const M: usize> {
 
 pub(crate) const LANE_FRAME_ALIGNMENT: usize = align_of::<AlignedFrame<0>>();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneFrameKind {
+    Message,
+    MethodError,
+}
+
+type BorrowedLaneFrame = (Ref<'static, [u8]>, LaneFrameKind);
+type BorrowedLaneFramePoll = Poll<RpcResult<Option<BorrowedLaneFrame>>>;
+
 impl<const M: usize> AlignedFrame<M> {
     const fn new() -> Self {
         Self { bytes: [0; M] }
@@ -28,6 +37,7 @@ impl<const M: usize> AlignedFrame<M> {
 
 struct StaticPipeState {
     len: usize,
+    kind: LaneFrameKind,
     occupied: bool,
     frame_borrowed: bool,
     reader_open: bool,
@@ -40,6 +50,7 @@ impl StaticPipeState {
     const fn new() -> Self {
         Self {
             len: 0,
+            kind: LaneFrameKind::Message,
             occupied: false,
             frame_borrowed: false,
             reader_open: true,
@@ -66,6 +77,7 @@ impl<const M: usize> StaticPipe<M> {
     fn reset(&self) {
         let mut state = self.state.borrow_mut();
         state.len = 0;
+        state.kind = LaneFrameKind::Message;
         state.occupied = false;
         state.frame_borrowed = false;
         state.reader_open = true;
@@ -77,6 +89,7 @@ impl<const M: usize> StaticPipe<M> {
     fn poll_encode_frame(
         &self,
         context: &mut Context<'_>,
+        kind: LaneFrameKind,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> (Poll<RpcResult<()>>, Option<Waker>) {
         let mut state = self.state.borrow_mut();
@@ -100,14 +113,12 @@ impl<const M: usize> StaticPipe<M> {
             return (Poll::Ready(Err(RpcError::InvalidFrameState)), None);
         }
         state.len = length;
+        state.kind = kind;
         state.occupied = true;
         (Poll::Ready(Ok(())), state.reader_waker.take())
     }
 
-    fn poll_borrow_frame(
-        &'static self,
-        context: &mut Context<'_>,
-    ) -> Poll<RpcResult<Option<Ref<'static, [u8]>>>> {
+    fn poll_borrow_frame(&'static self, context: &mut Context<'_>) -> BorrowedLaneFramePoll {
         let mut state = self.state.borrow_mut();
         if state.frame_borrowed {
             update_waker(&mut state.reader_waker, context.waker());
@@ -121,11 +132,12 @@ impl<const M: usize> StaticPipe<M> {
             return Poll::Pending;
         }
         let length = state.len;
+        let kind = state.kind;
         state.frame_borrowed = true;
         drop(state);
 
         match Ref::filter_map(self.bytes.borrow(), |frame| frame.bytes.get(..length)) {
-            Ok(bytes) => Poll::Ready(Ok(Some(bytes))),
+            Ok(bytes) => Poll::Ready(Ok(Some((bytes, kind)))),
             Err(_) => {
                 self.state.borrow_mut().frame_borrowed = false;
                 Poll::Ready(Err(RpcError::InvalidFrameState))
@@ -280,11 +292,13 @@ impl<const N: usize, const Q: usize> PoolState<N, Q> {
 /// Fixed-capacity storage for active RPC calls and lane waiters.
 ///
 /// Each lane owns one 16-byte-aligned `M`-byte request pipe and one aligned
-/// `M`-byte response pipe. `N` therefore reserves approximately `N * 2 * M`
-/// payload bytes. A returned [`RpcFrame`](super::RpcFrame) retains its pipe and
-/// lane until drop. `Q` bounds the number of root calls that may wait for a
-/// lane. The storage must have application lifetime and is intended for the
-/// registry's one cooperative executor thread.
+/// `M`-byte response pipe. Response-pipe metadata tags each payload as either a
+/// successful response or a typed method error without adding a payload header.
+/// `N` therefore reserves approximately `N * 2 * M` payload bytes. A returned
+/// [`RpcFrame`](super::RpcFrame) retains its pipe and lane until drop. `Q` bounds
+/// the number of root calls that may wait for a lane. The storage must have
+/// application lifetime and is intended for the registry's one cooperative
+/// executor thread.
 pub struct RpcLaneStorage<const N: usize, const M: usize, const Q: usize> {
     state: RefCell<PoolState<N, Q>>,
     requests: [StaticPipe<M>; N],
@@ -300,24 +314,6 @@ impl<const N: usize, const M: usize, const Q: usize> RpcLaneStorage<N, M, Q> {
             requests: [const { StaticPipe::new() }; N],
             responses: [const { StaticPipe::new() }; N],
         }
-    }
-
-    /// Returns the maximum number of active calls.
-    #[must_use]
-    pub const fn lane_count(&self) -> usize {
-        N
-    }
-
-    /// Returns the byte capacity of each request and response direction.
-    #[must_use]
-    pub const fn frame_capacity(&self) -> usize {
-        M
-    }
-
-    /// Returns the maximum number of root calls waiting for a lane.
-    #[must_use]
-    pub const fn waiter_capacity(&self) -> usize {
-        Q
     }
 
     fn pipe(&self, lane: usize, direction: RpcDirection) -> Option<&StaticPipe<M>> {
@@ -347,6 +343,7 @@ pub(crate) struct BorrowedFrame {
     pool: &'static dyn LanePool,
     lane: usize,
     direction: RpcDirection,
+    kind: LaneFrameKind,
 }
 
 impl BorrowedFrame {
@@ -355,17 +352,23 @@ impl BorrowedFrame {
         pool: &'static dyn LanePool,
         lane: usize,
         direction: RpcDirection,
+        kind: LaneFrameKind,
     ) -> Self {
         Self {
             bytes: Some(bytes),
             pool,
             lane,
             direction,
+            kind,
         }
     }
 
     pub(crate) fn as_bytes(&self) -> RpcResult<&[u8]> {
         self.bytes.as_deref().ok_or(RpcError::InvalidFrameState)
+    }
+
+    pub(crate) fn kind(&self) -> LaneFrameKind {
+        self.kind
     }
 }
 
@@ -396,6 +399,7 @@ pub(crate) trait LanePool {
         lane: usize,
         direction: RpcDirection,
         context: &mut Context<'_>,
+        kind: LaneFrameKind,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> Poll<RpcResult<()>>;
     fn close_reader(&self, lane: usize, direction: RpcDirection);
@@ -488,13 +492,15 @@ impl<const N: usize, const M: usize, const Q: usize> LanePool for RpcLaneStorage
             return Poll::Ready(Err(RpcError::InvalidLaneState));
         };
         match pipe.poll_borrow_frame(context) {
-            Poll::Ready(Ok(Some(bytes))) => {
+            Poll::Ready(Ok(Some((bytes, kind)))) => {
                 if let Err(error) = self.retain_handle(lane) {
                     drop(bytes);
                     self.release_borrowed_frame(lane, direction);
                     return Poll::Ready(Err(error));
                 }
-                Poll::Ready(Ok(Some(BorrowedFrame::new(bytes, self, lane, direction))))
+                Poll::Ready(Ok(Some(BorrowedFrame::new(
+                    bytes, self, lane, direction, kind,
+                ))))
             }
             Poll::Ready(Ok(None)) => Poll::Ready(Ok(None)),
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -507,12 +513,13 @@ impl<const N: usize, const M: usize, const Q: usize> LanePool for RpcLaneStorage
         lane: usize,
         direction: RpcDirection,
         context: &mut Context<'_>,
+        kind: LaneFrameKind,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> Poll<RpcResult<()>> {
         let Some(pipe) = self.pipe(lane, direction) else {
             return Poll::Ready(Err(RpcError::InvalidLaneState));
         };
-        let (poll, waker) = pipe.poll_encode_frame(context, encode);
+        let (poll, waker) = pipe.poll_encode_frame(context, kind, encode);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -713,10 +720,11 @@ impl LaneWriter {
     pub(crate) fn poll_encode_frame(
         &mut self,
         context: &mut Context<'_>,
+        kind: LaneFrameKind,
         encode: &mut dyn FnMut(&mut [u8]) -> RpcResult<usize>,
     ) -> Poll<RpcResult<()>> {
         self.pool
-            .poll_encode_frame(self.lane, self.direction, context, encode)
+            .poll_encode_frame(self.lane, self.direction, context, kind, encode)
     }
 }
 

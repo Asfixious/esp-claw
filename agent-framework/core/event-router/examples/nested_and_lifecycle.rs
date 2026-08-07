@@ -24,6 +24,7 @@ impl RpcMethod for Increment {
 
     type Request = Number;
     type Response = Number;
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
 }
@@ -35,6 +36,7 @@ impl RpcMethod for IncrementTwice {
 
     type Request = Number;
     type Response = Number;
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
 }
@@ -46,15 +48,20 @@ impl RpcMethod for CallsItself {
 
     type Request = Number;
     type Response = Number;
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
+}
+
+fn success<T, E>(outcome: Result<T, E>) -> RpcResult<T> {
+    outcome.map_err(|_| RpcError::InvalidFrameState)
 }
 
 async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
     let registry = Rc::new(RpcRegistry::new(lanes)?);
 
-    let increment_registration = registry.register_typed::<Increment, _>(
+    let increment_registration = registry.register::<Increment, _>(
         |context: RpcContext, request: RpcFrame<Number>| async move {
             println!(
                 "increment call={} root={} parent={:?} caller={:?} endpoint={}",
@@ -64,39 +71,41 @@ async fn run() -> RpcResult<()> {
                 context.caller_endpoint_id().map(|id| id.value()),
                 context.endpoint_id().value(),
             );
-            Ok(Number {
+            Ok(Ok(Number {
                 value: request.view()?.value.saturating_add(1),
-            })
+            }))
         },
     )?;
 
-    let twice_registration = registry.register_typed::<IncrementTwice, _>(
+    let twice_registration = registry.register::<IncrementTwice, _>(
         |context: RpcContext, request: RpcFrame<Number>| async move {
             // RpcContext carries a client with the current endpoint and call
             // chain already attached. Nested calls therefore propagate root,
             // parent, and caller endpoint identities automatically.
             let request = *request.view()?;
-            let once_frame = context.client().call::<Increment>(request)?.await?;
+            let once_frame = success(context.client().call::<Increment>(request)?.await?)?;
             let once = *once_frame.view()?;
             drop(once_frame);
-            let twice_frame = context.client().call::<Increment>(once)?.await?;
-            Ok(*twice_frame.view()?)
+            let twice_frame = success(context.client().call::<Increment>(once)?.await?)?;
+            Ok(Ok(*twice_frame.view()?))
         },
     )?;
 
-    registry.register_typed::<CallsItself, _>(
+    registry.register::<CallsItself, _>(
         |context: RpcContext, request: RpcFrame<Number>| async move {
             // This resolves to DirectSelfCall before another provider future starts.
-            let frame = context
-                .client()
-                .call::<CallsItself>(*request.view()?)?
-                .await?;
-            Ok(*frame.view()?)
+            let frame = success(
+                context
+                    .client()
+                    .call::<CallsItself>(*request.view()?)?
+                    .await?,
+            )?;
+            Ok(Ok(*frame.view()?))
         },
     )?;
 
     let client = registry.client();
-    let nested_result = client.call::<IncrementTwice>(Number { value: 10 })?.await?;
+    let nested_result = success(client.call::<IncrementTwice>(Number { value: 10 })?.await?)?;
     assert_eq!(nested_result.view()?, &Number { value: 12 });
     drop(nested_result);
 
@@ -107,7 +116,7 @@ async fn run() -> RpcResult<()> {
     // endpoint rejects new calls but does not cancel the in-flight call.
     let in_flight = client.call::<Increment>(Number { value: 20 })?;
     registry.unregister(&increment_registration)?;
-    assert_eq!(in_flight.await?.view()?, &Number { value: 21 });
+    assert_eq!(success(in_flight.await?)?.view()?, &Number { value: 21 });
     assert!(matches!(
         client.call::<Increment>(Number { value: 30 }),
         Err(RpcError::NotFound(_))

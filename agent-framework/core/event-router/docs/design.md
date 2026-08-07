@@ -124,6 +124,12 @@ struct SearchResult {
     title: [u8; 126],
 }
 
+#[repr(C)]
+#[derive(Immutable, IntoBytes, KnownLayout, TryFromBytes)]
+struct SearchError {
+    code: u16,
+}
+
 struct Search;
 
 impl RpcMethod for Search {
@@ -131,6 +137,7 @@ impl RpcMethod for Search {
 
     type Request = SearchRequest;
     type Response = SearchResult;
+    type Error = SearchError;
     type Input = Unary;
     type Output = Streaming;
 }
@@ -138,17 +145,20 @@ impl RpcMethod for Search {
 
 Typed message 必须是固定布局，不能包含 `String`、`Vec`、指针或引用。`IntoBytes` derive 同时保证没有未初始化 padding；`TryFromBytes` 负责校验并建立借用 view。跨架构协议应使用明确的 byte-order field，而不是假设 native integer endian。
 
-Provider 收到 `RpcFrame<Request>`，业务代码通过 `view()` 借用 request；返回值仍是 owned fixed-layout struct 或 `RpcStream<struct>`：
+Provider 收到 `RpcFrame<Request>`，业务代码通过 `view()` 借用 request。外层 `RpcResult` 表示 transport/runtime 错误；内层 `Result<Response, Error>` 表示 Method 自己的 typed 业务结果。Streaming output 是零个或多个成功 response，或以一个 method error 终止：
 
 ```rust
-registry.register_typed::<Search, _>(|context, request: RpcFrame<SearchRequest>| async move {
+registry.register::<Search, _>(|_context, request: RpcFrame<SearchRequest>| async move {
     let request: &SearchRequest = request.view()?;
     Ok(results)
 })?;
 
 let mut results = client.call::<Search>(request)?;
-while let Some(frame) = results.next().await {
-    consume(frame?.view()?);
+while let Some(outcome) = results.next().await {
+    match outcome? {
+        Ok(frame) => consume(frame.view()?),
+        Err(error) => handle_search_error(error.view()?),
+    }
 }
 ```
 
@@ -156,10 +166,10 @@ while let Some(frame) = results.next().await {
 
 | Input | Output | Handler input | Handler output | Client result |
 | --- | --- | --- | --- | --- |
-| Unary | Unary | `RpcFrame<Request>` | `Response` | `RpcUnaryCall<Response>` → `RpcFrame<Response>` |
-| Unary | Stream | `RpcFrame<Request>` | `RpcStream<Response>` | `RpcStream<RpcFrame<Response>>` |
-| Stream | Unary | `RpcStream<RpcFrame<Request>>` | `Response` | `RpcUnaryCall<Response>` → `RpcFrame<Response>` |
-| Stream | Stream | `RpcStream<RpcFrame<Request>>` | `RpcStream<Response>` | `RpcStream<RpcFrame<Response>>` |
+| Unary | Unary | `RpcFrame<Request>` | `Result<Response, Error>` | `RpcUnaryCall<Response, Error>` → `RpcResult<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
+| Unary | Stream | `RpcFrame<Request>` | `RpcStream<Result<Response, Error>>` | `RpcStream<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
+| Stream | Unary | `RpcStream<RpcFrame<Request>>` | `Result<Response, Error>` | `RpcUnaryCall<Response, Error>` → `RpcResult<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
+| Stream | Stream | `RpcStream<RpcFrame<Request>>` | `RpcStream<Result<Response, Error>>` | `RpcStream<Result<RpcFrame<Response>, RpcFrame<Error>>>` |
 
 Typed call 是 self-driving 的。poll 返回的 future/stream 时，同一个 driver 会公平推进 lane acquisition、request encoder、provider future 和 response decoder，不要求调用者额外 spawn 或 `join!` 一个 call future。
 
@@ -180,15 +190,15 @@ Q fixed root-call waiter slots
 
 根调用在 `N` 个 lane 全部占用时进入固定 waiter table，按 ticket 顺序等待；超过 `Q` 返回 `LaneWaiterCapacityExceeded`。嵌套调用不能在持有外层 lane 时无限等待：若没有空 lane，立即返回 `NestedLaneExhausted`，避免 `N` 条调用链互相持有 lane 形成死锁。取消 active call 会释放 lane；取消 waiter（包括已经获得 reservation、尚未再次 poll 的 waiter）会把 reservation 交给下一个 waiter。
 
-Lane-backed typed request 通过 `IntoBytes::as_bytes()` 直接复制到 request lane；接收端和 response 端不反序列化，而是由 `RpcFrame<T>` 持有 frame lease，并通过 `TryFromBytes::try_ref_from_bytes()` 返回指向 lane 的 `&T`。frame boundary 由 lane metadata 表达，不创建中间 `Vec<u8>`，response payload 也不复制。
+Lane-backed typed request 通过 `IntoBytes::as_bytes()` 直接复制到 request lane；接收端和 response 端不反序列化，而是由 `RpcFrame<T>` 持有 frame lease，并通过 `TryFromBytes::try_ref_from_bytes()` 返回指向 lane 的 `&T`。response pipe metadata 标记当前 frame 是成功 Response 还是 Method Error，payload 本身仍从 aligned buffer 的 offset 0 开始，不增加 header、不破坏 alignment，也不创建中间 `Vec<u8>`。
 
 `RpcFrame<T>` drop 前，对应 pipe 不会被覆盖；drop 时 frame 才被消费并唤醒等待的 writer/reader。Unary response frame 还会保留整个 lane，因此调用者应在用完 view 后尽快 drop frame。若需要跨越后续调用长期保存结果，应把所需字段复制到自己的 fixed-layout storage，再释放 frame。Streaming 同样要求消费并释放当前 frame 后，下一帧才能复用该方向的 buffer。
 
-Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。Request/Response 都是固定布局，因此 frame size 直接等于 `size_of::<Request/Response>()`，Method 不再声明重复的大小配置。`RpcRegistry<N, M, Q>` 和 Method descriptor 在 Method 单态化时通过 const assertion 验证两种消息均能放入 lane 的 `M` bytes 且 alignment 不大于 lane frame 的实际 alignment；不满足时编译失败，不产生运行时 Method layout 容量或 alignment 错误分支。
+Unary 必须恰好包含一个成功或错误 frame。Streaming 包含零个或多个成功 frame，并可用一个 Method Error frame 终止；error 后的 handler stream items 不再发送。Request/Response/Error 都是固定布局，frame size 直接等于对应消息的 `size_of`。`RpcRegistry<N, M, Q>` 和 Method descriptor 在 Method 单态化时通过 const assertion 验证三种消息均能放入 lane 的 `M` bytes 且 alignment 不大于 lane frame 的实际 alignment；不满足时编译失败，不产生运行时 Method layout 容量或 alignment 错误分支。
 
 Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed provider/future 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
 
-Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response type、两侧 cardinality 和 limits，防止同一 address 上发生错误解析。
+Registry 在注册 typed provider 时保存 method descriptor。Typed client 会在开始任何 payload IO 前校验 method marker、request/response/error type 和两侧 cardinality，防止同一 address 上发生错误解析。
 
 Zerocopy 是 RPC 的唯一 codec；固定布局、alignment、padding、bit validity 和 frame lease 都是公开契约的一部分。
 

@@ -3,8 +3,9 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcContext, RpcFrame, RpcHandlerFuture, RpcHandlerInput, RpcHandlerOutput, RpcLaneStorage,
-    RpcMethod, RpcRegistry, RpcResult, RpcStream, Streaming, TypedRpcHandler, Unary,
+    RpcContext, RpcError, RpcFrame, RpcHandler, RpcHandlerFuture, RpcHandlerInput,
+    RpcHandlerOutput, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, RpcStream, Streaming,
+    Unary,
 };
 use futures_util::stream;
 use static_cell::ConstStaticCell;
@@ -32,6 +33,7 @@ impl RpcMethod for UnaryUnary {
 
     type Request = Number;
     type Response = Total;
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
 }
@@ -42,16 +44,16 @@ struct AddOffset {
 
 // Implementing the handler trait directly allows its future to borrow handler
 // state. Stateless handlers can use the closure shorthand shown below.
-impl TypedRpcHandler<UnaryUnary> for AddOffset {
+impl RpcHandler<UnaryUnary> for AddOffset {
     fn call<'a>(
         &'a self,
         _context: RpcContext,
         request: RpcHandlerInput<UnaryUnary>,
     ) -> RpcHandlerFuture<'a, RpcHandlerOutput<UnaryUnary>> {
         Box::pin(async move {
-            Ok(Total {
+            Ok(Ok(Total {
                 value: request.view()?.value.saturating_add(self.offset),
-            })
+            }))
         })
     }
 }
@@ -63,6 +65,7 @@ impl RpcMethod for UnaryStream {
 
     type Request = Number;
     type Response = Total;
+    type Error = ();
     type Input = Unary;
     type Output = Streaming;
 }
@@ -74,6 +77,7 @@ impl RpcMethod for StreamUnary {
 
     type Request = Number;
     type Response = Total;
+    type Error = ();
     type Input = Streaming;
     type Output = Unary;
 }
@@ -85,6 +89,7 @@ impl RpcMethod for StreamStream {
 
     type Request = Number;
     type Response = Total;
+    type Error = ();
     type Input = Streaming;
     type Output = Streaming;
 }
@@ -99,10 +104,16 @@ where
     ))
 }
 
-async fn collect(mut stream: RpcStream<RpcFrame<Total>>) -> RpcResult<Vec<Total>> {
+fn success<T, E>(outcome: Result<T, E>) -> RpcResult<T> {
+    outcome.map_err(|_| RpcError::InvalidFrameState)
+}
+
+async fn collect(
+    mut stream: RpcStream<Result<RpcFrame<Total>, RpcFrame<()>>>,
+) -> RpcResult<Vec<Total>> {
     let mut values = Vec::new();
     while let Some(value) = stream.next().await {
-        values.push(*value?.view()?);
+        values.push(*success(value?)?.view()?);
     }
     Ok(values)
 }
@@ -111,39 +122,37 @@ async fn run() -> RpcResult<()> {
     let lanes = RPC_LANES.take();
     let registry = Rc::new(RpcRegistry::new(lanes)?);
 
-    registry.register_typed::<UnaryUnary, _>(AddOffset { offset: 1 })?;
+    registry.register::<UnaryUnary, _>(AddOffset { offset: 1 })?;
 
-    registry.register_typed::<UnaryStream, _>(
-        |_context, request: RpcFrame<Number>| async move {
-            let value = request.view()?.value;
-            Ok(RpcStream::new(stream::iter([
-                Ok(Total { value }),
-                Ok(Total {
-                    value: value.saturating_add(1),
-                }),
-            ])))
-        },
-    )?;
+    registry.register::<UnaryStream, _>(|_context, request: RpcFrame<Number>| async move {
+        let value = request.view()?.value;
+        Ok(RpcStream::new(stream::iter([
+            Ok(Ok(Total { value })),
+            Ok(Ok(Total {
+                value: value.saturating_add(1),
+            })),
+        ])))
+    })?;
 
-    registry.register_typed::<StreamUnary, _>(
+    registry.register::<StreamUnary, _>(
         |_context, mut requests: RpcStream<RpcFrame<Number>>| async move {
             let mut total = 0_u32;
             while let Some(request) = requests.next().await {
                 total = total.saturating_add(request?.view()?.value);
             }
-            Ok(Total { value: total })
+            Ok(Ok(Total { value: total }))
         },
     )?;
 
-    registry.register_typed::<StreamStream, _>(
+    registry.register::<StreamStream, _>(
         |_context, requests: RpcStream<RpcFrame<Number>>| async move {
             let responses = stream::unfold(requests, |mut requests| async move {
                 match requests.next().await {
                     Some(Ok(request)) => match request.view() {
                         Ok(request) => Some((
-                            Ok(Total {
+                            Ok(Ok(Total {
                                 value: request.value.saturating_mul(2),
-                            }),
+                            })),
                             requests,
                         )),
                         Err(error) => Some((Err(error), requests)),
@@ -159,7 +168,7 @@ async fn run() -> RpcResult<()> {
     let client = registry.client();
 
     // Unary -> Unary returns a self-driving future.
-    let unary = client.call::<UnaryUnary>(Number { value: 41 })?.await?;
+    let unary = success(client.call::<UnaryUnary>(Number { value: 41 })?.await?)?;
     assert_eq!(unary.view()?, &Total { value: 42 });
 
     // Unary -> Stream returns a self-driving RpcStream.
@@ -170,6 +179,7 @@ async fn run() -> RpcResult<()> {
     let stream_unary = client
         .call::<StreamUnary>(request_stream([2, 3, 4]))?
         .await?;
+    let stream_unary = success(stream_unary)?;
     assert_eq!(stream_unary.view()?, &Total { value: 9 });
 
     // Stream -> Stream can transform requests incrementally without buffering

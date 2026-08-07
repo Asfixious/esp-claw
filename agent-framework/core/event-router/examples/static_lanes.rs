@@ -25,6 +25,7 @@ impl RpcMethod for YieldingEcho {
 
     type Request = Number;
     type Response = Number;
+    type Error = ();
     type Input = Unary;
     type Output = Unary;
 }
@@ -33,29 +34,24 @@ async fn run() -> RpcResult<()> {
     // One lane permits one active call. Each direction owns 64 fixed payload
     // bytes, and at most two root calls can wait without allocating a queue.
     let lanes = RPC_LANES.take();
-    assert_eq!(lanes.lane_count(), 1);
-    assert_eq!(lanes.frame_capacity(), 64);
-    assert_eq!(lanes.waiter_capacity(), 2);
 
     let registry = Rc::new(RpcRegistry::new(lanes)?);
-    registry.register_typed::<YieldingEcho, _>(
-        |_context, request: RpcFrame<Number>| async move {
-            // Let the second root call observe the occupied lane and enter the
-            // fixed waiter table before this call returns its lane.
-            tokio::task::yield_now().await;
-            Ok(*request.view()?)
-        },
-    )?;
+    registry.register::<YieldingEcho, _>(|_context, request: RpcFrame<Number>| async move {
+        // Let the second root call observe the occupied lane and enter the
+        // fixed waiter table before this call returns its lane.
+        tokio::task::yield_now().await;
+        Ok(Ok(*request.view()?))
+    })?;
 
     let client = registry.client();
     let first = client.call::<YieldingEcho>(Number { value: 1 })?;
     let second = client.call::<YieldingEcho>(Number { value: 2 })?;
     let first = async move {
-        let frame = first.await?;
+        let frame = first.await?.map_err(|_| RpcError::InvalidFrameState)?;
         Ok::<Number, RpcError>(*frame.view()?)
     };
     let second = async move {
-        let frame = second.await?;
+        let frame = second.await?.map_err(|_| RpcError::InvalidFrameState)?;
         Ok::<Number, RpcError>(*frame.view()?)
     };
     let (first, second) = join!(first, second);

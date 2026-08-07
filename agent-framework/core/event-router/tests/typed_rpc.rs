@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use claw_event_router::rpc::{
-    RpcContext, RpcDirection, RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod,
-    RpcRegistry, RpcResult, RpcStream, Streaming, Unary,
+    RpcContext, RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult,
+    RpcStream, Streaming, Unary,
 };
 use futures_lite::future::{block_on, poll_once};
 use futures_util::stream;
@@ -28,7 +28,7 @@ struct Total {
 #[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
 struct OverAligned([u8; 32]);
 
-fn registry() -> Rc<RpcRegistry> {
+fn registry() -> Rc<RpcRegistry<4, 4_096, 8>> {
     let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4_096, 8>::new()));
     Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"))
 }
@@ -267,29 +267,6 @@ fn zero_byte_zerocopy_frames_are_preserved_by_static_lanes() {
         .expect("start empty-frame call");
     let response = block_on(call).expect("complete empty-frame call");
     assert_eq!(response.view(), Ok(&()));
-}
-
-#[test]
-fn typed_registration_requires_method_frames_to_fit_the_lane_capacity() {
-    let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 8, 1>::new()));
-    let registry = Rc::new(RpcRegistry::new(lanes).expect("valid lane storage"));
-    let result = registry.register_typed::<UnaryUnaryMethod, _>(
-        |_context, request: RpcFrame<Number>| async move {
-            Ok(Total {
-                value: request.view()?.value,
-            })
-        },
-    );
-
-    assert!(matches!(
-        result,
-        Err(RpcError::MethodFrameExceedsLane {
-            direction: RpcDirection::Request,
-            frame_size,
-            lane_capacity: 8,
-            ..
-        }) if frame_size == size_of::<Number>()
-    ));
 }
 
 struct LeaseMethod;

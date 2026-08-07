@@ -30,11 +30,6 @@ pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane
 pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::available: usize
 pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::message_type: &'static str
 pub claw_event_router::rpc::RpcError::MessageAlignmentExceedsLane::required: usize
-pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane
-pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::address: claw_event_router::rpc::RpcAddress
-pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::direction: claw_event_router::rpc::RpcDirection
-pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::frame_size: usize
-pub claw_event_router::rpc::RpcError::MethodFrameExceedsLane::lane_capacity: usize
 pub claw_event_router::rpc::RpcError::MissingUnaryFrame
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted
 pub claw_event_router::rpc::RpcError::NestedLaneExhausted::limit: usize
@@ -104,14 +99,14 @@ pub struct claw_event_router::rpc::RpcRegistration
 impl claw_event_router::rpc::RpcRegistration
 pub fn claw_event_router::rpc::RpcRegistration::address(&self) -> &claw_event_router::rpc::RpcAddress
 pub fn claw_event_router::rpc::RpcRegistration::endpoint_id(&self) -> claw_event_router::rpc::RpcEndpointId
-pub struct claw_event_router::rpc::RpcRegistry
-impl claw_event_router::rpc::RpcRegistry
-pub fn claw_event_router::rpc::RpcRegistry::client(&alloc::rc::Rc<Self>) -> claw_event_router::rpc::RpcClient
-pub fn claw_event_router::rpc::RpcRegistry::is_empty(&self) -> bool
-pub fn claw_event_router::rpc::RpcRegistry::len(&self) -> usize
-pub fn claw_event_router::rpc::RpcRegistry::new<const N: usize, const M: usize, const Q: usize>(&'static claw_event_router::rpc::RpcLaneStorage<N, M, Q>) -> claw_event_router::rpc::RpcResult<Self>
-pub fn claw_event_router::rpc::RpcRegistry::register_typed<M, H>(&self, H) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcRegistration> where M: claw_event_router::rpc::RpcMethod, H: claw_event_router::rpc::TypedRpcHandler<M> + 'static
-pub fn claw_event_router::rpc::RpcRegistry::unregister(&self, &claw_event_router::rpc::RpcRegistration) -> claw_event_router::rpc::RpcResult<()>
+pub struct claw_event_router::rpc::RpcRegistry<const N: usize, const M: usize, const Q: usize>
+impl<const N: usize, const M: usize, const Q: usize> claw_event_router::rpc::RpcRegistry<N, M, Q>
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::client(&alloc::rc::Rc<Self>) -> claw_event_router::rpc::RpcClient
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::is_empty(&self) -> bool
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::len(&self) -> usize
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::new(&'static claw_event_router::rpc::RpcLaneStorage<N, M, Q>) -> claw_event_router::rpc::RpcResult<Self>
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::register_typed<Method, H>(&self, H) -> claw_event_router::rpc::RpcResult<claw_event_router::rpc::RpcRegistration> where Method: claw_event_router::rpc::RpcMethod, H: claw_event_router::rpc::TypedRpcHandler<Method> + 'static
+pub fn claw_event_router::rpc::RpcRegistry<N, M, Q>::unregister(&self, &claw_event_router::rpc::RpcRegistration) -> claw_event_router::rpc::RpcResult<()>
 pub struct claw_event_router::rpc::RpcStream<T>
 impl<T> claw_event_router::rpc::RpcStream<T>
 pub fn claw_event_router::rpc::RpcStream<T>::new<S>(S) -> Self where S: futures_core::stream::Stream<Item = claw_event_router::rpc::RpcResult<T>> + 'static

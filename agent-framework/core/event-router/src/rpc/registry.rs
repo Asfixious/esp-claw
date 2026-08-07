@@ -51,23 +51,21 @@ pub(crate) trait RpcProvider {
 /// futures to be `Send`. It is intended to run inside Event Router's
 /// cooperative executor thread. Root calls wait when every lane is active;
 /// nested calls fail instead of waiting when doing so could deadlock.
-pub struct RpcRegistry {
+pub struct RpcRegistry<const N: usize, const M: usize, const Q: usize> {
     endpoints: RefCell<HashMap<RpcAddress, EndpointEntry>>,
     next_endpoint_id: Cell<u64>,
     next_call_id: Cell<u64>,
     lanes: &'static dyn LanePool,
 }
 
-impl RpcRegistry {
+impl<const N: usize, const M: usize, const Q: usize> RpcRegistry<N, M, Q> {
     /// Creates an empty registry backed by fixed-capacity lane storage.
     ///
     /// # Errors
     ///
     /// Returns [`RpcError::InvalidLaneConfiguration`] when the storage has no
     /// active lanes or no bytes in each request/response direction.
-    pub fn new<const N: usize, const M: usize, const Q: usize>(
-        lanes: &'static RpcLaneStorage<N, M, Q>,
-    ) -> RpcResult<Self> {
+    pub fn new(lanes: &'static RpcLaneStorage<N, M, Q>) -> RpcResult<Self> {
         if N == 0 {
             return Err(RpcError::InvalidLaneConfiguration { field: "N" });
         }
@@ -87,8 +85,9 @@ impl RpcRegistry {
     /// Calls from the returned client start new root call chains.
     #[must_use]
     pub fn client(self: &Rc<Self>) -> RpcClient {
+        let registry: Rc<dyn RegistryAccess> = self.clone();
         RpcClient {
-            registry: Rc::downgrade(self),
+            registry: Rc::downgrade(&registry),
             caller_endpoint_id: None,
             parent_call_id: None,
             root_call_id: None,
@@ -100,22 +99,62 @@ impl RpcRegistry {
     /// The method descriptor is retained with the endpoint so typed clients can
     /// reject request, response, or cardinality mismatches before payload IO.
     ///
+    /// # Compile-time capacity check
+    ///
+    /// A Method whose fixed-layout message exceeds `M` does not compile:
+    ///
+    /// ```compile_fail
+    /// use claw_event_router::rpc::{
+    ///     RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, Unary,
+    /// };
+    /// use static_cell::ConstStaticCell;
+    ///
+    /// struct TooLarge;
+    ///
+    /// impl RpcMethod for TooLarge {
+    ///     const ADDRESS: &'static str = "static.too_large";
+    ///     type Request = [u8; 65];
+    ///     type Response = [u8; 1];
+    ///     type Input = Unary;
+    ///     type Output = Unary;
+    /// }
+    ///
+    /// static LANES: ConstStaticCell<RpcLaneStorage<1, 64, 1>> =
+    ///     ConstStaticCell::new(RpcLaneStorage::new());
+    /// let registry = RpcRegistry::new(LANES.take())?;
+    /// let _ = registry.register_typed::<TooLarge, _>(
+    ///     |_context, _request: RpcFrame<[u8; 65]>| async move { Ok([0]) },
+    /// )?;
+    /// # Ok::<(), claw_event_router::rpc::RpcError>(())
+    /// ```
+    ///
     /// # Errors
     ///
-    /// Returns an error if the method configuration or address is invalid, the
-    /// address is occupied, either message type exceeds the lane capacity, or
-    /// no endpoint identity remains.
-    pub fn register_typed<M, H>(&self, handler: H) -> RpcResult<RpcRegistration>
+    /// Returns an error if the method address or message alignment is invalid,
+    /// the address is occupied, or no endpoint identity remains.
+    ///
+    /// Compilation fails if the fixed request or response type is larger than
+    /// the registry's `M`-byte lane frames.
+    pub fn register_typed<Method, H>(&self, handler: H) -> RpcResult<RpcRegistration>
     where
-        M: RpcMethod,
-        H: TypedRpcHandler<M> + 'static,
+        Method: RpcMethod,
+        H: TypedRpcHandler<Method> + 'static,
     {
-        let descriptor = RpcMethodDescriptor::for_method::<M>()?;
-        self.validate_method_capacity::<M>(&descriptor)?;
+        const {
+            assert!(
+                size_of::<Method::Request>() <= M,
+                "RPC request message exceeds lane frame capacity"
+            );
+            assert!(
+                size_of::<Method::Response>() <= M,
+                "RPC response message exceeds lane frame capacity"
+            );
+        }
+        let descriptor = RpcMethodDescriptor::for_method::<Method>()?;
         let address = descriptor.address().clone();
         self.register_provider(
             address,
-            Rc::new(TypedProvider::<M, H>::new(handler)),
+            Rc::new(TypedProvider::<Method, H>::new(handler)),
             descriptor,
         )
     }
@@ -179,7 +218,7 @@ impl RpcRegistry {
 
     fn prepare_call(
         &self,
-        registry: Weak<Self>,
+        registry: Weak<dyn RegistryAccess>,
         caller: &RpcClient,
         address: &RpcAddress,
         expected: &RpcMethodDescriptor,
@@ -231,31 +270,27 @@ impl RpcRegistry {
     fn take_call_id(&self) -> RpcResult<u64> {
         take_identifier(&self.next_call_id)
     }
+}
 
-    fn validate_method_capacity<M>(&self, descriptor: &RpcMethodDescriptor) -> RpcResult<()>
-    where
-        M: RpcMethod,
-    {
-        let lane_capacity = self.lanes.frame_capacity();
-        let request_size = size_of::<M::Request>();
-        if request_size > lane_capacity {
-            return Err(RpcError::MethodFrameExceedsLane {
-                address: descriptor.address().clone(),
-                direction: RpcDirection::Request,
-                frame_size: request_size,
-                lane_capacity,
-            });
-        }
-        let response_size = size_of::<M::Response>();
-        if response_size > lane_capacity {
-            return Err(RpcError::MethodFrameExceedsLane {
-                address: descriptor.address().clone(),
-                direction: RpcDirection::Response,
-                frame_size: response_size,
-                lane_capacity,
-            });
-        }
-        Ok(())
+trait RegistryAccess {
+    fn prepare_call(
+        &self,
+        registry: Weak<dyn RegistryAccess>,
+        caller: &RpcClient,
+        address: &RpcAddress,
+        expected: &RpcMethodDescriptor,
+    ) -> RpcResult<PreparedCall>;
+}
+
+impl<const N: usize, const M: usize, const Q: usize> RegistryAccess for RpcRegistry<N, M, Q> {
+    fn prepare_call(
+        &self,
+        registry: Weak<dyn RegistryAccess>,
+        caller: &RpcClient,
+        address: &RpcAddress,
+        expected: &RpcMethodDescriptor,
+    ) -> RpcResult<PreparedCall> {
+        self.prepare_call(registry, caller, address, expected)
     }
 }
 
@@ -311,7 +346,7 @@ impl AcquiredCall {
 /// Handle used to invoke endpoints in one registry.
 #[derive(Clone)]
 pub struct RpcClient {
-    registry: Weak<RpcRegistry>,
+    registry: Weak<dyn RegistryAccess>,
     caller_endpoint_id: Option<RpcEndpointId>,
     parent_call_id: Option<RpcCallId>,
     root_call_id: Option<RpcCallId>,
@@ -328,10 +363,9 @@ impl RpcClient {
     /// # Errors
     ///
     /// Returns an error when the registry was dropped, the endpoint does not
-    /// exist, its typed signature differs, either message type exceeds the lane
-    /// capacity, identifiers are exhausted, or this is a direct synchronous
-    /// self-call. The returned future or stream may later report lane
-    /// acquisition or framing errors.
+    /// exist, its typed signature differs, identifiers are exhausted, or this
+    /// is a direct synchronous self-call. The returned future or stream may
+    /// later report lane acquisition or framing errors.
     pub fn call<M>(
         &self,
         input: <M::Input as RpcInputMode<M::Request>>::ClientInput,
@@ -341,7 +375,6 @@ impl RpcClient {
     {
         let descriptor = RpcMethodDescriptor::for_method::<M>()?;
         let registry = self.registry.upgrade().ok_or(RpcError::RegistryDropped)?;
-        registry.validate_method_capacity::<M>(&descriptor)?;
         let prepared = registry.prepare_call(
             self.registry.clone(),
             self,
@@ -468,20 +501,6 @@ pub enum RpcError {
     InvalidLaneConfiguration {
         /// Invalid const generic field.
         field: &'static str,
-    },
-    /// A method message is larger than the configured lane direction.
-    #[error(
-        "RPC {direction} message size {frame_size} for {address} exceeds lane capacity {lane_capacity}"
-    )]
-    MethodFrameExceedsLane {
-        /// Method address.
-        address: RpcAddress,
-        /// Request or response direction.
-        direction: RpcDirection,
-        /// Fixed-layout message size.
-        frame_size: usize,
-        /// Lane direction capacity.
-        lane_capacity: usize,
     },
     /// A typed frame writer was already closed.
     #[error("typed RPC frame writer is closed")]

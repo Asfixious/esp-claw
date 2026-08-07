@@ -6,7 +6,11 @@ use claw_event_router::rpc::{
     RpcError, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Unary,
 };
 use futures_util::join;
+use static_cell::ConstStaticCell;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+static RPC_LANES: ConstStaticCell<RpcLaneStorage<1, 64, 2>> =
+    ConstStaticCell::new(RpcLaneStorage::new());
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
@@ -28,7 +32,7 @@ impl RpcMethod for YieldingEcho {
 async fn run() -> RpcResult<()> {
     // One lane permits one active call. Each direction owns 64 fixed payload
     // bytes, and at most two root calls can wait without allocating a queue.
-    let lanes = Box::leak(Box::new(RpcLaneStorage::<1, 64, 2>::new()));
+    let lanes = RPC_LANES.take();
     assert_eq!(lanes.lane_count(), 1);
     assert_eq!(lanes.frame_capacity(), 64);
     assert_eq!(lanes.waiter_capacity(), 2);

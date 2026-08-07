@@ -5,7 +5,11 @@ use std::rc::Rc;
 use claw_event_router::rpc::{
     RpcContext, RpcError, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Unary,
 };
+use static_cell::ConstStaticCell;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+static RPC_LANES: ConstStaticCell<RpcLaneStorage<2, 4_096, 8>> =
+    ConstStaticCell::new(RpcLaneStorage::new());
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
@@ -47,7 +51,7 @@ impl RpcMethod for CallsItself {
 }
 
 async fn run() -> RpcResult<()> {
-    let lanes = Box::leak(Box::new(RpcLaneStorage::<2, 4_096, 8>::new()));
+    let lanes = RPC_LANES.take();
     let registry = Rc::new(RpcRegistry::new(lanes)?);
 
     let increment_registration = registry.register_typed::<Increment, _>(

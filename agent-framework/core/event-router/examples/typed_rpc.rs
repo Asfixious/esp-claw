@@ -7,7 +7,11 @@ use claw_event_router::rpc::{
     RpcMethod, RpcRegistry, RpcResult, RpcStream, Streaming, TypedRpcHandler, Unary,
 };
 use futures_util::stream;
+use static_cell::ConstStaticCell;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+static RPC_LANES: ConstStaticCell<RpcLaneStorage<4, 4_096, 8>> =
+    ConstStaticCell::new(RpcLaneStorage::new());
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
@@ -104,9 +108,7 @@ async fn collect(mut stream: RpcStream<RpcFrame<Total>>) -> RpcResult<Vec<Total>
 }
 
 async fn run() -> RpcResult<()> {
-    // Firmware can place this value in platform static storage. Box::leak gives
-    // the host example the same application-lifetime placement.
-    let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4_096, 8>::new()));
+    let lanes = RPC_LANES.take();
     let registry = Rc::new(RpcRegistry::new(lanes)?);
 
     registry.register_typed::<UnaryUnary, _>(AddOffset { offset: 1 })?;

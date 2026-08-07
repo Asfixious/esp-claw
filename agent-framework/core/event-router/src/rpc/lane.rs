@@ -377,7 +377,6 @@ impl Drop for BorrowedFrame {
 }
 
 pub(crate) trait LanePool {
-    fn frame_capacity(&self) -> usize;
     fn poll_acquire(
         &self,
         token: &mut Option<u64>,
@@ -406,10 +405,6 @@ pub(crate) trait LanePool {
 }
 
 impl<const N: usize, const M: usize, const Q: usize> LanePool for RpcLaneStorage<N, M, Q> {
-    fn frame_capacity(&self) -> usize {
-        M
-    }
-
     fn poll_acquire(
         &self,
         token: &mut Option<u64>,

@@ -64,10 +64,13 @@ Registry 必须显式接收 application-lifetime lane storage：
 ```rust
 use std::rc::Rc;
 use claw_event_router::rpc::{RpcLaneStorage, RpcRegistry, RpcResult};
+use static_cell::ConstStaticCell;
 
-fn build_registry() -> RpcResult<Rc<RpcRegistry>> {
-    // Host 示例用 Box::leak 模拟 firmware 的 static-cell 放置。
-    let lanes = Box::leak(Box::new(RpcLaneStorage::<4, 4096, 8>::new()));
+static RPC_LANES: ConstStaticCell<RpcLaneStorage<4, 4096, 8>> =
+    ConstStaticCell::new(RpcLaneStorage::new());
+
+fn build_registry() -> RpcResult<Rc<RpcRegistry<4, 4096, 8>>> {
+    let lanes = RPC_LANES.take();
     Ok(Rc::new(RpcRegistry::new(lanes)?))
 }
 ```
@@ -181,7 +184,7 @@ Lane-backed typed request 通过 `IntoBytes::as_bytes()` 直接复制到 request
 
 `RpcFrame<T>` drop 前，对应 pipe 不会被覆盖；drop 时 frame 才被消费并唤醒等待的 writer/reader。Unary response frame 还会保留整个 lane，因此调用者应在用完 view 后尽快 drop frame。若需要跨越后续调用长期保存结果，应把所需字段复制到自己的 fixed-layout storage，再释放 frame。Streaming 同样要求消费并释放当前 frame 后，下一帧才能复用该方向的 buffer。
 
-Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。Request/Response 都是固定布局，因此 frame size 直接等于 `size_of::<Request/Response>()`，Method 不再声明重复的大小配置。Typed provider 注册和 typed client 调用都会在 acquisition 和 payload IO 之前检查两种消息均能放入 lane 的 `M` bytes。消息 alignment 大于 lane 保证的 16 bytes 时，在注册或调用前返回 `MessageAlignmentExceedsLane`。
+Unary 必须恰好包含一个 frame，Streaming 包含零个或多个 frame 并以 EOF 结束。Request/Response 都是固定布局，因此 frame size 直接等于 `size_of::<Request/Response>()`，Method 不再声明重复的大小配置。`RpcRegistry<N, M, Q>` 在 Method 单态化时通过 const assertion 验证两种消息均能放入 lane 的 `M` bytes；不满足时编译失败，不产生运行时容量分支。消息 alignment 大于 lane 保证的 16 bytes 时，在注册或调用前返回 `MessageAlignmentExceedsLane`。
 
 Typed message 和 transport payload 已经完全固定布局：消息不能携带 `String`、`Vec` 等动态字段，response view 直接借用 lane。Registry entries、boxed provider/future 等 RPC 控制对象目前仍会使用 heap；若固件 profile 要求整个 RPC runtime 完全无 heap，还需要继续把这些控制对象放入 object pool。
 

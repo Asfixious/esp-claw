@@ -1,4 +1,4 @@
-//! Demonstrates expected registration, signature, capacity, and provider errors.
+//! Demonstrates expected registration, signature, and provider errors.
 
 use std::rc::Rc;
 
@@ -6,7 +6,11 @@ use claw_event_router::rpc::{
     RpcError, RpcFailure, RpcFrame, RpcLaneStorage, RpcMethod, RpcRegistry, RpcResult, Streaming,
     Unary,
 };
+use static_cell::ConstStaticCell;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+static RPC_LANES: ConstStaticCell<RpcLaneStorage<2, 4_096, 8>> =
+    ConstStaticCell::new(RpcLaneStorage::new());
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout, PartialEq, Eq, TryFromBytes)]
@@ -48,7 +52,7 @@ impl RpcMethod for DomainFailure {
 }
 
 async fn run() -> RpcResult<()> {
-    let lanes = Box::leak(Box::new(RpcLaneStorage::<2, 4_096, 8>::new()));
+    let lanes = RPC_LANES.take();
     let registry = Rc::new(RpcRegistry::new(lanes)?);
     registry.register_typed::<Echo, _>(|_context, request: RpcFrame<Number>| async move {
         Ok(*request.view()?)
@@ -66,20 +70,6 @@ async fn run() -> RpcResult<()> {
         .client()
         .call::<IncompatibleEcho>(Number { value: 1 });
     assert!(matches!(mismatch, Err(RpcError::SignatureMismatch { .. })));
-
-    let small_lanes = Box::leak(Box::new(RpcLaneStorage::<1, 2, 1>::new()));
-    let small_registry = RpcRegistry::new(small_lanes)?;
-    let oversized = small_registry.register_typed::<Echo, _>(
-        |_context, request: RpcFrame<Number>| async move { Ok(*request.view()?) },
-    );
-    assert!(matches!(
-        oversized,
-        Err(RpcError::MethodFrameExceedsLane {
-            frame_size: 4,
-            lane_capacity: 2,
-            ..
-        })
-    ));
 
     registry.register_typed::<DomainFailure, _>(
         |_context, _request: RpcFrame<Number>| async move {
@@ -107,7 +97,7 @@ async fn run() -> RpcResult<()> {
         }
     }
 
-    println!("registration, signature, capacity, and provider errors completed");
+    println!("registration, signature, and provider errors completed");
     Ok(())
 }
 

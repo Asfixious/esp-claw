@@ -1,5 +1,5 @@
 version: 1.0.0
-# Devices Configuration for Waveshare ESP32-S3-Touch-AMOLED-2.16
+# Devices Configuration for Waveshare ESP32-S3-Touch-LCD-4.3C (WS43C) board.
 
 devices:
   # ES8311 speaker playback path.
@@ -52,62 +52,6 @@ devices:
   #         cmd: 1
   #         d0: 3
 
-  # 2.16-inch 480x480 AMOLED, CO5300 over QSPI.
-  # - name: display_lcd
-  #   chip: co5300
-  #   type: display_lcd
-  #   sub_type: spi
-  #   version: default
-  #   dependencies:
-  #     esp_lcd_co5300: "*"
-  #     esp_lcd_panel_io_additions: "^1"
-  #   config:
-  #     x_max: 480
-  #     y_max: 480
-  #     swap_xy: true
-  #     mirror_x: false
-  #     mirror_y: true
-  #     io_spi_config:
-  #       cs_gpio_num: 12
-  #       dc_gpio_num: -1
-  #       spi_mode: 0
-  #       lcd_cmd_bits: 32
-  #       flags:
-  #         quad_mode: true
-  #     lcd_panel_config:
-  #       reset_gpio_num: 39
-  #       rgb_ele_order: LCD_RGB_ELEMENT_ORDER_RGB
-  #       bits_per_pixel: 16
-  #       data_endian: LCD_RGB_DATA_ENDIAN_BIG
-  #       vendor_config: NULL
-  #   peripherals:
-  #     - name: spi_display
-
-  # # Capacitive touch controller used by Waveshare's official BSP.
-  # - name: lcd_touch
-  #   chip: cst9217
-  #   type: lcd_touch
-  #   sub_type: i2c
-  #   version: default
-  #   dependencies:
-  #     esp_lcd_touch:
-  #       version: "*"
-  #       require: public
-  #     waveshare/esp_lcd_touch_cst9217: "*"
-  #   config:
-  #     io_i2c_config:
-  #       scl_speed_hz: 400000
-  #     touch_config:
-  #       x_max: 480
-  #       y_max: 480
-  #       rst_gpio_num: 40
-  #       int_gpio_num: 11
-  #   peripherals:
-  #     - name: i2c_master
-  #       i2c_addr: [0xB4]
-
-  # 800x480 RGB LCD panel. Schematic nets: RGB565 data GPIO8-19/33-36,
-  # PCLK=GPIO40, DE=GPIO43, HSYNC=GPIO44, VSYNC=GPIO45.
   - name: display_lcd
     chip: generic_rgb
     type: display_lcd
@@ -150,11 +94,17 @@ devices:
             pclk_active_neg: true
         flags:
           fb_in_psram: true
+  - name: ws43c_touch_preinit
+    type: custom
+    config: {}
+    peripherals:
+      - name: i2c_master
   - name: lcd_touch
     chip: gt911
     type: lcd_touch
     sub_type: i2c
     version: default
+    depends_on: ws43c_touch_preinit
     dependencies:
       esp_lcd_touch:
         version: "*"
@@ -168,7 +118,7 @@ devices:
         x_max: 800
         y_max: 480
         rst_gpio_num: -1
-        int_gpio_num: -1
+        int_gpio_num: 4
         flags:
           swap_xy: false
           mirror_x: false

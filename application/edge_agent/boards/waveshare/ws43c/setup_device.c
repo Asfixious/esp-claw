@@ -49,7 +49,7 @@ static esp_err_t ws43c_backlight_on(void)
     static void ws43c_backlight_task(void *arg)
     
 {
-    vTaskDelay(pdMS_TO_TICKS(500)); // Wait for .5 second before starting the backlight task
+    vTaskDelay(pdMS_TO_TICKS(1500)); // Wait for 1.5 second before starting the backlight task
     
     for (int i = 0; i < 50; i++) {
         esp_err_t ret = ws43c_backlight_on();
@@ -77,6 +77,7 @@ static void __attribute__((constructor)) ws43c_start_backlight_task(void)
 }
 static esp_err_t ws43c_touch_reset(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(500));
     void *handle = NULL;
 
     esp_err_t ret = esp_board_periph_ref_handle("i2c_master", &handle);
@@ -105,7 +106,8 @@ static esp_err_t ws43c_touch_reset(void)
     if (ret == ESP_OK) {
         uint8_t output_low[] = {0x03, 0xF5};
         ret = i2c_master_transmit(io_expander, output_low,
-                                  sizeof(output_low), 100);
+            sizeof(output_low), 100);
+            vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     if (ret == ESP_OK) {
@@ -133,16 +135,35 @@ static esp_err_t ws43c_touch_reset(void)
 
     return ret;
 }
+static uint8_t ws43c_touch_preinit_handle;
+
+static int ws43c_touch_preinit_init(void *cfg, int cfg_size, void **device_handle)
+{
+    (void)cfg;
+    (void)cfg_size;
+    esp_err_t ret = ws43c_touch_reset();
+    if (ret != ESP_OK) {
+        return -1;
+    }
+
+    *device_handle = &ws43c_touch_preinit_handle;
+    return 0;
+}
+
+static int ws43c_touch_preinit_deinit(void *device_handle)
+{
+    (void)device_handle;
+    return 0;
+}
+
+CUSTOM_DEVICE_IMPLEMENT(ws43c_touch_preinit,
+                        ws43c_touch_preinit_init,
+                        ws43c_touch_preinit_deinit);
 esp_err_t lcd_touch_factory_entry_t(
     esp_lcd_panel_io_handle_t io,
     const esp_lcd_touch_config_t *touch_dev_config,
     esp_lcd_touch_handle_t *ret_touch)
 {
-    esp_err_t ret = ws43c_touch_reset();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "GT911 hardware reset failed");
-        return ret;
-    }
-
+  
     return esp_lcd_touch_new_i2c_gt911(io, touch_dev_config, ret_touch);
 }
